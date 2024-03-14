@@ -756,9 +756,11 @@ class ModelRunner:
         self.cupy_nccl_backend = None
 
 
-class CUDAGraphRunner:
+class CUDAGraphRunner(nn.Module):
 
     def __init__(self, model: nn.Module):
+        super().__init__()
+
         self.model = model
         self.graph = None
         self.input_buffers: Dict[str, torch.Tensor] = {}
@@ -836,9 +838,6 @@ class CUDAGraphRunner:
 
         # Return the output tensor.
         return self.output_buffers["hidden_states"]
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
 
 
 @contextlib.contextmanager
