@@ -1,8 +1,10 @@
+import pandas as pd
+
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from vllm.profiler.utils import (indent_string, TablePrinter, event_has_module,
                                  event_is_torch_op, event_module_repr,
-                                 event_torch_op_stack_trace)
+                                 event_torch_op_stack_trace, trim_string_back)
 from typing import Dict, List, Union, Optional, Tuple
 from torch.profiler import profile, ProfilerActivity
 from torch.autograd.profiler import EventList, FunctionEvent
@@ -33,16 +35,62 @@ class _ModuleTreeNode:
 
 @dataclass
 class NMProfileResults(profile):
+
+    @dataclass
+    class SummaryRow:
+        name: str
+        cuda_time_us: float
+        pct_cuda_time: float
+        invocations: int
+
+    @dataclass
+    class ModelRow:
+        name: str
+        cpu_time_us: float
+        cuda_time_us: float
+        pct_cuda_time: float
+        trace: str
+
     _kineto_results: _ProfilerResult
     _event_list: EventList
     _kineto_event_correlation_map: Dict[int,
                                         List[_KinetoEvent]] = field(init=False)
     _event_correlation_map: Dict[int, List[FunctionEvent]] = field(init=False)
     _module_tree: List[_ModuleTreeNode] = field(init=False)
+    _model_table: List[ModelRow] = field(init=False)
+    _summary_table: List[SummaryRow] = field(init=False)
 
     def __post_init__(self):
         self._build_correlation_maps()
         self._build_module_tree()
+        self._model_table = self._build_model_table()
+        self._summary_table = self._build_summary_table()
+
+    def print_model_table(self,
+                          column_widths=dict(name=60,
+                                             cpu_time_us=12,
+                                             cuda_time_us=12,
+                                             pct_cuda_time=12,
+                                             trace=60)):
+        TablePrinter(self.ModelRow, column_widths).print_table(
+            self._model_table,
+            filter=lambda row: row.cuda_time_us == 0 and row.cpu_time_us == 0)
+
+    def print_summary_table(self,
+                            column_widths=dict(name=80,
+                                               cuda_time_us=12,
+                                               pct_cuda_time=12,
+                                               invocations=15)):
+        TablePrinter(self.SummaryRow, column_widths).print_table(
+            self._summary_table, filter=lambda row: row.cuda_time_us == 0)
+
+    def export_model_table_csv(self, filename: str):
+        df = pd.DataFrame([asdict(row) for row in self._model_table])
+        df.to_csv(filename)
+
+    def export_summary_table_csv(self, filename: str):
+        df = pd.DataFrame([asdict(row) for row in self._summary_table])
+        df.to_csv(filename)
 
     def _build_correlation_maps(self):
         self._kineto_event_correlation_map = defaultdict(list)
@@ -109,24 +157,8 @@ class NMProfileResults(profile):
         return sum(
             [self._cumulative_cuda_time(root) for root in self._module_tree])
 
-    def print_model_table(self):
-
-        @dataclass
-        class ModelRow:
-            name: str
-            cpu_time_us: float
-            cuda_time_us: float
-            pct_cuda_time: float
-            trace: str
-
-        column_widths = dict(name=60,
-                             cpu_time_us=12,
-                             cuda_time_us=12,
-                             pct_cuda_time=12,
-                             trace=60)
-
-        model_table_printer = TablePrinter(ModelRow, column_widths)
-        rows: List[ModelRow] = []
+    def _build_model_table(self):
+        rows: List[self.ModelRow] = []
 
         total_cuda_time = self._total_cuda_time()
 
@@ -135,7 +167,7 @@ class NMProfileResults(profile):
             if event_has_module(node.event):
                 name = indent_string(event_module_repr(node.event), indent)
                 cumulative_cuda_time = self._cumulative_cuda_time(node)
-                row = ModelRow(
+                row = self.ModelRow(
                     name=name,
                     cpu_time_us=node.event.duration_time_ns / 1000,
                     cuda_time_us=cumulative_cuda_time,
@@ -147,12 +179,13 @@ class NMProfileResults(profile):
             elif node.is_leaf and (gpu_kineto_event :=
                                    self._get_kineto_gpu_event(node)):
                 name = indent_string(gpu_kineto_event.name(), indent)
-                row = ModelRow(name=name,
-                               cpu_time_us=0,
-                               cuda_time_us=gpu_kineto_event.duration_us(),
-                               pct_cuda_time=(gpu_kineto_event.duration_us() /
-                                              total_cuda_time) * 100,
-                               trace=node.trace)
+                row = self.ModelRow(
+                    name=name,
+                    cpu_time_us=0,
+                    cuda_time_us=gpu_kineto_event.duration_us(),
+                    pct_cuda_time=(gpu_kineto_event.duration_us() /
+                                   total_cuda_time) * 100,
+                    trace=node.trace)
                 rows.append(row)
 
             for child in node.children:
@@ -161,11 +194,9 @@ class NMProfileResults(profile):
         for root in self._module_tree:
             _df_traversal(root)
 
-        model_table_printer.print_table(
-            rows,
-            filter=lambda row: row.cuda_time_us == 0 and row.cpu_time_us == 0)
+        return rows
 
-    def print_summary_table(self):
+    def _build_summary_table(self) -> List[SummaryRow]:
 
         @dataclass
         class SummaryEntry:
@@ -197,21 +228,7 @@ class NMProfileResults(profile):
             _df_traversal(root)
 
         total_cuda_time = self._total_cuda_time()
-
-        @dataclass
-        class SummaryRow:
-            name: str
-            cuda_time_us: float
-            pct_cuda_time: float
-            invocations: int
-
-        column_widths = dict(name=80,
-                             cuda_time_us=12,
-                             pct_cuda_time=12,
-                             invocations=15)
-
-        summary_table_printer = TablePrinter(SummaryRow, column_widths)
-        rows: List[SummaryRow] = []
+        rows: List[self.SummaryRow] = []
 
         def _construct_summary_rows(summary: Dict[str, Union[Dict,
                                                              SummaryEntry]],
@@ -220,10 +237,10 @@ class NMProfileResults(profile):
             cumulative_cuda_time_us = 0
             for key, value in summary.items():
                 if isinstance(value, dict):
-                    row = SummaryRow(name=indent_string(key, indent),
-                                     cuda_time_us=0,
-                                     pct_cuda_time=0,
-                                     invocations="")
+                    row = self.SummaryRow(name=indent_string(key, indent),
+                                          cuda_time_us=0,
+                                          pct_cuda_time=0,
+                                          invocations="")
                     rows.append(row)
                     row.cuda_time_us = _construct_summary_rows(value,
                                                                indent=indent +
@@ -232,7 +249,7 @@ class NMProfileResults(profile):
                                          total_cuda_time) * 100
                     cumulative_cuda_time_us += row.cuda_time_us
                 elif isinstance(value, SummaryEntry):
-                    row = SummaryRow(
+                    row = self.SummaryRow(
                         name=indent_string(key, indent),
                         cuda_time_us=value.cuda_time_us,
                         pct_cuda_time=(value.cuda_time_us / total_cuda_time) *
@@ -245,8 +262,7 @@ class NMProfileResults(profile):
 
         _construct_summary_rows(summary)
 
-        summary_table_printer.print_table(
-            rows, filter=lambda row: row.cuda_time_us == 0)
+        return rows
 
 
 class nm_profile(profile):

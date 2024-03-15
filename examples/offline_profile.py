@@ -10,8 +10,8 @@ PROMPT_LEN_DEFAULT = 256
 MAX_SEQ_LEN_DEFAULT = 1024
 
 
-def run_profile(model_name, model_revision, is_sparse, quant_method,
-                max_seq_len, prompt_len, batch_size, num_gpus,
+def run_profile(model_name, model_revision, csv_output, is_sparse,
+                quant_method, max_seq_len, prompt_len, batch_size, num_gpus,
                 allow_cuda_graphs):
     print("Run profile with:")
     print(f"  model_name = {model_name}")
@@ -68,13 +68,16 @@ def run_profile(model_name, model_revision, is_sparse, quant_method,
     with nm_profile() as decode_prof:
         llm.llm_engine.step()
 
+    prefill_results = prefill_prof.results
+    decode_results = prefill_prof.results
+
     print("=" * 80)
     print(
         f"= Prefill Model Table (prompt_len={prompt_len}, batch_size={batch_size})"
     )
     print("=" * 80)
     print()
-    prefill_prof.results.print_model_table()
+    prefill_results.print_model_table()
     print()
     print("=" * 80)
     print(
@@ -82,7 +85,7 @@ def run_profile(model_name, model_revision, is_sparse, quant_method,
     )
     print("=" * 80)
     print()
-    decode_prof.results.print_model_table()
+    decode_results.print_model_table()
     print()
     print("=" * 80)
     print(
@@ -90,7 +93,7 @@ def run_profile(model_name, model_revision, is_sparse, quant_method,
     )
     print("=" * 80)
     print()
-    prefill_prof.results.print_summary_table()
+    prefill_results.print_summary_table()
     print()
     print("=" * 80)
     print(
@@ -98,7 +101,18 @@ def run_profile(model_name, model_revision, is_sparse, quant_method,
     )
     print("=" * 80)
     print()
-    decode_prof.results.print_summary_table()
+    decode_results.print_summary_table()
+
+    csv_filename_base = csv_output.replace(".csv", "")
+    if csv_output:
+        prefill_results.export_model_table_csv(csv_filename_base +
+                                               "_prefill_model_table.csv")
+        prefill_results.export_summary_table_csv(csv_filename_base +
+                                                 "_prefill_summary_table.csv")
+        decode_results.export_model_table_csv(csv_filename_base +
+                                              "_decode_model_table.csv")
+        decode_results.export_summary_table_csv(csv_filename_base +
+                                                "_decode_summary_table.csv")
 
 
 if __name__ == "__main__":
@@ -106,6 +120,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_name", type=str, required=True)
     parser.add_argument("--model_revision", type=str, default=None)
+    parser.add_argument("--csv", type=str, default=None)
     parser.add_argument('--is_sparse', action='store_true')
     parser.add_argument("--quant_method", type=str, default=None)
     parser.add_argument("--max_seq_len", type=int, default=MAX_SEQ_LEN_DEFAULT)
@@ -118,6 +133,7 @@ if __name__ == "__main__":
 
     run_profile(model_name=args.model_name,
                 model_revision=args.model_revision,
+                csv_output=args.csv,
                 is_sparse=args.is_sparse,
                 quant_method=args.quant_method,
                 max_seq_len=args.max_seq_len,
