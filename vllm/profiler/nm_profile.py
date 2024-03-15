@@ -83,6 +83,32 @@ class NMProfileResults(profile):
         for root in event_tree:
             _df_traversal(root)
 
+    def _get_kineto_gpu_event(self, node: _ModuleTreeNode):
+        correlated_kineto_events = self._kineto_event_correlation_map.get(
+            node.event.correlation_id, [])
+        iterator = (x for x in correlated_kineto_events
+                    if x.device_type() == DeviceType.CUDA)
+        return next(iterator, None)
+
+    def _cumulative_cuda_time(self, node: _ModuleTreeNode):
+
+        def _cumulative_cuda_time_recursive(node: _ModuleTreeNode):
+            if node.is_leaf and (gpu_kineto_event :=
+                                 self._get_kineto_gpu_event(node)):
+                return gpu_kineto_event.duration_us()
+            else:
+                cumulative_cuda_time = 0
+                for child in node.children:
+                    cumulative_cuda_time += _cumulative_cuda_time_recursive(
+                        child)
+                return cumulative_cuda_time
+
+        return _cumulative_cuda_time_recursive(node)
+
+    def _total_cuda_time(self):
+        return sum(
+            [self._cumulative_cuda_time(root) for root in self._module_tree])
+
     def print_model_table(self):
 
         @dataclass
@@ -90,48 +116,47 @@ class NMProfileResults(profile):
             name: str
             cpu_time_us: float
             cuda_time_us: float
+            pct_cuda_time: float
             trace: str
 
         column_widths = dict(name=60,
-                             cpu_time_us=15,
-                             cuda_time_us=15,
-                             trace=90)
+                             cpu_time_us=12,
+                             cuda_time_us=12,
+                             pct_cuda_time=12,
+                             trace=60)
 
         model_table_printer = TablePrinter(ModelRow, column_widths)
         rows: List[ModelRow] = []
 
-        def _df_traversal(node: _ModuleTreeNode, indent=0):
+        total_cuda_time = self._total_cuda_time()
+
+        def _df_traversal(node: _ModuleTreeNode, indent: int = 0):
             row = None
             if event_has_module(node.event):
                 name = indent_string(event_module_repr(node.event), indent)
-                row = ModelRow(name=name,
-                               cpu_time_us=node.event.duration_time_ns / 1000,
-                               cuda_time_us=0,
-                               trace="")
+                cumulative_cuda_time = self._cumulative_cuda_time(node)
+                row = ModelRow(
+                    name=name,
+                    cpu_time_us=node.event.duration_time_ns / 1000,
+                    cuda_time_us=cumulative_cuda_time,
+                    pct_cuda_time=(cumulative_cuda_time / total_cuda_time) *
+                    100,
+                    trace="")
                 rows.append(row)
                 indent += 1
-            elif node.is_leaf:
-                correlated_kineto_events = self._kineto_event_correlation_map.get(
-                    node.event.correlation_id, [])
-                iterator = (x for x in correlated_kineto_events
-                            if x.device_type() == DeviceType.CUDA)
-                if gpu_kineto_event := next(iterator, None):
-                    name = indent_string(gpu_kineto_event.name(), indent)
-                    row = ModelRow(name=name,
-                                   cpu_time_us=0,
-                                   cuda_time_us=gpu_kineto_event.duration_us(),
-                                   trace=node.trace)
-                    rows.append(row)
-            row_idx = len(rows) - 1
+            elif node.is_leaf and (gpu_kineto_event :=
+                                   self._get_kineto_gpu_event(node)):
+                name = indent_string(gpu_kineto_event.name(), indent)
+                row = ModelRow(name=name,
+                               cpu_time_us=0,
+                               cuda_time_us=gpu_kineto_event.duration_us(),
+                               pct_cuda_time=(gpu_kineto_event.duration_us() /
+                                              total_cuda_time) * 100,
+                               trace=node.trace)
+                rows.append(row)
 
-            cumulative_cuda_time_us = 0 if row is None else row.cuda_time_us
             for child in node.children:
-                cumulative_cuda_time_us += _df_traversal(child, indent=indent)
-
-            if cumulative_cuda_time_us > 0:
-                rows[row_idx].cuda_time_us = cumulative_cuda_time_us
-
-            return cumulative_cuda_time_us
+                _df_traversal(child, indent=indent)
 
         for root in self._module_tree:
             _df_traversal(root)
@@ -155,21 +180,15 @@ class NMProfileResults(profile):
             if event_has_module(node.event):
                 module_trace = module_trace + (event_module_repr(node.event), )
                 indent += 1
-            elif node.is_leaf:
-                kineto_events = self._kineto_event_correlation_map.get(
-                    node.event.correlation_id, [])
-                if gpu_kineto_event := next(
-                    (x for x in kineto_events
-                     if x.device_type() == DeviceType.CUDA), None):
-                    summary_entry = summary
-                    for module_name in module_trace:
-                        summary_entry = summary_entry.setdefault(
-                            module_name, {})
-                    summary_entry = summary_entry.setdefault(
-                        gpu_kineto_event.name(), SummaryEntry())
-                    summary_entry.cuda_time_us += gpu_kineto_event.duration_us(
-                    )
-                    summary_entry.invocations += 1
+            elif node.is_leaf and (gpu_kineto_event :=
+                                   self._get_kineto_gpu_event(node)):
+                summary_entry = summary
+                for module_name in module_trace:
+                    summary_entry = summary_entry.setdefault(module_name, {})
+                summary_entry = summary_entry.setdefault(
+                    gpu_kineto_event.name(), SummaryEntry())
+                summary_entry.cuda_time_us += gpu_kineto_event.duration_us()
+                summary_entry.invocations += 1
 
             for child in node.children:
                 _df_traversal(child, indent=indent, module_trace=module_trace)
@@ -177,13 +196,19 @@ class NMProfileResults(profile):
         for root in self._module_tree:
             _df_traversal(root)
 
+        total_cuda_time = self._total_cuda_time()
+
         @dataclass
         class SummaryRow:
             name: str
-            cuda_time_us: float = 0
-            invocations: int = 0
+            cuda_time_us: float
+            pct_cuda_time: float
+            invocations: int
 
-        column_widths = dict(name=80, cuda_time_us=15, invocations=15)
+        column_widths = dict(name=80,
+                             cuda_time_us=12,
+                             pct_cuda_time=12,
+                             invocations=15)
 
         summary_table_printer = TablePrinter(SummaryRow, column_widths)
         rows: List[SummaryRow] = []
@@ -197,16 +222,22 @@ class NMProfileResults(profile):
                 if isinstance(value, dict):
                     row = SummaryRow(name=indent_string(key, indent),
                                      cuda_time_us=0,
+                                     pct_cuda_time=0,
                                      invocations="")
                     rows.append(row)
                     row.cuda_time_us = _construct_summary_rows(value,
                                                                indent=indent +
                                                                1)
+                    row.pct_cuda_time = (row.cuda_time_us /
+                                         total_cuda_time) * 100
                     cumulative_cuda_time_us += row.cuda_time_us
                 elif isinstance(value, SummaryEntry):
-                    row = SummaryRow(name=indent_string(key, indent),
-                                     cuda_time_us=value.cuda_time_us,
-                                     invocations=value.invocations)
+                    row = SummaryRow(
+                        name=indent_string(key, indent),
+                        cuda_time_us=value.cuda_time_us,
+                        pct_cuda_time=(value.cuda_time_us / total_cuda_time) *
+                        100,
+                        invocations=value.invocations)
                     cumulative_cuda_time_us += value.cuda_time_us
                     rows.append(row)
 
