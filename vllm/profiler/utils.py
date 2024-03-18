@@ -1,6 +1,6 @@
 import dataclasses
 
-from typing import Callable, Dict, Type, List, Optional
+from typing import Callable, Dict, Type, List, Optional, Union
 
 from torch._C._profiler import _EventType, _ProfilerEvent, _TensorMetadata
 
@@ -36,12 +36,10 @@ class TablePrinter:
         self.column_widths = column_widths
         assert set(self.column_widths.keys()) == set(self.fieldnames)
 
-    def print_table(self, rows: List[dataclasses.dataclass],
-                    filter: Optional[Callable]):
+    def print_table(self, rows: List[dataclasses.dataclass]):
         self._print_header()
         self._print_line()
-        valid_rows = (row for row in rows if not filter or not filter(row))
-        for row in valid_rows:
+        for row in rows:
             self._print_row(row)
 
     def _print_header(self):
@@ -75,9 +73,14 @@ class TablePrinter:
         print("=" * (total_col_width + 3 * (len(self.column_widths) - 1)))
 
 
-def indent_string(string: str, indent: int):
+def indent_string(string: str,
+                  indent: int,
+                  indent_style: Union[Callable[[int], str], str] = " ") -> str:
     if indent:
-        return "|" * indent + "- " + string
+        if isinstance(indent_style, str):
+            return indent_style * indent + string
+        else:
+            return indent_style(indent) + string
     else:
         return string
 
@@ -98,7 +101,7 @@ def event_is_torch_op(event: _ProfilerEvent) -> bool:
     return event.tag == _EventType.TorchOp
 
 
-def event_arg_repr(arg):
+def event_arg_repr(arg) -> str:
     if arg is None or type(arg) in [float, int, bool, str]:
         return f"{arg}"
     elif isinstance(arg, list):
@@ -111,13 +114,13 @@ def event_arg_repr(arg):
         return f"{str(arg.dtype).replace('torch.', '')}[{', '.join([str(x) for x in arg.sizes])}]"
 
 
-def event_torch_op_repr(event: _ProfilerEvent):
+def event_torch_op_repr(event: _ProfilerEvent) -> str:
     assert event.tag == _EventType.TorchOp
     return f"{event.name}({', '.join([event_arg_repr(x) for x in event.typed[1].inputs])})".replace(
         "aten::", "")
 
 
-def event_module_repr(event: _ProfilerEvent):
+def event_module_repr(event: _ProfilerEvent) -> str:
     assert event_has_module(event)
     module = event.typed[1].module
     if module.parameters and len(module.parameters) > 0:
@@ -127,7 +130,7 @@ def event_module_repr(event: _ProfilerEvent):
 
 
 def event_torch_op_stack_trace(curr_event: _ProfilerEvent,
-                               until: Callable[[_ProfilerEvent], bool]):
+                               until: Callable[[_ProfilerEvent], bool]) -> str:
     trace = ""
     curr_event = curr_event.parent
     while curr_event and not until(curr_event):
