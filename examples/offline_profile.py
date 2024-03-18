@@ -69,7 +69,7 @@ def run_profile(model_name, model_revision, csv_output, is_sparse,
         llm.llm_engine.step()
 
     prefill_results = prefill_prof.results
-    decode_results = prefill_prof.results
+    decode_results = decode_prof.results
 
     print("=" * 80)
     print(
