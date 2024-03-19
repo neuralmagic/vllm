@@ -124,9 +124,9 @@ class NMProfileResults(profile):
     def convert_stats_to_dict(self) -> str:
         return {
             "summary_stats":
-            self._convert_stats_tree_dict(self._summary_stats_tree),
+            self._convert_stats_tree_to_dict(self._summary_stats_tree),
             "model_stats":
-            self._convert_stats_tree_dict(self._model_stats_tree)
+            self._convert_stats_tree_to_dict(self._model_stats_tree)
         }
 
     @staticmethod
@@ -268,7 +268,7 @@ class NMProfileResults(profile):
             elif (gpu_kineto_event := self._get_kineto_gpu_event(node)):
                 name = gpu_kineto_event.name()
                 cuda_time_us = gpu_kineto_event.duration_us()
-                cpu_time_us = 0
+                cpu_time_us = node.event.duration_time_ns / 1000
                 trace = node.trace
             else:
                 return None
@@ -307,9 +307,9 @@ class NMProfileResults(profile):
 
         return entries
 
-    def _convert_stats_tree_dict(self,
-                                 tree: List[_StatsTreeNode]) -> List[Dict]:
-        curr_dict: List[Dict] = []
+    def _convert_stats_tree_to_dict(self,
+                                    tree: List[_StatsTreeNode]) -> List[Dict]:
+        root_dicts: List[Dict] = []
 
         def df_traversal(node: _StatsTreeNode, curr_json_list: List[Dict]):
             curr_json_list.append({
@@ -317,12 +317,12 @@ class NMProfileResults(profile):
                 "children": []
             })
             for child in node.children:
-                df_traversal(child, curr_dict[-1]["children"])
+                df_traversal(child, curr_json_list[-1]["children"])
 
         for root in tree:
-            df_traversal(root, curr_dict)
+            df_traversal(root, root_dicts)
 
-        return curr_dict
+        return root_dicts
 
 
 class nm_profile(profile):
