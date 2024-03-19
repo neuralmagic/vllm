@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, asdict
 from vllm.profiler.utils import (indent_string, TablePrinter, event_has_module,
                                  event_is_torch_op, event_module_repr,
                                  event_torch_op_stack_trace, trim_string_back)
-from typing import Dict, List, Union, Optional, Tuple, Callable
+from typing import Dict, List, Union, Optional, Tuple, Callable, TypeAlias
 from torch.profiler import profile, ProfilerActivity
 from torch.autograd.profiler import EventList, FunctionEvent
 from torch._C._autograd import _ProfilerResult, _KinetoEvent, DeviceType
@@ -35,36 +35,46 @@ class _ModuleTreeNode:
 
 
 @dataclass
+class SummaryStatsEntry:
+    name: str
+    cuda_time_us: float
+    pct_cuda_time: float
+    invocations: int
+
+
+@dataclass
+class ModelStatsEntry:
+    name: str
+    cpu_time_us: float
+    cuda_time_us: float
+    pct_cuda_time: float
+    trace: str
+
+
+StatsEntry: TypeAlias = Union[ModelStatsEntry, SummaryStatsEntry]
+
+
+@dataclass
+class _StatsTreeNode:
+    entry: StatsEntry
+    children: List[StatsEntry]
+    parent: Optional[StatsEntry]
+
+
+@dataclass
 class NMProfileResults(profile):
-
-    @dataclass
-    class SummaryRow:
-        name: str
-        cuda_time_us: float
-        pct_cuda_time: float
-        invocations: int
-
-    @dataclass
-    class ModelRow:
-        name: str
-        cpu_time_us: float
-        cuda_time_us: float
-        pct_cuda_time: float
-        trace: str
-
     _kineto_results: _ProfilerResult
     _kineto_event_correlation_map: Dict[int,
                                         List[_KinetoEvent]] = field(init=False)
     _event_correlation_map: Dict[int, List[FunctionEvent]] = field(init=False)
     _module_tree: List[_ModuleTreeNode] = field(init=False)
-    _model_table: List[Tuple[int, ModelRow]] = field(init=False)
-    _summary_table: List[Tuple[int, SummaryRow]] = field(init=False)
+    _model_stats_tree: List[_StatsTreeNode] = field(init=False)
+    _summary_stats_tree: List[_StatsTreeNode] = field(init=False)
 
     def __post_init__(self):
         self._build_correlation_map()
         self._build_module_tree()
-        self._model_table = self._build_model_table()
-        self._summary_table = self._build_summary_table()
+        self._build_stats_trees()
 
     def print_model_table(self,
                           column_widths=dict(name=60,
@@ -72,10 +82,12 @@ class NMProfileResults(profile):
                                              cuda_time_us=12,
                                              pct_cuda_time=12,
                                              trace=60)):
-        filtered_model_table = [(depth, row)
-                                for depth, row in self._model_table
-                                if row.cuda_time_us > 0 or row.cpu_time_us > 0]
-        TablePrinter(self.ModelRow, column_widths).print_table(
+        filtered_model_table = [
+            (depth, row)
+            for depth, row in self._flatten_stats_tree(self._model_stats_tree)
+            if row.cuda_time_us > 0 or row.cpu_time_us > 0
+        ]
+        TablePrinter(ModelStatsEntry, column_widths).print_table(
             self._indent_row_names_based_on_depth(
                 filtered_model_table,
                 indent_style=lambda indent: "|" + "-" * indent + " "))
@@ -86,25 +98,34 @@ class NMProfileResults(profile):
                                                pct_cuda_time=12,
                                                invocations=15)):
         filtered_summary_table = [(depth, row)
-                                  for depth, row in self._summary_table
+                                  for depth, row in self._flatten_stats_tree(
+                                      self._summary_stats_tree)
                                   if row.cuda_time_us > 0]
-        TablePrinter(self.SummaryRow, column_widths).print_table(
+        TablePrinter(SummaryStatsEntry, column_widths).print_table(
             self._indent_row_names_based_on_depth(
                 filtered_summary_table,
                 indent_style=lambda indent: "|" + "-" * indent + " "))
 
     def export_model_table_csv(self, filename: str):
-        df = pd.DataFrame([asdict(row) for _, row in self._model_table])
+        df = pd.DataFrame([
+            asdict(row)
+            for _, row in self._flatten_stats_tree(self._model_stats_tree)
+        ])
         df.to_csv(filename)
 
     def export_summary_table_csv(self, filename: str):
-        df = pd.DataFrame([asdict(row) for _, row in self._summary_table])
+        df = pd.DataFrame([
+            asdict(row)
+            for _, row in self._flatten_stats_tree(self._summary_stats_tree)
+        ])
         df.to_csv(filename)
 
     @staticmethod
-    def _indent_row_names_based_on_depth(
-            depths_rows: List[Tuple[int, Union[ModelRow, SummaryRow]]],
-            indent_style: Union[Callable[[int], str], str] = " "):
+    def _indent_row_names_based_on_depth(depths_rows: List[Tuple[int,
+                                                                 StatsEntry]],
+                                         indent_style: Union[Callable[[int],
+                                                                      str],
+                                                             str] = " "):
         indented_rows = []
         for depth, row in depths_rows:
             if row.cuda_time_us == 0:
@@ -179,105 +200,103 @@ class NMProfileResults(profile):
         return sum(
             [self._cumulative_cuda_time(root) for root in self._module_tree])
 
-    def _build_model_table(self) -> List[Tuple[int, ModelRow]]:
-        rows: List[self.ModelRow] = []
-
+    def _build_stats_trees(self):
+        summary_dict: Dict[str, self.StatsTreeNode] = {}
         total_cuda_time = self._total_cuda_time()
 
-        def _df_traversal(node: _ModuleTreeNode, depth: int = 0):
-            row = None
+        def pct_cuda_time(cuda_time_us):
+            return (cuda_time_us / total_cuda_time) * 100
+
+        def build_summary_stats_tree_df(
+            node: _ModuleTreeNode,
+            parent: Optional[_StatsTreeNode] = None,
+            summary_trace: Tuple[str] = ()):
+
             if event_has_module(node.event):
                 name = event_module_repr(node.event)
-                cumulative_cuda_time = self._cumulative_cuda_time(node)
-                row = self.ModelRow(
-                    name=name,
-                    cpu_time_us=node.event.duration_time_ns / 1000,
-                    cuda_time_us=cumulative_cuda_time,
-                    pct_cuda_time=(cumulative_cuda_time / total_cuda_time) *
-                    100,
-                    trace="")
-                rows.append((depth, row))
-                depth += 1
-            elif node.is_leaf and (gpu_kineto_event :=
-                                   self._get_kineto_gpu_event(node)):
+                cuda_time_us = self._cumulative_cuda_time(node)
+            elif (gpu_kineto_event := self._get_kineto_gpu_event(node)):
                 name = gpu_kineto_event.name()
-                row = self.ModelRow(
+                cuda_time_us = gpu_kineto_event.duration_us()
+            else:
+                return None
+
+            summary_trace = summary_trace + (name, )
+            if summary_trace in summary_dict:
+                entry = summary_dict[summary_trace].entry
+                entry.cuda_time_us += cuda_time_us
+                entry.invocations += 1
+                entry.pct_cuda_time = pct_cuda_time(entry.cuda_time_us)
+            else:
+                new_node = _StatsTreeNode(entry=SummaryStatsEntry(
                     name=name,
-                    cpu_time_us=0,
-                    cuda_time_us=gpu_kineto_event.duration_us(),
-                    pct_cuda_time=(gpu_kineto_event.duration_us() /
-                                   total_cuda_time) * 100,
-                    trace=node.trace)
-                rows.append((depth, row))
+                    cuda_time_us=cuda_time_us,
+                    pct_cuda_time=pct_cuda_time(cuda_time_us),
+                    invocations=1),
+                                          children=[],
+                                          parent=parent)
+                if parent:
+                    parent.children.append(new_node)
+                summary_dict[summary_trace] = new_node
 
             for child in node.children:
-                _df_traversal(child, depth)
+                build_summary_stats_tree_df(child, summary_dict[summary_trace],
+                                            summary_trace)
 
+            return summary_dict[summary_trace]
+
+        self._summary_stats_tree = []
         for root in self._module_tree:
-            _df_traversal(root)
+            self._summary_stats_tree.append(build_summary_stats_tree_df(root))
 
-        return rows
+        def build_model_stats_tree_df(node: _ModuleTreeNode,
+                                      parent: Optional[_StatsTreeNode] = None):
+            if event_has_module(node.event, ):
+                name = event_module_repr(node.event)
+                cuda_time_us = self._cumulative_cuda_time(node)
+                cpu_time_us = node.event.duration_time_ns / 1000
+                trace = ""
+            elif (gpu_kineto_event := self._get_kineto_gpu_event(node)):
+                name = gpu_kineto_event.name()
+                cuda_time_us = gpu_kineto_event.duration_us()
+                cpu_time_us = 0
+                trace = node.trace
+            else:
+                return None
 
-    def _build_summary_table(self) -> List[Tuple[int, SummaryRow]]:
-        summary = {}
-
-        @dataclass
-        class SummaryEntry:
-            cuda_time_us: float = 0
-            invocations: int = 0
-
-        def _df_traversal(node: _ModuleTreeNode,
-                          module_trace: Tuple[str] = ()):
-            if event_has_module(node.event):
-                module_trace = module_trace + (event_module_repr(node.event), )
-            elif node.is_leaf and (gpu_kineto_event :=
-                                   self._get_kineto_gpu_event(node)):
-                summary_entry = summary
-                for module_name in module_trace:
-                    summary_entry = summary_entry.setdefault(module_name, {})
-                summary_entry = summary_entry.setdefault(
-                    gpu_kineto_event.name(), SummaryEntry())
-                summary_entry.cuda_time_us += gpu_kineto_event.duration_us()
-                summary_entry.invocations += 1
+            new_node = _StatsTreeNode(entry=ModelStatsEntry(
+                name=name,
+                cpu_time_us=cpu_time_us,
+                cuda_time_us=cuda_time_us,
+                pct_cuda_time=pct_cuda_time(cuda_time_us),
+                trace=trace),
+                                      parent=parent,
+                                      children=[])
+            if parent:
+                parent.children.append(new_node)
 
             for child in node.children:
-                _df_traversal(child, module_trace=module_trace)
+                build_model_stats_tree_df(child, new_node)
 
+            return new_node
+
+        self._model_stats_tree = []
         for root in self._module_tree:
-            _df_traversal(root)
+            self._model_stats_tree.append(build_model_stats_tree_df(root))
 
-        total_cuda_time = self._total_cuda_time()
-        rows: List[self.SummaryRow] = []
+    def _flatten_stats_tree(
+            self, tree: List[_StatsTreeNode]) -> List[Tuple[int, StatsEntry]]:
+        entries: List[Tuple[int, StatsEntry]] = []
 
-        def _construct_summary_rows(summary, depth=0):
-            cumulative_cuda_time_us = 0
-            for key, value in summary.items():
-                if isinstance(value, dict):
-                    row = self.SummaryRow(name=key,
-                                          cuda_time_us=0,
-                                          pct_cuda_time=0,
-                                          invocations="")
-                    rows.append((depth, row))
-                    row.cuda_time_us = _construct_summary_rows(
-                        value, depth + 1)
-                    row.pct_cuda_time = (row.cuda_time_us /
-                                         total_cuda_time) * 100
-                    cumulative_cuda_time_us += row.cuda_time_us
-                elif isinstance(value, SummaryEntry):
-                    row = self.SummaryRow(
-                        name=key,
-                        cuda_time_us=value.cuda_time_us,
-                        pct_cuda_time=(value.cuda_time_us / total_cuda_time) *
-                        100,
-                        invocations=value.invocations)
-                    cumulative_cuda_time_us += value.cuda_time_us
-                    rows.append((depth, row))
+        def df_traversal(node: _StatsTreeNode, depth=0):
+            entries.append((depth, node.entry))
+            for child in node.children:
+                df_traversal(child, depth=depth + 1)
 
-            return cumulative_cuda_time_us
+        for root in tree:
+            df_traversal(root)
 
-        _construct_summary_rows(summary)
-
-        return rows
+        return entries
 
 
 class nm_profile(profile):
