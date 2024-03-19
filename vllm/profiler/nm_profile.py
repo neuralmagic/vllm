@@ -268,7 +268,7 @@ class NMProfileResults(profile):
             elif (gpu_kineto_event := self._get_kineto_gpu_event(node)):
                 name = gpu_kineto_event.name()
                 cuda_time_us = gpu_kineto_event.duration_us()
-                cpu_time_us = node.event.duration_time_ns / 1000
+                cpu_time_us = 0
                 trace = node.trace
             else:
                 return None
