@@ -1,5 +1,6 @@
 import pandas as pd
 import copy
+import json
 
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
@@ -106,19 +107,27 @@ class NMProfileResults(profile):
                 filtered_summary_table,
                 indent_style=lambda indent: "|" + "-" * indent + " "))
 
-    def export_model_table_csv(self, filename: str):
+    def export_model_stats_table_csv(self, filename: str):
         df = pd.DataFrame([
             asdict(row)
             for _, row in self._flatten_stats_tree(self._model_stats_tree)
         ])
         df.to_csv(filename)
 
-    def export_summary_table_csv(self, filename: str):
+    def export_summary_stats_table_csv(self, filename: str):
         df = pd.DataFrame([
             asdict(row)
             for _, row in self._flatten_stats_tree(self._summary_stats_tree)
         ])
         df.to_csv(filename)
+
+    def convert_stats_to_dict(self) -> str:
+        return {
+            "summary_stats":
+            self._convert_stats_tree_dict(self._summary_stats_tree),
+            "model_stats":
+            self._convert_stats_tree_dict(self._model_stats_tree)
+        }
 
     @staticmethod
     def _indent_row_names_based_on_depth(depths_rows: List[Tuple[int,
@@ -297,6 +306,23 @@ class NMProfileResults(profile):
             df_traversal(root)
 
         return entries
+
+    def _convert_stats_tree_dict(self,
+                                 tree: List[_StatsTreeNode]) -> List[Dict]:
+        curr_dict: List[Dict] = []
+
+        def df_traversal(node: _StatsTreeNode, curr_json_list: List[Dict]):
+            curr_json_list.append({
+                "entry": asdict(node.entry),
+                "children": []
+            })
+            for child in node.children:
+                df_traversal(child, curr_dict[-1]["children"])
+
+        for root in tree:
+            df_traversal(root, curr_dict)
+
+        return curr_dict
 
 
 class nm_profile(profile):
