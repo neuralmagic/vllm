@@ -118,3 +118,4 @@ if __name__ == "__main__":
                  f"NumGpus={context['num_gpus']}"
                  f"{', Sparse' if context['is_sparse'] else ''}")
     plt.savefig(output, bbox_inches='tight')
+    print("Created: ", output)
