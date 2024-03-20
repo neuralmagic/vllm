@@ -39,20 +39,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--json_trace", type=str, required=True)
-    parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--output", type=str, required=False)
     parser.add_argument("--depth", type=int, default=-2)
     parser.add_argument("--ignore_sampler", action='store_true')
 
     args = parser.parse_args()
+    json_trace = args.json_trace
     depth = args.depth
     ignore_sampler = args.ignore_sampler
-    output = args.output
+    output = args.output if args.output else json_trace.strip(".json") + ".pdf"
 
-    with open(args.json_trace, "r") as f:
+    with open(json_trace, "r") as f:
         profile_data = json.load(f)
 
-    prefill_entries = []
-    decode_entries = []
+    prefill_entries_and_traces = []
+    decode_entries_and_traces = []
 
     def largest_dist_from_leaf(node, depth=0):
         if len(node["children"]) == 0:
@@ -62,28 +63,71 @@ if __name__ == "__main__":
             for child in node["children"]
         ])
 
-    def get_entries_at_depth(depth, entries, node, curr_depth=0):
+    def get_entries_at_depth(depth,
+                             entries_and_traces,
+                             node,
+                             curr_depth=0,
+                             trace=()):
         if ignore_sampler and node["entry"]["name"] == "Sampler":
             return
 
         if (depth >= 0 and depth == curr_depth) or (
                 depth < 0
                 and largest_dist_from_leaf(node) == (abs(depth) - 1)):
-            entries.append(node["entry"])
+            entries_and_traces.append((node["entry"], trace))
+        trace = (node["entry"]["name"], ) + trace
         for child in node["children"]:
             get_entries_at_depth(depth,
-                                 entries,
+                                 entries_and_traces,
                                  child,
-                                 curr_depth=curr_depth + 1)
+                                 curr_depth=curr_depth + 1,
+                                 trace=trace)
 
     for root in profile_data["prefill"]["summary_stats"]:
-        get_entries_at_depth(depth, prefill_entries, root)
+        get_entries_at_depth(depth, prefill_entries_and_traces, root)
     for root in profile_data["decode"]["summary_stats"]:
-        get_entries_at_depth(depth, decode_entries, root)
+        get_entries_at_depth(depth, decode_entries_and_traces, root)
 
-    prefill_df = pd.DataFrame(prefill_entries)
+    def attempt_to_make_names_unique(entries_and_traces):
+        names, non_unique_names = (set(), set())
+
+        def all_the_same(items) -> bool:
+            return all(i == items[0] for i in items)
+
+        for entry, _ in entries_and_traces:
+            if entry["name"] in names:
+                non_unique_names.add(entry["name"])
+            else:
+                names.add(entry["name"])
+
+        for name in non_unique_names:
+            entries_and_traces_with_name = [
+                (entry, trace) for entry, trace in entries_and_traces
+                if entry["name"] == name
+            ]
+
+            zipped_traces = list(
+                zip(*[trace for _, trace in entries_and_traces_with_name]))
+            first_trace_difference = next(
+                (i for i, trace_eles in enumerate(zipped_traces)
+                 if not all_the_same(trace_eles)), None)
+
+            if first_trace_difference is None:
+                # can't create a unique name, leave them names as the
+                # are they will get aggregated by the pivot_table call
+                continue
+
+            for entry, trace in entries_and_traces_with_name:
+                entry["name"] = " <- ".join((entry["name"], ) +
+                                            trace[:first_trace_difference + 1])
+
+    attempt_to_make_names_unique(prefill_entries_and_traces)
+    attempt_to_make_names_unique(decode_entries_and_traces)
+
+    prefill_df = pd.DataFrame(
+        [entry for entry, _ in prefill_entries_and_traces])
     prefill_df["phase"] = "prefill"
-    decode_df = pd.DataFrame(decode_entries)
+    decode_df = pd.DataFrame([entry for entry, _ in decode_entries_and_traces])
     decode_df["phase"] = "decode"
     df = pd.concat([prefill_df, decode_df])
     df["cuda_time_ms"] = df["cuda_time_us"] / 1000

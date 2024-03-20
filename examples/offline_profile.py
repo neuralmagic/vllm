@@ -21,6 +21,7 @@ class ProfileContext:
     is_sparse: bool
     quant_method: str
     max_seq_len: int
+    max_num_batched_tokens: int
     prompt_len: int
     batch_size: int
     num_gpus: int
@@ -46,6 +47,7 @@ def run_profile(context: ProfileContext, csv_output: Optional[str],
         gpu_memory_utilization=0.9,
         max_model_len=context.max_seq_len,
         quantization=context.quant_method,
+        max_num_batched_tokens=context.max_num_batched_tokens,
     )
 
     batch_size = context.batch_size
@@ -55,13 +57,17 @@ def run_profile(context: ProfileContext, csv_output: Optional[str],
     max_num_seqs = llm.llm_engine.scheduler_config.max_num_seqs
     if batch_size * prompt_len > max_num_batched_tokens:
         print(
-            f"ERROR: chosen batch_size * prompt_len ({batch_size} * {prompt_len} = {batch_size * prompt_len}) is larger than max_num_batched_tokens ({max_num_batched_tokens}) and therefore cannot be run in a single profile step, please choose a smaller batch size or prompt length"
-        )
+            f"ERROR: chosen batch_size * prompt_len "
+            f"({batch_size} * {prompt_len} = {batch_size * prompt_len}) is larger "
+            f"than max_num_batched_tokens ({max_num_batched_tokens}) and therefore "
+            f"cannot be run in a single profile step, please choose a smaller batch "
+            f"size or prompt length, or increase --max_num_batched_tokens")
         sys.exit(-1)
     if batch_size >= max_num_seqs:
         print(
-            f"ERROR: chosen batch_size ({batch_size}) is larger than max_num_seqs ({max_num_seqs}) and therefore cannot be run in a single profile step, please choose a smaller batch size"
-        )
+            f"ERROR: chosen batch_size ({batch_size}) is larger than max_num_seqs "
+            f"({max_num_seqs}) and therefore cannot be run in a single profile step"
+            f", please choose a smaller batch size")
         sys.exit(-1)
 
     for i in range(batch_size):
@@ -159,6 +165,7 @@ if __name__ == "__main__":
     parser.add_argument('--is_sparse', action='store_true')
     parser.add_argument("--quant_method", type=str, default=None)
     parser.add_argument("--max_seq_len", type=int, default=MAX_SEQ_LEN_DEFAULT)
+    parser.add_argument("--max_num_batched_tokens", type=int, default=None)
     parser.add_argument("--prompt_len", type=int, default=PROMPT_LEN_DEFAULT)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE_DEFAULT)
     parser.add_argument("--num_gpus", type=int, default=1)
