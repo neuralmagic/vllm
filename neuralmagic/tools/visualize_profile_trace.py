@@ -88,7 +88,7 @@ if __name__ == "__main__":
     df = pd.concat([prefill_df, decode_df])
     df["cuda_time_ms"] = df["cuda_time_us"] / 1000
 
-    fig, axes = plt.subplots(2, sharex=True)
+    fig, axes = plt.subplots(2, figsize=(5, 8), sharex=True)
 
     def plot_metric(metric: str, ax, add_totals=False):
         pivoted_df = df.pivot_table(index="phase",
@@ -104,8 +104,12 @@ if __name__ == "__main__":
     plot_metric("cuda_time_ms", ax=axes[0], add_totals=True)
     plot_metric("pct_cuda_time", ax=axes[1])
 
-    l = plt.gca().legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    shorten_plot_legend_strings(l, 40)
+    handles, labels = plt.gca().get_legend_handles_labels()
+    l = fig.legend(handles,
+                   labels,
+                   loc='center left',
+                   bbox_to_anchor=(0.93, 0.5))
+    shorten_plot_legend_strings(l, 50)
 
     context = profile_data["context"]
     plt.suptitle(f"{context['model_name']}\n"
@@ -113,7 +117,4 @@ if __name__ == "__main__":
                  f"PromptLen={context['prompt_len']}, "
                  f"NumGpus={context['num_gpus']}"
                  f"{', Sparse' if context['is_sparse'] else ''}")
-    plt.tight_layout()
-    plt.savefig(output)
-
-    print(df)
+    plt.savefig(output, bbox_inches='tight')
