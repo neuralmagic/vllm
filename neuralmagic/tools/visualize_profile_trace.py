@@ -28,8 +28,8 @@ def abbreviate_known_names(name: str):
     return name
 
 
-def shorten_plot_legend_strings(l, max_char_len: int):
-    for t in l.get_texts():
+def shorten_plot_legend_strings(legend, max_char_len: int):
+    for t in legend.get_texts():
         t.set_text(
             trim_string_back(abbreviate_known_names(t.get_text()),
                              max_char_len))
@@ -105,11 +105,11 @@ if __name__ == "__main__":
     plot_metric("pct_cuda_time", ax=axes[1])
 
     handles, labels = plt.gca().get_legend_handles_labels()
-    l = fig.legend(handles,
-                   labels,
-                   loc='center left',
-                   bbox_to_anchor=(0.93, 0.5))
-    shorten_plot_legend_strings(l, 50)
+    legend = fig.legend(handles,
+                        labels,
+                        loc='center left',
+                        bbox_to_anchor=(0.93, 0.5))
+    shorten_plot_legend_strings(legend, 50)
 
     context = profile_data["context"]
     plt.suptitle(f"{context['model_name']}\n"

@@ -1,15 +1,14 @@
 import pandas as pd
 import copy
-import json
 
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from vllm.profiler.utils import (indent_string, TablePrinter, event_has_module,
                                  event_is_torch_op, event_module_repr,
-                                 event_torch_op_stack_trace, trim_string_back)
+                                 event_torch_op_stack_trace)
 from typing import Dict, List, Union, Optional, Tuple, Callable, TypeAlias
 from torch.profiler import profile, ProfilerActivity
-from torch.autograd.profiler import EventList, FunctionEvent
+from torch.autograd.profiler import FunctionEvent
 from torch._C._autograd import _ProfilerResult, _KinetoEvent, DeviceType
 from torch._C._profiler import _EventType, _ProfilerEvent, _ExperimentalConfig
 
@@ -77,12 +76,14 @@ class NMProfileResults(profile):
         self._build_module_tree()
         self._build_stats_trees()
 
-    def print_model_table(self,
-                          column_widths=dict(name=60,
-                                             cpu_time_us=12,
-                                             cuda_time_us=12,
-                                             pct_cuda_time=12,
-                                             trace=60)):
+    def print_model_table(self, column_widths: Dict[str, int] = None):
+        _column_widths = dict(name=60,
+                              cpu_time_us=12,
+                              cuda_time_us=12,
+                              pct_cuda_time=12,
+                              trace=60)
+        if column_widths:
+            _column_widths.update(**column_widths)
         filtered_model_table = [
             (depth, row)
             for depth, row in self._flatten_stats_tree(self._model_stats_tree)
@@ -93,16 +94,18 @@ class NMProfileResults(profile):
                 filtered_model_table,
                 indent_style=lambda indent: "|" + "-" * indent + " "))
 
-    def print_summary_table(self,
-                            column_widths=dict(name=80,
-                                               cuda_time_us=12,
-                                               pct_cuda_time=12,
-                                               invocations=15)):
+    def print_summary_table(self, column_widths: Dict[str, int] = None):
+        _column_widths = dict(name=80,
+                              cuda_time_us=12,
+                              pct_cuda_time=12,
+                              invocations=15)
+        if column_widths:
+            _column_widths.update(**column_widths)
         filtered_summary_table = [(depth, row)
                                   for depth, row in self._flatten_stats_tree(
                                       self._summary_stats_tree)
                                   if row.cuda_time_us > 0]
-        TablePrinter(SummaryStatsEntry, column_widths).print_table(
+        TablePrinter(SummaryStatsEntry, _column_widths).print_table(
             self._indent_row_names_based_on_depth(
                 filtered_summary_table,
                 indent_style=lambda indent: "|" + "-" * indent + " "))
