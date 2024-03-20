@@ -89,7 +89,7 @@ class NMProfileResults(profile):
             for depth, row in self._flatten_stats_tree(self._model_stats_tree)
             if row.cuda_time_us > 0 or row.cpu_time_us > 0
         ]
-        TablePrinter(ModelStatsEntry, column_widths).print_table(
+        TablePrinter(ModelStatsEntry, _column_widths).print_table(
             self._indent_row_names_based_on_depth(
                 filtered_model_table,
                 indent_style=lambda indent: "|" + "-" * indent + " "))
