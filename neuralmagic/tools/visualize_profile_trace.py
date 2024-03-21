@@ -2,7 +2,6 @@ import argparse
 import json
 import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
 
 
 def trim_string_back(string: str, width: int):
@@ -42,12 +41,12 @@ if __name__ == "__main__":
         "--json_trace",
         type=str,
         required=True,
-        help=f"json trace file output by examples/offline_profile.py")
+        help="json trace file output by examples/offline_profile.py")
     parser.add_argument(
         "--output",
         type=str,
         required=False,
-        help=f"Output figure file, should be a image file such as pdf, "
+        help="Output figure file, should be a image file such as pdf, "
         "jpeg, png, etc., defaults to <json_trace>.pdf")
     parser.add_argument("--level",
                         type=str,

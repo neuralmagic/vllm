@@ -197,15 +197,15 @@ if __name__ == "__main__":
         "--max_num_batched_tokens",
         type=int,
         default=None,
-        help=f"Maximum number of tokens to be processed in a single iteration. "
-        f" Should be greater than batch_size * prompt_len so the prefill can "
-        f" run in a single iteration.")
+        help="Maximum number of tokens to be processed in a single iteration. "
+        " Should be greater than batch_size * prompt_len so the prefill can "
+        " run in a single iteration.")
     parser.add_argument(
         "--prompt_len",
         type=int,
         default=PROMPT_LEN_DEFAULT,
         help=f"Length of the random prompt to use when profiling, all batched "
-        f"requests use the same prompt_len, defualt={PROMPT_LEN_DEFAULT}")
+        f"requests use the same prompt_len, default={PROMPT_LEN_DEFAULT}")
     parser.add_argument("--batch_size",
                         type=int,
                         default=BATCH_SIZE_DEFAULT,
@@ -214,14 +214,14 @@ if __name__ == "__main__":
     parser.add_argument("--num_gpus",
                         type=int,
                         default=1,
-                        help=f"Number of GPUs to use i.e. tensor parallelism, "
-                        f"default=1")
+                        help="Number of GPUs to use i.e. tensor parallelism, "
+                        "default=1")
     parser.add_argument(
         '--allow_cuda_graphs',
         action='store_true',
-        help=f"Enables cuda graphs to be used, well remove alot of the module "
-        f"level info in the profiler results since almost everything runs in "
-        f"the graph where we do not have access to an informative stack trace")
+        help="Enables cuda graphs to be used, well remove a lot of the module "
+        "level info in the profiler results since almost everything runs in "
+        "the graph where we do not have access to an informative stack trace")
 
     args = parser.parse_args()
 
