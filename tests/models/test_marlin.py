@@ -1,3 +1,4 @@
+# UPSTREAM SYNC: Use the current downstream version.
 """Compare the outputs of a GPTQ model to a Marlin model.
 
 Note: GPTQ and Marlin do not have bitwise correctness.
@@ -20,7 +21,8 @@ import torch
 import gc
 from compare_utils import check_logprobs_close
 from dataclasses import dataclass
-from vllm.model_executor.layers.quantization import _QUANTIZATION_CONFIG_REGISTRY
+from vllm.model_executor.layers.quantization import (
+    _QUANTIZATION_CONFIG_REGISTRY)
 
 MAX_MODEL_LEN = 1024
 
@@ -67,11 +69,7 @@ def test_models(
     marlin_outputs = marlin_model.generate_greedy_logprobs(
         example_prompts, max_tokens, num_logprobs)
 
-    # vllm memory cleanup is poor. This seems to fix things.
-    # NOTE: upstream sync should use downstream version.
-    del marlin_model.model.llm_engine.driver_worker
     del marlin_model
-
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -82,9 +80,6 @@ def test_models(
                                                        max_tokens,
                                                        num_logprobs)
 
-    # vllm memory cleanup is poor. This seems to fix things.
-    # NOTE: upstream sync should use downstream version.
-    del gptq_model.model.llm_engine.driver_worker
     del gptq_model
     gc.collect()
     torch.cuda.empty_cache()
