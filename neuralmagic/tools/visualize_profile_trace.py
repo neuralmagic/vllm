@@ -38,15 +38,38 @@ def shorten_plot_legend_strings(legend, max_char_len: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--json_trace", type=str, required=True)
-    parser.add_argument("--output", type=str, required=False)
-    parser.add_argument("--depth", type=int, default=-2)
-    parser.add_argument("--ignore_sampler", action='store_true')
+    parser.add_argument(
+        "--json_trace",
+        type=str,
+        required=True,
+        help=f"json trace file output by examples/offline_profile.py")
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=False,
+        help=f"Output figure file, should be a image file such as pdf, "
+        "jpeg, png, etc., defaults to <json_trace>.pdf")
+    parser.add_argument("--level",
+                        type=str,
+                        default="module",
+                        choices=["module", "kernel"])
 
     args = parser.parse_args()
+
+    ignore_sampler = False
+    if args.level == "module":
+        depth = -2
+    elif args.level == "kernel":
+        ignore_sampler = True
+        depth = -1
+    else:
+        raise Exception(f"Unexpected level value ({args.level})")
+
+    if ignore_sampler:
+        print("WARNING: ignoring Sampler time so the pct_cuda_time will not "
+              "add up to 100%")
+
     json_trace = args.json_trace
-    depth = args.depth
-    ignore_sampler = args.ignore_sampler
     output = args.output if args.output else json_trace.strip(".json") + ".pdf"
 
     with open(json_trace, "r") as f:
@@ -138,7 +161,7 @@ if __name__ == "__main__":
         pivoted_df = df.pivot_table(index="phase",
                                     columns="name",
                                     values=metric,
-                                    aggfunc=np.sum)
+                                    aggfunc="sum")
         pivoted_df.plot.bar(stacked=True, legend=False, ax=ax)
         ax.set_ylabel(metric)
 
