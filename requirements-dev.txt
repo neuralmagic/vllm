@@ -27,3 +27,8 @@ peft
 
 # Benchmarking
 aiohttp
+
+# Profiling
+matplotlib
+pandas
+pyarrow
