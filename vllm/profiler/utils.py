@@ -111,20 +111,23 @@ def event_arg_repr(arg) -> str:
     else:
         assert isinstance(arg,
                           _TensorMetadata), f"Unsupported type: {type(arg)}"
-        return f"{str(arg.dtype).replace('torch.', '')}[{', '.join([str(x) for x in arg.sizes])}]"
+        sizes_str = ', '.join([str(x) for x in arg.sizes])
+        return f"{str(arg.dtype).replace('torch.', '')}[{sizes_str}]"
 
 
 def event_torch_op_repr(event: _ProfilerEvent) -> str:
     assert event.tag == _EventType.TorchOp
-    return f"{event.name}({', '.join([event_arg_repr(x) for x in event.typed[1].inputs])})".replace(
-        "aten::", "")
+    args_str = ', '.join([event_arg_repr(x) for x in event.typed[1].inputs])
+    return f"{event.name}({args_str})".replace("aten::", "")
 
 
 def event_module_repr(event: _ProfilerEvent) -> str:
     assert event_has_module(event)
     module = event.typed[1].module
     if module.parameters and len(module.parameters) > 0:
-        return f"{module.cls_name}({', '.join([f'{x[0]}={event_arg_repr(x[1])}' for x in module.parameters])})"
+        args_str = ', '.join(
+            [f'{x[0]}={event_arg_repr(x[1])}' for x in module.parameters])
+        return f"{module.cls_name}({args_str})"
     else:
         return module.cls_name
 

@@ -53,21 +53,23 @@ def run_profile(context: ProfileContext, csv_output: Optional[str],
     batch_size = context.batch_size
     prompt_len = context.prompt_len
 
-    max_num_batched_tokens = llm.llm_engine.scheduler_config.max_num_batched_tokens
-    max_num_seqs = llm.llm_engine.scheduler_config.max_num_seqs
+    scheduler_config = llm.llm_engine.scheduler_config
+    max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+    max_num_seqs = scheduler_config.max_num_seqs
+
     if batch_size * prompt_len > max_num_batched_tokens:
-        print(
-            f"ERROR: chosen batch_size * prompt_len "
-            f"({batch_size} * {prompt_len} = {batch_size * prompt_len}) is larger "
-            f"than max_num_batched_tokens ({max_num_batched_tokens}) and therefore "
-            f"cannot be run in a single profile step, please choose a smaller batch "
-            f"size or prompt length, or increase --max_num_batched_tokens")
+        print(f"ERROR: chosen batch_size * prompt_len "
+              f"({batch_size} * {prompt_len} = {batch_size * prompt_len}) is  "
+              f"larger than max_num_batched_tokens ({max_num_batched_tokens}) "
+              f"and therefore cannot be run in a single profile step, please "
+              f"choose a smaller batch size or prompt length, or increase "
+              f"--max_num_batched_tokens")
         sys.exit(-1)
     if batch_size >= max_num_seqs:
         print(
-            f"ERROR: chosen batch_size ({batch_size}) is larger than max_num_seqs "
-            f"({max_num_seqs}) and therefore cannot be run in a single profile step"
-            f", please choose a smaller batch size")
+            f"ERROR: chosen batch_size ({batch_size}) is larger than "
+            f"max_num_seqs ({max_num_seqs}) and therefore cannot be run in a "
+            f"single profile step, please choose a smaller batch size")
         sys.exit(-1)
 
     for i in range(batch_size):
@@ -75,7 +77,7 @@ def run_profile(context: ProfileContext, csv_output: Optional[str],
             request_id=f"seq{i}",
             prompt=None,
             prompt_token_ids=torch.randint(
-                0,
+                128,  # 128 to skip over special tokens
                 llm.llm_engine.model_config.get_vocab_size() // 2,
                 size=(prompt_len, )).tolist(),
             sampling_params=sampling_params)
@@ -90,33 +92,29 @@ def run_profile(context: ProfileContext, csv_output: Optional[str],
     decode_results = decode_prof.results
 
     print("=" * 80)
-    print(
-        f"= Prefill Model Table (prompt_len={prompt_len}, batch_size={batch_size})"
-    )
+    print(f"= Prefill Model Table "
+          f"(prompt_len={prompt_len}, batch_size={batch_size})")
     print("=" * 80)
     print()
     prefill_results.print_model_table()
     print()
     print("=" * 80)
-    print(
-        f"= Decode Model Table (prompt_len={prompt_len}, batch_size={batch_size})"
-    )
+    print(f"= Decode Model Table "
+          f"(prompt_len={prompt_len}, batch_size={batch_size})")
     print("=" * 80)
     print()
     decode_results.print_model_table()
     print()
     print("=" * 80)
-    print(
-        f"= Prefill Summary Table (prompt_len={prompt_len}, batch_size={batch_size})"
-    )
+    print(f"= Prefill Summary Table "
+          f"(prompt_len={prompt_len}, batch_size={batch_size})")
     print("=" * 80)
     print()
     prefill_results.print_summary_table()
     print()
     print("=" * 80)
-    print(
-        f"= Decode Summary Table (prompt_len={prompt_len}, batch_size={batch_size})"
-    )
+    print(f"= Decode Summary Table "
+          f"(prompt_len={prompt_len}, batch_size={batch_size})")
     print("=" * 80)
     print()
     decode_results.print_summary_table()
@@ -158,18 +156,72 @@ def run_profile(context: ProfileContext, csv_output: Optional[str],
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        required=True,
+        help='The name or path of a HuggingFace Transformers model.')
     parser.add_argument("--model_revision", type=str, default=None)
-    parser.add_argument("--csv", type=str, default=None)
-    parser.add_argument("--json", type=str, default=None)
-    parser.add_argument('--is_sparse', action='store_true')
-    parser.add_argument("--quant_method", type=str, default=None)
-    parser.add_argument("--max_seq_len", type=int, default=MAX_SEQ_LEN_DEFAULT)
-    parser.add_argument("--max_num_batched_tokens", type=int, default=None)
-    parser.add_argument("--prompt_len", type=int, default=PROMPT_LEN_DEFAULT)
-    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE_DEFAULT)
-    parser.add_argument("--num_gpus", type=int, default=1)
-    parser.add_argument('--allow_cuda_graphs', action='store_true')
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default=None,
+        help="Export the results as multiple csv file. This should be the root "
+        "filename, will create <filename>_prefill_model_table.csv, "
+        "<filename>_prefill_summary_table.csv, "
+        "<filename>_decode_model_table.csv, and "
+        "<filename>_decode_summary_table.csv")
+    parser.add_argument(
+        "--json",
+        type=str,
+        default=None,
+        help="Export the results as a json file. This should be the filename")
+    parser.add_argument(
+        "--is_sparse",
+        action='store_true',
+        help=
+        "Use unstructured sparse kernels, sets sparse config to sparse_W16A16")
+    parser.add_argument(
+        "--quant_method",
+        type=str,
+        default=None,
+        help="The method used to quantize the model weights, "
+        "options are \"marlin\", \"awq\", \"gptq\" and \"squeezellm\"")
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=MAX_SEQ_LEN_DEFAULT,
+        help=f"Maximum length of a sequence (including prompt and output), "
+        f"default={MAX_SEQ_LEN_DEFAULT}")
+    parser.add_argument(
+        "--max_num_batched_tokens",
+        type=int,
+        default=None,
+        help=f"Maximum number of tokens to be processed in a single iteration. "
+        f" Should be greater than batch_size * prompt_len so the prefill can "
+        f" run in a single iteration.")
+    parser.add_argument(
+        "--prompt_len",
+        type=int,
+        default=PROMPT_LEN_DEFAULT,
+        help=f"Length of the random prompt to use when profiling, all batched "
+        f"requests use the same prompt_len, defualt={PROMPT_LEN_DEFAULT}")
+    parser.add_argument("--batch_size",
+                        type=int,
+                        default=BATCH_SIZE_DEFAULT,
+                        help=f"Number of requests to run as a single batch, "
+                        f"default={BATCH_SIZE_DEFAULT}")
+    parser.add_argument("--num_gpus",
+                        type=int,
+                        default=1,
+                        help=f"Number of GPUs to use i.e. tensor parallelism, "
+                        f"default=1")
+    parser.add_argument(
+        '--allow_cuda_graphs',
+        action='store_true',
+        help=f"Enables cuda graphs to be used, well remove alot of the module "
+        f"level info in the profiler results since almost everything runs in "
+        f"the graph where we do not have access to an informative stack trace")
 
     args = parser.parse_args()
 
