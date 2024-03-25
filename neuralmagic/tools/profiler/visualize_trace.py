@@ -178,10 +178,12 @@ if __name__ == "__main__":
     shorten_plot_legend_strings(legend, 50)
 
     context = profile_data["context"]
-    plt.suptitle(f"{context['model_name']}\n"
-                 f"Batch={context['batch_size']}, "
-                 f"PromptLen={context['prompt_len']}, "
-                 f"NumGpus={context['num_gpus']}"
-                 f"{', Sparse' if context['is_sparse'] else ''}")
+    plt.suptitle(
+        f"{context['model']}\n"
+        f"Batch={context['batch_size']}, "
+        f"PromptLen={context['prompt_len']}, "
+        f"NumGpus={context['tensor_parallel_size']}"
+        f"{', Sparsity ' +  context['sparsity'] if context['sparsity'] else ''}"
+    )
     plt.savefig(output, bbox_inches='tight')
     print("Created: ", output)
