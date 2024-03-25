@@ -158,7 +158,8 @@ if __name__ == "__main__":
         attempt_to_make_names_unique(decode_entries_and_traces)
 
     def keep_only_top_entries(df, metric, top_k=9):
-        df.loc[df.nsmallest(len(df) - top_k + 1, metric).index, ["name"]] = "others"
+        df.loc[df.nsmallest(len(df) - top_k + 1, metric).index,
+               ["name"]] = "others"
 
     prefill_df = pd.DataFrame(
         [entry for entry, _ in prefill_entries_and_traces])
