@@ -38,7 +38,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--json_trace",
+        "--json-trace",
         type=str,
         required=True,
         help="json trace file output by examples/offline_profile.py")
