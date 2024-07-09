@@ -331,8 +331,8 @@ class LlamaModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: LlamaDecoderLayer(config=config,
-                                             first_layer=(idx==0),
-                                             last_layer=(idx==config.num_hidden_layers-1),
+                                             first_layer=(idx==self.start_layer),
+                                             last_layer=(idx==self.end_layer-1),
                                              cache_config=cache_config,
                                              quant_config=quant_config,
                                              prefix=prefix),
