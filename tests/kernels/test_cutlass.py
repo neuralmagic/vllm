@@ -2,7 +2,7 @@
 
 Run `pytest tests/kernels/test_cutlass.py`.
 """
-from typing import Optional, Type
+from typing import Optional
 
 import pytest
 import torch
@@ -36,7 +36,7 @@ def baseline_scaled_mm(a: torch.Tensor,
                        b: torch.Tensor,
                        scale_a: torch.Tensor,
                        scale_b: torch.Tensor,
-                       out_dtype: Type[torch.dtype],
+                       out_dtype: torch.dtype,
                        bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     output = (scale_a * (scale_b * (torch.mm(
         a.to(dtype=torch.float32), b.to(dtype=torch.float32))))).to(out_dtype)
@@ -52,7 +52,7 @@ def cutlass_fp8_gemm_helper(m: int,
                             per_token_act_quant: bool,
                             per_out_channel_weight_quant: bool,
                             use_bias: bool,
-                            out_dtype: Type[torch.dtype] = torch.bfloat16,
+                            out_dtype: torch.dtype = torch.bfloat16,
                             device: str = "cuda"):
     # Test for a cutlass kernel with per-token activation quantization
     # and per-output channel weight quantization.
@@ -83,7 +83,7 @@ def cutlass_int8_gemm_helper(m: int,
                              per_token_act_quant: bool,
                              per_out_channel_weight_quant: bool,
                              use_bias: bool,
-                             out_dtype: Type[torch.dtype] = torch.bfloat16,
+                             out_dtype: torch.dtype = torch.bfloat16,
                              device: str = "cuda"):
     # Test for a cutlass kernel with per-token activation quantization
     # and per-output channel weight quantization.
@@ -138,7 +138,7 @@ def test_cutlass_int8_gemm(m: int, n: int, k: int, per_act_token: bool,
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_bias", [True, False])
 def test_cutlass_int8_gemm_output_dtype(per_act_token: bool, per_out_ch: bool,
-                                        out_dtype: Type[torch.dtype],
+                                        out_dtype: torch.dtype,
                                         use_bias: bool):
     cutlass_int8_gemm_helper(512,
                              512,
@@ -156,8 +156,7 @@ def test_cutlass_int8_gemm_output_dtype(per_act_token: bool, per_out_ch: bool,
 @pytest.mark.skipif(capability < 89,
                     reason="FP8 is not supported on this GPU type.")
 def test_cutlass_fp8_gemm_output_dtype(per_act_token: bool, per_out_ch: bool,
-                                       out_dtype: Type[torch.dtype],
-                                       use_bias: bool):
+                                       out_dtype: torch.dtype, use_bias: bool):
     cutlass_fp8_gemm_helper(512,
                             512,
                             512,
