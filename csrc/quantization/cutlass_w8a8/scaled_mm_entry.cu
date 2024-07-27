@@ -108,8 +108,7 @@ void cutlass_scaled_mm(torch::Tensor& c, torch::Tensor const& a,
   TORCH_CHECK(a_scales.is_contiguous() && b_scales.is_contiguous());
 
   if (bias) {
-    TORCH_CHECK(bias->numel() == b.size(1) && bias->is_contiguous() &&
-                bias->dim() == 1);
+    TORCH_CHECK(bias->numel() == b.size(1) && bias->is_contiguous());
   }
 
   at::cuda::OptionalCUDAGuard const device_guard(device_of(a));
