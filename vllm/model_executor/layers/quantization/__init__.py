@@ -20,6 +20,8 @@ from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
     GPTQMarlin24Config)
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
+from vllm.model_executor.layers.quantization.sparsity_24 import (
+    Sparsity24Config)
 from vllm.model_executor.layers.quantization.squeezellm import SqueezeLLMConfig
 
 QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -39,6 +41,7 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "compressed-tensors": CompressedTensorsConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "qqq": QQQConfig,
+    "sparsity_24": Sparsity24Config,
 }
 
 
