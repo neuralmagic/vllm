@@ -4,17 +4,11 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
-                                               UnquantizedLinearMethod)
+from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.platforms import current_platform
-from vllm.utils import print_warning_once
-
-ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = init_logger(__name__)
 
@@ -22,9 +16,7 @@ logger = init_logger(__name__)
 class Sparsity24Config(QuantizationConfig):
     """Config class for 2:4 sparsity."""
 
-    def __init__(
-        self,
-    ) -> None:
+    def __init__(self) -> None:
         return
 
     @classmethod
@@ -97,11 +89,12 @@ class Sparsity24LinearMethod(LinearMethodBase):
             "output_dim": 0,
         })
 
-
     def process_weights_after_loading(self, layer: Module) -> None:
-        from torch.sparse import to_sparse_semi_structured, SparseSemiStructuredTensor
+        from torch.sparse import to_sparse_semi_structured
 
-        layer.weight = torch.nn.Parameter(to_sparse_semi_structured(layer.weight), requires_grad=False)
+        layer.weight = torch.nn.Parameter(to_sparse_semi_structured(
+            layer.weight),
+                                          requires_grad=False)
 
     def apply(self,
               layer: torch.nn.Module,
@@ -109,4 +102,3 @@ class Sparsity24LinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         return torch.nn.functional.linear(x, layer.weight, bias=bias)
-
