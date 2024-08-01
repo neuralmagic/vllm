@@ -118,6 +118,19 @@ def verify_marlin_supports_shape(output_size_per_partition: int,
             "with --quantization gptq.")
 
 
+def check_marlin_supports_shape(output_size_per_partition: int,
+                                input_size_per_partition: int,
+                                input_size: int, group_size: int) \
+                                    -> Tuple[bool, str]:
+    try:
+        verify_marlin_supports_shape(output_size_per_partition,
+                                     input_size_per_partition, input_size,
+                                     group_size)
+    except ValueError as e:
+        return False, e.__str__()
+    return True, None
+
+
 def marlin_make_workspace(output_size_per_partition: int,
                           device: torch.device) -> torch.Tensor:
     max_workspace_size = (output_size_per_partition //

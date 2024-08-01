@@ -27,7 +27,7 @@ torch::Tensor prepack_impl(torch::Tensor const B) {
   auto const stride_B = make_cute_stride(StrideB{}, shape_Bt);
 
   // Allocate output
-  torch::Tensor D = torch::empty_like(B);
+  torch::Tensor D = torch::empty_like(B, {}, at::MemoryFormat::Contiguous);
 
   prepack_B<PrepackedLayoutB>(
       stream, B_ptr, make_layout(shape_Bt, stride_B),
