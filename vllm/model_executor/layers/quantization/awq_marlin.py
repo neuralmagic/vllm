@@ -9,10 +9,11 @@ from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.model_executor.layers.quantization.utils import replace_tensor
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     apply_awq_marlin_linear, awq_to_marlin_zero_points, check_marlin_supported,
     marlin_make_empty_g_idx, marlin_make_workspace, marlin_permute_scales,
-    replace_tensor, verify_marlin_supported, verify_marlin_supports_shape)
+    verify_marlin_supported, verify_marlin_supports_shape)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.scalar_type import scalar_types
 
