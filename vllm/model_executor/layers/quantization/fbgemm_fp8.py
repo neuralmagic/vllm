@@ -19,6 +19,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
+from vllm.utils import CudaMemoryProfiler
 logger = init_logger(__name__)
 
 
@@ -74,6 +75,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: FBGEMMFp8Config):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.ran_once = False
 
     def create_weights(
         self,
@@ -131,22 +133,31 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        if self.quant_config.use_marlin:
-            return apply_fp8_marlin_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                workspace=layer.workspace,
-                size_n=layer.output_size_per_partition,
-                size_k=layer.input_size_per_partition,
-                bias=bias)
+        with CudaMemoryProfiler() as m:
+            if self.quant_config.use_marlin:
+                out = apply_fp8_marlin_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    workspace=layer.workspace,
+                    size_n=layer.output_size_per_partition,
+                    size_k=layer.input_size_per_partition,
+                    bias=bias)
 
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=None,
-            input_scale_ub=layer.input_scale_ub,
-            bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
-            use_per_token_if_dynamic=True)
+            else:
+                out = apply_fp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=None,
+                    input_scale_ub=layer.input_scale_ub,
+                    bias=bias,
+                    cutlass_fp8_supported=self.cutlass_fp8_supported,
+                    use_per_token_if_dynamic=True)
+
+        if not self.ran_once:
+            model_memory_usage = m.consumed_memory
+            print(f"Executing fp8 layer {x.shape} * {layer.weight.shape} took {model_memory_usage / float(2**30)} GB")
+            self.ran_once = True
+
+        return out
