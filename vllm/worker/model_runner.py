@@ -1077,147 +1077,152 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                                                dtype=torch.int32,
                                                device=self.device)
 
-        with graph_capture() as graph_capture_context:
-            # NOTE: Capturing the largest batch size first may help reduce the
-            # memory usage of CUDA graph.
-            for virtual_engine in range(
-                    self.parallel_config.pipeline_parallel_size):
-                for batch_size in reversed(batch_size_capture_list):
-                    if self.attn_backend.get_name() == "flashinfer":
-                        _indptr_buffer = indptr_buffer[:batch_size + 1]
-                        _last_page_len_buffer = last_page_len_buffer[:
-                                                                     batch_size]
+        with CudaMemoryProfiler() as m:
+            with graph_capture() as graph_capture_context:
+                # NOTE: Capturing the largest batch size first may help reduce the
+                # memory usage of CUDA graph.
+                for virtual_engine in range(
+                        self.parallel_config.pipeline_parallel_size):
+                    for batch_size in reversed(batch_size_capture_list):
+                        if self.attn_backend.get_name() == "flashinfer":
+                            _indptr_buffer = indptr_buffer[:batch_size + 1]
+                            _last_page_len_buffer = last_page_len_buffer[:
+                                                                         batch_size]
 
-                        num_qo_heads = (
-                            self.model_config.get_num_attention_heads(
-                                self.parallel_config))
-                        num_kv_heads = self.model_config.get_num_kv_heads(
-                            self.parallel_config)
-                        if num_qo_heads // num_kv_heads >= 4:
-                            use_tensor_cores = True
+                            num_qo_heads = (
+                                self.model_config.get_num_attention_heads(
+                                    self.parallel_config))
+                            num_kv_heads = self.model_config.get_num_kv_heads(
+                                self.parallel_config)
+                            if num_qo_heads // num_kv_heads >= 4:
+                                use_tensor_cores = True
+                            else:
+                                use_tensor_cores = False
+                            decode_wrapper = \
+                                CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                                decode_workspace_buffer, _indptr_buffer,
+                                indices_buffer, _last_page_len_buffer, "NHD",
+                                use_tensor_cores)
+                            kv_cache_dtype = get_kv_cache_torch_dtype(
+                                self.kv_cache_dtype, self.model_config.dtype)
+
+                            paged_kv_indptr_tensor_host = torch.arange(
+                                0, batch_size + 1, dtype=torch.int32)
+                            paged_kv_indices_tensor_host = torch.arange(
+                                0, batch_size, dtype=torch.int32)
+                            paged_kv_last_page_len_tensor_host = torch.full(
+                                (batch_size, ), self.block_size, dtype=torch.int32)
+                            query_start_loc_host = torch.arange(0,
+                                                                batch_size + 1,
+                                                                dtype=torch.int32)
+
+                            attn_metadata = self.attn_backend.make_metadata(
+                                num_prefills=0,
+                                slot_mapping=slot_mapping[:batch_size],
+                                num_prefill_tokens=0,
+                                num_decode_tokens=batch_size,
+                                max_prefill_seq_len=0,
+                                block_tables=block_tables,
+                                paged_kv_indptr=paged_kv_indptr_tensor_host,
+                                paged_kv_indices=paged_kv_indices_tensor_host,
+                                paged_kv_last_page_len=
+                                paged_kv_last_page_len_tensor_host,
+                                num_qo_heads=num_qo_heads,
+                                num_kv_heads=num_kv_heads,
+                                head_dim=self.model_config.get_head_size(),
+                                page_size=self.block_size,
+                                seq_start_loc=None,
+                                query_start_loc=query_start_loc_host,
+                                device=self.device,
+                                data_type=kv_cache_dtype,
+                                use_cuda_graph=True,
+                                decode_wrapper=decode_wrapper,
+                                prefill_wrapper=None)
+                            attn_metadata.begin_forward()
                         else:
-                            use_tensor_cores = False
-                        decode_wrapper = \
-                            CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-                            decode_workspace_buffer, _indptr_buffer,
-                            indices_buffer, _last_page_len_buffer, "NHD",
-                            use_tensor_cores)
-                        kv_cache_dtype = get_kv_cache_torch_dtype(
-                            self.kv_cache_dtype, self.model_config.dtype)
+                            attn_metadata = self.attn_backend.make_metadata(
+                                num_prefills=0,
+                                num_prefill_tokens=0,
+                                num_decode_tokens=batch_size,
+                                slot_mapping=slot_mapping[:batch_size],
+                                seq_lens=None,
+                                seq_lens_tensor=seq_lens[:batch_size],
+                                max_query_len=None,
+                                max_prefill_seq_len=0,
+                                max_decode_seq_len=self.max_seq_len_to_capture,
+                                query_start_loc=None,
+                                seq_start_loc=None,
+                                context_lens_tensor=None,
+                                block_tables=block_tables[:batch_size],
+                                use_cuda_graph=True,
+                            )
 
-                        paged_kv_indptr_tensor_host = torch.arange(
-                            0, batch_size + 1, dtype=torch.int32)
-                        paged_kv_indices_tensor_host = torch.arange(
-                            0, batch_size, dtype=torch.int32)
-                        paged_kv_last_page_len_tensor_host = torch.full(
-                            (batch_size, ), self.block_size, dtype=torch.int32)
-                        query_start_loc_host = torch.arange(0,
-                                                            batch_size + 1,
-                                                            dtype=torch.int32)
+                        if self.lora_config:
+                            lora_mapping = LoRAMapping(
+                                **dict(index_mapping=[0] * batch_size,
+                                       prompt_mapping=[0] * batch_size,
+                                       is_prefill=False))
+                            self.set_active_loras(set(), lora_mapping)
 
-                        attn_metadata = self.attn_backend.make_metadata(
-                            num_prefills=0,
-                            slot_mapping=slot_mapping[:batch_size],
-                            num_prefill_tokens=0,
-                            num_decode_tokens=batch_size,
-                            max_prefill_seq_len=0,
-                            block_tables=block_tables,
-                            paged_kv_indptr=paged_kv_indptr_tensor_host,
-                            paged_kv_indices=paged_kv_indices_tensor_host,
-                            paged_kv_last_page_len=
-                            paged_kv_last_page_len_tensor_host,
-                            num_qo_heads=num_qo_heads,
-                            num_kv_heads=num_kv_heads,
-                            head_dim=self.model_config.get_head_size(),
-                            page_size=self.block_size,
-                            seq_start_loc=None,
-                            query_start_loc=query_start_loc_host,
-                            device=self.device,
-                            data_type=kv_cache_dtype,
-                            use_cuda_graph=True,
-                            decode_wrapper=decode_wrapper,
-                            prefill_wrapper=None)
-                        attn_metadata.begin_forward()
-                    else:
-                        attn_metadata = self.attn_backend.make_metadata(
-                            num_prefills=0,
-                            num_prefill_tokens=0,
-                            num_decode_tokens=batch_size,
-                            slot_mapping=slot_mapping[:batch_size],
-                            seq_lens=None,
-                            seq_lens_tensor=seq_lens[:batch_size],
-                            max_query_len=None,
-                            max_prefill_seq_len=0,
-                            max_decode_seq_len=self.max_seq_len_to_capture,
-                            query_start_loc=None,
-                            seq_start_loc=None,
-                            context_lens_tensor=None,
-                            block_tables=block_tables[:batch_size],
-                            use_cuda_graph=True,
-                        )
+                        if self.prompt_adapter_config:
+                            prompt_adapter_mapping = PromptAdapterMapping(
+                                [-1] * batch_size,
+                                [-1] * batch_size,
+                            )
+                            self.set_active_prompt_adapters(
+                                set(), prompt_adapter_mapping)
 
-                    if self.lora_config:
-                        lora_mapping = LoRAMapping(
-                            **dict(index_mapping=[0] * batch_size,
-                                   prompt_mapping=[0] * batch_size,
-                                   is_prefill=False))
-                        self.set_active_loras(set(), lora_mapping)
+                        graph_runner = CUDAGraphRunner(
+                            self.model, self.attn_backend.get_name())
 
-                    if self.prompt_adapter_config:
-                        prompt_adapter_mapping = PromptAdapterMapping(
-                            [-1] * batch_size,
-                            [-1] * batch_size,
-                        )
-                        self.set_active_prompt_adapters(
-                            set(), prompt_adapter_mapping)
+                        if self.attn_backend.get_name() == "flashinfer":
+                            graph_runner.flashinfer_indptr_buffer = _indptr_buffer
+                            graph_runner.flashinfer_indices_buffer = indices_buffer
+                            graph_runner.flashinfer_last_page_len_buffer = \
+                                _last_page_len_buffer
+                            graph_runner.flashinfer_decode_workspace_buffer = \
+                                    decode_workspace_buffer
+                            graph_runner.flashinfer_decode_wrapper = \
+                                decode_wrapper
 
-                    graph_runner = CUDAGraphRunner(
-                        self.model, self.attn_backend.get_name())
+                        capture_inputs = {
+                            "input_ids":
+                            input_tokens[:batch_size],
+                            "positions":
+                            input_positions[:batch_size],
+                            "hidden_or_intermediate_states":
+                            hidden_or_intermediate_states[
+                                virtual_engine]  # type: ignore
+                            [:batch_size]
+                            if hidden_or_intermediate_states[virtual_engine]
+                            is not None else None,
+                            "intermediate_inputs":
+                            intermediate_inputs[:batch_size]
+                            if intermediate_inputs is not None else None,
+                            "kv_caches":
+                            kv_caches[virtual_engine],
+                            "attn_metadata":
+                            attn_metadata,
+                            "memory_pool":
+                            self.graph_memory_pool,
+                            "stream":
+                            graph_capture_context.stream
+                        }
+                        if self.has_seqlen_agnostic:
+                            # Only used by Mamba-based models CUDA graph atm (Jamba)
+                            capture_inputs.update({
+                                "seqlen_agnostic_capture_inputs":
+                                self.model.get_seqlen_agnostic_capture_inputs(
+                                    batch_size)
+                            })
+                        graph_runner.capture(**capture_inputs)
+                        self.graph_memory_pool = graph_runner.graph.pool()
+                        self.graph_runners[virtual_engine][batch_size] = (
+                            graph_runner)
 
-                    if self.attn_backend.get_name() == "flashinfer":
-                        graph_runner.flashinfer_indptr_buffer = _indptr_buffer
-                        graph_runner.flashinfer_indices_buffer = indices_buffer
-                        graph_runner.flashinfer_last_page_len_buffer = \
-                            _last_page_len_buffer
-                        graph_runner.flashinfer_decode_workspace_buffer = \
-                                decode_workspace_buffer
-                        graph_runner.flashinfer_decode_wrapper = \
-                            decode_wrapper
-
-                    capture_inputs = {
-                        "input_ids":
-                        input_tokens[:batch_size],
-                        "positions":
-                        input_positions[:batch_size],
-                        "hidden_or_intermediate_states":
-                        hidden_or_intermediate_states[
-                            virtual_engine]  # type: ignore
-                        [:batch_size]
-                        if hidden_or_intermediate_states[virtual_engine]
-                        is not None else None,
-                        "intermediate_inputs":
-                        intermediate_inputs[:batch_size]
-                        if intermediate_inputs is not None else None,
-                        "kv_caches":
-                        kv_caches[virtual_engine],
-                        "attn_metadata":
-                        attn_metadata,
-                        "memory_pool":
-                        self.graph_memory_pool,
-                        "stream":
-                        graph_capture_context.stream
-                    }
-                    if self.has_seqlen_agnostic:
-                        # Only used by Mamba-based models CUDA graph atm (Jamba)
-                        capture_inputs.update({
-                            "seqlen_agnostic_capture_inputs":
-                            self.model.get_seqlen_agnostic_capture_inputs(
-                                batch_size)
-                        })
-                    graph_runner.capture(**capture_inputs)
-                    self.graph_memory_pool = graph_runner.graph.pool()
-                    self.graph_runners[virtual_engine][batch_size] = (
-                        graph_runner)
+        graphcap_memory_usage = m.consumed_memory
+        logger.info("Capturing graphs took %.4f GB",
+                    graphcap_memory_usage / float(2**30))
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
