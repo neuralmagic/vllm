@@ -87,46 +87,51 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        del input_size, output_size
-        output_size_per_partition = sum(output_partition_sizes)
+        with CudaMemoryProfiler() as m:
+            del input_size, output_size
+            output_size_per_partition = sum(output_partition_sizes)
 
-        layer.logical_widths = output_partition_sizes
+            layer.logical_widths = output_partition_sizes
 
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
+            layer.input_size_per_partition = input_size_per_partition
+            layer.output_size_per_partition = output_size_per_partition
+            layer.orig_dtype = params_dtype
 
-        # WEIGHT
-        weight = Parameter(torch.empty(output_size_per_partition,
-                                       input_size_per_partition,
-                                       dtype=torch.float8_e4m3fn),
-                           requires_grad=False)
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, {
-            "input_dim": 1,
-            "output_dim": 0,
-            **extra_weight_attrs,
-        })
+            # WEIGHT
+            weight = Parameter(torch.empty(output_size_per_partition,
+                                           input_size_per_partition,
+                                           dtype=torch.float8_e4m3fn),
+                               requires_grad=False)
+            layer.register_parameter("weight", weight)
+            set_weight_attrs(weight, {
+                "input_dim": 1,
+                "output_dim": 0,
+                **extra_weight_attrs,
+            })
 
-        # WEIGHT SCALE
-        weight_scale = create_per_channel_scale_param(output_partition_sizes,
-                                                      **extra_weight_attrs)
-        layer.register_parameter("weight_scale", weight_scale)
+            # WEIGHT SCALE
+            weight_scale = create_per_channel_scale_param(output_partition_sizes,
+                                                          **extra_weight_attrs)
+            layer.register_parameter("weight_scale", weight_scale)
 
-        # INPUT SCALE UPPER BOUND
-        input_scale_ub = torch.nn.Parameter(torch.tensor(
-            (self.quant_config.input_scale_ub), dtype=torch.float32),
-                                            requires_grad=False)
-        layer.input_scale_ub = input_scale_ub
+            # INPUT SCALE UPPER BOUND
+            input_scale_ub = torch.nn.Parameter(torch.tensor(
+                (self.quant_config.input_scale_ub), dtype=torch.float32),
+                                                requires_grad=False)
+            layer.input_scale_ub = input_scale_ub
+        print(f"Create fp8 layer weights {layer.weight.shape} took {m.consumed_memory / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
 
     def process_weights_after_loading(self, layer: Module) -> None:
         weight = layer.weight
         layer.weight = Parameter(weight.t(), requires_grad=False)
 
-        if self.quant_config.use_marlin:
-            prepare_fp8_layer_for_marlin(layer)
-            # Activations not quantized for marlin.
-            del layer.input_scale_ub
+        with CudaMemoryProfiler() as m:
+
+            if self.quant_config.use_marlin:
+                prepare_fp8_layer_for_marlin(layer)
+                # Activations not quantized for marlin.
+                del layer.input_scale_ub
+        print(f"Processing fp8 layer {layer.weight.shape} took {m.consumed_memory / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
 
     def apply(self,
               layer: torch.nn.Module,
@@ -157,7 +162,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
 
         if not self.ran_once:
             model_memory_usage = m.consumed_memory
-            print(f"Executing fp8 layer {x.shape} * {layer.weight.shape} took {model_memory_usage / float(2**30)} GB")
+            print(f"Executing fp8 layer {x.shape} * {layer.weight.shape} took {model_memory_usage / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
             self.ran_once = True
 
         return out
