@@ -430,8 +430,10 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA):
 
     def compute_logits(self, hidden_states: torch.Tensor,
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        with CudaMemoryProfiler() as m:
+            logits = self.logits_processor(self.lm_head, hidden_states,
+                                           sampling_metadata)
+        logger.info(f"Logits memory. Initial: {m.initial_memory / float(2**30)} GB. consumed: {m.consumed_memory / float(2**30)} final: {m.final_memory / float(2**30)} max: {m.max_memory / float(2**30)}")
         return logits
 
     def sample(
