@@ -12,6 +12,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.platforms import current_platform
 
+from vllm.utils import CudaMemoryProfiler
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 class LogitsProcessor(nn.Module):
     """Process logits and apply logits processors from sampling metadata.
@@ -54,11 +57,15 @@ class LogitsProcessor(nn.Module):
         if self.logits_as_input:
             logits = hidden_states
         else:
-            hidden_states = _prune_hidden_states(hidden_states,
-                                                 sampling_metadata)
+            with CudaMemoryProfiler() as m:
+                hidden_states = _prune_hidden_states(hidden_states,
+                                                     sampling_metadata)
+            m.log("Prune hidden states")
 
             # Get the logits for the next tokens.
-            logits = self._get_logits(hidden_states, lm_head, embedding_bias)
+            with CudaMemoryProfiler() as m:
+                logits = self._get_logits(hidden_states, lm_head, embedding_bias)
+            m.log("Get logits")
         if logits is not None:
             if self.soft_cap is not None:
                 logits = logits / self.soft_cap
@@ -69,7 +76,9 @@ class LogitsProcessor(nn.Module):
                 logits *= self.scale
 
             # Apply logits processors (if any).
-            logits = _apply_logits_processors(logits, sampling_metadata)
+            with CudaMemoryProfiler() as m:
+                logits = _apply_logits_processors(logits, sampling_metadata)
+            m.log("Apply logits processors")
 
         return logits
 
@@ -77,21 +86,26 @@ class LogitsProcessor(nn.Module):
                     lm_head: VocabParallelEmbedding,
                     embedding_bias: Optional[torch.Tensor]) -> torch.Tensor:
         # Get the logits for the next tokens.
-        logits = lm_head.linear_method.apply(lm_head,
-                                             hidden_states,
-                                             bias=embedding_bias)
-        if self.use_gather:
-            logits = tensor_model_parallel_gather(logits)
-        else:
-            # Gather is not supported for some devices such as TPUs.
-            # Use all-gather instead.
-            # NOTE(woosuk): Here, the outputs of every device should not be None
-            # because XLA requires strict SPMD among all devices. Every device
-            # should execute the same operations after gathering the logits.
-            logits = tensor_model_parallel_all_gather(logits)
-        # Remove paddings in vocab (if any).
-        if logits is not None:
-            logits = logits[:, :self.org_vocab_size]
+        with CudaMemoryProfiler() as m:
+            logits = lm_head.linear_method.apply(lm_head,
+                                                 hidden_states,
+                                                 bias=embedding_bias)
+        m.log("Apply LM Head")
+
+        with CudaMemoryProfiler() as m:
+            if self.use_gather:
+                logits = tensor_model_parallel_gather(logits)
+            else:
+                # Gather is not supported for some devices such as TPUs.
+                # Use all-gather instead.
+                # NOTE(woosuk): Here, the outputs of every device should not be None
+                # because XLA requires strict SPMD among all devices. Every device
+                # should execute the same operations after gathering the logits.
+                logits = tensor_model_parallel_all_gather(logits)
+            # Remove paddings in vocab (if any).
+            if logits is not None:
+                logits = logits[:, :self.org_vocab_size]
+        m.log("Get logits other stuff.")
         return logits
 
     def extra_repr(self) -> str:

@@ -626,6 +626,9 @@ class CudaMemoryProfiler:
         # Force garbage collection
         gc.collect()
 
+    def log(self, name):
+        logger.info(f"{name} memory profile:\n\tInitial: {self.initial_memory / float(2**30)} GB.\n\tConsumed: {self.consumed_memory / float(2**30)} GB.\n\tFinal: {self.final_memory / float(2**30)} GB.\n\tMax: {self.max_memory / float(2**30)} GB.")
+
 
 def str_to_int_tuple(s: str) -> Tuple[int, ...]:
     """Convert a string to a tuple of integers."""
