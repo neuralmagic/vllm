@@ -85,6 +85,8 @@ class LogitsProcessor(nn.Module):
     def _get_logits(self, hidden_states: torch.Tensor,
                     lm_head: VocabParallelEmbedding,
                     embedding_bias: Optional[torch.Tensor]) -> torch.Tensor:
+        print(lm_head.linear_method)
+        print(lm_head.weight.shape)
         # Get the logits for the next tokens.
         with CudaMemoryProfiler() as m:
             logits = lm_head.linear_method.apply(lm_head,

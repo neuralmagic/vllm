@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.utils import set_weight_attrs
 
+from vllm.utils import CudaMemoryProfiler
 logger = init_logger(__name__)
 
 
@@ -119,7 +120,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        return F.linear(x, layer.weight, bias)
+        with CudaMemoryProfiler() as m:
+            out = F.linear(x, layer.weight, bias)
+        m.log("UnquantizedLinearMethod")
+
+        return out
 
 
 class LinearBase(torch.nn.Module):
