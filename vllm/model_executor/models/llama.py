@@ -50,10 +50,13 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors, SamplerOutput
 from vllm.utils import is_hip
+from vllm.utils import CudaMemoryProfiler
 
 from .interfaces import SupportsLoRA
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 class LlamaMLP(nn.Module):
 
@@ -317,15 +320,17 @@ class LlamaModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                kv_caches[i - self.start_layer],
-                attn_metadata,
-                residual,
-            )
+        with CudaMemoryProfiler() as m:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    kv_caches[i - self.start_layer],
+                    attn_metadata,
+                    residual,
+                )
+        logger.info(f"Layers memory. Initial: {m.initial_memory / float(2**30)} GB. consumed: {m.consumed_memory / float(2**30)} final: {m.final_memory / float(2**30)} max: {m.max_memory / float(2**30)}")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
