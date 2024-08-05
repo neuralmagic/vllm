@@ -937,7 +937,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 batch_size=batch_size,
                 dtype=self.model_config.dtype,
                 device=self.device)
-        self.execute_model(model_input, kv_caches, intermediate_tensors)
+        with CudaMemoryProfiler() as m:
+            self.execute_model(model_input, kv_caches, intermediate_tensors)
+        logger.info(f"Profile run initial: {m.initial_memory / float(2**30)} GB. consumed: {m.consumed_memory / float(2**30)} final: {m.final_memory / float(2**30)}")
         torch.cuda.synchronize()
         return
 

@@ -621,6 +621,7 @@ class CudaMemoryProfiler:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.final_memory = self.current_memory_usage()
         self.consumed_memory = self.final_memory - self.initial_memory
+        self.max_memory = torch.cuda.max_memory_allocated(self.device)
 
         # Force garbage collection
         gc.collect()

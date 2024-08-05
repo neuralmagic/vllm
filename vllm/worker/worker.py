@@ -18,6 +18,7 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.platforms import current_platform
+from vllm.utils import CudaMemoryProfiler
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import ExecuteModelRequest
 from vllm.worker.cache_engine import CacheEngine
@@ -176,10 +177,12 @@ class Worker(LocalOrDistributedWorkerBase):
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(self.device_config.device)
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        self.model_runner.profile_run()
+        with CudaMemoryProfiler(self.device_config.device) as m:
+            self.model_runner.profile_run()
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
@@ -187,6 +190,8 @@ class Worker(LocalOrDistributedWorkerBase):
         free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
 
         logger.info(f"Determining num available blocks. Initial: {self.init_gpu_memory / float(2**30)} GB. Free memory: {free_gpu_memory / float(2**30)} GB. Total: {total_gpu_memory / float(2**30)} GB")
+
+        logger.info(f"Determining num available blocks 2. Initial: {m.initial_memory / float(2**30)} GB. consumed: {m.consumed_memory / float(2**30)} final: {m.final_memory / float(2**30)} max: {m.max_memory / float(2**30)}")
 
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.

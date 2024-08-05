@@ -119,7 +119,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 (self.quant_config.input_scale_ub), dtype=torch.float32),
                                                 requires_grad=False)
             layer.input_scale_ub = input_scale_ub
-        print(f"Create fp8 layer weights {layer.weight.shape} took {m.consumed_memory / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
+#        print(f"Create fp8 layer weights {layer.weight.shape} took {m.consumed_memory / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
 
     def process_weights_after_loading(self, layer: Module) -> None:
         weight = layer.weight
@@ -131,7 +131,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
                 prepare_fp8_layer_for_marlin(layer)
                 # Activations not quantized for marlin.
                 del layer.input_scale_ub
-        print(f"Processing fp8 layer {layer.weight.shape} took {m.consumed_memory / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
+#        print(f"Processing fp8 layer {layer.weight.shape} took {m.consumed_memory / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
 
     def apply(self,
               layer: torch.nn.Module,
@@ -162,7 +162,7 @@ class FBGEMMFp8LinearMethod(LinearMethodBase):
 
         if not self.ran_once:
             model_memory_usage = m.consumed_memory
-            print(f"Executing fp8 layer {x.shape} * {layer.weight.shape} took {model_memory_usage / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
+#            print(f"Executing fp8 layer {x.shape} * {layer.weight.shape} took {model_memory_usage / float(2**30)} GB. Initial: {m.initial_memory / float(2**30)}")
             self.ran_once = True
 
         return out
