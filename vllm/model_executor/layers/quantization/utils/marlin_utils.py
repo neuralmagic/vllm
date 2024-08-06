@@ -159,6 +159,11 @@ def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
                               requires_grad=False)
 
 
+def marlin_make_empty_zp(device: torch.device) -> torch.Tensor:
+    return torch.nn.Parameter(torch.empty(0, dtype=torch.int, device=device),
+                              requires_grad=False)
+
+
 def marlin_sort_g_idx(
         g_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     g_idx_sort_indices = torch.argsort(g_idx).to(torch.int)

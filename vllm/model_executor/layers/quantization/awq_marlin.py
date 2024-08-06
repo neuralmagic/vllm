@@ -9,7 +9,7 @@ from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
-from vllm.model_executor.layers.quantization.utils import replace_tensor
+from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     apply_awq_marlin_linear, awq_to_marlin_zero_points, check_marlin_supported,
     marlin_make_empty_g_idx, marlin_make_workspace, marlin_permute_scales,
@@ -240,7 +240,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
             num_bits=self.quant_config.quant_type.size_bits)
-        replace_tensor(layer, "qweight", marlin_qweight)
+        replace_parameter(layer, "qweight", marlin_qweight)
 
         # Permute scales from AWQ format to marlin format.
         marlin_scales = marlin_permute_scales(
@@ -248,7 +248,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
             group_size=self.quant_config.group_size)
-        replace_tensor(layer, "scales", marlin_scales)
+        replace_parameter(layer, "scales", marlin_scales)
 
         # Permute zero-points from AWQ format to marlin format.
         marlin_zp = awq_to_marlin_zero_points(
@@ -256,7 +256,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             size_k=layer.num_groups,
             size_n=layer.output_size_per_partition,
             num_bits=self.quant_config.quant_type.size_bits)
-        replace_tensor(layer, "qzeros", marlin_zp)
+        replace_parameter(layer, "qzeros", marlin_zp)
 
         # Not-used
         layer.g_idx = marlin_make_empty_g_idx(device)
