@@ -4,6 +4,7 @@ from vllm.model_executor.layers.quantization.utils.machete_utils import (
     query_machete_supported_quant_types)
 from vllm.model_executor.parameter import (ModelWeightParameter,
                                            PackedvLLMParameter)
+
 from .MPLinearKernel import *
 
 
@@ -43,20 +44,22 @@ class MacheteLinearKernel(MPLinearKernel):
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `weight_scale`  is: {input_dim = 0, output_dim = 1}
     def process_weights_after_loading(self, layer: torch.nn.Module):
+
         def transform_w_q(x):
-            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once 
+            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once
             # everything is migrated to using weight_loader_v2
             if isinstance(x, PackedvLLMParameter):
                 x = x.permute_layout(input_dim=0, output_dim=1, packed_dim=0)
             return ops.machete_prepack_B(x.t().contiguous().t(),
                                          self.config.weight_type)
+
         def transform_w_s(x):
-            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once 
+            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once
             # everything is migrated to using weight_loader_v2
             if isinstance(x, ModelWeightParameter):
                 x = x.permute_layout(input_dim=0, output_dim=1)
             return x.contiguous()
-        
+
         # Repack weights and scales for Machete
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)

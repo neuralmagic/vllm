@@ -1,13 +1,14 @@
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     MARLIN_SUPPORTED_GROUP_SIZES, apply_gptq_marlin_linear,
-    check_marlin_supports_shape, marlin_make_empty_g_idx,
+    check_marlin_supports_shape, marlin_is_k_full, marlin_make_empty_g_idx,
     marlin_make_workspace, marlin_permute_scales, marlin_sort_g_idx,
-    marlin_is_k_full, query_marlin_supported_quant_types)
-
-from .MPLinearKernel import *
+    query_marlin_supported_quant_types)
 from vllm.model_executor.parameter import (ModelWeightParameter,
                                            PackedvLLMParameter)
+
+from .MPLinearKernel import *
+
 
 class MarlinLinearKernel(MPLinearKernel):
 
@@ -82,27 +83,25 @@ class MarlinLinearKernel(MPLinearKernel):
             setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
 
         def transform_w_q(x):
-            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once 
+            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once
             # everything is migrated to using weight_loader_v2
             if isinstance(x, PackedvLLMParameter):
                 x = x.permute_layout(input_dim=0, output_dim=1, packed_dim=0)
-            return ops.gptq_marlin_repack(
-                x.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits)
-        
+            return ops.gptq_marlin_repack(x.contiguous(),
+                                          perm=layer.g_idx_sort_indices,
+                                          size_k=c.partition_weight_shape[0],
+                                          size_n=c.partition_weight_shape[1],
+                                          num_bits=c.weight_type.size_bits)
+
         def transform_w_s(x):
-            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once 
+            # TODO (lucas): assert isinstance(x, PackedvLLMParameter) once
             # everything is migrated to using weight_loader_v2
             if isinstance(x, ModelWeightParameter):
                 x = x.permute_layout(input_dim=0, output_dim=1)
-            return marlin_permute_scales(
-                x.contiguous(),
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                group_size=c.group_size)
+            return marlin_permute_scales(x.contiguous(),
+                                         size_k=c.partition_weight_shape[0],
+                                         size_n=c.partition_weight_shape[1],
+                                         group_size=c.group_size)
 
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)

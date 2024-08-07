@@ -142,25 +142,25 @@ class ModelWeightParameter(_ColumnvLLMParameter):
     def __init__(self, input_dim: int, **kwargs):
         self._input_dim = input_dim
         super().__init__(**kwargs)
-        
+
     def permute_layout(self, input_dim: int, output_dim: int, **kwargs) \
         -> 'ModelWeightParameter':
-            
+
         # create permutation from the current layout to the layout with
         # self.input_dim at input_dim and self.output_dim at output_dim
         # preservier other dimensions
-        perm = [i for i in range(self.data.dim()) 
-                if i not in [self.input_dim, self.output_dim]
+        perm = [
+            i for i in range(self.data.dim())
+            if i not in [self.input_dim, self.output_dim]
         ]
         perm.insert(input_dim, self.input_dim)
         perm.insert(output_dim, self.output_dim)
-            
-        return ModelWeightParameter(
-            data=self.data.permute(*perm).contiguous(),
-            weight_loader=self.weight_loader,
-            input_dim=input_dim, 
-            output_dim=output_dim, 
-            **kwargs)
+
+        return ModelWeightParameter(data=self.data.permute(*perm).contiguous(),
+                                    weight_loader=self.weight_loader,
+                                    input_dim=input_dim,
+                                    output_dim=output_dim,
+                                    **kwargs)
 
     @property
     def input_dim(self):
@@ -272,18 +272,18 @@ class PackedvLLMParameter(ModelWeightParameter):
         self._marlin_tile = marlin_tile_size
         super().__init__(**kwargs)
 
-    def permute_layout(self, input_dim: int, output_dim: int, 
+    def permute_layout(self, input_dim: int, output_dim: int,
                        packed_dim: int = 0,
                        **kwargs)\
         -> 'ModelWeightParameter':
-            
+
         assert packed_dim == packed_dim
 
         return PackedvLLMParameter(
             data=ModelWeightParameter\
                 .permute_layout(self, input_dim, output_dim).data,
             weight_loader=self.weight_loader,
-            input_dim=input_dim, 
+            input_dim=input_dim,
             output_dim=output_dim,
             packed_dim=self.packed_dim,
             packed_factor=self.packed_factor,

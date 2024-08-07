@@ -3,21 +3,16 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-
-from vllm.model_executor.layers.quantization.kernels import (
-    MPLinearLayerConfig, choose_mp_linear_kernel)
-
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
+from vllm.model_executor.layers.quantization.kernels import (
+    MPLinearLayerConfig, choose_mp_linear_kernel)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    apply_gptq_marlin_linear, check_marlin_supported, marlin_is_k_full,
-    marlin_make_empty_g_idx, marlin_make_workspace, marlin_permute_scales,
-    marlin_repeat_scales_on_all_ranks, marlin_sort_g_idx,
-    verify_marlin_supported, verify_marlin_supports_shape)
+    check_marlin_supported, marlin_repeat_scales_on_all_ranks,
+    verify_marlin_supported)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.scalar_type import scalar_types
 
@@ -289,8 +284,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
     # marlin format. This function is called after the weights are loaded.
     # Here, we handle the repacking, including the activation reordering case.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        device = layer.qweight.device
-
         # `qweight` and `scales` are already in the correct format. So we can
         # just call `process_weights_after_loading` right-away
         self.kernel.process_weights_after_loading(layer)

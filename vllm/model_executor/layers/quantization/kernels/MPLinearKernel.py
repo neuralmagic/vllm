@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Callable
+from typing import Callable, Optional, Tuple
 
 import torch
 

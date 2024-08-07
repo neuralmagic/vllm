@@ -4,13 +4,12 @@ import torch
 
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme)
+from vllm.model_executor.layers.quantization.kernels import (
+    MPLinearLayerConfig, choose_mp_linear_kernel)
 from vllm.model_executor.parameter import (BasevLLMParameter,
                                            ChannelQuantScaleParameter,
                                            GroupQuantScaleParameter,
                                            PackedvLLMParameter)
-from vllm.model_executor.layers.quantization.utils import replace_parameter
-from vllm.model_executor.layers.quantization.kernels import (
-    MPLinearLayerConfig, choose_mp_linear_kernel)
 from vllm.scalar_type import scalar_types
 
 __all__ = ["CompressedTensorsWNA16"]
@@ -54,7 +53,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                        input_size_per_partition: int,
                        params_dtype: torch.dtype, weight_loader: Callable,
                        **kwargs):
-    
+
         output_size_per_partition = sum(output_partition_sizes)
 
         mp_linear_kernel_config = MPLinearLayerConfig(
@@ -135,7 +134,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
-
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
