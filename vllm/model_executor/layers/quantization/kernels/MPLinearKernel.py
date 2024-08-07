@@ -45,7 +45,7 @@ class MPLinearKernel(ABC):
         self.w_zp_name = w_zp_param_name
         self.w_gidx_name = w_gidx_param_name
 
-    # note assumes that
+    # note assumes that (if the they are not ModelWeightParameters)
     #  `getattr(layer, w_q_name)` is:
     #     {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `getattr(layer, w_s_name)` is:
