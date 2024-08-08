@@ -52,7 +52,7 @@ torch::Tensor run_impl(PytorchArguments args) {
                                .device(device));
 
   auto A_ptr = data_ptr<ElementA const, LayoutA>(args.A, "A");
-  auto B_ptr = data_ptr<ElementB const, LayoutB>(args.B, "B");
+  auto B_ptr = data_ptr<ElementB const, void>(args.B, "B");
   auto D_ptr = data_ptr<ElementD, LayoutD>(D, "D");
   auto C_ptr = maybe_data_ptr<ElementC const, LayoutC>(args.C, "C");
   auto scales_ptr =

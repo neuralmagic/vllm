@@ -2,13 +2,10 @@ from typing import Callable, List, Optional
 
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme)
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    apply_gptq_marlin_linear, marlin_make_empty_g_idx, marlin_make_workspace,
-    marlin_permute_scales, replace_tensor, verify_marlin_supported,
-    verify_marlin_supports_shape)
+from vllm.model_executor.layers.quantization.kernels import (
+    MPLinearLayerConfig, choose_mp_linear_kernel)
 from vllm.model_executor.parameter import (BasevLLMParameter,
                                            ChannelQuantScaleParameter,
                                            GroupQuantScaleParameter,
@@ -46,22 +43,31 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
         self.quant_type = WNA16_SUPPORTED_TYPES_MAP[num_bits]
 
-        # Verify supported on platform.
-        verify_marlin_supported(quant_type=self.quant_type,
-                                group_size=self.group_size)
-
     @classmethod
     def get_min_capability(cls) -> int:
         # ampere and up
         return 80
 
-    def create_weights(self, layer: torch.nn.Module, input_size: int,
-                       output_partition_sizes: List[int],
+    def create_weights(self, layer: torch.nn.Module, output_size: int,
+                       input_size: int, output_partition_sizes: List[int],
                        input_size_per_partition: int,
                        params_dtype: torch.dtype, weight_loader: Callable,
                        **kwargs):
 
         output_size_per_partition = sum(output_partition_sizes)
+
+        mp_linear_kernel_config = MPLinearLayerConfig(
+            full_weight_shape=(input_size, output_size),
+            partition_weight_shape=\
+                (input_size_per_partition, output_size_per_partition),
+            weight_type=self.quant_type,
+            act_type=params_dtype,
+            group_size=self.group_size,
+            zero_points=False,
+            act_reordering=False
+        )
+
+        kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
 
         # If group_size is -1, we are in channelwise case.
         channelwise = (self.group_size == -1)
@@ -70,12 +76,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         # In the case of channelwise quantization, we need to replicate the
         # scales across all gpus.
         partition_scales = (row_parallel and not channelwise)
-
-        verify_marlin_supports_shape(
-            output_size_per_partition=output_size_per_partition,
-            input_size_per_partition=input_size_per_partition,
-            input_size=input_size,
-            group_size=group_size)
 
         scales_and_zp_size = input_size // group_size
 
@@ -105,6 +105,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                 dtype=params_dtype,
             )
         }
+
         if self.group_size == -1:
             weight_scale = ChannelQuantScaleParameter(output_dim=0,
                                                       **weight_scale_args)
@@ -123,62 +124,17 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         layer.register_parameter("weight_scale", weight_scale)
         layer.register_parameter("weight_shape", weight_shape)
 
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.input_size = input_size
-        layer.group_size = group_size
+        self.kernel = kernel_type(mp_linear_kernel_config,
+                                  w_q_param_name="weight_packed",
+                                  w_s_param_name="weight_scale",
+                                  w_zp_param_name=None,
+                                  w_gidx_param_name=None)
 
     # Checkpoints are serialized in compressed-tensors format, which is
-    # different from marlin format. Handle repacking here.
+    # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        device = layer.weight_packed.device
-
-        # Allocate marlin workspace.
-        layer.workspace = marlin_make_workspace(
-            layer.output_size_per_partition, device)
-
-        # Act-order not supported in compressed-tensors yet, so set to empty.
-        layer.g_idx = marlin_make_empty_g_idx(device)
-        layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
-
-        # No zero-point
-        layer.weight_zp = marlin_make_empty_g_idx(device)
-        # Update for kernel
-        layer.weight_packed = torch.nn.Parameter(
-            layer.weight_packed.t().contiguous(), requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(
-            layer.weight_scale.squeeze().t().contiguous(), requires_grad=False)
-
-        # Repack weights from compressed-tensors format to marlin format.
-        marlin_qweight = ops.gptq_marlin_repack(
-            layer.weight_packed,
-            perm=layer.g_idx_sort_indices,
-            size_k=layer.input_size_per_partition,
-            size_n=layer.output_size_per_partition,
-            num_bits=self.quant_type.size_bits)
-        replace_tensor(layer, "weight_packed", marlin_qweight)
-
-        # Permute scales from compressed-tensors format to marlin format.
-        marlin_scales = marlin_permute_scales(
-            layer.weight_scale,
-            size_k=layer.input_size_per_partition,
-            size_n=layer.output_size_per_partition,
-            group_size=layer.group_size)
-        replace_tensor(layer, "weight_scale", marlin_scales)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
-
-        return apply_gptq_marlin_linear(
-            input=x,
-            weight=layer.weight_packed,
-            weight_scale=layer.weight_scale,
-            weight_zp=layer.weight_zp,
-            g_idx=layer.g_idx,
-            g_idx_sort_indices=layer.g_idx_sort_indices,
-            workspace=layer.workspace,
-            wtype=self.quant_type,
-            output_size_per_partition=layer.output_size_per_partition,
-            input_size_per_partition=layer.input_size_per_partition,
-            is_k_full=True,
-            bias=bias)
+        return self.kernel.apply_weights(layer, x, bias)
