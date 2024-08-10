@@ -33,6 +33,7 @@ from vllm.usage.usage_lib import UsageContext
 logger = init_logger(__name__)
 ENGINE_ITERATION_TIMEOUT_S = envs.VLLM_ENGINE_ITERATION_TIMEOUT_S
 
+
 class AsyncEngineDeadError(RuntimeError):
     pass
 
