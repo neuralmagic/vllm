@@ -260,7 +260,6 @@ class _AsyncLLMEngine(LLMEngine):
         while True:
             data = await self.logging_queue.get()
             self.do_log_stats(data[0], data[1])
-
         
     async def step_async(
         self, virtual_engine: int
