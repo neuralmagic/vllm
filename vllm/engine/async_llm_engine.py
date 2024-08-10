@@ -251,6 +251,16 @@ class RequestTracker:
 class _AsyncLLMEngine(LLMEngine):
     """Extension of LLMEngine to add async methods."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logging_task = asyncio.create_task(self.run_logging_loop())
+        self.logging_queue = asyncio.Queue()
+
+    async def run_logging_loop(self):
+        while True:
+            data = await self.logging_queue.get()
+            self.do_log_stats(data[0], data[1])
+        
     async def step_async(
         self, virtual_engine: int
     ) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
@@ -288,8 +298,9 @@ class _AsyncLLMEngine(LLMEngine):
             output, scheduler_outputs.scheduled_seq_groups,
             scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
 
-        # Log stats.
-        self.do_log_stats(scheduler_outputs, output)
+        self.logging_queue.put_nowait((
+            scheduler_outputs, output
+        ))
 
         # Tracing
         self.do_tracing(scheduler_outputs)
