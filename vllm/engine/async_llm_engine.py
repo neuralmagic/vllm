@@ -1,5 +1,8 @@
 import asyncio
 import time
+import zmq
+import zmq.asyncio
+import pickle
 from functools import partial
 from typing import (AsyncGenerator, Callable, Dict, Iterable, List, Mapping,
                     Optional, Set, Tuple, Type, Union)
@@ -252,9 +255,24 @@ class RequestTracker:
 class _AsyncLLMEngine(LLMEngine):
     """Extension of LLMEngine to add async methods."""
 
-    async def do_log_stats_async(self, scheduler_outputs, model_output):
-        self.do_log_stats(scheduler_outputs, model_output)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.logger_ctx = zmq.asyncio.Context()
         
+        self.to_logger = self.logger_ctx.socket(zmq.constants.PUSH)
+        self.to_logger.bind("inproc://doesitwork")
+
+        self.from_engine = self.logger_ctx.socket(zmq.constants.PULL)
+        self.from_engine.connect("inproc://doesitwork")
+
+        self.logging_task = asyncio.create_task(self.run_logging_loop())
+
+
+    async def run_logging_loop(self):
+
+        while True:
+            data = await self.from_engine.recv_pyobj()
+            self.do_log_stats(**data)
         
     async def step_async(
         self, virtual_engine: int
@@ -294,14 +312,21 @@ class _AsyncLLMEngine(LLMEngine):
             scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
 
         # Log stats.
-        log_task = asyncio.create_task(self.do_log_stats_async(
-            scheduler_outputs, output))
-        _running_tasks.add(log_task)
-        log_task.add_done_callback(_running_tasks.discard)
+        # log_task = asyncio.create_task(self.do_log_stats_async(
+        #     scheduler_outputs, output))
+        # _running_tasks.add(log_task)
+        # log_task.add_done_callback(_running_tasks.discard)
         # self.do_log_stats(scheduler_outputs, output)
+        await self.to_logger.send_pyobj(
+            {
+                "scheduler_outputs": scheduler_outputs,
+                "model_output": output
+            }
+        )
 
         # Tracing
         self.do_tracing(scheduler_outputs)
+
 
         return request_outputs
 
