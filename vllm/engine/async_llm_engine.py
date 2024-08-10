@@ -271,8 +271,8 @@ class _AsyncLLMEngine(LLMEngine):
     async def run_logging_loop(self):
 
         while True:
-            data = await self.from_engine.recv_pyobj()
-            self.do_log_stats(**data)
+            msg = await self.from_engine.recv_string()
+            self.do_log_stats()
         
     async def step_async(
         self, virtual_engine: int
@@ -317,12 +317,7 @@ class _AsyncLLMEngine(LLMEngine):
         # _running_tasks.add(log_task)
         # log_task.add_done_callback(_running_tasks.discard)
         # self.do_log_stats(scheduler_outputs, output)
-        await self.to_logger.send_pyobj(
-            {
-                "scheduler_outputs": scheduler_outputs,
-                "model_output": output
-            }
-        )
+        await self.to_logger.send_string("Do log")
 
         # Tracing
         self.do_tracing(scheduler_outputs)
