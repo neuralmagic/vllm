@@ -33,8 +33,6 @@ from vllm.usage.usage_lib import UsageContext
 logger = init_logger(__name__)
 ENGINE_ITERATION_TIMEOUT_S = envs.VLLM_ENGINE_ITERATION_TIMEOUT_S
 
-_running_tasks = set()
-
 class AsyncEngineDeadError(RuntimeError):
     pass
 
@@ -261,6 +259,7 @@ class _AsyncLLMEngine(LLMEngine):
         while True:
             data = await self.logging_queue.get()
             self.do_log_stats(data[0], data[1])
+
         
     async def step_async(
         self, virtual_engine: int
@@ -1080,8 +1079,7 @@ class AsyncLLMEngine:
             await self.engine.do_log_stats.remote(  # type: ignore
                 scheduler_outputs, model_output)
         else:
-            self.engine.do_log_stats(scheduler_outputs,
-                                     model_output)
+            self.engine.do_log_stats()
 
     async def check_health(self) -> None:
         """Raises an error if engine is unhealthy."""
