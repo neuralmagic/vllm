@@ -327,7 +327,6 @@ class _AsyncLLMEngine(LLMEngine):
         # Tracing
         self.do_tracing(scheduler_outputs)
 
-
         return request_outputs
 
     async def stop_remote_worker_execution_loop_async(self) -> None:
