@@ -36,7 +36,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from enum import Enum
 import sys
 
-sys.path.insert(0,'/home/varun/code/nm-fork/vllm')
+sys.path.insert(0, '/home/varun/code/nm-fork/vllm')
 
 from tests.utils import RemoteOpenAIServer
 
@@ -56,6 +56,7 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+
 class MultiStepChunkedPrefillPolicy(Enum):
     # When prompt and decode sequences are scheduled together,
     # the DEFAULT policy is to run the prompt and decodes sequences
@@ -67,17 +68,12 @@ class MultiStepChunkedPrefillPolicy(Enum):
     FORCE_SINGLE_STEP = 2
     INVALID = 3
 
+
 DEFAULT_SERVER_ARGS: List[str] = [
-    "--disable-log-requests",
-    "--use-v2-block-manager",
-    "--worker-use-ray",
-    "--gpu-memory-utilization",
-    "0.85",
-    "--swap-space",
-    "16",
-    "--port",
-    "9000"
+    "--disable-log-requests", "--use-v2-block-manager", "--worker-use-ray",
+    "--gpu-memory-utilization", "0.85", "--swap-space", "16", "--port", "9000"
 ]
+
 
 class EnvContextManager():
 
@@ -497,8 +493,8 @@ async def benchmark(
     }
     return result
 
-def dump_result_json(result_json,
-                     result_dir: str = None) -> None:
+
+def dump_result_json(result_json, result_dir: str = None) -> None:
     # Save to file
     base_model_id = result_json["model_id"].split("/")[-1]
     file_name = f'{result_json["backend"]}-{result_json["request_rate"]}qps-{base_model_id}-{result_json["date"]}.json'  #noqa
@@ -507,18 +503,11 @@ def dump_result_json(result_json,
     with open(file_name, "w") as outfile:
         json.dump(result_json, outfile)
 
-def get_result_as_json(
-        backend:str,
-        model_id: str,
-        tokenizer_id:str,
-        best_of: int,
-        use_beam_search: int,
-        num_prompts: int,
-        request_rate: float,
-        server_args: list[str],
-        test_env : dict,
-        benchmark_result: dict
-) -> dict:
+
+def get_result_as_json(backend: str, model_id: str, tokenizer_id: str,
+                       best_of: int, use_beam_search: int, num_prompts: int,
+                       request_rate: float, server_args: list[str],
+                       test_env: dict, benchmark_result: dict) -> dict:
     result_json: Dict[str, Any] = {}
 
     # Setup
@@ -541,51 +530,47 @@ def get_result_as_json(
                 result_json[kvstring[0].strip()] = kvstring[1].strip()
             else:
                 raise ValueError(
-                    "Invalid metadata format. Please use KEY=VALUE format."
-                )
+                    "Invalid metadata format. Please use KEY=VALUE format.")
 
     # Traffic
-    result_json["request_rate"] = (
-        request_rate if request_rate < float("inf") else "inf")
+    result_json["request_rate"] = (request_rate
+                                   if request_rate < float("inf") else "inf")
 
     # Merge with benchmark result
     result_json = {**result_json, **benchmark_result}
 
     return result_json
 
-async def benchmark_with_server(backend: str,
-                                api_url: str,
-                                base_url: str,
+
+async def benchmark_with_server(backend: str, api_url: str, base_url: str,
                                 model_id: str,
                                 tokenizer: PreTrainedTokenizerBase,
-                                input_requests: List[Tuple[str, int, int]],
-                                best_of: int,
-                                use_beam_search: bool,
-                                disable_tqdm: bool,
-                                profile: bool,
-                                request_rates: list[float],
-                                server_args: list[str],
-                                test_env: dict):
+                                input_requests: List[Tuple[str, int,
+                                                           int]], best_of: int,
+                                use_beam_search: bool, disable_tqdm: bool,
+                                profile: bool, request_rates: list[float],
+                                server_args: list[str], test_env: dict):
 
-    print (f"Using server args {server_args}")
+    print(f"Using server args {server_args}")
 
-    benchmark_results = [] 
+    benchmark_results = []
     with EnvContextManager(test_env) as _:  # noqa: SIM117
-        with RemoteOpenAIServer(model_id, server_args, auto_port=False) as server:
+        with RemoteOpenAIServer(model_id, server_args,
+                                auto_port=False) as server:
             for rr in request_rates:
                 benchmark_result = await benchmark(
-                        backend=backend,
-                        base_url=base_url,
-                        api_url=api_url,
-                        model_id=model_id,
-                        tokenizer=tokenizer,
-                        input_requests=input_requests,
-                        best_of=best_of,
-                        use_beam_search=use_beam_search,
-                        request_rate=rr,
-                        profile=profile,
-                        disable_tqdm=disable_tqdm,
-                    )
+                    backend=backend,
+                    base_url=base_url,
+                    api_url=api_url,
+                    model_id=model_id,
+                    tokenizer=tokenizer,
+                    input_requests=input_requests,
+                    best_of=best_of,
+                    use_beam_search=use_beam_search,
+                    request_rate=rr,
+                    profile=profile,
+                    disable_tqdm=disable_tqdm,
+                )
                 benchmark_results.append(benchmark_result)
 
     assert len(benchmark_results) == len(request_rates)
@@ -593,22 +578,22 @@ async def benchmark_with_server(backend: str,
     result_jsons = []
     for result, rr in zip(benchmark_results, request_rates):
         # Get all jsons and dump jsons
-        result_json = get_result_as_json(
-            backend = backend,
-            model_id = model_id,
-            tokenizer_id = model_id,
-            best_of = best_of,
-            use_beam_search = use_beam_search,
-            num_prompts = len(input_requests),
-            request_rate = rr,
-            server_args = server_args,
-            test_env = test_env,
-            benchmark_result = result)
+        result_json = get_result_as_json(backend=backend,
+                                         model_id=model_id,
+                                         tokenizer_id=model_id,
+                                         best_of=best_of,
+                                         use_beam_search=use_beam_search,
+                                         num_prompts=len(input_requests),
+                                         request_rate=rr,
+                                         server_args=server_args,
+                                         test_env=test_env,
+                                         benchmark_result=result)
 
         result_jsons.append(result_json)
 
-    assert result_jsons 
+    assert result_jsons
     return result_jsons
+
 
 def main_benchmark_with_server(args: argparse.Namespace):
     print(args)
@@ -692,14 +677,16 @@ def main_benchmark_with_server(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    _tp_pp = [(1,1)]
+    _tp_pp = [(1, 1)]
     _chunked_prefill_args = [(False, MultiStepChunkedPrefillPolicy.INVALID),
-                       (True, MultiStepChunkedPrefillPolicy.DEFAULT),
-                       (True, MultiStepChunkedPrefillPolicy.FORCE_SINGLE_STEP)]
+                             (True, MultiStepChunkedPrefillPolicy.DEFAULT),
+                             (True,
+                              MultiStepChunkedPrefillPolicy.FORCE_SINGLE_STEP)]
 
-    for tp_pp, chunked_prefill_arg in itertools.product(_tp_pp, _chunked_prefill_args):
+    for tp_pp, chunked_prefill_arg in itertools.product(
+            _tp_pp, _chunked_prefill_args):
         tp, pp = tp_pp
-        cp_enabled, cp_policy = chunked_prefill_arg 
+        cp_enabled, cp_policy = chunked_prefill_arg
 
         # launch server
         server_args = DEFAULT_SERVER_ARGS + \
@@ -711,36 +698,34 @@ def main_benchmark_with_server(args: argparse.Namespace):
                f"{pp}"]
 
         if cp_enabled:
-            server_args = server_args + [
-                "--enable-chunked-prefill"
-            ] 
+            server_args = server_args + ["--enable-chunked-prefill"]
 
         test_env = {}
-        if cp_policy == MultiStepChunkedPrefillPolicy.FORCE_SINGLE_STEP: 
+        if cp_policy == MultiStepChunkedPrefillPolicy.FORCE_SINGLE_STEP:
             test_env[
                 'VLLM_MULTI_STEP_CHUNKED_PREFILL_SINGLE_STEP_POLICY'] = '1'
 
         # run all request rates
         request_rates = [4, 8, 16, 32, 64]
 
-        result_jsons = asyncio.run(benchmark_with_server(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            best_of=args.best_of,
-            use_beam_search=args.use_beam_search,
-            disable_tqdm=args.disable_tqdm,
-            profile=args.profile,
-            request_rates=request_rates,
-            server_args = server_args,
-            test_env = test_env
-        ))
+        result_jsons = asyncio.run(
+            benchmark_with_server(backend=backend,
+                                  api_url=api_url,
+                                  base_url=base_url,
+                                  model_id=model_id,
+                                  tokenizer=tokenizer,
+                                  input_requests=input_requests,
+                                  best_of=args.best_of,
+                                  use_beam_search=args.use_beam_search,
+                                  disable_tqdm=args.disable_tqdm,
+                                  profile=args.profile,
+                                  request_rates=request_rates,
+                                  server_args=server_args,
+                                  test_env=test_env))
 
         for rj in result_jsons:
             dump_result_json(rj, args.result_dir)
+
 
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
@@ -912,7 +897,6 @@ if __name__ == "__main__":
         "{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
         " format.",
     )
-
 
     args = parser.parse_args()
     main_benchmark_with_server(args)
