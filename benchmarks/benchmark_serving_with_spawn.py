@@ -497,6 +497,62 @@ async def benchmark(
     }
     return result
 
+def dump_result_json(result_json,
+                     result_dir: str = None) -> None:
+    # Save to file
+    base_model_id = result_json["model_id"].split("/")[-1]
+    file_name = f'{result_json["backend"]}-{result_json["request_rate"]}qps-{base_model_id}-{result_json["date"]}.json'  #noqa
+    if result_dir:
+        file_name = f"{result_dir}/{file_name}"
+    with open(file_name, "w") as outfile:
+        json.dump(result_json, outfile)
+
+def get_result_as_json(
+        backend:str,
+        model_id: str,
+        tokenizer_id:str,
+        best_of: int,
+        use_beam_search: int,
+        num_prompts: int,
+        request_rate: float,
+        server_args: list[str],
+        test_env : dict,
+        benchmark_result: dict
+) -> dict:
+    result_json: Dict[str, Any] = {}
+
+    # Setup
+    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+    result_json["date"] = current_dt
+    result_json["backend"] = backend
+    result_json["model_id"] = model_id
+    result_json["tokenizer_id"] = tokenizer_id
+    result_json["best_of"] = best_of
+    result_json["use_beam_search"] = use_beam_search
+    result_json["num_prompts"] = num_prompts
+    result_json["server_args"] = server_args
+    result_json["test_env"] = test_env
+
+    # Metadata
+    if args.metadata:
+        for item in args.metadata:
+            if "=" in item:
+                kvstring = item.split("=")
+                result_json[kvstring[0].strip()] = kvstring[1].strip()
+            else:
+                raise ValueError(
+                    "Invalid metadata format. Please use KEY=VALUE format."
+                )
+
+    # Traffic
+    result_json["request_rate"] = (
+        request_rate if request_rate < float("inf") else "inf")
+
+    # Merge with benchmark result
+    result_json = {**result_json, **benchmark_result}
+
+    return result_json
+
 async def benchmark_with_server(backend: str,
                                 api_url: str,
                                 base_url: str,
@@ -684,195 +740,7 @@ def main_benchmark_with_server(args: argparse.Namespace):
         ))
 
         for rj in result_jsons:
-            dump_result_json(rj)
-
-def dump_result_json(result_json) -> None:
-    # Save to file
-    base_model_id = result_json["model_id"].split("/")[-1]
-    file_name = f'{result_json["backend"]}-{result_json["request_rate"]}qps-{base_model_id}-{result_json["date"]}.json'  #noqa
-    with open(file_name, "w") as outfile:
-        json.dump(result_json, outfile)
-
-def get_result_as_json(
-        backend:str,
-        model_id: str,
-        tokenizer_id:str,
-        best_of: int,
-        use_beam_search: int,
-        num_prompts: int,
-        request_rate: float,
-        server_args: list[str],
-        test_env : dict,
-        benchmark_result: dict
-) -> dict:
-    result_json: Dict[str, Any] = {}
-
-    # Setup
-    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_json["date"] = current_dt
-    result_json["backend"] = backend
-    result_json["model_id"] = model_id
-    result_json["tokenizer_id"] = tokenizer_id
-    result_json["best_of"] = best_of
-    result_json["use_beam_search"] = use_beam_search
-    result_json["num_prompts"] = num_prompts
-    result_json["server_args"] = server_args
-    result_json["test_env"] = test_env
-
-    # Metadata
-    if args.metadata:
-        for item in args.metadata:
-            if "=" in item:
-                kvstring = item.split("=")
-                result_json[kvstring[0].strip()] = kvstring[1].strip()
-            else:
-                raise ValueError(
-                    "Invalid metadata format. Please use KEY=VALUE format."
-                )
-
-    # Traffic
-    result_json["request_rate"] = (
-        request_rate if request_rate < float("inf") else "inf")
-
-    # Merge with benchmark result
-    result_json = {**result_json, **benchmark_result}
-
-    return result_json
-
-def main(args: argparse.Namespace):
-    print(args)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-
-    backend = args.backend
-    model_id = args.model
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
-
-    if args.base_url is not None:
-        api_url = f"{args.base_url}{args.endpoint}"
-    else:
-        api_url = f"http://{args.host}:{args.port}{args.endpoint}"
-
-    tokenizer = get_tokenizer(tokenizer_id,
-                              trust_remote_code=args.trust_remote_code)
-
-    if args.dataset is not None:
-        warnings.warn(
-            "The '--dataset' argument will be deprecated in the next "
-            "release. Please use '--dataset-name' and "
-            "'--dataset-path' in the future runs.",
-            stacklevel=2)
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-        )
-
-    elif args.dataset_name == "sharegpt":
-        input_requests = sample_sharegpt_requests(
-            dataset_path=args.dataset_path,
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            fixed_output_len=args.sharegpt_output_len,
-        )
-
-    elif args.dataset_name == "sonnet":
-        # Do not format the prompt, pass to message directly
-        if args.backend == "openai-chat":
-            input_requests = sample_sonnet_requests(
-                dataset_path=args.dataset_path,
-                num_requests=args.num_prompts,
-                input_len=args.sonnet_input_len,
-                output_len=args.sonnet_output_len,
-                prefix_len=args.sonnet_prefix_len,
-                tokenizer=tokenizer,
-            )
-            input_requests = [(prompt, prompt_len, output_len)
-                              for prompt, prompt_formatted, prompt_len,
-                              output_len in input_requests]
-        else:
-            assert (
-                tokenizer.chat_template or tokenizer.default_chat_template
-            ), "Tokenizer/model must have chat template for sonnet dataset."
-            input_requests = sample_sonnet_requests(
-                dataset_path=args.dataset_path,
-                num_requests=args.num_prompts,
-                input_len=args.sonnet_input_len,
-                output_len=args.sonnet_output_len,
-                prefix_len=args.sonnet_prefix_len,
-                tokenizer=tokenizer,
-            )
-            input_requests = [(prompt_formatted, prompt_len, output_len)
-                              for prompt, prompt_formatted, prompt_len,
-                              output_len in input_requests]
-
-    elif args.dataset_name == "random":
-        input_requests = sample_random_requests(
-            input_len=args.random_input_len,
-            output_len=args.random_output_len,
-            num_prompts=args.num_prompts,
-            range_ratio=args.random_range_ratio,
-            tokenizer=tokenizer,
-        )
-
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset_name}")
-
-    benchmark_result = asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            best_of=args.best_of,
-            use_beam_search=args.use_beam_search,
-            request_rate=args.request_rate,
-            disable_tqdm=args.disable_tqdm,
-        ))
-
-    # Save config and results to json
-    if args.save_result:
-        result_json: Dict[str, Any] = {}
-
-        # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-        result_json["date"] = current_dt
-        result_json["backend"] = backend
-        result_json["model_id"] = model_id
-        result_json["tokenizer_id"] = tokenizer_id
-        result_json["best_of"] = args.best_of
-        result_json["use_beam_search"] = args.use_beam_search
-        result_json["num_prompts"] = args.num_prompts
-
-        # Metadata
-        if args.metadata:
-            for item in args.metadata:
-                if "=" in item:
-                    kvstring = item.split("=")
-                    result_json[kvstring[0].strip()] = kvstring[1].strip()
-                else:
-                    raise ValueError(
-                        "Invalid metadata format. Please use KEY=VALUE format."
-                    )
-
-        # Traffic
-        result_json["request_rate"] = (
-            args.request_rate if args.request_rate < float("inf") else "inf")
-
-        # Merge with benchmark result
-        result_json = {**result_json, **benchmark_result}
-
-        # Save to file
-        base_model_id = model_id.split("/")[-1]
-        file_name = f"{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"  #noqa
-        if args.result_filename:
-            file_name = args.result_filename
-        if args.result_dir:
-            file_name = os.path.join(args.result_dir, file_name)
-        with open(file_name, "w") as outfile:
-            json.dump(result_json, outfile)
+            dump_result_json(rj, args.result_dir)
 
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
