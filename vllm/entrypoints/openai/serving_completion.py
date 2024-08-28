@@ -110,7 +110,6 @@ class OpenAIServingCompletion(OpenAIServing):
                 ))
 
             for i, prompt_inputs in enumerate(prompts):
-                print(guided_decode_logits_processor)
                 sampling_params = request.to_sampling_params(
                     tokenizer,
                     guided_decode_logits_processor,
