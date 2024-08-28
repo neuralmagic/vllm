@@ -87,6 +87,7 @@ def run_vllm(
     download_dir: Optional[str] = None,
     load_format: str = EngineArgs.load_format,
     disable_async_output_proc: bool = False,
+    max_num_seqs: Optional[int] = None,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -240,7 +241,7 @@ def main(args: argparse.Namespace):
             args.max_num_batched_tokens, args.distributed_executor_backend,
             args.gpu_memory_utilization, args.num_scheduler_steps,
             args.use_v2_block_manager, args.download_dir, args.load_format,
-            args.disable_async_output_proc)
+            args.disable_async_output_proc, args.max_num_seqs)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -398,6 +399,11 @@ if __name__ == "__main__":
         help='Backend to use for distributed serving. When more than 1 GPU '
         'is used, will be automatically set to "ray" if installed '
         'or "mp" (multiprocessing) otherwise.')
+    parser.add_argument(
+        '--max-num-seqs',
+        type=int,
+        default=None,
+        help='Max num seqs.')
     parser.add_argument(
         '--load-format',
         type=str,
