@@ -1078,12 +1078,12 @@ class AsyncLLMEngine:
         """
         if isinstance(sampling_params, list):
             sampling_params = [
-                self._add_guided_processor(param, guided_options)
+                self._add_guided_processor(param, guided_options_request)
                 if isinstance(param, SamplingParams) else param
                 for param in sampling_params
             ]
         elif isinstance(sampling_params, SamplingParams):
-            sampling_params = self._add_guided_processor(sampling_params, guided_options)
+            sampling_params = self._add_guided_processor(sampling_params, guided_options_request)
         
         async for output in await self.add_request(
                 request_id,
