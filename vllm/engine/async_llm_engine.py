@@ -1106,7 +1106,7 @@ class AsyncLLMEngine:
                     decoding_config.guided_decoding_backend)
             guided_logits_processor = get_local_guided_decoding_logits_processor(  #noqa
                 guided_options.guided_decoding_backend, guided_options,
-                self.get_tokenizer_group(TokenizerGroup).tokenizer)
+                self.engine.get_tokenizer_group(TokenizerGroup).tokenizer)
             if guided_logits_processor:
                 if params.logits_processors is None:
                     params.logits_processors = []
