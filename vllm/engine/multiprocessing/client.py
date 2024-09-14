@@ -70,7 +70,7 @@ class MQLLMEngineClient:
             every N seconds, confirming the engine is healthy
     """
 
-    def __init__(self, ipc_path: str, engine_config: EngineConfig):
+    def __init__(self, ipc_path: str, engine_config: EngineConfig, loop):
         self.context = zmq.asyncio.Context()
         self._errored_with: Optional[BaseException] = None
 
@@ -102,12 +102,18 @@ class MQLLMEngineClient:
         self.data_ipc_path = f"{ipc_path}{IPC_DATA_EXT}"
 
         # Stream for each individual request.
+        self.loop = loop
         self.output_queues: Dict[str, asyncio.Queue] = {}
-        self.output_loop = asyncio.create_task(self.run_output_handler_loop())
+        # self.output_loop = asyncio.create_task(self.run_output_handler_loop())
+        self.output_future = asyncio.run_coroutine_threadsafe(self.run_output_handler_loop(), self.loop)
 
         # Loop to check health of the LLMEngine periodically.
         # Started after the MQLLMEngine is ready.
         self.health_loop: Optional[asyncio.Task] = None
+
+    def create_task(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
 
     @staticmethod
     def is_unsupported_config(engine_args: AsyncEngineArgs):
@@ -235,13 +241,16 @@ class MQLLMEngineClient:
 
         with self.get_data_socket() as socket:
             # Wait until server is ready.
+            print("waiting for server")
             response = await self._wait_for_server_rpc(socket)
 
             self.tracing_flag = response.tracing_enabled
 
             # Start health_loop.
-            self.health_loop = asyncio.create_task(
-                self.run_check_health_loop(timeout=VLLM_RPC_TIMEOUT))
+            # self.health_loop = asyncio.create_task(
+            #     self.run_check_health_loop(timeout=VLLM_RPC_TIMEOUT))
+            self.health_future = asyncio.run_coroutine_threadsafe(
+                self.run_check_health_loop(timeout=VLLM_RPC_TIMEOUT), self.loop)
 
             # Notify MQLLMEngine client is ready to start sending requests.
             await self._notify_ready(socket)
@@ -252,9 +261,12 @@ class MQLLMEngineClient:
         self.context.destroy(linger=0)
 
         # Cancel background tasks.
-        if self.health_loop is not None:
-            self.health_loop.cancel()
-        self.output_loop.cancel()
+        # if self.health_loop is not None:
+        #     self.health_loop.cancel()
+        # self.output_loop.cancel()
+        if self.health_future is not None:
+            self.health_future.cancel()
+        self.output_future.cancel()
 
     def _set_errored(self, e: BaseException):
         logger.exception(repr(e))
