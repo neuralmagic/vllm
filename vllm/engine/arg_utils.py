@@ -589,7 +589,6 @@ class EngineArgs:
                             help=('Maximum number of forward steps per '
                                   'scheduler call.'))
 
-        # LoRA related configs
         parser.add_argument(
             '--multi-step-stream-outputs',
             action='store_true',

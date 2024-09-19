@@ -169,7 +169,8 @@ class SequenceData(msgspec.Struct,
     # It is used to compute mrope_position_ids.
     _mrope_position_delta: Optional[int] = None
 
-    # TODO: Add doc
+    # Used to quickly access the last appended tokens between scheduler
+    # iterations
     last_appended_tokens: List[int] = []
 
     def __post_init__(self) -> None:
@@ -492,7 +493,7 @@ class Sequence:
         return ""
 
     def get_output_token_ids_to_return(
-            self, delta: bool) -> GenericSequence[int] | int:
+            self, delta: bool) -> Union[GenericSequence[int], int]:
         """If delta is True, only new tokens since the last call to
         this method are returned"""
         if not delta:
