@@ -3,15 +3,31 @@
 import itertools
 import random
 from numbers import Number
-from typing import Any, List, NamedTuple, Optional, Tuple, Union
+from typing import (Any, Dict, List, NamedTuple, Optional, Sequence, Tuple,
+                    Union)
 
 import pytest
 import torch
 
 from vllm.attention import AttentionBackend, AttentionMetadata, AttentionType
-from vllm.attention.backends.xformers import XFormersBackend
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.utils import (STR_BACKEND_ENV_VAR, STR_XFORMERS_ATTN_VAL,
                         make_tensor_with_pad)
+
+# For now, disable "test_aot_dispatch_dynamic" since there are some
+# bugs related to this test in PyTorch 2.4.
+DEFAULT_OPCHECK_TEST_UTILS: Tuple[str, ...] = (
+    "test_schema",
+    "test_autograd_registration",
+    "test_faketensor",
+)
+
+ALL_OPCHECK_TEST_UTILS: Tuple[str, ...] = (
+    "test_schema",
+    "test_autograd_registration",
+    "test_faketensor",
+    "test_aot_dispatch_dynamic",
+)
 
 
 class QKVInputs(NamedTuple):
@@ -505,6 +521,9 @@ def make_backend(backend_name: str) -> AttentionBackend:
     * Backend instance
     '''
     if backend_name == STR_XFORMERS_ATTN_VAL:
+        # NOTE: xFormers backend cannot be imported for CPU and AMD GPUs.
+        from vllm.attention.backends.xformers import XFormersBackend
+
         return XFormersBackend()
     raise AssertionError(
         f"Unrecognized backend_name {backend_name} for unit test")
@@ -926,3 +945,63 @@ def assert_actual_matches_ideal(test_params: PhaseTestParameters,
     ideal_output = test_params.packed_qkvo.ideal_output
     torch.testing.assert_close(ideal_output,
                                output_under_test.view_as(ideal_output))
+
+
+def opcheck(op: Union[torch._ops.OpOverload, torch._ops.OpOverloadPacket,
+                      torch._library.custom_ops.CustomOpDef],
+            args: Tuple[Any, ...],
+            kwargs: Optional[Dict[str, Any]] = None,
+            *,
+            test_utils: Union[str, Sequence[str]] = ALL_OPCHECK_TEST_UTILS,
+            raise_exception: bool = True,
+            cond: bool = True) -> Dict[str, str]:
+    return torch.library.opcheck(
+        op,
+        args,
+        kwargs,
+        test_utils=test_utils,
+        raise_exception=raise_exception) if cond else {}
+
+
+# Marlin MoE test utils
+
+
+def stack_and_dev(tensors: List[torch.Tensor]):
+    dev = tensors[0].device
+    return torch.stack(tensors, dim=0).to(dev)
+
+
+def compute_max_diff(output, output_ref):
+    return torch.mean(torch.abs(output - output_ref)) / torch.mean(
+        torch.abs(output_ref))
+
+
+def torch_moe(a, w1, w2, score, topk):
+    B, D = a.shape
+    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+    topk_weight = topk_weight.view(-1)
+    topk_ids = topk_ids.view(-1)
+    for i in range(w1.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            out[mask] = SiluAndMul()(
+                a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(0, 1)
+    return (out.view(B, -1, w2.shape[1]) *
+            topk_weight.view(B, -1, 1).to(out.dtype)).sum(dim=1)
+
+
+def torch_moe_single(a, w, score, topk):
+    B, D = a.shape
+    a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
+    out = torch.zeros(B * topk, w.shape[1], dtype=a.dtype, device=a.device)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    _, topk_ids = torch.topk(score, topk)
+    topk_ids = topk_ids.view(-1)
+    for i in range(w.shape[0]):
+        mask = topk_ids == i
+        if mask.sum():
+            out[mask] = a[mask] @ w[i].transpose(0, 1)
+    return (out.view(B, -1, w.shape[1])).sum(dim=1)
