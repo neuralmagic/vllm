@@ -30,7 +30,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 
 import flux
-
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
