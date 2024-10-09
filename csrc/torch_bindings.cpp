@@ -300,6 +300,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? has_initial_state,"
       "bool silu_activation) -> Tensor");
   ops.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+
+  ops.def("cslt_compress_fp8_semi_structured(Tensor! input) -> Tensor");
+  ops.impl("cslt_compress_fp8_semi_structured", torch::kCUDA,
+           &cslt_compress_fp8_semi_structured);
+
+  ops.def(
+      "cslt_mm_fp8_semi_structured(Tensor! compressed_A, Tensor! denseB,"
+      "Tensor!? bias, bool transpose_result) -> Tensor");
+
+  ops.impl("cslt_mm_fp8_semi_structured", torch::kCUDA,
+           &cslt_mm_fp8_semi_structured);
 #endif
 
   // Quantized GEMM for GPTQ.
