@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -o pipefail
+set -u
 set -x
 
 check_gpus() {
@@ -39,7 +40,7 @@ upload_to_buildkite() {
     return 0
   fi
   # /workspace/buildkite-agent annotate --style "success" --context "benchmark-results" --append < $RESULTS_FOLDER/${CURRENT_LLM_SERVING_ENGINE}_nightly_results.md
-  /workspace/buildkite-agent artifact upload "$RESULTS_FOLDER/*"
+  #/workspace/buildkite-agent artifact upload "$RESULTS_FOLDER/*"
 }
 
 
@@ -73,7 +74,6 @@ get_current_llm_serving_engine() {
     echo "Container: vllm"
     # move to a completely irrelevant directory, to avoid import vllm from current folder
     export CURRENT_LLM_SERVING_ENGINE=vllm
-    
     return
   fi
 }
@@ -169,6 +169,11 @@ run_serving_tests() {
       continue
     fi
 
+    # just wait before trying to start a new session !!.
+    # for big models, the server needs more time to exit. otherwise we get "port still in use"
+    # type messages.
+    sleep 120
+
     if [[ $reuse_server == "true" ]]; then
       echo "Reuse previous server for test case $test_name"
     else
@@ -191,11 +196,11 @@ run_serving_tests() {
     # prepare tokenizer
     # this is required for lmdeploy.
     cd $VLLM_SOURCE_CODE_LOC/benchmarks
-    rm -rf /tokenizer_cache
-    mkdir /tokenizer_cache
+    rm -rf ${VLLM_SOURCE_CODE_LOC}/tokenizer_cache
+    mkdir ${VLLM_SOURCE_CODE_LOC}/tokenizer_cache
     python3 ../.buildkite/nightly-benchmarks/scripts/download-tokenizer.py \
       --model "$model" \
-      --cachedir /tokenizer_cache
+      --cachedir $VLLM_SOURCE_CODE_LOC/tokenizer_cache
     cd $VLLM_SOURCE_CODE_LOC/benchmarks
 
 
@@ -229,7 +234,7 @@ run_serving_tests() {
 
         client_command="python3 benchmark_serving.py \
           --backend $backend \
-          --tokenizer /tokenizer_cache \
+          --tokenizer ${VLLM_SOURCE_CODE_LOC}/tokenizer_cache \
           --model $model \
           --dataset-name $dataset_name \
           --dataset-path $dataset_path \
@@ -250,7 +255,7 @@ run_serving_tests() {
 
         client_command="python3 benchmark_serving.py \
           --backend $backend \
-          --tokenizer /tokenizer_cache \
+          --tokenizer ${VLLM_SOURCE_CODE_LOC}/tokenizer_cache \
           --model $model \
           --dataset-name $dataset_name \
           --dataset-path $dataset_path \
@@ -345,12 +350,14 @@ main() {
   BENCHMARK_ROOT=$VLLM_SOURCE_CODE_LOC/.buildkite/nightly-benchmarks/
 
   # run the test
-  run_serving_tests $BENCHMARK_ROOT/tests/nightly-tests.json
+  #$BENCHMARK_ROOT/tests/nightly-tests.json
+  # Please provide the path to the test config json file
+  run_serving_tests $1
 
   # upload benchmark results to buildkite
   python3 -m pip install tabulate pandas
   python3 $BENCHMARK_ROOT/scripts/summary-nightly-results.py
-  upload_to_buildkite
+  #upload_to_buildkite
 
 }
 

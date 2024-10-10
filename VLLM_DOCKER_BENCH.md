@@ -1,0 +1,52 @@
+## Benchmarking Using Docker Benchmarking Infrastructure
+
+Describe how to run vllm benchmarks locally using the scripts under .buildkite directory. The reference HOWTO for
+running the vllm buildkite benchmarks can be found at https://github.com/vllm-project/vllm/issues/8176
+
+
+#### Download the necessary huggingface models
+
+Create a models directory in your HOME directory.
+
+$ mkdir ~/models
+
+Create a venv so we can use the huggingface download utils safely
+
+$ cd ~/models
+$ python3 -m venv test
+$ source test/bin/activate
+$ pip3 install huggingface[cli]
+
+Download the models as,
+
+$ huggingface-cli download <model-tag> --local-dir ./<last-part-of-model-tag>
+
+`huggingface-cli download meta-llama/Meta-Llama3-8B` --local-dir ./Meta-Llama3-8B
+
+#### Build the docker image
+
+`docker build -t vllm_bench -f Dockerfile.bench --build-arg torch_cuda_arch_list="9.0;9.0a"  --build-arg UID=$(id -u) GID=$(id -g) .`
+
+The docker build does the following steps,
+  1. Sets up the build environments. i.e. installs the required vllm requirements*.txt
+  2. Builds a pip wheel off the current state of the vllm directory
+      - Passing the appropriate `torch_cuda_arch_list` is important. This is not set by default as
+        default values encompasses all of the supported CUDA arch and the build times can be intolerable.
+  3. Sets up the user home directory with the same UID and GID of the host user.
+
+### Start the docker image
+
+`docker run -it -d --net host --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus all -v $HOME/models:/models -v `pwd`/.buildkite:/home/docker-user/.buildkite -v `pwd`/benchmarks:/home/docker-user/benchmarks  --name vllm_bench vllm_bench:latest `
+
+Note that we are mounting 3 volumes, 
+ - The models folder where the models reside
+ - The .buildkite folder where all the scripts are
+ - The benchmarks folder where the client scripts are and where the results will be stored 
+
+### Enter the docker shell
+
+`docker exec -it vllm_bench /bin/bash`
+
+### Start benchmarks
+`VLLM_SOURCE_CODE_LOC=$(pwd) bash .buildkite/nightly-benchmarks/scripts/run-nightly-benchmarks.sh  <test-description-json>`
+where <test-description-json> could be .buildkite/nightly-benchmarks/tests/nightly-tests.json
