@@ -54,3 +54,24 @@ Note that we are mounting 3 volumes,
 `VLLM_SOURCE_CODE_LOC=$(pwd) bash .buildkite/nightly-benchmarks/scripts/run-nightly-benchmarks.sh  <test-description-json>`
 where <test-description-json> could be /home/docker-user/.buildkite/nightly-benchmarks/tests/nightly-tests-tp1.json - Make sure to give the absolute path.
 
+## TRTLLM
+
+There is also a Dockerfile.trtllm docker file for benchmarking TRTLLM
+
+### Build the Docker image
+`docker build -t trtllm_bench -f Dockerfile.trtllm --build-arg UID=$(id -u) --build-arg GID=$(id -g) .` 
+
+### Run the docker image
+
+`docker run -it -d --net host --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus all -v $HOME/models:/models -v `pwd`/.buildkite:/home/docker-user/.buildkite -v `pwd`/benchmarks:/home/docker-user/benchmarks  --name trtllm_bench trtllm_bench:latest`
+
+### Enter the docker shell
+
+`docker exec -it trtllm_bench /bin/bash`
+
+### Start benchmarks
+- Export your HF_TOKEN
+- Export CUDA_VISIBLE_DEVICES
+
+`VLLM_SOURCE_CODE_LOC=$(pwd) bash .buildkite/nightly-benchmarks/scripts/run-nightly-benchmarks.sh  <test-description-json>`
+where <test-description-json> could be /home/docker-user/.buildkite/nightly-benchmarks/tests/nightly-tests-tp1.json - Make sure to give the absolute path.

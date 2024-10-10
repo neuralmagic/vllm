@@ -1,0 +1,25 @@
+FROM nvcr.io/nvidia/tritonserver:24.07-trtllm-python-py3 AS base
+
+## Install packages required for bench 
+RUN apt-get update -y \
+    && apt-get install -y ccache curl wget jq sudo
+
+
+## Setup user account
+ARG UNAME=docker-user
+ARG UID=
+ARG GID=
+
+RUN groupadd -g ${GID} ${UNAME} && \
+    useradd -m -u ${UID}  -g ${UNAME} ${UNAME}
+ 
+# Switch to the custom user
+USER ${UNAME}
+
+RUN pip3 install -U transformers
+
+# Set the workdir and copy necessary folders to run benchmarks
+WORKDIR /home/${UNAME}
+
+# Switch to the custom user
+USER docker-user

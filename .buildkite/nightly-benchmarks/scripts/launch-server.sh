@@ -36,7 +36,7 @@ launch_trt_server() {
   trt_llm_version=$(echo "$server_params" | jq -r '.trt_llm_version')
 
   # create model caching directory
-  cd ~
+  cd ${HOME}
   rm -rf models
   mkdir -p models
   cd models
@@ -45,7 +45,7 @@ launch_trt_server() {
   trt_engine_path=${models_dir}/${model_name}-trt-engine
 
   # clone tensorrt backend
-  cd /
+  cd ${HOME}
   rm -rf tensorrtllm_backend
   git clone https://github.com/triton-inference-server/tensorrtllm_backend.git
   git lfs install
@@ -55,7 +55,7 @@ launch_trt_server() {
   git submodule update --init --recursive
 
   # build trtllm engine
-  cd /tensorrtllm_backend
+  cd ${HOME}/tensorrtllm_backend
   cd ./tensorrt_llm/examples/${model_type}
   python3 convert_checkpoint.py \
     --model_dir ${model_path} \
@@ -77,21 +77,21 @@ launch_trt_server() {
     --output_dir ${trt_engine_path}
 
   # handle triton protobuf files and launch triton server
-  cd /tensorrtllm_backend
+  cd ${HOME}/tensorrtllm_backend
   mkdir triton_model_repo
   cp -r all_models/inflight_batcher_llm/* triton_model_repo/
   cd triton_model_repo
   rm -rf ./tensorrt_llm/1/*
   cp -r ${trt_engine_path}/* ./tensorrt_llm/1
-  python3 ../tools/fill_template.py -i tensorrt_llm/config.pbtxt triton_backend:tensorrtllm,engine_dir:/tensorrtllm_backend/triton_model_repo/tensorrt_llm/1,decoupled_mode:true,batching_strategy:inflight_fused_batching,batch_scheduler_policy:guaranteed_no_evict,exclude_input_in_output:true,triton_max_batch_size:2048,max_queue_delay_microseconds:0,max_beam_width:1,max_queue_size:2048,enable_kv_cache_reuse:false
+  python3 ../tools/fill_template.py -i tensorrt_llm/config.pbtxt triton_backend:tensorrtllm,engine_dir:${HOME}/tensorrtllm_backend/triton_model_repo/tensorrt_llm/1,decoupled_mode:true,batching_strategy:inflight_fused_batching,batch_scheduler_policy:guaranteed_no_evict,exclude_input_in_output:true,triton_max_batch_size:2048,max_queue_delay_microseconds:0,max_beam_width:1,max_queue_size:2048,enable_kv_cache_reuse:false
   python3 ../tools/fill_template.py -i preprocessing/config.pbtxt triton_max_batch_size:2048,tokenizer_dir:$model_path,preprocessing_instance_count:5
   python3 ../tools/fill_template.py -i postprocessing/config.pbtxt triton_max_batch_size:2048,tokenizer_dir:$model_path,postprocessing_instance_count:5,skip_special_tokens:false
   python3 ../tools/fill_template.py -i ensemble/config.pbtxt triton_max_batch_size:$max_batch_size
   python3 ../tools/fill_template.py -i tensorrt_llm_bls/config.pbtxt triton_max_batch_size:$max_batch_size,decoupled_mode:true,accumulate_tokens:"False",bls_instance_count:1
-  cd /tensorrtllm_backend
+  cd ${HOME}/tensorrtllm_backend
   python3 scripts/launch_triton_server.py \
     --world_size=${model_tp_size} \
-    --model_repo=/tensorrtllm_backend/triton_model_repo &
+    --model_repo=${HOME}/tensorrtllm_backend/triton_model_repo &
 
 }
 
