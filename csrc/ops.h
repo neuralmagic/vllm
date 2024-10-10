@@ -49,7 +49,10 @@ void batched_rotary_embedding(torch::Tensor& positions, torch::Tensor& query,
                               int64_t rot_dim,
                               torch::Tensor& cos_sin_cache_offsets);
 
-void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+void silu_and_mul(torch::Tensor& result, torch::Tensor& input);
+
+void silu_and_mul_quant(torch::Tensor& result, torch::Tensor const& input,
+                        torch::Tensor const& scale);
 
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
 

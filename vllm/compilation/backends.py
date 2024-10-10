@@ -170,7 +170,7 @@ def fix_functionalization(graph: fx.Graph):
                 kwargs = node.kwargs
 
                 input = kwargs['input']
-                out = kwargs['out']
+                out = kwargs['result'] # TODO
 
                 # Create a new call to torch.ops._C.rotary_embedding.default
                 # cannot use kwargs, because we have an `out`, see https://github.com/pytorch/pytorch/blob/a00faf440888ffb724bad413f329a49e2b6388e7/torch/_inductor/lowering.py#L351 # noqa
@@ -183,6 +183,24 @@ def fix_functionalization(graph: fx.Graph):
                         args=(out, input),
                     )
                 replace_node = out
+
+                for user in list(node.users):
+                    if user.op == 'call_function' and user.target == operator.getitem:  # noqa
+                        user.replace_all_uses_with(replace_node)
+                        nodes_to_remove.append(user)
+                nodes_to_remove.append(node)
+            elif node.args[0] == torch.ops.neuralmagic.silu_mul_quant.default:
+                #
+                kwargs = node.kwargs
+
+                replace_node = kwargs['result']
+                # Create a new call to torch.ops._C.rotary_embedding.default
+                with graph.inserting_before(node):
+                    # just insert the call to the custom op
+                    # NOTE: don't run dead code elimination,
+                    # otherwise this op will be removed
+                    graph.call_function(
+                        torch.ops._C.silu_mul_quant.default, kwargs=kwargs)
 
                 for user in list(node.users):
                     if user.op == 'call_function' and user.target == operator.getitem:  # noqa

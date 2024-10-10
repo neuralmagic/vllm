@@ -26,7 +26,6 @@ class TorchCompileWrapperWithCustomDispatcher:
     """
 
     def __init__(self, compiled_callable: Optional[Callable] = None):
-
         if compiled_callable is None:
             # default compilation settings
             # compiling the forward method

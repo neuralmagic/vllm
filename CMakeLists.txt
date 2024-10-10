@@ -49,7 +49,7 @@ set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx11
 # requirements.txt files and should be kept consistent.  The ROCm torch
 # versions are derived from Dockerfile.rocm
 #
-set(TORCH_SUPPORTED_VERSION_CUDA "2.4.0")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.5.0")
 set(TORCH_SUPPORTED_VERSION_ROCM "2.5.0")
 
 #
@@ -240,7 +240,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/quantization/gguf/gguf_kernel.cu"
     "csrc/custom_all_reduce.cu"
     "csrc/permute_cols.cu"
-    "csrc/quantization/cutlass_w8a8/scaled_mm_entry.cu")
+    "csrc/quantization/cutlass_w8a8/scaled_mm_entry.cu"
+    "csrc/quantization/layernorm_kernels/activation_kernels.cu")
 
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"

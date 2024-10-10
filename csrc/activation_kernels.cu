@@ -69,9 +69,10 @@ __device__ __forceinline__ T gelu_tanh_kernel(const T& x) {
                                          input.data_ptr<scalar_t>(), d); \
       });
 
-void silu_and_mul(torch::Tensor& out,    // [..., d]
+void silu_and_mul(torch::Tensor& result,    // [..., d]
                   torch::Tensor& input)  // [..., 2 * d]
 {
+  torch::Tensor& out = result;
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel);
 }
 
