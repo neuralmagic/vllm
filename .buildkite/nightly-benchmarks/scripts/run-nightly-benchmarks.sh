@@ -168,15 +168,14 @@ run_serving_tests() {
       continue
     fi
 
-    # just wait before trying to start a new session !!.
-    # for big models, the server needs more time to exit. otherwise we get "port still in use"
-    # type messages.
-    sleep 120
-
     if [[ $reuse_server == "true" ]]; then
       echo "Reuse previous server for test case $test_name"
     else
       kill_gpu_processes
+      # just wait before trying to start a new session !!.
+      # for big models, the server needs more time to exit. otherwise we get "port still in use"
+      # type messages.
+      sleep 120
       bash $VLLM_SOURCE_CODE_LOC/.buildkite/nightly-benchmarks/scripts/launch-server.sh \
         "$server_params" "$common_params"
     fi
