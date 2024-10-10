@@ -118,18 +118,18 @@ ARG UNAME=docker-user
 ARG UID=
 ARG GID=
 
-RUN groupadd -g GID UNAME && \
-    useradd -m -u UID  -g UNAME UNAME
+RUN groupadd -g ${GID} ${UNAME} && \
+    useradd -m -u ${UID}  -g ${UNAME} ${UNAME}
  
 # Switch to the custom user
-USER UNAME
+USER ${UNAME}
 
 # install vllm wheel
 RUN  --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install dist/*.whl --verbose
  
 # Set the workdir and copy necessary folders to run benchmarks
-WORKDIR /home/UNAME
+WORKDIR /home/${UNAME}
 
 # Switch to the custom user
 USER docker-user

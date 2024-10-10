@@ -25,7 +25,7 @@ $ huggingface-cli download <model-tag> --local-dir ./<last-part-of-model-tag>
 
 #### Build the docker image
 
-`docker build -t vllm_bench -f Dockerfile.bench --build-arg torch_cuda_arch_list="9.0;9.0a"  --build-arg UID=$(id -u) GID=$(id -g) .`
+`docker build -t vllm_bench -f Dockerfile.bench --build-arg torch_cuda_arch_list="9.0;9.0a"  --build-arg UID=$(id -u) --build-arg GID=$(id -g) .`
 
 The docker build does the following steps,
   1. Sets up the build environments. i.e. installs the required vllm requirements*.txt
@@ -48,5 +48,9 @@ Note that we are mounting 3 volumes,
 `docker exec -it vllm_bench /bin/bash`
 
 ### Start benchmarks
+- Export your HF_TOKEN
+- Export CUDA_VISIBLE_DEVICES
+
 `VLLM_SOURCE_CODE_LOC=$(pwd) bash .buildkite/nightly-benchmarks/scripts/run-nightly-benchmarks.sh  <test-description-json>`
-where <test-description-json> could be .buildkite/nightly-benchmarks/tests/nightly-tests.json
+where <test-description-json> could be /home/docker-user/.buildkite/nightly-benchmarks/tests/nightly-tests-tp1.json - Make sure to give the absolute path.
+
