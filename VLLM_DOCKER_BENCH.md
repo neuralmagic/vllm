@@ -36,7 +36,7 @@ The docker build does the following steps,
 
 ### Start the docker image
 
-`docker run -it -d --net host --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus all -v $HOME/models:/models -v `pwd`/.buildkite:/home/docker-user/.buildkite -v `pwd`/benchmarks:/home/docker-user/benchmarks  --name vllm_bench vllm_bench:latest `
+`docker run --shm-size=2g -it -d --net host --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus all -v $HOME/models:/models -v `pwd`/.buildkite:/home/docker-user/.buildkite -v `pwd`/benchmarks:/home/docker-user/benchmarks  --name vllm_bench vllm_bench:latest `
 
 Note that we are mounting 3 volumes, 
  - The models folder where the models reside
@@ -63,7 +63,7 @@ There is also a Dockerfile.trtllm docker file for benchmarking TRTLLM
 
 ### Run the docker image
 
-`docker run -it -d --net host --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus all -v $HOME/models:/models -v `pwd`/.buildkite:/home/docker-user/.buildkite -v `pwd`/benchmarks:/home/docker-user/benchmarks  --name trtllm_bench trtllm_bench:latest`
+`docker run --shm-size=2g  -it -d --net host --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus all -v $HOME/models:/models -v `pwd`/.buildkite:/home/docker-user/.buildkite -v `pwd`/benchmarks:/home/docker-user/benchmarks  --name trtllm_bench trtllm_bench:latest`
 
 ### Enter the docker shell
 
