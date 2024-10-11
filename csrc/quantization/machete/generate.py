@@ -12,8 +12,8 @@ import jinja2
 from vllm_cutlass_library_extension import (DataType, EpilogueScheduleTag,
                                             EpilogueScheduleType,
                                             MixedInputKernelScheduleType,
-                                            TileSchedulerTag,
-                                            TileSchedulerType, VLLMDataType,
+                                            VLLMTileSchedulerTag,
+                                            VLLMTileSchedulerType, VLLMDataType,
                                             VLLMDataTypeNames, VLLMDataTypeTag,
                                             VLLMKernelScheduleTag)
 
@@ -163,7 +163,7 @@ class ScheduleConfig:
     cluster_shape_mnk: Tuple[int, int, int]
     kernel_schedule: MixedInputKernelScheduleType
     epilogue_schedule: EpilogueScheduleType
-    tile_scheduler: TileSchedulerType
+    tile_scheduler: VLLMTileSchedulerType
 
 
 @dataclass
@@ -202,7 +202,7 @@ def generate_schedule_name(schedule_config: ScheduleConfig) -> str:
         .split("::")[-1]
     epilogue_schedule = EpilogueScheduleTag[
         schedule_config.epilogue_schedule].split("::")[-1]
-    tile_scheduler = TileSchedulerTag[schedule_config.tile_scheduler]\
+    tile_scheduler = VLLMTileSchedulerTag[schedule_config.tile_scheduler]\
         .split("::")[-1]
 
     return (f"{tile_shape}_{cluster_shape}_{kernel_schedule}" +
@@ -215,6 +215,7 @@ def generate_terse_schedule_name(schedule_config: ScheduleConfig) -> str:
         "KernelTmaWarpSpecializedCooperativeMixedInput_": "TmaMI_",
         "TmaWarpSpecializedCooperative_": "TmaCoop_",
         "StreamKScheduler": "streamK",
+        "StreamKSchedulerWithReset": "streamKWithReset",
     }
 
     schedule_name = generate_schedule_name(schedule_config)
@@ -267,7 +268,7 @@ template_globals = {
     "DataTypeTag": VLLMDataTypeTag,
     "KernelScheduleTag": VLLMKernelScheduleTag,
     "EpilogueScheduleTag": EpilogueScheduleTag,
-    "TileSchedulerTag": TileSchedulerTag,
+    "TileSchedulerTag": VLLMTileSchedulerTag,
     "to_cute_constant": to_cute_constant,
     "gen_sch_name": generate_terse_schedule_name,
 }
@@ -331,115 +332,115 @@ def generate():
     schedule_common_params = dict(
         kernel_schedule=TmaMI,
         epilogue_schedule=TmaCoop,
-        tile_scheduler=TileSchedulerType.StreamK,
+        tile_scheduler=VLLMTileSchedulerType.StreamKWithReset,
     )
 
     # For now we use the same heuristic for all types
     # Heuristic is currently tuned for H100s
     default_heuristic = [
-        #### M = 257+
-        (
-            "M > 256 && K <= 16384 && N <= 4096",
-            ScheduleConfig(
-                tile_shape_mn=(128, 128),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 256",
-            ScheduleConfig(
-                tile_shape_mn=(128, 256),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        #### M = 129-256
-        (
-            "M > 128 && K <= 4096 && N <= 4096",
-            ScheduleConfig(
-                tile_shape_mn=(128, 64),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 128 && K <= 8192 && N <= 8192",
-            ScheduleConfig(
-                tile_shape_mn=(128, 128),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 128",
-            ScheduleConfig(
-                tile_shape_mn=(128, 256),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        #### M = 65-128
-        (
-            "M > 64 && K <= 4069 && N <= 4069",
-            ScheduleConfig(
-                tile_shape_mn=(128, 32),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 64 && K <= 4069 && N <= 8192",
-            ScheduleConfig(
-                tile_shape_mn=(128, 64),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 64 && K >= 8192 && N >= 12288",
-            ScheduleConfig(
-                tile_shape_mn=(256, 128),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 64",
-            ScheduleConfig(
-                tile_shape_mn=(128, 128),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        #### M = 33-64
-        (
-            "M > 32 && K <= 6144 && N <= 6144",
-            ScheduleConfig(
-                tile_shape_mn=(128, 16),
-                cluster_shape_mnk=(1, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 32 && K >= 16384 && N >= 12288",
-            ScheduleConfig(
-                tile_shape_mn=(256, 64),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 32",
-            ScheduleConfig(
-                tile_shape_mn=(128, 64),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        #### M = 17-32
-        (
-            "M > 16 && K <= 12288 && N <= 8192",
-            ScheduleConfig(
-                tile_shape_mn=(128, 32),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
-        (
-            "M > 16",
-            ScheduleConfig(
-                tile_shape_mn=(256, 32),
-                cluster_shape_mnk=(2, 1, 1),
-                **schedule_common_params  # type: ignore
-            )),
+        # #### M = 257+
+        # (
+        #     "M > 256 && K <= 16384 && N <= 4096",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 128),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 256",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 256),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # #### M = 129-256
+        # (
+        #     "M > 128 && K <= 4096 && N <= 4096",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 64),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 128 && K <= 8192 && N <= 8192",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 128),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 128",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 256),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # #### M = 65-128
+        # (
+        #     "M > 64 && K <= 4069 && N <= 4069",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 32),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 64 && K <= 4069 && N <= 8192",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 64),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 64 && K >= 8192 && N >= 12288",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(256, 128),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 64",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 128),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # #### M = 33-64
+        # (
+        #     "M > 32 && K <= 6144 && N <= 6144",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 16),
+        #         cluster_shape_mnk=(1, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 32 && K >= 16384 && N >= 12288",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(256, 64),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 32",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 64),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # #### M = 17-32
+        # (
+        #     "M > 16 && K <= 12288 && N <= 8192",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(128, 32),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
+        # (
+        #     "M > 16",
+        #     ScheduleConfig(
+        #         tile_shape_mn=(256, 32),
+        #         cluster_shape_mnk=(2, 1, 1),
+        #         **schedule_common_params  # type: ignore
+        #     )),
         #### M = 1-16
         (
             "N >= 26624",
@@ -504,12 +505,12 @@ def generate():
         Specialization(with_C=False, with_zeropoints=True, with_scales=True)
     ]
 
-    impl_configs += [
-        ImplConfig(x[0], x[1], x[2], x[3])
-        for x in zip(AWQ_kernel_type_configs, itertools.repeat(schedules),
-                     itertools.repeat(AWQ_kernel_specializations),
-                     itertools.repeat(default_heuristic))
-    ]
+    # impl_configs += [
+    #     ImplConfig(x[0], x[1], x[2], x[3])
+    #     for x in zip(AWQ_kernel_type_configs, itertools.repeat(schedules),
+    #                  itertools.repeat(AWQ_kernel_specializations),
+    #                  itertools.repeat(default_heuristic))
+    # ]
 
     output_dir = os.path.join(SCRIPT_DIR, "generated")
 

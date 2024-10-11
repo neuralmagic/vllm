@@ -21,6 +21,7 @@
 
 #include "cutlass_extensions/cute_utils.cuh"
 #include "cutlass_extensions/vllm_numeric_conversion.cuh"
+#include "cutlass_extensions/gemm/kernel/vllm_sm90_tile_scheduler_stream_k.hpp"
 #include "machete_collective_builder.cuh"
 #include "machete_prepacked_layout.cuh"
 #include "machete_interleaving_utils.cuh"

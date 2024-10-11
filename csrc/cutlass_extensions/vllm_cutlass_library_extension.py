@@ -35,6 +35,21 @@ VLLMDataTypeTag: Dict[Union[VLLMDataType, DataType], str] = {
     }
 }
 
+class VLLMTileSchedulerType(enum.Enum):
+    StreamKWithReset = enum_auto()
+
+
+VLLMTileSchedulerTag: \
+    Dict[Union[VLLMTileSchedulerType, TileSchedulerType], str] = {
+    **TileSchedulerTag, # type: ignore
+    **{
+        VLLMTileSchedulerType.StreamKWithReset: \
+            'cutlass::gemm::StreamKSchedulerWithReset',
+    }
+}
+    
+
+
 VLLMKernelScheduleTag: Dict[Union[
     MixedInputKernelScheduleType, KernelScheduleType], str] = {
         **KernelScheduleTag,  # type: ignore
