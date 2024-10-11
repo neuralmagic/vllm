@@ -6,8 +6,8 @@ requires = [
     "packaging",
     "setuptools>=61",
     "setuptools-scm>=8.0",
-    "torch == 2.4.0",
     "wheel",
+    "torch",
     "jinja2",
 ]
 build-backend = "setuptools.build_meta"

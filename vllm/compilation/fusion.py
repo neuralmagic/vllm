@@ -10,6 +10,29 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+@torch.library.custom_op("neuralmagic::silu_mul_quant", mutates_args=())
+def silu_mul_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    result = torch.empty(x.shape[0], x.shape[1] // 2, device=x.device, dtype=torch.float8_e4m3fn)
+
+    torch.ops._C.silu_and_mul_quant(result, x, scale)
+    return result
+
+@silu_mul_quant.register_fake
+def silu_mul_quant(x: torch.Tensor, scale: torch.Tensor):
+    return torch.empty(x.shape[0], x.shape[1] // 2, device=x.device, dtype=torch.float8_e4m3fn)
+
+def silu_mul_quant_replacement(x: torch.Tensor, scale:torch.Tensor) -> torch.tensor:
+    # print("MATCH QUANT")
+    return torch.ops.neuralmagic.silu_mul_quant(x, scale)
+
+def silu_mul_quant_pattern(input_: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    silu_mul_result = torch.empty([input_.shape[0], input_.shape[1] // 2], dtype=torch.float16, device=input_.device)
+    silu_mul_func = torch.ops.higher_order.auto_functionalized(torch.ops._C.silu_and_mul.default, result = silu_mul_result, input = input_)
+    result = torch.empty([input_.shape[0], input_.shape[1] // 2], dtype=torch.float8_e4m3fn, device=input_.device)
+    static_fp8_quant_func = torch.ops.higher_order.auto_functionalized(torch.ops._C.static_scaled_fp8_quant.default, result=result, input=silu_mul_func[1], scale=scale)
+    return static_fp8_quant_func[1]
+
+
 def rms_pattern_static(result: torch.Tensor, result_rms: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
                        scale: torch.Tensor):
     at1 = auto_functionalized(torch.ops._C.rms_norm.default, result=result_rms, input=input, weight=weight,
@@ -74,6 +97,16 @@ def get_patterns():
     inputs = [empty_fp8(5, 4), empty_bf16(5, 4), empty_bf16(5, 4), empty_bf16(1, 5), torch.empty(1, 1, device="cuda", dtype=torch.float32)]
     register_replacement(rms_pattern_residual_static, rms_replacement_residual_static, inputs, fwd_only, my_patterns,
                          extra_check=record_match_fn)
+
+    # silu-mul quant
+    x = torch.empty((128, 256), device="cuda", dtype=torch.float16)
+    scale = torch.empty((1,1), device="cuda" , dtype=torch.float32)
+
+    register_replacement(silu_mul_quant_pattern,
+                         silu_mul_quant_replacement,
+                         [x, scale],
+                         fwd_only,
+                         [my_patterns])
 
     return my_patterns, matches
 

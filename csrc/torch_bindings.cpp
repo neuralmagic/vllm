@@ -49,7 +49,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // Activation ops
   // Activation function used in SwiGLU.
-  ops.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
+  ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 
   // Activation function used in GeGLU with `none` approximation.
@@ -107,15 +107,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // Layernorm-quant
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(
-      "rms_norm_static_fp8_quant(Tensor! result, Tensor input, Tensor weight, Tensor scale, float epsilon) -> "
+      "rms_norm_static_fp8_quant(Tensor! result, Tensor input, Tensor weight, "
+      "Tensor scale, float epsilon) -> "
       "()");
-  ops.impl("rms_norm_static_fp8_quant", torch::kCUDA, &rms_norm_static_fp8_quant);
+  ops.impl("rms_norm_static_fp8_quant", torch::kCUDA,
+           &rms_norm_static_fp8_quant);
 
   // In-place fused Add and RMS Normalization.
   ops.def(
-      "fused_add_rms_norm_static_fp8_quant(Tensor! result, Tensor input, Tensor! residual, Tensor weight, "
+      "fused_add_rms_norm_static_fp8_quant(Tensor! result, Tensor input, "
+      "Tensor! residual, Tensor weight, "
       "Tensor scale, float epsilon) -> ()");
-  ops.impl("fused_add_rms_norm_static_fp8_quant", torch::kCUDA, &fused_add_rms_norm_static_fp8_quant);
+  ops.impl("fused_add_rms_norm_static_fp8_quant", torch::kCUDA,
+           &fused_add_rms_norm_static_fp8_quant);
 
   // Rotary embedding
   // Apply GPT-NeoX or GPT-J style rotary embedding to query and key.
@@ -281,6 +285,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // capability
   ops.def("cutlass_scaled_mm_supports_fp8(int cuda_device_capability) -> bool");
   ops.impl("cutlass_scaled_mm_supports_fp8", &cutlass_scaled_mm_supports_fp8);
+  ops.def("silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
+  ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
 
   // Mamba selective scan kernel
   ops.def(
@@ -330,12 +336,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // Compute FP8 quantized tensor for given scaling factor.
   ops.def(
-      "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
+      "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale) -> "
+      "()");
   ops.impl("static_scaled_fp8_quant", torch::kCUDA, &static_scaled_fp8_quant);
 
   // Compute dynamic-per-tensor FP8 quantized tensor and scaling factor.
   ops.def(
-      "dynamic_scaled_fp8_quant(Tensor! result, Tensor input, Tensor! scale) -> "
+      "dynamic_scaled_fp8_quant(Tensor! result, Tensor input, Tensor! scale) "
+      "-> "
       "()");
   ops.impl("dynamic_scaled_fp8_quant", torch::kCUDA, &dynamic_scaled_fp8_quant);
 
