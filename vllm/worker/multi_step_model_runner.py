@@ -530,11 +530,14 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
             frozen_model_input = model_input.frozen_model_input
             assert frozen_model_input is not None
 
+        do_graph_copy: bool = not model_input.is_first_multi_step
+
         # Execute the model
         output = self._base_model_runner.execute_model(frozen_model_input,
                                                        kv_caches,
                                                        intermediate_tensors,
-                                                       num_steps=1)
+                                                       num_steps=1,
+                                                       do_graph_copy = do_graph_copy,)
 
         # record the event for the current step so that the next step can sync
         model_input.record_step_event(current_stream)

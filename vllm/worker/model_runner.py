@@ -1607,13 +1607,14 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                    virtual_engine=virtual_engine)
 
     @torch.inference_mode()
-    @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
+    #@dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
     def execute_model(
         self,
         model_input: ModelInputForGPUWithSamplingMetadata,
         kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
+        do_graph_copy: bool = True,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
@@ -1640,11 +1641,13 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
+        using_cuda_graphs: bool = False
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][
                 graph_batch_size]
+            using_cuda_graphs = True
         else:
             model_executable = self.model
 
@@ -1666,6 +1669,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 kv_caches=kv_caches,
                 attn_metadata=model_input.attn_metadata,
                 intermediate_tensors=intermediate_tensors,
+                do_graph_copy = using_cuda_graphs and do_graph_copy,
                 **MultiModalInputs.as_kwargs(multi_modal_kwargs,
                                              device=self.device),
                 **seqlen_agnostic_kwargs)
@@ -1853,6 +1857,21 @@ class CUDAGraphRunner:
     ) -> torch.Tensor:
         # KV caches are fixed tensors, so we don't need to copy them.
         del kv_caches
+
+        do_graph_copy: bool = kwargs.get('do_graph_copy', True)
+
+        if not do_graph_copy:
+            # sanity check the inputs
+            assert torch.isclose(self.input_buffers['input_ids'],
+                                 input_ids)
+            assert torch.isclose(self.input_buffers['positions'],
+                                 positions)
+            assert torch.isclose(self.input_buffers['slot_mapping'],
+                                 attn_metadata.slot_mapping)
+            assert torch.isclose(self.input_buffers['seq_lens_tensor'],
+                                 attn_metadata.decode_metadata.seq_lens_tensor)
+            assert torch.isclose(self.input_buffers['block_tables'],
+                                 attn_metadata.decode_metadata.block_tables)
 
         # Copy the input tensors to the input buffers.
         self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
