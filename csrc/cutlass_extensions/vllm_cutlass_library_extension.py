@@ -44,7 +44,7 @@ VLLMTileSchedulerTag: \
     **TileSchedulerTag, # type: ignore
     **{
         VLLMTileSchedulerType.StreamKWithReset: \
-            'cutlass::gemm::StreamKSchedulerWithReset',
+            'cutlass::gemm::vLLMStreamKSchedulerWithReset',
     }
 }
     

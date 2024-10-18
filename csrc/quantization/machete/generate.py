@@ -505,12 +505,12 @@ def generate():
         Specialization(with_C=False, with_zeropoints=True, with_scales=True)
     ]
 
-    # impl_configs += [
-    #     ImplConfig(x[0], x[1], x[2], x[3])
-    #     for x in zip(AWQ_kernel_type_configs, itertools.repeat(schedules),
-    #                  itertools.repeat(AWQ_kernel_specializations),
-    #                  itertools.repeat(default_heuristic))
-    # ]
+    impl_configs += [
+        ImplConfig(x[0], x[1], x[2], x[3])
+        for x in zip(AWQ_kernel_type_configs, itertools.repeat(schedules),
+                     itertools.repeat(AWQ_kernel_specializations),
+                     itertools.repeat(default_heuristic))
+    ]
 
     output_dir = os.path.join(SCRIPT_DIR, "generated")
 
