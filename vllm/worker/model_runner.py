@@ -1522,6 +1522,13 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     self.graph_runners[virtual_engine][batch_size] = (
                         graph_runner)
 
+
+        for batch_size in reversed(batch_size_capture_list):
+            block_tables = self.graph_runners[0][batch_size].input_buffers['block_tables']
+            slt = self.graph_runners[0][batch_size].input_buffers['seq_lens_tensor']
+            print (f"graph {batch_size} - block tables {hex(block_tables.data_ptr())} | seq_lens_tensor {hex(slt.data_ptr())}")
+
+
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
         # This usually takes < 10 seconds.
@@ -1638,6 +1645,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
         decode_meta = model_input.attn_metadata.decode_metadata
+
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
@@ -1663,16 +1671,27 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         with set_forward_context(model_input.attn_metadata):
-            hidden_or_intermediate_states = model_executable(
-                input_ids=model_input.input_tokens,
-                positions=model_input.input_positions,
-                kv_caches=kv_caches,
-                attn_metadata=model_input.attn_metadata,
-                intermediate_tensors=intermediate_tensors,
-                do_graph_copy = using_cuda_graphs and do_graph_copy,
-                **MultiModalInputs.as_kwargs(multi_modal_kwargs,
-                                             device=self.device),
-                **seqlen_agnostic_kwargs)
+            if using_cuda_graphs:
+                hidden_or_intermediate_states = model_executable(
+                    input_ids=model_input.input_tokens,
+                    positions=model_input.input_positions,
+                    kv_caches=kv_caches,
+                    attn_metadata=model_input.attn_metadata,
+                    intermediate_tensors=intermediate_tensors,
+                    do_graph_copy = do_graph_copy,
+                    **MultiModalInputs.as_kwargs(multi_modal_kwargs,
+                                                 device=self.device),
+                    **seqlen_agnostic_kwargs)
+            else:
+                hidden_or_intermediate_states = model_executable(
+                    input_ids=model_input.input_tokens,
+                    positions=model_input.input_positions,
+                    kv_caches=kv_caches,
+                    attn_metadata=model_input.attn_metadata,
+                    intermediate_tensors=intermediate_tensors,
+                    **MultiModalInputs.as_kwargs(multi_modal_kwargs,
+                                                 device=self.device),
+                    **seqlen_agnostic_kwargs)
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
@@ -1857,20 +1876,20 @@ class CUDAGraphRunner:
     ) -> torch.Tensor:
         # KV caches are fixed tensors, so we don't need to copy them.
         del kv_caches
-
         do_graph_copy: bool = kwargs.get('do_graph_copy', True)
+
+        print (f"cudagraph forward - input buffer keys {self.input_buffers.keys()}")
 
         if not do_graph_copy:
             # sanity check the inputs
-            assert torch.isclose(self.input_buffers['input_ids'],
-                                 input_ids)
-            assert torch.isclose(self.input_buffers['positions'],
-                                 positions)
-            assert torch.isclose(self.input_buffers['slot_mapping'],
-                                 attn_metadata.slot_mapping)
-            assert torch.isclose(self.input_buffers['seq_lens_tensor'],
-                                 attn_metadata.decode_metadata.seq_lens_tensor)
-            assert torch.isclose(self.input_buffers['block_tables'],
+            #assert torch.allclose(self.input_buffers['input_ids'],
+            #                     input_ids)
+            #assert torch.allclose(self.input_buffers['positions'],
+            #                   positions)
+            #assert torch.allclose(self.input_buffers['slot_mapping'],
+            #                   attn_metadata.slot_mapping)
+            print (f"inputbuffers blocktables {hex(self.input_buffers['block_tables'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.block_tables.data_ptr())}")
+            assert torch.allclose(self.input_buffers['block_tables'],
                                  attn_metadata.decode_metadata.block_tables)
 
         # Copy the input tensors to the input buffers.

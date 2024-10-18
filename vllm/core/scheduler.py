@@ -1360,6 +1360,11 @@ class Scheduler:
         # Move to next cache (if exists)
         self.cache_id = self.next_cache_id
 
+        # num prefills num decodes 
+        num_prefills = len([None for sgm in seq_group_metadata_list if sgm.is_prompt])
+        num_decodes = len(seq_group_metadata_list) - num_prefills
+        print (f"Scheduler step : prefills {num_prefills} | decodes {num_decodes}")
+
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,
                 allow_async_output_proc)
