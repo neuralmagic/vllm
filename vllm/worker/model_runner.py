@@ -1888,9 +1888,18 @@ class CUDAGraphRunner:
             #                   positions)
             #assert torch.allclose(self.input_buffers['slot_mapping'],
             #                   attn_metadata.slot_mapping)
+
+            print (f"inputbuffers blocktables {hex(self.input_buffers['slot_mapping'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.slot_mapping.data_ptr())}")
+            assert torch.allclose(self.input_buffers['slot_mapping'],
+                                 attn_metadata.decode_metadata.slot_mapping)
+
             print (f"inputbuffers blocktables {hex(self.input_buffers['block_tables'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.block_tables.data_ptr())}")
             assert torch.allclose(self.input_buffers['block_tables'],
                                  attn_metadata.decode_metadata.block_tables)
+
+            print (f"inputbuffers seq lens tensor {hex(self.input_buffers['seq_lens_tensor'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.seq_lens_tensor.data_ptr())}")
+            assert torch.allclose(self.input_buffers['seq_lens_tensor'],
+                                 attn_metadata.decode_metadata.seq_lens_tensor)
 
         # Copy the input tensors to the input buffers.
         self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)

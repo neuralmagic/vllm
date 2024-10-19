@@ -224,8 +224,14 @@ class StatefulModelInput(BroadcastableModelInput):
     def use_cugraph_tensors(self, graph_runner: CUDAGraphRunner):
         # need to update the block tables
         graph_block_tables: torch.Tensor = graph_runner.input_buffers['block_tables']
+        graph_seq_lens_tensor: torch.Tensor = graph_runner.input_buffers['seq_lens_tensor']
+        graph_slot_mapping_tensor: torch.Tensor = graph_runner.input_buffers['slot_mapping']
         assert graph_block_tables.shape == self.frozen_model_input.attn_metadata.block_tables.shape
         self.frozen_model_input.attn_metadata.block_tables = graph_block_tables
+        assert graph_seq_lens_tensor.shape == self.frozen_model_input.attn_metadata.seq_lens_tensor.shape
+        self.frozen_model_input.attn_metadata.seq_lens_tensor = graph_seq_lens_tensor
+        assert self.frozen_model_input.attn_metadata.slot_mapping.shape == graph_slot_mapping_tensor.shape
+        self.frozen_model_input.attn_metadata.slot_mapping = graph_slot_mapping_tensor 
 
     def maybe_advance_sampling_metadata(self, device: str, pin_memory: bool):
         """

@@ -360,6 +360,7 @@ class CommonAttentionState(AttentionState):
             attn_metadata,
             is_encoder_decoder_model: bool = False) -> None:
         print ("utils.py : prepare_graph_input_buffers() ...")
+        print (f"copy seq lens | input buffers {hex(input_buffers['seq_lens_tensor'].data_ptr())} | attn {hex(attn_metadata.decode_metadata.seq_lens_tensor.data_ptr())}")
         input_buffers["seq_lens_tensor"].copy_(
             attn_metadata.decode_metadata.seq_lens_tensor, non_blocking=True)
 
