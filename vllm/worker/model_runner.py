@@ -1523,10 +1523,10 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         graph_runner)
 
 
-        for batch_size in reversed(batch_size_capture_list):
-            block_tables = self.graph_runners[0][batch_size].input_buffers['block_tables']
-            slt = self.graph_runners[0][batch_size].input_buffers['seq_lens_tensor']
-            print (f"graph {batch_size} - block tables {hex(block_tables.data_ptr())} | seq_lens_tensor {hex(slt.data_ptr())}")
+        #for batch_size in reversed(batch_size_capture_list):
+        #    block_tables = self.graph_runners[0][batch_size].input_buffers['block_tables']
+        #    slt = self.graph_runners[0][batch_size].input_buffers['seq_lens_tensor']
+        #    print (f"graph {batch_size} - block tables {hex(block_tables.data_ptr())} | seq_lens_tensor {hex(slt.data_ptr())}")
 
 
         end_time = time.perf_counter()
@@ -1878,39 +1878,38 @@ class CUDAGraphRunner:
         del kv_caches
         do_graph_copy: bool = kwargs.get('do_graph_copy', True)
 
-        print (f"cudagraph forward - input buffer keys {self.input_buffers.keys()}")
+        #print (f"cudagraph forward - input buffer keys {self.input_buffers.keys()}")
 
-        if not do_graph_copy:
-            # sanity check the inputs
-            #assert torch.allclose(self.input_buffers['input_ids'],
-            #                     input_ids)
-            #assert torch.allclose(self.input_buffers['positions'],
-            #                   positions)
-            #assert torch.allclose(self.input_buffers['slot_mapping'],
-            #                   attn_metadata.slot_mapping)
+        #if not do_graph_copy:
+        #    # sanity check the inputs
+        #    assert torch.allclose(self.input_buffers['input_ids'],
+        #                         input_ids)
+        #    assert torch.allclose(self.input_buffers['positions'],
+        #                         positions)
 
-            print (f"inputbuffers blocktables {hex(self.input_buffers['slot_mapping'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.slot_mapping.data_ptr())}")
-            assert torch.allclose(self.input_buffers['slot_mapping'],
-                                 attn_metadata.decode_metadata.slot_mapping)
+        #    print (f"inputbuffers blocktables {hex(self.input_buffers['slot_mapping'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.slot_mapping.data_ptr())}")
+        #    assert torch.allclose(self.input_buffers['slot_mapping'],
+        #                         attn_metadata.decode_metadata.slot_mapping)
 
-            print (f"inputbuffers blocktables {hex(self.input_buffers['block_tables'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.block_tables.data_ptr())}")
-            assert torch.allclose(self.input_buffers['block_tables'],
-                                 attn_metadata.decode_metadata.block_tables)
+        #    print (f"inputbuffers blocktables {hex(self.input_buffers['block_tables'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.block_tables.data_ptr())}")
+        #    assert torch.allclose(self.input_buffers['block_tables'],
+        #                         attn_metadata.decode_metadata.block_tables)
 
-            print (f"inputbuffers seq lens tensor {hex(self.input_buffers['seq_lens_tensor'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.seq_lens_tensor.data_ptr())}")
-            assert torch.allclose(self.input_buffers['seq_lens_tensor'],
-                                 attn_metadata.decode_metadata.seq_lens_tensor)
+        #    print (f"inputbuffers seq lens tensor {hex(self.input_buffers['seq_lens_tensor'].data_ptr())} -- attn {hex(attn_metadata.decode_metadata.seq_lens_tensor.data_ptr())}")
+        #    assert torch.allclose(self.input_buffers['seq_lens_tensor'],
+        #                         attn_metadata.decode_metadata.seq_lens_tensor)
 
-        # Copy the input tensors to the input buffers.
-        self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
-        self.input_buffers["positions"].copy_(positions, non_blocking=True)
+        if do_graph_copy:
+            # Copy the input tensors to the input buffers.
+            self.input_buffers["input_ids"].copy_(input_ids, non_blocking=True)
+            self.input_buffers["positions"].copy_(positions, non_blocking=True)
 
-        if self.backend_name != "placeholder-attn":
-            self.input_buffers["slot_mapping"].copy_(
-                attn_metadata.slot_mapping, non_blocking=True)
+            if self.backend_name != "placeholder-attn":
+                self.input_buffers["slot_mapping"].copy_(
+                    attn_metadata.slot_mapping, non_blocking=True)
 
-        self.attn_state.prepare_graph_input_buffers(
-            self.input_buffers, attn_metadata, self._is_encoder_decoder_model)
+            self.attn_state.prepare_graph_input_buffers(
+                self.input_buffers, attn_metadata, self._is_encoder_decoder_model)
 
         if "seqlen_agnostic_capture_inputs" in self.input_buffers:
             self.model.copy_inputs_before_cuda_graphs(self.input_buffers,

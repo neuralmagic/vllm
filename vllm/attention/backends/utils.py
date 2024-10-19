@@ -304,7 +304,7 @@ class CommonAttentionState(AttentionState):
 
     def graph_capture_get_metadata_for_batch(
             self, batch_size: int, is_encoder_decoder_model: bool = False):
-        print ("utils.py : graph_capture_metadata_for_batch() ...")
+        #print ("utils.py : graph_capture_metadata_for_batch() ...")
         assert self._is_graph_capturing
         attn_metadata = self.runner.attn_backend.make_metadata(
             num_prefills=0,
@@ -338,7 +338,7 @@ class CommonAttentionState(AttentionState):
             self,
             attn_metadata,
             is_encoder_decoder_model: bool = False) -> Dict[str, Any]:
-        print (f"utils.py : get_graph_input_buffers() ...")
+        #print (f"utils.py : get_graph_input_buffers() ...")
         input_buffers = {
             "slot_mapping": attn_metadata.slot_mapping,
             "seq_lens_tensor": attn_metadata.decode_metadata.seq_lens_tensor,
@@ -359,12 +359,12 @@ class CommonAttentionState(AttentionState):
             input_buffers,
             attn_metadata,
             is_encoder_decoder_model: bool = False) -> None:
-        print ("utils.py : prepare_graph_input_buffers() ...")
-        print (f"copy seq lens | input buffers {hex(input_buffers['seq_lens_tensor'].data_ptr())} | attn {hex(attn_metadata.decode_metadata.seq_lens_tensor.data_ptr())}")
+        #print ("utils.py : prepare_graph_input_buffers() ...")
+        #print (f"copy seq lens | input buffers {hex(input_buffers['seq_lens_tensor'].data_ptr())} | attn {hex(attn_metadata.decode_metadata.seq_lens_tensor.data_ptr())}")
         input_buffers["seq_lens_tensor"].copy_(
             attn_metadata.decode_metadata.seq_lens_tensor, non_blocking=True)
 
-        print (f"copy block tables | input buffers {hex(input_buffers['block_tables'].data_ptr())} | attn {hex(attn_metadata.decode_metadata.block_tables.data_ptr())}")
+        #print (f"copy block tables | input buffers {hex(input_buffers['block_tables'].data_ptr())} | attn {hex(attn_metadata.decode_metadata.block_tables.data_ptr())}")
         input_buffers["block_tables"].copy_(
             attn_metadata.decode_metadata.block_tables, non_blocking=True)
         if is_encoder_decoder_model:

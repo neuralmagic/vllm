@@ -226,12 +226,22 @@ class StatefulModelInput(BroadcastableModelInput):
         graph_block_tables: torch.Tensor = graph_runner.input_buffers['block_tables']
         graph_seq_lens_tensor: torch.Tensor = graph_runner.input_buffers['seq_lens_tensor']
         graph_slot_mapping_tensor: torch.Tensor = graph_runner.input_buffers['slot_mapping']
+        graph_input_ids_tensor: torch.Tensor = graph_runner.input_buffers['input_ids']
+        graph_positions_tensor: torch.Tensor = graph_runner.input_buffers['positions']
+
         assert graph_block_tables.shape == self.frozen_model_input.attn_metadata.block_tables.shape
         self.frozen_model_input.attn_metadata.block_tables = graph_block_tables
         assert graph_seq_lens_tensor.shape == self.frozen_model_input.attn_metadata.seq_lens_tensor.shape
         self.frozen_model_input.attn_metadata.seq_lens_tensor = graph_seq_lens_tensor
         assert self.frozen_model_input.attn_metadata.slot_mapping.shape == graph_slot_mapping_tensor.shape
         self.frozen_model_input.attn_metadata.slot_mapping = graph_slot_mapping_tensor 
+
+        assert self.frozen_model_input.input_tokens.shape == graph_input_ids_tensor.shape
+        assert self.frozen_model_input.input_positions.shape == graph_positions_tensor.shape
+        self.frozen_model_input = dataclasses.replace(
+            self.frozen_model_input,
+            input_tokens=graph_input_ids_tensor,
+            input_positions=graph_positions_tensor)
 
     def maybe_advance_sampling_metadata(self, device: str, pin_memory: bool):
         """
@@ -518,11 +528,10 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
             # far ahead if needed)
             model_input.wait_previous_step()
 
-
             ve = model_input.frozen_model_input.virtual_engine
             batch_size = model_input.num_seqs
             graph_runners = self._base_model_runner.graph_runners[model_input.frozen_model_input.virtual_engine]
-            print (f"virtual engine {ve} | batch size {batch_size} | grunners {list(graph_runners.keys())}")
+            #print (f"virtual engine {ve} | batch size {batch_size} | grunners {list(graph_runners.keys())}")
             
             model_input.use_cugraph_tensors(graph_runners[batch_size])
             model_input = self._advance_step(
@@ -554,7 +563,7 @@ class MultiStepModelRunner(GPUModelRunnerBase[StatefulModelInput]):
 
         do_graph_copy: bool = model_input.is_first_multi_step
 
-        print (f"Model Execute step {model_input.current_step} ")
+        #print (f"Model Execute step {model_input.current_step} ")
         # Execute the model
         output = self._base_model_runner.execute_model(frozen_model_input,
                                                        kv_caches,
