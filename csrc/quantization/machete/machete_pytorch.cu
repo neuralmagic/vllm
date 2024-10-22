@@ -56,6 +56,7 @@ torch::Tensor gemm(torch::Tensor const& A, torch::Tensor const& B,
                    c10::optional<int64_t> group_size,
                    c10::optional<torch::Tensor> const& C,
                    c10::optional<double> alpha, c10::optional<double> beta,
+                   c10::optional<torch::Tensor> const& barrier_workspace,
                    c10::optional<std::string> schedule) {
 #if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 12
   ScalarType const btype = ScalarType::from_id(btype_id);
@@ -65,6 +66,7 @@ torch::Tensor gemm(torch::Tensor const& A, torch::Tensor const& B,
                                .zeros = zeros,
                                .group_size = group_size,
                                .C = C,
+                               .barrier_workspace = barrier_workspace,
                                .alpha = alpha,
                                .beta = beta,
                                .schedule = schedule};

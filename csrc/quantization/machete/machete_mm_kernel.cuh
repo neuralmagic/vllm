@@ -131,11 +131,12 @@ struct MacheteKernelTemplate {
   using Arguments = typename Gemm::Arguments;
   using MainloopArguments = typename GemmKernel::MainloopArguments;
   using EpilogueArguments = typename GemmKernel::EpilogueArguments;
+  using TileSchedulerArguments = typename GemmKernel::TileSchedulerArguments;
 
   template <typename ShapeA, typename ShapeC, typename ShapeD, typename ShapeS,
             typename ShapeZ>
   static Arguments create_arguments(
-      cudaStream_t stream,
+      cudaStream_t stream, int device_id,
       ElementA const* A_ptr,  // A is an MxK matrix
       Layout<ShapeA, StrideA> const& layout_A,
       ElementB const* B_ptr,  // B is an KxN prepacked matrix
@@ -150,6 +151,18 @@ struct MacheteKernelTemplate {
       ElementCompute alpha, ElementCompute beta,
       std::optional<int> maybe_group_size) {
     static_assert(!with_zeropoints || with_scales);
+
+    static std::vector<int> multi_processor_count;
+
+    if (multi_processor_count.empty() ||
+        multi_processor_count.size() < device_id) {
+      multi_processor_count.resize(device_id + 1, -1);
+    }
+
+    if (multi_processor_count[device_id] < 0) {
+      multi_processor_count[device_id] =
+          KernelHardwareInfo::query_device_multiprocessor_count(device_id);
+    }
 
     int M = size<0>(layout_A), N = size<1>(layout_D), K = size<1>(layout_A);
 
@@ -210,14 +223,25 @@ struct MacheteKernelTemplate {
           MainloopArguments{B_ptr, _StrideB{}, A_ptr, stride_At};
     }
 
+    auto tile_scheduler_arguments = TileSchedulerArguments{{}, nullptr};
+
     return Arguments{cutlass::gemm::GemmUniversalMode::kGemm,
                      {N, M, K, 1},
                      mainloop_arguments,
-                     epilogue_arguments};
+                     epilogue_arguments,
+                     {device_id, multi_processor_count[device_id]},
+                     tile_scheduler_arguments};
   };
 
   static size_t get_workspace_size(Arguments const& args) {
     return Gemm::get_workspace_size(args);
+  }
+
+  static size_t get_barrier_workspace_size(Arguments const& args) {
+    return GemmKernel::TileScheduler::template get_barrier_workspace_size<
+        decltype(args.problem_shape), ElementAccumulator>(
+        args.scheduler, args.problem_shape, args.hw_info,
+        GemmKernel::NumMmaWarpGroups);
   }
 
   static bool can_implement(Arguments const& args) {

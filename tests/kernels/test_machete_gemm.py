@@ -20,6 +20,8 @@ CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 ]
 
+BARRIER_WORKSPACE = torch.zeros(16384, dtype=torch.uint8, device="cuda")
+
 MNK_SHAPES = [
     (1, 128, 128),
     (1, 512, 1024),
@@ -150,13 +152,14 @@ def test_machete_all_schedules(shape, atype: torch.dtype,
             b_scales=w_s,
             b_zeros=maybe_convert_zeropoints(w_zp, w_s),
             b_group_size=group_size,
+            barrier_workspace=BARRIER_WORKSPACE,
             schedule=schedule,
         )
 
         opcheck(
             torch.ops._C.machete_gemm,
             (a, w_q_machete, wtype.id, w_s, maybe_convert_zeropoints(
-                w_zp, w_s), group_size, None, None, None, schedule))
+                w_zp, w_s), group_size, None, None, None, BARRIER_WORKSPACE, schedule))
 
         # Relax atol as our reduction dim becomes larger (more rounding error)
         # Relax atol when we have zeropoints since the way machete applies

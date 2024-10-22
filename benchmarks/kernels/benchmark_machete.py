@@ -159,11 +159,13 @@ def bench(atype: torch.dtype,
                                      is_k_full=True))))
 
     # machete
+    BARRIER_WORKSPACE = torch.zeros(16384, dtype=torch.uint8, device="cuda")
     timers.append(
         bench_fn(
             label, sub_label, "machete_heuristic", lambda: loop_over_weights(
                 a, weights_machete, lambda a, _, w_q, w_s: ops.machete_gemm(
-                    a, w_q, wtype, b_scales=w_s, b_group_size=group_size))))
+                    a, w_q, wtype, b_scales=w_s, b_group_size=group_size,
+                    barrier_workspace=BARRIER_WORKSPACE))))
 
     if sweep_schedules:
         print("Finding best schedule for machete")
