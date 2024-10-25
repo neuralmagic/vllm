@@ -182,20 +182,16 @@ struct MacheteKernelTemplate {
 
   static Arguments create_arguments(
       cudaStream_t stream, int device_id,
-      ElementA const* A_ptr,  // A is an MxK matrix
-      Layout<ShapeA, StrideA> const& layout_A,
-      ElementB const* B_ptr,  // B is an KxN prepacked matrix
-      ElementD* D_ptr,        // D is an MxN matrix
-      Layout<ShapeD, StrideD> const& layout_D,
-      ElementC const* C_ptr,  // C is an MxN matrix
-      std::optional<Layout<ShapeC, StrideC>> const& layout_C,
-      ElementS const* S_ptr,  // S is an scale_KxN matrix
-      std::optional<Layout<ShapeS, StrideS>> const& layout_S,
-      ElementZ const* Z_ptr,  // Z is an scale_KxN matrix
-      std::optional<Layout<ShapeZ, StrideZ>> const& layout_Z,
-      ElementCompute alpha, ElementCompute beta,
-      std::optional<int> maybe_group_size) {
-    static_assert(!with_zeropoints || with_scales);
+      torch::Tensor const& A,  // MxK matrix
+      torch::Tensor const& B,  // KxN prepacked matrix
+      torch::Tensor& D,        // MxN matrix
+      c10::optional<torch::Tensor> const& maybe_g_scales,  // scale_KxN matrix
+      c10::optional<torch::Tensor> const& maybe_g_zeros,   // scale_KxN matrix
+      c10::optional<int64_t> maybe_group_size,
+      c10::optional<torch::Tensor> const& maybe_ch_scales,   // len N vector
+      c10::optional<torch::Tensor> const& maybe_tok_scales)  // len M vector
+  {
+    static_assert(!with_group_zeropoints || with_group_scales);
 
     static std::vector<int> multi_processor_count;
 
