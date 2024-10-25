@@ -449,6 +449,7 @@ if hasattr(torch.ops._C, "gptq_marlin_24_gemm"):
         b_group_size: Optional[int] = None,
         b_channel_scales: Optional[torch.Tensor] = None,
         a_token_scales: Optional[torch.Tensor] = None,
+        barrier_workspace: Optional[torch.Tensor] = None,
         schedule: Optional[str] = None,
     ) -> torch.Tensor:
         m = a.size(0)
@@ -621,10 +622,12 @@ def machete_mm(
         b_group_size: Optional[int] = None,
         b_channel_scales: Optional[torch.Tensor] = None,
         a_token_scales: Optional[torch.Tensor] = None,
+        barrier_workspace: Optional[torch.Tensor] = None,
         schedule: Optional[str] = None) -> torch.Tensor:
     return torch.ops._C.machete_mm(a, b_q, b_type.id, out_type, b_group_scales,
                                    b_group_zeros, b_group_size,
-                                   b_channel_scales, a_token_scales, schedule)
+                                   b_channel_scales, a_token_scales,
+                                   barrier_workspace, schedule)
 
 
 def machete_prepack_B(

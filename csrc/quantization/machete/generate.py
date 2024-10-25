@@ -14,13 +14,13 @@ import jinja2
 from vllm_cutlass_library_extension import (DataType, EpilogueScheduleTag,
                                             EpilogueScheduleType,
                                             MixedInputKernelScheduleType,
-                                            TileSchedulerTag,
-                                            TileSchedulerType, VLLMDataType,
-                                            VLLMDataTypeNames,
+                                            VLLMDataType, VLLMDataTypeNames,
                                             VLLMDataTypeSize, VLLMDataTypeTag,
                                             VLLMDataTypeTorchDataTypeTag,
                                             VLLMDataTypeVLLMScalarTypeTag,
-                                            VLLMKernelScheduleTag)
+                                            VLLMKernelScheduleTag,
+                                            VLLMTileSchedulerTag,
+                                            VLLMTileSchedulerType)
 
 # yapf: enable
 
@@ -249,7 +249,7 @@ class ScheduleConfig:
     cluster_shape_mnk: Tuple[int, int, int]
     kernel_schedule: MixedInputKernelScheduleType
     epilogue_schedule: EpilogueScheduleType
-    tile_scheduler: TileSchedulerType
+    tile_scheduler: VLLMTileSchedulerType
 
 
 @dataclass(frozen=True)
@@ -290,7 +290,7 @@ def generate_sch_sig(schedule_config: ScheduleConfig) -> str:
         .split("::")[-1]
     epilogue_schedule = EpilogueScheduleTag[
         schedule_config.epilogue_schedule].split("::")[-1]
-    tile_scheduler = TileSchedulerTag[schedule_config.tile_scheduler]\
+    tile_scheduler = VLLMTileSchedulerTag[schedule_config.tile_scheduler]\
         .split("::")[-1]
 
     return (f"{tile_shape}_{cluster_shape}_{kernel_schedule}" +
@@ -303,6 +303,7 @@ def generate_terse_sch_sig(schedule_config: ScheduleConfig) -> str:
         "KernelTmaWarpSpecializedCooperativeMixedInput_": "TmaMI_",
         "TmaWarpSpecializedCooperative_": "TmaCoop_",
         "StreamKScheduler": "streamK",
+        "StreamKSchedulerWithReset": "streamKWithReset",
     }
 
     sch_sig = generate_sch_sig(schedule_config)
@@ -368,7 +369,7 @@ template_globals = {
     "TorchTypeTag": VLLMDataTypeTorchDataTypeTag,
     "KernelScheduleTag": VLLMKernelScheduleTag,
     "EpilogueScheduleTag": EpilogueScheduleTag,
-    "TileSchedulerTag": TileSchedulerTag,
+    "TileSchedulerTag": VLLMTileSchedulerTag,
     "to_cute_constant": to_cute_constant,
     "gen_sch_sig": generate_terse_sch_sig,
     "gen_type_sig": generate_type_signature,
@@ -476,7 +477,7 @@ def generate():
     sch_common_params = dict(
         kernel_schedule=TmaMI,
         epilogue_schedule=TmaCoop,
-        tile_scheduler=TileSchedulerType.StreamK,
+        tile_scheduler=VLLMTileSchedulerType.StreamKWithReset,
     )
 
     # Stored as "condition": ((tile_shape_mn), (cluster_shape_mnk))

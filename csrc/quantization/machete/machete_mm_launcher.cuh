@@ -19,6 +19,7 @@ struct MMArgs {
   c10::optional<int64_t> maybe_group_size;
   c10::optional<torch::Tensor> const& maybe_channel_scales;
   c10::optional<torch::Tensor> const& maybe_token_scales;
+  c10::optional<torch::Tensor> const& maybe_barrier_workspace;
   c10::optional<std::string> maybe_schedule;
 };
 
@@ -64,9 +65,31 @@ torch::Tensor run_impl(MMArgs args) {
               "Machete kernel cannot be run with these arguments");
 
   size_t workspace_size = MacheteKernel::get_workspace_size(arguments);
+  size_t barrier_workspace_size =
+      MacheteKernel::get_barrier_workspace_size(arguments);
+
   torch::Tensor workspace = torch::empty(
       workspace_size, torch::TensorOptions().dtype(torch::kU8).device(device));
 
+  torch::Tensor barrier_workspace;
+  if (args.barrier_workspace.has_value()) {
+    TORCH_CHECK(args.barrier_workspace->device() == device,
+                "Barrier workspace must be on the same device as the input");
+    TORCH_CHECK(args.barrier_workspace->dtype() == torch::kU8,
+                "Barrier workspace must be of type torch.uint8");
+    TORCH_CHECK(args.barrier_workspace->numel() >= barrier_workspace_size,
+                "Provided barrier workspace is too small, need %d bytes "
+                "got %d bytes",
+                args.barrier_workspace->numel(), barrier_workspace_size);
+
+    barrier_workspace = args.barrier_workspace.value();
+  } else {
+    barrier_workspace =
+        torch::zeros(barrier_workspace_size,
+                     torch::TensorOptions().dtype(torch::kU8).device(device));
+  }
+
+  arguments.scheduler.barrier_workspace = barrier_workspace.mutable_data_ptr();
   MacheteKernel::run(arguments, workspace.mutable_data_ptr(), stream);
 
   return D;

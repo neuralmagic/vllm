@@ -35,6 +35,7 @@ torch::Tensor mm(torch::Tensor const& A, torch::Tensor const& B,
                  c10::optional<int64_t> maybe_group_size,
                  c10::optional<torch::Tensor> const& maybe_channel_scales,
                  c10::optional<torch::Tensor> const& maybe_token_scales,
+                 c10::optional<torch::Tensor> const& barrier_workspace,
                  c10::optional<std::string> maybe_schedule) {
   ScalarType const b_type = ScalarType::from_id(btype_id);
   return mm_dispatch({.A = A,
@@ -46,6 +47,7 @@ torch::Tensor mm(torch::Tensor const& A, torch::Tensor const& B,
                       .maybe_group_size = maybe_group_size,
                       .maybe_channel_scales = maybe_channel_scales,
                       .maybe_token_scales = maybe_token_scales,
+                      .maybe_barrier_workspace = barrier_workspace,
                       .maybe_schedule = maybe_schedule});
 }
 

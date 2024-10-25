@@ -64,6 +64,20 @@ VLLMDataTypeTorchDataTypeTag: Dict[Union[VLLMDataType, DataType], str] = {
     DataType.f32: "at::ScalarType::Float",
 }
 
+
+class VLLMTileSchedulerType(enum.Enum):
+    StreamKWithReset = enum_auto()
+
+
+VLLMTileSchedulerTag: \
+    Dict[Union[VLLMTileSchedulerType, TileSchedulerType], str] = {
+    **TileSchedulerTag, # type: ignore
+    **{
+        VLLMTileSchedulerType.StreamKWithReset: \
+            'cutlass::gemm::vLLMStreamKSchedulerWithReset',
+    }
+}
+
 VLLMKernelScheduleTag: Dict[Union[
     MixedInputKernelScheduleType, KernelScheduleType], str] = {
         **KernelScheduleTag,  # type: ignore

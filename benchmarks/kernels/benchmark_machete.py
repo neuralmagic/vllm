@@ -348,6 +348,7 @@ def bench(types: TypeConfig,
                        for bt in benchmark_tensors]))
 
     # machete
+    #BARRIER_WORKSPACE = torch.zeros(16384, dtype=torch.uint8, device="cuda")
     timers.append(
         bench_fns(label, sub_label, f"machete ({name_type_string})", [
             machete_create_bench_fn(bt, out_type=types.output_type)

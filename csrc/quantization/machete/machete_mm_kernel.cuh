@@ -23,6 +23,7 @@
 #include "cutlass_extensions/vllm_numeric_conversion.cuh"
 #include "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
 #include "cutlass_extensions/torch_utils.hpp"
+#include "cutlass_extensions/gemm/kernel/vllm_sm90_tile_scheduler_stream_k.hpp"
 #include "machete_collective_builder.cuh"
 #include "machete_prepacked_layout.cuh"
 #include "machete_interleaving_utils.cuh"
@@ -177,19 +178,36 @@ struct MacheteKernelTemplate {
   using Arguments = typename Gemm::Arguments;
   using MainloopArguments = typename GemmKernel::MainloopArguments;
   using EpilogueArguments = typename GemmKernel::EpilogueArguments;
+  using TileSchedulerArguments = typename GemmKernel::TileSchedulerArguments;
 
   static Arguments create_arguments(
-      cudaStream_t stream,
-      torch::Tensor const& A,  // MxK matrix
-      torch::Tensor const& B,  // KxN prepacked matrix
-      torch::Tensor& D,        // MxN matrix
-      c10::optional<torch::Tensor> const& maybe_g_scales,  // scale_KxN matrix
-      c10::optional<torch::Tensor> const& maybe_g_zeros,   // scale_KxN matrix
-      c10::optional<int64_t> maybe_group_size,
-      c10::optional<torch::Tensor> const& maybe_ch_scales,   // len N vector
-      c10::optional<torch::Tensor> const& maybe_tok_scales)  // len M vector
-  {
-    static_assert(!with_group_zeropoints || with_group_scales);
+      cudaStream_t stream, int device_id,
+      ElementA const* A_ptr,  // A is an MxK matrix
+      Layout<ShapeA, StrideA> const& layout_A,
+      ElementB const* B_ptr,  // B is an KxN prepacked matrix
+      ElementD* D_ptr,        // D is an MxN matrix
+      Layout<ShapeD, StrideD> const& layout_D,
+      ElementC const* C_ptr,  // C is an MxN matrix
+      std::optional<Layout<ShapeC, StrideC>> const& layout_C,
+      ElementS const* S_ptr,  // S is an scale_KxN matrix
+      std::optional<Layout<ShapeS, StrideS>> const& layout_S,
+      ElementZ const* Z_ptr,  // Z is an scale_KxN matrix
+      std::optional<Layout<ShapeZ, StrideZ>> const& layout_Z,
+      ElementCompute alpha, ElementCompute beta,
+      std::optional<int> maybe_group_size) {
+    static_assert(!with_zeropoints || with_scales);
+
+    static std::vector<int> multi_processor_count;
+
+    if (multi_processor_count.empty() ||
+        multi_processor_count.size() < device_id) {
+      multi_processor_count.resize(device_id + 1, -1);
+    }
+
+    if (multi_processor_count[device_id] < 0) {
+      multi_processor_count[device_id] =
+          KernelHardwareInfo::query_device_multiprocessor_count(device_id);
+    }
 
     int M = A.size(0), N = B.size(1), K = A.size(1);
     TORCH_CHECK(D.size(0) == M && D.size(1) == N);
@@ -285,14 +303,25 @@ struct MacheteKernelTemplate {
           MainloopArguments{B_ptr, _StrideB{}, A_ptr, stride_At};
     }
 
+    auto tile_scheduler_arguments = TileSchedulerArguments{{}, nullptr};
+
     return Arguments{cutlass::gemm::GemmUniversalMode::kGemm,
                      {N, M, K, 1},
                      mainloop_arguments,
-                     epilogue_arguments};
+                     epilogue_arguments,
+                     {device_id, multi_processor_count[device_id]},
+                     tile_scheduler_arguments};
   };
 
   static size_t get_workspace_size(Arguments const& args) {
     return Gemm::get_workspace_size(args);
+  }
+
+  static size_t get_barrier_workspace_size(Arguments const& args) {
+    return GemmKernel::TileScheduler::template get_barrier_workspace_size<
+        decltype(args.problem_shape), ElementAccumulator>(
+        args.scheduler, args.problem_shape, args.hw_info,
+        GemmKernel::NumMmaWarpGroups);
   }
 
   static bool can_implement(Arguments const& args) {
