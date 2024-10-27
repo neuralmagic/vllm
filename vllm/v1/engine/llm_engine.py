@@ -1,6 +1,5 @@
 import time
-from typing import (Any, Dict, Iterable, List, Mapping, Optional, Tuple, Type,
-                    Union)
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
@@ -23,7 +22,6 @@ from vllm.transformers_utils.tokenizer_group import (
     BaseTokenizerGroup, init_tokenizer_from_configs)
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.core.scheduler import Scheduler
-from vllm.v1.executor.gpu_executor import GPUExecutor
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.tokenizer.detokenizer import Detokenizer, DetokenizerInputs
 from vllm.version import __version__ as VLLM_VERSION
@@ -46,7 +44,7 @@ class LLMEngine:
         decoding_config: Optional[DecodingConfig],
         observability_config: Optional[ObservabilityConfig],
         prompt_adapter_config: Optional[PromptAdapterConfig],
-        executor_class: Type[GPUExecutor],
+        executor_class,  #: Type[GPUExecutor], TODO: add a base class, maybe
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
@@ -489,7 +487,18 @@ class LLMEngine:
 
     @classmethod
     def _get_executor_cls(cls, engine_config: EngineConfig):
-        return GPUExecutor
+        distributed_executor_backend = (
+            engine_config.parallel_config.distributed_executor_backend)
+        if distributed_executor_backend == "mp":
+            from vllm.v1.executor.multiproc_gpu_executor import (
+                MultiprocessingGPUExecutor)
+            executor_class = MultiprocessingGPUExecutor
+        else:
+            assert (distributed_executor_backend is None)
+            from vllm.v1.executor.gpu_executor import GPUExecutor
+            executor_class = GPUExecutor
+
+        return executor_class
 
     def is_tracing_enabled(self) -> bool:
         return False
