@@ -709,15 +709,15 @@ struct NumericArrayConverter<cutlass::bfloat16_t, vllm_uint4b8_t, N, Round> {
       // high BF16:
       // hi_bf16 - 136, lo_bf16 - 136
 
-      // This is the BF16 {136, 136} represented as an integer.
-      static constexpr uint32_t bias_rep = 0x43084308;
+      // This is the BF16 {-136, -136} represented as an integer.
+      static constexpr uint32_t bias_rep = 0xC308C308;
       const __nv_bfloat162& bias =
           reinterpret_cast<const __nv_bfloat162&>(bias_rep);
 
       CUTLASS_PRAGMA_UNROLL
       for (int ii = 0; ii < RegArray::kElements; ++ii) {
         __nv_bfloat162& bf16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
-        bf16x2_val = __hsub2(bf16x2_val, bias);
+        bf16x2_val = __hadd2(bf16x2_val, bias);
       }
 
       return reinterpret_cast<PackedResultType&>(r);
@@ -779,12 +779,12 @@ struct InterleavedNumericArrayConverter<Layout<Shape<_2, _4>, Stride<_4, _1>>,
 
         // For low nibble:
         //  {x1, x0} = {128+(x1+8), 128+(x0+8)} * {1, 1} - {136, 136}
-        static constexpr uint32_t low_nib_bias = 0x43084308;  // {136, 136}
+        static constexpr uint32_t low_nib_bias = 0xC308C308;  // {-136, -136}
 
         {
           __nv_bfloat162& fp16x2_val = reinterpret_cast<__nv_bfloat162&>(r[ii]);
           fp16x2_val =
-              __hsub2(fp16x2_val,
+              __hadd2(fp16x2_val,
                       reinterpret_cast<const __nv_bfloat162&>(low_nib_bias));
         }
       }

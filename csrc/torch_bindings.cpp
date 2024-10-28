@@ -200,6 +200,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "   int?    group_size,"
       "   Tensor? channel_scales,"
       "   Tensor? token_scales,"
+      "   Tensor? barrier_workspace,"
       "   str?    schedule"
       ") -> Tensor");
   ops.def(
