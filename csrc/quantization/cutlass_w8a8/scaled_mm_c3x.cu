@@ -54,7 +54,7 @@ struct enable_sm90_or_later : Kernel {
   CUTLASS_DEVICE void operator()(Args&&... args) {
   #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 900
     Kernel::operator()(std::forward<Args>(args)...);
-  #endif
+  #endif3
   }
 };
 template <typename ElementAB_, typename ElementD_,
