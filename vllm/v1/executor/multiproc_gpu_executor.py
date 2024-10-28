@@ -8,6 +8,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ObservabilityConfig, ParallelConfig,
                          PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig)
+from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper,
                                                   ResultHandler, WorkerMonitor)
 from vllm.logger import init_logger
@@ -106,7 +107,19 @@ class MultiprocessingGPUExecutor:
         result_handler.start()
         self.worker_monitor.start()
 
-        self._run_workers("initialize")
+        # Initialize worker and set up message queues for SchedulerOutputs
+        # and ModelRunnerOutputs
+        self.scheduler_output_sender = MessageQueue(world_size, world_size)
+        model_output_receiver_handle = self._run_workers(
+            "initialize", self.scheduler_output_sender.export_handle())[0]
+        self.model_output_receiver = MessageQueue.create_from_handle(
+            model_output_receiver_handle, 0)
+
+        # Everyone must call wait_until_ready on their MessageQueues
+        wait_futures = self._run_workers_async("wait_until_ready")
+        self.scheduler_output_sender.wait_until_ready()
+        self.model_output_receiver.wait_until_ready()
+        self._finalize_run_workers_async(wait_futures)
 
         # TODO: pass in parallel_config.max_parallel_loading_workers
         self._run_workers("load_model")
@@ -168,6 +181,36 @@ class MultiprocessingGPUExecutor:
         # Get the results of the workers.
         return [output.get() for output in worker_outputs]
 
+    def _run_workers_async(
+        self,
+        method: str,
+        *args,
+        **kwargs,
+    ) -> Any:
+        """Runs the given method on all workers.
+
+        Args:
+            async_run_tensor_parallel_workers_only: If True the method will be
+                run only in the remote TP workers, not the driver worker.
+                It will also be run asynchronously and return a list of futures
+                rather than blocking on the results.
+        """
+
+        # Start all remote workers first.
+        worker_futures = [
+            worker.execute_method(method, *args, **kwargs)
+            for worker in self.workers
+        ]
+        return worker_futures
+
+    def _finalize_run_workers_async(
+        self,
+        worker_futures,
+    ) -> Any:
+
+        # Get the results of the workers.
+        return [output.get() for output in worker_futures]
+
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
         underlying worker.
@@ -198,10 +241,20 @@ class MultiprocessingGPUExecutor:
         scheduler_output,
     ) -> ModelRunnerOutput:
 
-        # TODO: I don't think this is the right way to do it lol
-        outputs = self._run_workers("execute_model", scheduler_output)
+        if False:
+            # Simple functioning execution
+            outputs = self._run_workers("execute_model", scheduler_output)
+            return outputs[0]
+        else:
+            # Tell workers to start their busy loop
+            #TODO This is very stupid
+            self._run_workers_async("execute_model_busy_loop")
+            print("launched worker busy loops")
 
-        return outputs[0]
+            print("enqueueing")
+            self.scheduler_output_sender.enqueue(scheduler_output)
+            print("dequeueing...")
+            return self.model_output_receiver.dequeue()
 
     def check_health(self) -> None:
         # GPUExecutor will always be healthy as long as

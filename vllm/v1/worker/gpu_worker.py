@@ -13,6 +13,7 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
+from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
@@ -73,7 +74,7 @@ class Worker:
             lora_config=lora_config,
         )
 
-    def initialize(self):
+    def initialize(self, scheduler_output_receiver_handle):
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -99,8 +100,32 @@ class Worker:
         init_worker_distributed_environment(self.parallel_config, self.rank,
                                             self.distributed_init_method,
                                             self.local_rank)
+
+        # Initialize MessageQueue for receiving SchedulerOutput
+        # Add 1 rank to account for driver process
+        self.scheduler_output_receiver = MessageQueue.create_from_handle(
+            scheduler_output_receiver_handle, self.rank)
+
+        # Initialize group coordinator for sending the ModelRunnerOutput back to
+        # the driver process
+        if self.rank == 0:
+            self.model_output_sender = MessageQueue(1, 1)
+        else:
+            self.model_output_sender = None
+
         # Set random seed.
         set_random_seed(self.model_config.seed)
+
+        return self.model_output_sender.export_handle(
+        ) if self.model_output_sender else None
+
+    def wait_until_ready(self):
+        print("worker waiting_until_ready")
+        self.scheduler_output_receiver.wait_until_ready()
+        print("Past wait_until_ready A")
+        if self.rank == 0:
+            self.model_output_sender.wait_until_ready()
+        print("Past wait_until_ready")
 
     def load_model(self) -> None:
         self.model_runner.load_model()
@@ -186,6 +211,15 @@ class Worker:
         output = self.model_runner.execute_model(scheduler_output)
         # TODO(woosuk): Send the output to the engine process.
         return output
+
+    @torch.inference_mode()
+    def execute_model_busy_loop(self):
+        print("Busy loop started")
+        while True:
+            scheduler_output = self.scheduler_output_receiver.dequeue()
+            output = self.model_runner.execute_model(scheduler_output)
+            if self.rank == 0:
+                self.model_output_sender.enqueue(output)
 
 
 def init_worker_distributed_environment(
