@@ -121,6 +121,9 @@ class MultiprocessingGPUExecutor:
         self.model_output_receiver.wait_until_ready()
         self._finalize_run_workers_async(wait_futures)
 
+        # Flag that's set if workers are waiting in the main execution loop
+        self.workers_in_busy_loop = False
+
         # TODO: pass in parallel_config.max_parallel_loading_workers
         self._run_workers("load_model")
 
@@ -247,13 +250,12 @@ class MultiprocessingGPUExecutor:
             return outputs[0]
         else:
             # Tell workers to start their busy loop
-            #TODO This is very stupid
-            self._run_workers_async("execute_model_busy_loop")
-            print("launched worker busy loops")
+            # TODO: Find a better way to start this loop
+            if not self.workers_in_busy_loop:
+                self._run_workers_async("execute_model_busy_loop")
+                self.workers_in_busy_loop
 
-            print("enqueueing")
             self.scheduler_output_sender.enqueue(scheduler_output)
-            print("dequeueing...")
             return self.model_output_receiver.dequeue()
 
     def check_health(self) -> None:

@@ -120,12 +120,9 @@ class Worker:
         ) if self.model_output_sender else None
 
     def wait_until_ready(self):
-        print("worker waiting_until_ready")
         self.scheduler_output_receiver.wait_until_ready()
-        print("Past wait_until_ready A")
         if self.rank == 0:
             self.model_output_sender.wait_until_ready()
-        print("Past wait_until_ready")
 
     def load_model(self) -> None:
         self.model_runner.load_model()
@@ -214,7 +211,6 @@ class Worker:
 
     @torch.inference_mode()
     def execute_model_busy_loop(self):
-        print("Busy loop started")
         while True:
             scheduler_output = self.scheduler_output_receiver.dequeue()
             output = self.model_runner.execute_model(scheduler_output)
