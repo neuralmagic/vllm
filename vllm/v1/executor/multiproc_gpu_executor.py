@@ -116,10 +116,11 @@ class MultiprocessingGPUExecutor:
             model_output_receiver_handle, 0)
 
         # Everyone must call wait_until_ready on their MessageQueues
-        wait_futures = self._run_workers_async("wait_until_ready")
+        wait_futures = self._run_workers("wait_until_ready", run_async=True)
         self.scheduler_output_sender.wait_until_ready()
         self.model_output_receiver.wait_until_ready()
-        self._finalize_run_workers_async(wait_futures)
+        for output in wait_futures:
+            output.get()
 
         # Flag that's set if workers are waiting in the main execution loop
         self.workers_in_busy_loop = False
@@ -140,7 +141,7 @@ class MultiprocessingGPUExecutor:
             distributed_init_method = get_distributed_init_method(
                 get_ip(), get_open_port())
 
-        # TODO: Nicer way to do this?
+        # The worker's device should be the one that goes with its local rank
         device_config = DeviceConfig(
             torch.device(self.device_config.device.type, local_rank))
 
@@ -164,55 +165,25 @@ class MultiprocessingGPUExecutor:
         self,
         method: str,
         *args,
+        run_async: bool = False,
         **kwargs,
     ) -> Any:
         """Runs the given method on all workers.
 
         Args:
-            async_run_tensor_parallel_workers_only: If True the method will be
-                run only in the remote TP workers, not the driver worker.
-                It will also be run asynchronously and return a list of futures
-                rather than blocking on the results.
+            run_async: If True the method will be run asynchronously and return
+            a list of futures rather than blocking on the results.
         """
 
-        # Start all remote workers first.
         worker_outputs = [
             worker.execute_method(method, *args, **kwargs)
             for worker in self.workers
         ]
 
-        # Get the results of the workers.
-        return [output.get() for output in worker_outputs]
-
-    def _run_workers_async(
-        self,
-        method: str,
-        *args,
-        **kwargs,
-    ) -> Any:
-        """Runs the given method on all workers.
-
-        Args:
-            async_run_tensor_parallel_workers_only: If True the method will be
-                run only in the remote TP workers, not the driver worker.
-                It will also be run asynchronously and return a list of futures
-                rather than blocking on the results.
-        """
-
-        # Start all remote workers first.
-        worker_futures = [
-            worker.execute_method(method, *args, **kwargs)
-            for worker in self.workers
-        ]
-        return worker_futures
-
-    def _finalize_run_workers_async(
-        self,
-        worker_futures,
-    ) -> Any:
-
-        # Get the results of the workers.
-        return [output.get() for output in worker_futures]
+        if run_async:
+            return worker_outputs
+        else:
+            return [output.get() for output in worker_outputs]
 
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
@@ -251,9 +222,9 @@ class MultiprocessingGPUExecutor:
             # Tell workers to start their busy loop
             # TODO: Find a better way to start this loop
             if not self.workers_in_busy_loop:
-                self._run_workers_async("execute_model_busy_loop")
+                self._run_workers("execute_model_busy_loop", run_async=True)
                 self.workers_in_busy_loop = True
-            
+
             self.scheduler_output_sender.enqueue(scheduler_output)
             model_output = self.model_output_receiver.dequeue()
             return model_output

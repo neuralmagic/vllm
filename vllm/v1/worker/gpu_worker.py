@@ -211,28 +211,6 @@ class Worker:
 
     @torch.inference_mode()
     def execute_model_busy_loop(self):
-        if True:
-            # Unprofiled warmup iterations
-            for i in range(5):
-                scheduler_output = self.scheduler_output_receiver.dequeue()
-                output = self.model_runner.execute_model(scheduler_output)
-                if self.rank == 0:
-                    self.model_output_sender.enqueue(output)
-
-            # Profile some iterations
-            with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                        "/home/tms/vllm/traces")) as p:
-                for i in range(5):
-                    scheduler_output = self.scheduler_output_receiver.dequeue()
-                    output = self.model_runner.execute_model(scheduler_output)
-                    if self.rank == 0:
-                        self.model_output_sender.enqueue(output)
-
         # Work for eternity
         while True:
             scheduler_output = self.scheduler_output_receiver.dequeue()
