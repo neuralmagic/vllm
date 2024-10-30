@@ -1,13 +1,14 @@
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme)
-from vllm.model_executor.parameter import ModelWeightParameter
+from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
 import torch
 from typing import List, Callable, Optional
 from compressed_tensors.compressors import ModelCompressor
 from torch.nn import Parameter
 from vllm.model_executor.layers.sparsity.utils.cusparse_2_4_utils import (
     compress_to_torch_sparse_semi_structured_mat,
-    semi_structured_sparse_dense_gemm
+    semi_structured_sparse_dense_gemm,
+    semi_structured_sparse_dense_gemm_scaled,
     )
 
 __all__ = ["CompressedTensors24"]
@@ -27,12 +28,15 @@ class CompressedTensors24(CompressedTensorsScheme):
                     params_dtype: torch.dtype, weight_loader: Callable,
                     **kwargs):
     
+        
+        # assume fp8 for now
+        weight_dtype = torch.float8_e4m3fn
 
         # packed dim is dim 1/along input dim
         weight = ModelWeightParameter(data=torch.empty(
             sum(output_partition_sizes),
             input_size_per_partition // 2,
-            dtype=torch.bfloat16),
+            dtype=weight_dtype),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader)
@@ -50,21 +54,37 @@ class CompressedTensors24(CompressedTensorsScheme):
         }
 
         meta_dtype = meta_dtype_map[weight.dtype]
+        
+        meta_input_size = (
+            input_size_per_partition // 32 
+            if meta_dtype == torch.int32
+            else input_size_per_partition // 16
+             )
 
         # meta dim changes based on dtype
         meta = ModelWeightParameter(data=torch.empty(
             sum(output_partition_sizes), 
-            input_size_per_partition // 16,
+            meta_input_size,
             dtype=meta_dtype),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader)
 
-        # per tensor quantization ---> map to channel?
-        """
-        weight_scale = torch.nn.Parameter()
-        input_scale = torch.nn.Parameter()
-        """
+        # assume per tensor static quantization
+        weight_scale = PerTensorScaleParameter(data=torch.empty(
+                len(output_partition_sizes), dtype=torch.float32),
+                                                   weight_loader=weight_loader)
+         # min requirement for fp8 kernels
+        weight_scale[:] = torch.finfo(torch.float32).min
+        layer.register_parameter("weight_scale", weight_scale)
+        
+        input_scale = PerTensorScaleParameter(data=torch.empty(
+                len(output_partition_sizes), dtype=torch.float32),
+                                                  weight_loader=weight_loader)
+        input_scale[:] = torch.finfo(torch.float32).min
+        layer.register_parameter("input_scale", input_scale)
+
+
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("meta", meta)
         
@@ -99,13 +119,18 @@ class CompressedTensors24(CompressedTensorsScheme):
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         
         weight = layer.weight_packed.data
+        input_scale = layer.input_scale.data
+        weight_scale = layer.weight_scale.data
+
 
         # apply the kernel
-        output =  semi_structured_sparse_dense_gemm(weight, x)
-
-        if bias is not None:
-            output.add_(bias) # In-place add
-        
+        output =  semi_structured_sparse_dense_gemm_scaled(
+            a_packed=weight,
+            b_dense=x,
+            scale_a=weight_scale,
+            scale_b=input_scale,
+            bias=bias
+        )        
         return output.t().contiguous()
 
 
