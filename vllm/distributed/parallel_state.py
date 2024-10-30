@@ -392,8 +392,12 @@ class GroupCoordinator:
             # Convert negative dim to positive.
             dim += input_.dim()
         input_size = input_.size()
+        # NOTE: we have to use concat-style all-gather here,
+        # stack-style all-gather has compatibility issues with
+        # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
+        output_size = (input_size[0] * world_size, ) + input_size[1:]
         # Allocate output tensor.
-        output_tensor = torch.empty((world_size, ) + input_size,
+        output_tensor = torch.empty(output_size,
                                     dtype=input_.dtype,
                                     device=input_.device)
         # All-gather.
@@ -401,6 +405,7 @@ class GroupCoordinator:
                                                  input_,
                                                  group=self.device_group)
         # Reshape
+        output_tensor = output_tensor.reshape((world_size, ) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(input_size[:dim] +
                                               (world_size *
@@ -426,6 +431,28 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+        # For xpu path, gather doesn't work properly together with ray
+        # cluster so we use all_gather instead for now.
+        if current_platform.is_xpu():
+            input_size = input_.size()
+            # Allocate output tensor.
+            output_tensor = torch.empty((world_size, ) + input_size,
+                                        dtype=input_.dtype,
+                                        device=input_.device)
+            # All-gather.
+            torch.distributed.all_gather_into_tensor(output_tensor,
+                                                     input_,
+                                                     group=self.device_group)
+            if self.rank_in_group == dst:
+                # Reshape
+                output_tensor = output_tensor.movedim(0, dim)
+                output_tensor = output_tensor.reshape(input_size[:dim] +
+                                                      (world_size *
+                                                       input_size[dim], ) +
+                                                      input_size[dim + 1:])
+            else:
+                output_tensor = None
+            return output_tensor
         # Allocate output tensor.
         if self.rank_in_group == dst:
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]

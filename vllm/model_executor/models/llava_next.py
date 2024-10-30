@@ -11,7 +11,7 @@ from transformers.models.llava_next.modeling_llava_next import (
 from typing_extensions import NotRequired
 
 from vllm.attention import AttentionMetadata
-from vllm.config import CacheConfig, MultiModalConfig
+from vllm.config import CacheConfig, MultiModalConfig, PoolerConfig
 from vllm.inputs import INPUT_REGISTRY, DecoderOnlyInputs, InputContext
 from vllm.model_executor.layers.pooler import Pooler, PoolingType
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -32,9 +32,6 @@ from .siglip import (SiglipVisionModel, dummy_image_for_siglip,
                      get_siglip_patch_grid_length, input_processor_for_siglip)
 from .utils import (AutoWeightsLoader, embed_multimodal, flatten_bn,
                     init_vllm_registered_model)
-
-# Result in the max possible feature size (2x2 grid of 336x336px tiles)
-MAX_IMAGE_FEATURE_SIZE_HEIGHT = MAX_IMAGE_FEATURE_SIZE_WIDTH = 448
 
 
 class LlavaNextImagePixelInputs(TypedDict):
@@ -149,11 +146,28 @@ def get_llava_next_image_feature_size(
 
 
 def get_max_llava_next_image_tokens(ctx: InputContext):
-    return get_llava_next_image_feature_size(
-        ctx.get_hf_config(LlavaNextConfig),
-        input_height=MAX_IMAGE_FEATURE_SIZE_HEIGHT,
-        input_width=MAX_IMAGE_FEATURE_SIZE_WIDTH,
-    )
+    """Compute the max feature size for all possible image grid pinpoints."""
+    return _get_pinpoint_with_largest_features(ctx)[0]
+
+
+def _get_pinpoint_with_largest_features(
+        ctx: InputContext) -> Tuple[int, Tuple[int, int]]:
+    """Get the grid pinpoint with the largest features & its feature size."""
+    hf_config = ctx.get_hf_config(LlavaNextConfig)
+    largest_feature_size = 0
+    largest_feature_pinpoint = None
+    for (height, width) in hf_config.image_grid_pinpoints:
+        feat_size = get_llava_next_image_feature_size(
+            hf_config,
+            input_height=height,
+            input_width=width,
+        )
+        if feat_size > largest_feature_size:
+            largest_feature_size = feat_size
+            largest_feature_pinpoint = (height, width)
+    if not largest_feature_size or largest_feature_pinpoint is None:
+        raise ValueError("Cannot have a largest feature size of 0!")
+    return largest_feature_size, largest_feature_pinpoint
 
 
 def dummy_data_for_llava_next(ctx: InputContext, seq_len: int,
@@ -162,7 +176,8 @@ def dummy_data_for_llava_next(ctx: InputContext, seq_len: int,
     vision_config = hf_config.vision_config
     num_images = mm_counts["image"]
 
-    image_feature_size = get_max_llava_next_image_tokens(ctx)
+    image_feature_size, pinpoint = _get_pinpoint_with_largest_features(ctx)
+    max_feat_height, max_feat_width = pinpoint
 
     if isinstance(vision_config, CLIPVisionConfig):
         seq_data = dummy_seq_data_for_clip(
@@ -176,8 +191,8 @@ def dummy_data_for_llava_next(ctx: InputContext, seq_len: int,
         mm_data = dummy_image_for_clip(
             vision_config,
             num_images,
-            image_width_override=MAX_IMAGE_FEATURE_SIZE_WIDTH,
-            image_height_override=MAX_IMAGE_FEATURE_SIZE_HEIGHT,
+            image_width_override=max_feat_width,
+            image_height_override=max_feat_height,
         )
 
         return seq_data, mm_data
@@ -193,8 +208,8 @@ def dummy_data_for_llava_next(ctx: InputContext, seq_len: int,
         mm_data = dummy_image_for_siglip(
             vision_config,
             num_images,
-            image_width_override=MAX_IMAGE_FEATURE_SIZE_WIDTH,
-            image_height_override=MAX_IMAGE_FEATURE_SIZE_HEIGHT,
+            image_width_override=max_feat_width,
+            image_height_override=max_feat_height,
         )
 
         return seq_data, mm_data
@@ -270,14 +285,19 @@ class LlavaNextForConditionalGeneration(nn.Module, SupportsMultiModal,
                  config: LlavaNextConfig,
                  multimodal_config: MultiModalConfig,
                  cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None) -> None:
+                 quant_config: Optional[QuantizationConfig] = None,
+                 pooler_config: Optional[PoolerConfig] = None) -> None:
         super().__init__()
 
         self.config = config
         self.multimodal_config = multimodal_config
 
         # TODO: Optionally initializes this for supporting embeddings.
-        self.vision_tower = init_vision_tower_for_llava(config, quant_config)
+        self.vision_tower = init_vision_tower_for_llava(
+            config,
+            quant_config,
+            require_post_norm=False,
+            prefix="vision_tower")
         self.image_newline = nn.Parameter(
             torch.empty(config.text_config.hidden_size))
         self.multi_modal_projector = LlavaMultiModalProjector(
@@ -286,12 +306,18 @@ class LlavaNextForConditionalGeneration(nn.Module, SupportsMultiModal,
             projector_hidden_act=config.projector_hidden_act)
 
         self.language_model = init_vllm_registered_model(
-            config.text_config, cache_config, quant_config)
+            config.text_config,
+            cache_config,
+            quant_config,
+            prefix="language_model")
 
         # The same model class supports both language generation and embedding
         # because the architecture name is the same
-        self._pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
+        self._pooler = Pooler.from_config_with_defaults(
+            pooler_config,
+            pooling_type=PoolingType.LAST,
+            normalize=True,
+            softmax=False)
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors)
 
