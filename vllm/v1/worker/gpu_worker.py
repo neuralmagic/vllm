@@ -74,7 +74,7 @@ class Worker:
             lora_config=lora_config,
         )
 
-    def initialize(self, scheduler_output_receiver_handle):
+    def initialize(self, scheduler_output_receiver_handle=None):
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
             # the synchronization point. This causes the memory usage to grow
@@ -101,23 +101,25 @@ class Worker:
                                             self.distributed_init_method,
                                             self.local_rank)
 
-        # Initialize MessageQueue for receiving SchedulerOutput
-        # Add 1 rank to account for driver process
-        self.scheduler_output_receiver = MessageQueue.create_from_handle(
-            scheduler_output_receiver_handle, self.rank)
-
-        # Initialize group coordinator for sending the ModelRunnerOutput back to
-        # the driver process
-        if self.rank == 0:
-            self.model_output_sender = MessageQueue(1, 1)
-        else:
-            self.model_output_sender = None
-
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
-        return self.model_output_sender.export_handle(
-        ) if self.model_output_sender else None
+        # Set up message queues if given a message queue handle
+        if scheduler_output_receiver_handle is not None:
+            # Initialize MessageQueue for receiving SchedulerOutput
+            # Add 1 rank to account for driver process
+            self.scheduler_output_receiver = MessageQueue.create_from_handle(
+                scheduler_output_receiver_handle, self.rank)
+
+            # Initialize group coordinator for sending the ModelRunnerOutput
+            # to the driver process
+            if self.rank == 0:
+                self.model_output_sender = MessageQueue(1, 1)
+            else:
+                self.model_output_sender = None
+
+            return self.model_output_sender.export_handle(
+            ) if self.model_output_sender else None
 
     def wait_until_ready(self):
         self.scheduler_output_receiver.wait_until_ready()
