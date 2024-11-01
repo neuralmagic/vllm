@@ -219,6 +219,7 @@ class Worker:
             output = self.model_runner.execute_model(scheduler_output)
             if self.rank == 0:
                 self.model_output_sender.enqueue(output)
+        
 
 
 def init_worker_distributed_environment(

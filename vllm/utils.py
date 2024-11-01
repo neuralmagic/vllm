@@ -32,6 +32,7 @@ import torch
 import torch.types
 import yaml
 from packaging.version import Version
+from torch.library import Library
 from typing_extensions import ParamSpec, TypeIs, assert_never
 
 import vllm.envs as envs
@@ -1512,3 +1513,30 @@ def weak_ref_tensors(
     if isinstance(tensors, tuple):
         return tuple(weak_ref_tensor(t) for t in tensors)
     raise ValueError("Invalid type for tensors")
+
+
+vllm_lib = Library("vllm", "FRAGMENT")
+
+
+def direct_register_custom_op(
+    library_name: str,
+    op_name: str,
+    op_func: Callable,
+    mutates_args: List[str],
+    fake_impl: Optional[Callable] = None,
+):
+    """
+    `torch.library.custom_op` can have significant overhead because it
+    needs to consider complicated dispatching logic. This function
+    directly registers a custom op and dispatches it to the CUDA backend.
+    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
+    for more details.
+    """
+    schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    # FIXME after https://github.com/pytorch/pytorch/issues/139444 is resolved
+    assert library_name == "vllm"
+    my_lib = vllm_lib
+    my_lib.define(op_name + schema_str)
+    my_lib.impl(op_name, op_func, "CUDA")
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)

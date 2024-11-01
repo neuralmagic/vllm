@@ -334,7 +334,7 @@ class MessageQueue:
                     # we need to wait until it is read by all readers
 
                     # wait for a while
-                    time.sleep(RINGBUFFER_SLEEP_INTERVAL)
+#                    time.sleep(RINGBUFFER_SLEEP_INTERVAL)
 
                     # if we wait for a long time, we should warn the user
                     if (time.monotonic() - start_time >
@@ -388,7 +388,7 @@ class MessageQueue:
                     # we need to wait until it is written
 
                     # wait for a while
-                    time.sleep(RINGBUFFER_SLEEP_INTERVAL)
+#                    time.sleep(RINGBUFFER_SLEEP_INTERVAL)
 
                     # if we wait for a long time, we should warn the user
                     if (time.monotonic() - start_time >

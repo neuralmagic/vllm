@@ -214,20 +214,14 @@ class MultiprocessingGPUExecutor:
         self,
         scheduler_output,
     ) -> ModelRunnerOutput:
-        if False:
-            # Simple functioning execution
-            outputs = self._run_workers("execute_model", scheduler_output)
-            return outputs[0]
-        else:
-            # Tell workers to start their busy loop
-            # TODO: Find a better way to start this loop
-            if not self.workers_in_busy_loop:
-                self._run_workers("execute_model_busy_loop", run_async=True)
-                self.workers_in_busy_loop = True
+        # TODO: Find a better way to start this loop
+        if not self.workers_in_busy_loop:
+            self._run_workers("execute_model_busy_loop", run_async=True)
+            self.workers_in_busy_loop = True
 
-            self.scheduler_output_sender.enqueue(scheduler_output)
-            model_output = self.model_output_receiver.dequeue()
-            return model_output
+        self.scheduler_output_sender.enqueue(scheduler_output)
+        model_output = self.model_output_receiver.dequeue()
+        return model_output
 
     def check_health(self) -> None:
         # GPUExecutor will always be healthy as long as

@@ -327,8 +327,7 @@ class GPUModelRunner:
         )
 
         # NOTE: CPU-GPU synchronization happens here.
-        sampled_token_ids = sampler_output.sampled_token_ids.cpu()
-        sampled_token_ids_list = sampled_token_ids.tolist()
+        sampled_token_ids = sampler_output.sampled_token_ids
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
         num_reqs = self.input_batch.num_reqs
@@ -339,7 +338,7 @@ class GPUModelRunner:
             assert seq_len <= req_state.num_tokens
             if seq_len == req_state.num_tokens:
                 # Append the sampled token to the output token ids.
-                token_id = sampled_token_ids_list[i]
+                token_id = sampled_token_ids[i]
                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
                 req_state.output_token_ids.append(token_id)
             else:
