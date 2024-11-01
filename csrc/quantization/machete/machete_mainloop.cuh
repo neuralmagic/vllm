@@ -171,7 +171,8 @@ struct MacheteCollectiveMma {
       make_shape(size<0>(TileShape_MNK{}), size<2>(TileShape_MNK{}),
                  Int<DispatchPolicy::Stages>{})));
 
-  using SmemLayoutACopy = decltype(GmemLayoutA::TVbNbKL_to_offset_copy(
+  // ((CPY_256, CPY_B), (BlocksN, BlocksK), L) -> offset
+  using SmemLayoutACopy = decltype(GmemLayoutA::TVbNbKL_to_offset_tma_copy(
       make_shape(size<0>(TileShape_MNK{}), size<2>(TileShape_MNK{}),
                  Int<DispatchPolicy::Stages>{})));
 
@@ -425,12 +426,13 @@ struct MacheteCollectiveMma {
   // clang-format on
 
   // ((athrid, val), (BlocksM, BlockK), L) -> (storage_idx)
-  using PrepackedStrideA = decltype(stride(GmemLayoutA::TVbNbKL_to_offset_copy(
-      make_shape(int32_t(0), int32_t(0), int32_t(0)))));
+  using PrepackedStrideA =
+      decltype(stride(GmemLayoutA::TVbNbKL_to_offset_tma_copy(
+          make_shape(int32_t(0), int32_t(0), int32_t(0)))));
 
   using ATensor = decltype(make_tensor(
       get_logical_ptr(static_cast<InternalElementA const*>(nullptr)),
-      shape(GmemLayoutA::TVbNbKL_to_offset_copy(
+      shape(GmemLayoutA::TVbNbKL_to_offset_tma_copy(
           make_shape(int32_t(0), int32_t(0), int32_t(0)))),
       PrepackedStrideA{}));
 
@@ -581,7 +583,7 @@ struct MacheteCollectiveMma {
     typename Params::TMA_Scale tma_load_scale;
     typename Params::TMA_Zero tma_load_zero;
 
-    auto layout = GmemLayoutA::TVbNbKL_to_offset_copy(make_shape(M, K, L));
+    auto layout = GmemLayoutA::TVbNbKL_to_offset_tma_copy(make_shape(M, K, L));
     tma_load_a = make_tma_copy_A(
         make_logical_tensor(ptr_A, shape(layout), stride(layout)));
 
@@ -719,7 +721,7 @@ struct MacheteCollectiveMma {
     // (TILE_V,TILE_B,m,k,l)
     auto make_gA_mkl = [&]() {
       // ((athrid, val), (BlocksM, BlockK), L) -> (storage_idx)
-      auto layout = GmemLayoutA::TVbNbKL_to_offset_copy(make_shape(M, K, L));
+      auto layout = GmemLayoutA::TVbNbKL_to_offset_tma_copy(make_shape(M, K, L));
       Tensor mA_mkl = mainloop_params.tma_load_a.get_tma_tensor(shape(layout));
       return local_tile(mA_mkl,
                         make_shape(size<0>(layout), PPBlocksPerTile_MK{}),

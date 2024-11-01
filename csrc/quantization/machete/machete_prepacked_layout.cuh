@@ -183,13 +183,22 @@ struct PrepackedLayoutBTemplate {
     return group<1, 3>(result(_, repeat<rank<1>(result)>(_)));
   }
 
-  // ((athrid_val), (BlocksN, BlocksK, L)) -> (N, K, L)
+  // ((CPY_256, CPY_B), (BlocksN, BlocksK), L) -> offset
+  // For the TMA we don't actually care about the (athrid, val) part (i.e. mode
+  // 0 of) of `TVbNbKL_to_offset` layout since we know that block is contiguous
+  // in memory and we want to copy it in its entirety. So we instead replace
+  // this portion of the layout with 256xN col major layout since the TMAs max
+  // block size for a single dim is 256, this results in a more efficient copy
+  // since the TMA just sees contiguous vectors of 256.
   template <typename Shape_NKL>
-  CUTE_HOST_DEVICE static constexpr auto TVbNbKL_to_offset_copy(
+  CUTE_HOST_DEVICE static constexpr auto TVbNbKL_to_offset_tma_copy(
       Shape_NKL shape_mkl) {
     auto layout = TVbNbKL_to_offset(shape_mkl);
-    return make_layout(coalesce(get<0>(layout)), get<1>(layout),
-                       get<2>(layout));
+    static_assert(size<0>(layout) % 256 == 0);
+    static_assert(size<0>(layout) / 256 <= 256);
+    return make_layout(
+        make_layout(make_shape(_256{}, Int<size<0>(layout) / 256>{})),
+        get<1>(layout), get<2>(layout));
   }
 
   // ((BlockN, BlockK), (BlocksN, BlocksK), L) -> (storage_idx)
