@@ -1,6 +1,5 @@
 import time
-from typing import (Any, Dict, Iterable, List, Mapping, Optional, Tuple, Type,
-                    Union)
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from vllm.config import (DecodingConfig, EngineConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig)
@@ -33,7 +32,7 @@ class LLMEngine:
     def __init__(
         self,
         vllm_config: EngineConfig,
-        executor_class: Type[GPUExecutor],
+        executor_class,# : Type[GPUExecutor],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
@@ -478,7 +477,18 @@ class LLMEngine:
 
     @classmethod
     def _get_executor_cls(cls, engine_config: EngineConfig):
-        return GPUExecutor
+        distributed_executor_backend = (
+            engine_config.parallel_config.distributed_executor_backend)
+        if distributed_executor_backend == "mp":
+            from vllm.v1.executor.multiproc_gpu_executor import (
+                MultiprocessingGPUExecutor)
+            executor_class = MultiprocessingGPUExecutor
+        else:
+            assert (distributed_executor_backend is None)
+            from vllm.v1.executor.gpu_executor import GPUExecutor
+            executor_class = GPUExecutor
+
+        return executor_class 
 
     def is_tracing_enabled(self) -> bool:
         return False
