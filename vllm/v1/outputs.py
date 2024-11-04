@@ -4,7 +4,6 @@ from typing import Dict, List, Optional
 import torch
 
 
-
 @dataclass
 class SamplerOutput:
 
@@ -19,6 +18,7 @@ class SamplerOutput:
     # TODO: Support prompt logprobs.
     prompt_logprob_token_ids: Optional[torch.Tensor]
     prompt_logprobs: Optional[torch.Tensor]
+
 
 # ModelRunnerOutput is pickeled and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use List instead.

@@ -4,10 +4,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
-                         ModelConfig, ObservabilityConfig, ParallelConfig,
-                         PromptAdapterConfig, SchedulerConfig,
-                         SpeculativeConfig)
+from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.executor.multiproc_worker_utils import (ProcessWorkerWrapper,
                                                   ResultHandler, WorkerMonitor)
@@ -16,36 +13,25 @@ from vllm.triton_utils import maybe_set_triton_cache_manager
 from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
                         get_vllm_instance_id)
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.gpu_worker import Worker
+from vllm.v1.worker.gpu_worker import MultiprocessingWorker
 
 logger = init_logger(__name__)
 
 
 class MultiprocessingGPUExecutor:
 
-    def __init__(
-        self,
-        model_config: ModelConfig,
-        cache_config: CacheConfig,
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
-        device_config: DeviceConfig,
-        load_config: LoadConfig,
-        lora_config: Optional[LoRAConfig],
-        speculative_config: Optional[SpeculativeConfig],
-        prompt_adapter_config: Optional[PromptAdapterConfig],
-        observability_config: Optional[ObservabilityConfig],
-    ) -> None:
-        self.model_config = model_config
-        self.cache_config = cache_config
-        self.lora_config = lora_config
-        self.load_config = load_config
-        self.parallel_config = parallel_config
-        self.scheduler_config = scheduler_config
-        self.device_config = device_config
-        self.speculative_config = speculative_config
-        self.prompt_adapter_config = prompt_adapter_config
-        self.observability_config = observability_config
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.lora_config = vllm_config.lora_config
+        self.load_config = vllm_config.load_config
+        self.parallel_config = vllm_config.parallel_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.device_config = vllm_config.device_config
+        self.speculative_config = vllm_config.speculative_config
+        self.prompt_adapter_config = vllm_config.prompt_adapter_config
+        self.observability_config = vllm_config.observability_config
 
         world_size = self.parallel_config.world_size
         tensor_parallel_size = self.parallel_config.tensor_parallel_size
@@ -107,16 +93,22 @@ class MultiprocessingGPUExecutor:
         result_handler.start()
         self.worker_monitor.start()
 
+        self._run_workers("initialize")
+        self._run_workers("load_model")
+
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
         self.scheduler_output_sender = MessageQueue(world_size, world_size)
         model_output_receiver_handle = self._run_workers(
-            "initialize", self.scheduler_output_sender.export_handle())[0]
+            "initialize_message_queues",
+            self.scheduler_output_sender.export_handle())[0]
         self.model_output_receiver = MessageQueue.create_from_handle(
             model_output_receiver_handle, 0)
 
-        # Everyone must call wait_until_ready on their MessageQueues
-        wait_futures = self._run_workers("wait_until_ready", run_async=True)
+        # Message queues are not valid until all readers and writers call
+        # wait_until_ready()
+        wait_futures = self._run_workers("finish_message_queue_initialization",
+                                         run_async=True)
         self.scheduler_output_sender.wait_until_ready()
         self.model_output_receiver.wait_until_ready()
         for output in wait_futures:
@@ -125,14 +117,12 @@ class MultiprocessingGPUExecutor:
         # Flag that's set if workers are waiting in the main execution loop
         self.workers_in_busy_loop = False
 
-        # TODO: pass in parallel_config.max_parallel_loading_workers
-        self._run_workers("load_model")
-
     def _create_worker(
-            self,
-            local_rank: int = 0,
-            rank: int = 0,
-            distributed_init_method: Optional[str] = None) -> Worker:
+        self,
+        local_rank: int = 0,
+        rank: int = 0,
+        distributed_init_method: Optional[str] = None
+    ) -> MultiprocessingWorker:
         """Return worker init args for a given rank."""
         # see https://github.com/NVIDIA/nccl/issues/1234
         os.environ['NCCL_CUMEM_ENABLE'] = '0'
@@ -141,24 +131,11 @@ class MultiprocessingGPUExecutor:
             distributed_init_method = get_distributed_init_method(
                 get_ip(), get_open_port())
 
-        # The worker's device should be the one that goes with its local rank
-        device_config = DeviceConfig(
-            torch.device(self.device_config.device.type, local_rank))
-
-        return Worker(
-            model_config=self.model_config,
-            parallel_config=self.parallel_config,
-            scheduler_config=self.scheduler_config,
-            device_config=device_config,
-            cache_config=self.cache_config,
-            load_config=self.load_config,
+        return MultiprocessingWorker(
+            vllm_config=self.vllm_config,
             local_rank=local_rank,
             rank=rank,
             distributed_init_method=distributed_init_method,
-            lora_config=self.lora_config,
-            speculative_config=self.speculative_config,
-            prompt_adapter_config=self.prompt_adapter_config,
-            observability_config=self.observability_config,
         )
 
     def _run_workers(

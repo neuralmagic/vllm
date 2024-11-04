@@ -20,7 +20,6 @@ from vllm.transformers_utils.tokenizer_group import (
     BaseTokenizerGroup, init_tokenizer_from_configs)
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.core.scheduler import Scheduler
-from vllm.v1.executor.gpu_executor import GPUExecutor
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.tokenizer.detokenizer import Detokenizer, DetokenizerInputs
 from vllm.version import __version__ as VLLM_VERSION
@@ -33,7 +32,7 @@ class LLMEngine:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        executor_class,#: Type[GPUExecutor],
+        executor_class,  #: Type[GPUExecutor],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
@@ -477,8 +476,7 @@ class LLMEngine:
         return self.lora_config
 
     @classmethod
-<<<<<<< HEAD
-    def _get_executor_cls(cls, engine_config: EngineConfig):
+    def _get_executor_cls(cls, engine_config: VllmConfig):
         distributed_executor_backend = (
             engine_config.parallel_config.distributed_executor_backend)
         if distributed_executor_backend == "mp":
@@ -490,11 +488,7 @@ class LLMEngine:
             from vllm.v1.executor.gpu_executor import GPUExecutor
             executor_class = GPUExecutor
 
-        return executor_class 
-=======
-    def _get_executor_cls(cls, engine_config: VllmConfig):
-        return GPUExecutor
->>>>>>> main
+        return executor_class
 
     def is_tracing_enabled(self) -> bool:
         return False
