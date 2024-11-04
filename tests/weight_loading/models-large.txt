@@ -1,5 +1,12 @@
 compressed-tensors, nm-testing/Mixtral-8x7B-Instruct-v0.1-W4A16-quantized, main
 compressed-tensors, nm-testing/Mixtral-8x7B-Instruct-v0.1-W4A16-channel-quantized, main
 compressed-tensors, nm-testing/Mixtral-8x7B-Instruct-v0.1-W8A16-quantized, main
+compressed-tensors, neuralmagic/Phi-3-medium-128k-instruct-quantized.w4a16, main
+compressed-tensors, mgoin/DeepSeek-Coder-V2-Lite-Instruct-FP8, main
 gptq_marlin, TheBloke/Mixtral-8x7B-v0.1-GPTQ, main
+awq, casperhansen/mixtral-instruct-awq, main
+awq_marlin, casperhansen/mixtral-instruct-awq, main
 awq_marlin, casperhansen/deepseek-coder-v2-instruct-awq, main
+fp8, neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV, main
+qqq, HandH1998/QQQ-Llama-3-8b-g128, main
+qqq, HandH1998/QQQ-Llama-3-8b, main
