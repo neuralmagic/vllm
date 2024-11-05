@@ -102,7 +102,7 @@ def semi_structured_dense_sparse_T_gemm(a_dense: torch.Tensor,
     Returns:
         torch.Tensor - Result of matrix multiplication.
     '''
-    return (semi_structured_sparse_dense_gemm(b_T_packed, a_dense.t().contiguous(), bias)).t().contiguous()
+    return (semi_structured_sparse_dense_gemm(b_T_packed, a_dense.t(), bias)).t()
 
 
 def semi_structured_sparse_dense_gemm_scaled(a_packed: torch.Tensor,
