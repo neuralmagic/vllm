@@ -208,13 +208,33 @@ class MultiprocessingWorker:
         if self.worker.rank == 0:
             self.model_output_sender.wait_until_ready()
 
-    # Work for eternity
+    # Main busy loop for Multiprocessing Workers
     def execute_model_busy_loop(self):
-        while True:
-            scheduler_output = self.scheduler_output_receiver.dequeue()
-            output = self.worker.execute_model(scheduler_output)
-            if self.worker.rank == 0:
-                self.model_output_sender.enqueue(output)
+        with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=1000,  # Wait 1000 steps so we profile middle iters
+                    warmup=10,  # Warm up the scheduler
+                    active=3,  # Run a small number of steps so it's legible
+                    repeat=1,
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    "./traces/",
+                    worker_name=f"worker_{self.worker.rank}",
+                ),
+                with_stack=True,
+        ) as p:
+
+            while True:
+                scheduler_output = self.scheduler_output_receiver.dequeue()
+                output = self.worker.execute_model(scheduler_output)
+                if self.worker.rank == 0:
+                    self.model_output_sender.enqueue(output)
+
+                p.step()
 
     # Wrapper methods defined here
     def initialize(self):
