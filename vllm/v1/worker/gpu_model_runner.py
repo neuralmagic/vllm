@@ -330,7 +330,6 @@ class GPUModelRunner:
             sampling_metadata=sampling_metadata,
         )
 
-        # NOTE: CPU-GPU synchronization happens here.
         sampled_token_ids = sampler_output.sampled_token_ids
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
