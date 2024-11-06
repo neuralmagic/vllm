@@ -392,6 +392,20 @@ class ModelConfig:
                     f"method specified in the `quantization` argument "
                     f"({self.quantization}).")
 
+        from vllm.model_executor.layers.quantization.mx_quant import (
+            SUPPORTED_MX_CONFIGS)
+        if self.quantization is not None and self.quantization in \
+            SUPPORTED_MX_CONFIGS:
+            dtypes = self.quantization.split("_")
+            # remove 'w' and 'a' prefix
+            weight_dtype = dtypes[0][1:]
+            act_dtype = None if len(dtypes) == 1 else dtypes[1][1:]
+            self.hf_config.quantization_config = {
+                "weight_dtype": weight_dtype,
+                "act_dtype": act_dtype,
+                "quant_method": self.quantization,
+            }
+
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(
