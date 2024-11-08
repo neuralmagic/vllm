@@ -40,12 +40,6 @@ WEIGHT_SHAPES = {
         ([8192, 57344], 1),
         ([28672, 8192], 0),
     ],
-    "meta-llama/Llama-3.1-405b-hf": [
-        ([16384, 18432], 1),
-        ([16384, 16384], 0),
-        ([16384, 106496], 1),
-        ([53248, 16384], 0),
-    ]
     "meta-llama/Llama-2-70b-tp4-hf": [([8192, 2560], None), ([2048,
                                                               8192], None),
                                       ([8192, 14336], None),
@@ -72,7 +66,7 @@ WEIGHT_SHAPES = {
     # Ns : [2560, 4096, 5120, 6144, 8192, 12288, 14336, 15360,
     #         22016, 27648, 28672]
     "llama-representative-set": [
-        ([4096, 4096], None),  # small K, small N
+        # ([4096, 4096], None),  # small K, small N
         ([4096, 8192], None),  # small K, medium N
         ([4096, 22016], None),  # small K, large N
         ([14336, 4096], None),  # large K, small N

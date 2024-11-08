@@ -1,17 +1,5 @@
-// clang-format will break include orders
-// clang-format off
-#include <cudaTypedefs.h>
-
-#if defined CUDA_VERSION && CUDA_VERSION >= 12000
-
+#include <stddef.h>
 #include <torch/all.h>
-
-#include <ATen/cuda/CUDAContext.h>
-
-#include <iostream>
-#include <sstream>
-#include <vector>
-
 #include "cutlass/cutlass.h"
 
 #include "cute/tensor.hpp"
@@ -25,6 +13,7 @@
 
 #include "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
 #include "common.hpp"
+#include "scaled_mm_c3x.cuh"
 // clang-format on
 
 using namespace cute;
@@ -450,4 +439,75 @@ void cutlass_scaled_mm_azp_sm90(torch::Tensor& out, torch::Tensor const& a,
   }
 }
 
-#endif
+// hyper-parameter sweep kernels
+
+void cutlass_scaled_mm_sm90_dispatch(torch::Tensor& out, torch::Tensor const& a,
+                                     torch::Tensor const& b,
+                                     torch::Tensor const& a_scales,
+                                     torch::Tensor const& b_scales,
+                                     c10::optional<torch::Tensor> const& bias) {
+  assert(!bias);
+
+  TORCH_CHECK(a_scales.dtype() == torch::kFloat32);
+  TORCH_CHECK(b_scales.dtype() == torch::kFloat32);
+
+  using KernelSchedule = typename cutlass::gemm::KernelTmaWarpSpecialized;
+  using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
+  using TileShape = Shape<_64, _128, _256>;
+  using ClusterShape = Shape<_1, _4, _1>;
+  using AccType = float;
+
+  if (out.dtype() == torch::kBFloat16) {
+    using Cutlass3xGemm =
+        cutlass_3x_gemm<cutlass::float_e4m3_t, cutlass::bfloat16_t,
+                        ScaledEpilogue, TileShape, ClusterShape, KernelSchedule,
+                        EpilogueSchedule, AccType,
+                        cutlass::gemm::PersistentScheduler,
+                        cutlass::gemm::GemmUniversalMode::kGemm>;
+
+    return cutlass_gemm_caller<Cutlass3xGemm>(out, a, b, a_scales, b_scales);
+
+  } else {
+    TORCH_CHECK(out.dtype() == torch::kFloat16);
+
+    using Cutlass3xGemm =
+        cutlass_3x_gemm<cutlass::float_e4m3_t, cutlass::half_t, ScaledEpilogue,
+                        TileShape, ClusterShape, KernelSchedule,
+                        EpilogueSchedule, AccType,
+                        cutlass::gemm::PersistentScheduler,
+                        cutlass::gemm::GemmUniversalMode::kGemm>;
+
+    return cutlass_gemm_caller<Cutlass3xGemm>(out, a, b, a_scales, b_scales);
+  }
+}
+
+void cutlass_simple_gemm_sm90_dispatch(torch::Tensor& out,
+                                       torch::Tensor const& a,
+                                       torch::Tensor const& b) {
+  using KernelSchedule = typename cutlass::gemm::KernelTmaWarpSpecialized;
+  using EpilogueSchedule = typename cutlass::epilogue::TmaWarpSpecialized;
+  using TileShape = Shape<_64, _128, _256>;
+  using ClusterShape = Shape<_1, _4, _1>;
+  using AccType = float;
+
+  if (out.dtype() == torch::kBFloat16) {
+    using Cutlass3xGemm =
+        cutlass_3x_simple_gemm<cutlass::float_e4m3_t, cutlass::bfloat16_t,
+                               TileShape, ClusterShape, KernelSchedule, AccType,
+                               cutlass::gemm::PersistentScheduler,
+                               cutlass::gemm::GemmUniversalMode::kGemm>;
+
+    return cutlass_simple_gemm_caller<Cutlass3xGemm>(out, a, b);
+
+  } else {
+    TORCH_CHECK(out.dtype() == torch::kFloat16);
+
+    using Cutlass3xGemm =
+        cutlass_3x_simple_gemm<cutlass::float_e4m3_t, cutlass::half_t,
+                               TileShape, ClusterShape, KernelSchedule, AccType,
+                               cutlass::gemm::PersistentScheduler,
+                               cutlass::gemm::GemmUniversalMode::kGemm>;
+
+    return cutlass_simple_gemm_caller<Cutlass3xGemm>(out, a, b);
+  }
+}
