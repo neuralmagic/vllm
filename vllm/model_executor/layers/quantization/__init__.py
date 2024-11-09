@@ -24,6 +24,8 @@ from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
 from vllm.model_executor.layers.quantization.ipex_quant import IPEXConfig
 from vllm.model_executor.layers.quantization.marlin import MarlinConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
+from vllm.model_executor.layers.quantization.mx_quant import (
+    SUPPORTED_MX_CONFIGS, MXConfig)
 from vllm.model_executor.layers.quantization.neuron_quant import (
     NeuronQuantConfig)
 from vllm.model_executor.layers.quantization.qqq import QQQConfig
@@ -51,6 +53,9 @@ QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "experts_int8": ExpertsInt8Config,
     "neuron_quant": NeuronQuantConfig,
     "ipex": IPEXConfig,
+    # Aliases for the different MX quant configs
+    **{config: MXConfig
+       for config in SUPPORTED_MX_CONFIGS},
 }
 
 
