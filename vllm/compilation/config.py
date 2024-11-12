@@ -6,10 +6,35 @@ from pydantic import BaseModel, Field, PrivateAttr
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.utils import print_warning_once
 
 from .compile_context import get_compile_context
 
 logger = init_logger(__name__)
+
+
+class PassConfig(BaseModel):
+    """
+    Configuration for custom Inductor passes.
+    This is separate from general CompilationConfig so that inductor passes
+    don't all have access to full configuration - that would create a cycle
+    as the PassManager is set as a property of config.
+    - dump_graph_stages: list of stages for which we want to dump the graph.
+        Each pass defines its own stages (before, after, maybe in-between).
+    - dump_graph_dir: directory to dump the graphs. Default is .
+    - enable_fusion: whether to enable the custom fusion pass.
+        TODO better pass enabling system.
+    """
+    dump_graph_stages: List[str] = Field(default_factory=list)
+    dump_graph_dir: Path = Field(default=Path("."))
+    enable_fusion: bool = True
+    enable_reshape: bool = True
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.enable_reshape and self.enable_fusion:
+            print_warning_once(
+                "Fusion enabled but reshape elimination disabled."
+                "RMSNorm + quant (fp8) fusion might not work")
 
 
 class CompilationConfig(BaseModel):
@@ -57,12 +82,8 @@ class CompilationConfig(BaseModel):
             from Python, functions can also be passed directly via Python object
             constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`
     - Custom inductor passes:
-        - dump_graph_stages: list of stages for which we want to dump the graph.
-            Each pass defines its own stages (before, after, maybe in-between).
-        - dump_graph_dir: directory to dump the graph. Default is .
-        - enable_fusion: whether to enable the custom fusion pass.
-            TODO better pass enabling system.
-    
+        - pass_config: see PassConfig for details.
+
     Why we have different sizes for cudagraph and inductor:
     - cudagraph: a cudagraph captured for a specific size can only be used
         for the same size. We need to capture all the sizes we want to use.
@@ -85,9 +106,7 @@ class CompilationConfig(BaseModel):
     cudagraph_capture_sizes: Optional[List[int]] = None
     cudagraph_copy_inputs: bool = False
 
-    dump_graph_stages: List[str] = Field(default_factory=list)
-    dump_graph_dir: Path = Field(default=Path("."))
-    enable_fusion: bool = True
+    pass_config: PassConfig = Field(default_factory=PassConfig)
 
     # not configurable, computed after init
     compile_sizes: List[int] = PrivateAttr

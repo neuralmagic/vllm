@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from vllm.compilation.config import CompilationConfig
+from vllm.compilation.config import PassConfig
 # yapf: disable
 from vllm.distributed import get_tensor_model_parallel_rank as get_tp_rank
 from vllm.distributed import (
@@ -20,7 +20,7 @@ class InductorPass(ABC):
     def __call__(self, graph: torch.fx.Graph):
         raise NotImplementedError
 
-    def __init__(self, config: CompilationConfig):
+    def __init__(self, config: PassConfig):
         self.config = config
 
     def dump_graph(self, graph: torch.fx.Graph, stage: str):

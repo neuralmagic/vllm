@@ -6,7 +6,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import (Match, PatternMatcherPass,
                                              fwd_only, register_replacement)
 
-from vllm.compilation.config import CompilationConfig
+from vllm.compilation.config import PassConfig
 from vllm.compilation.inductor_pass import InductorPass
 from vllm.logger import init_logger
 
@@ -142,7 +142,7 @@ class FusionPass(InductorPass):
     _instance: 'Optional[FusionPass]' = None
 
     @classmethod
-    def instance(cls, config: CompilationConfig):
+    def instance(cls, config: PassConfig) -> 'FusionPass':
         """
         Get the singleton instance of the FusionPass.
         If the instance exists, the config is updated but
@@ -154,7 +154,7 @@ class FusionPass(InductorPass):
             cls._instance.config = config
         return cls._instance
 
-    def __init__(self, config: CompilationConfig):
+    def __init__(self, config: PassConfig):
         assert self.__class__._instance is None, \
             "FusionPass singleton instance already exists"
         super().__init__(config)
