@@ -12,13 +12,15 @@
   torch::Tensor cslt_mm_semi_structured(                               \
       const torch::Tensor& compressed_A, const torch::Tensor& dense_B, \
       const c10::optional<torch::Tensor>& scale_opt,                   \
-      const c10::optional<torch::Tensor>& bias_opt) {                  \
+      const c10::optional<torch::Tensor>& bias_opt,                    \
+      const std::optional<torch::ScalarType> out_dtype_opt) {          \
     TORCH_CHECK(false, "cusparseLt is not found");                     \
   }                                                                    \
-  torch::Tensor cslt_mm_fp8_semi_structured2(                          \
+  torch::Tensor cslt_mm_semi_structured2(                              \
       const torch::Tensor& compressed_A, const torch::Tensor& dense_B, \
       const c10::optional<torch::Tensor>& scale_opt,                   \
-      const c10::optional<torch::Tensor>& bias_opt) {                  \
+      const c10::optional<torch::Tensor>& bias_opt,                    \
+      const std::optional<torch::ScalarType> out_dtype_opt) {          \
     TORCH_CHECK(false, "cusparseLt is not found");                     \
   }                                                                    \
   void cslt_clear_cache() { TORCH_CHECK(false, "cusparseLt is not found"); }
@@ -75,17 +77,22 @@ struct cusparseLtEntry {
 
 cusparseLtHandle_t handle;
 bool handle_initialized = false;
-using cacheID = std::tuple<int64_t, int64_t, int64_t, at::ScalarType>;
+
+// m, k, n, input_type, output_type, bias enabled, scale enabled, is B
+// contiguous
+using cacheID = std::tuple<int64_t, int64_t, int64_t, at::ScalarType,
+                           at::ScalarType, int, int, int>;
 
 std::map<cacheID, cusparseLtEntry> cusparseLt_cache;
 
-void prepare_mm_semi_structured(const cacheID& tuple_id,
-                                at::ScalarType out_dtype,
-                                bool is_B_contiguous) {
+void prepare_mm_semi_structured(const cacheID& tuple_id) {
   auto m = std::get<0>(tuple_id);
   auto k = std::get<1>(tuple_id);
   auto n = std::get<2>(tuple_id);
-  at::ScalarType input_dtype = std::get<3>(tuple_id);
+  auto input_dtype = std::get<3>(tuple_id);
+  auto out_dtype = std::get<4>(tuple_id);
+  bool is_B_contiguous = std::get<7>(tuple_id);
+
   auto& entry = cusparseLt_cache[tuple_id];
 
   cudaDataType input_type;
@@ -131,33 +138,56 @@ void prepare_mm_semi_structured(const cacheID& tuple_id,
       break;
   }
 
-  // cudaDataType input_type = CUDA_R_8F_E4M3;
-  // cudaDataType output_type;
-  // cudaDataType C_type;
-  // cusparseComputeType compute_type = CUSPARSE_COMPUTE_32F;
-  // switch (out_dtype) {
-  //   case at::ScalarType::Float8_e4m3fn:
-  //     output_type = CUDA_R_8F_E4M3;
-  //     C_type = CUDA_R_16F;
-  //     break;
-  //   case at::ScalarType::Half:
-  //     output_type = CUDA_R_16F;
-  //     C_type = CUDA_R_16F;
-  //     break;
-  //   case at::ScalarType::BFloat16:
-  //     output_type = CUDA_R_16BF;
-  //     C_type = CUDA_R_16BF;
-  //     break;
-  //   case at::ScalarType::Float:
-  //     output_type = CUDA_R_32F;
-  //     C_type = CUDA_R_32F;
-  //     break;
-  //   default:
-  //     TORCH_CHECK(false,
-  //                 "Unsupported out_dtype passed, must be one of {fp16, bf16,
-  //                 " "float32} for fp8 inputs");
-  //     break;
-  // }
+  if (input_type == CUDA_R_8I) {
+    switch (out_dtype) {
+      case at::ScalarType::Char:
+        output_type = CUDA_R_8I;
+        C_type = CUDA_R_8I;
+        break;
+      case at::ScalarType::Half:
+        C_type = CUDA_R_16F;
+        output_type = CUDA_R_16F;
+        break;
+      case at::ScalarType::BFloat16:
+        C_type = CUDA_R_16BF;
+        output_type = CUDA_R_16BF;
+        break;
+      case at::ScalarType::Int:
+        C_type = CUDA_R_32I;
+        output_type = CUDA_R_32I;
+        break;
+      default:
+        TORCH_CHECK(false,
+                    "Unsupported out_dtype passed, must be one of {fp16, bf16, "
+                    "int32} for int8 inputs");
+        break;
+    }
+  } else if (input_type == CUDA_R_8F_E4M3) {
+    switch (out_dtype) {
+      case at::ScalarType::Float8_e4m3fn:
+        output_type = CUDA_R_8F_E4M3;
+        C_type = CUDA_R_16F;
+        break;
+      case at::ScalarType::Half:
+        output_type = CUDA_R_16F;
+        C_type = CUDA_R_16F;
+        break;
+      case at::ScalarType::BFloat16:
+        output_type = CUDA_R_16BF;
+        C_type = CUDA_R_16BF;
+        break;
+      case at::ScalarType::Float:
+        output_type = CUDA_R_32F;
+        C_type = CUDA_R_32F;
+        break;
+      default:
+        TORCH_CHECK(false,
+                    "Unsupported out_dtype passed, must be one of {fp16, bf16, "
+                    "float32} for fp8 inputs");
+        break;
+    }
+  }
+
   entry.sparse_input_descriptor_p = new cusparseLtMatDescriptor_t();
   entry.dense_input_descriptor_p = new cusparseLtMatDescriptor_t();
   entry.res_descriptor_p = new cusparseLtMatDescriptor_t();
@@ -269,8 +299,9 @@ torch::Tensor cslt_compress_fp8_semi_structured(const torch::Tensor& input) {
 
 torch::Tensor cslt_mm_semi_structured(
     const torch::Tensor& compressed_A, const torch::Tensor& dense_B,
-    const c10::optional<double>& alpha_opt,
-    const c10::optional<torch::Tensor>& bias_opt) {
+    const c10::optional<torch::Tensor>& scale_opt,
+    const c10::optional<torch::Tensor>& bias_opt,
+    const std::optional<torch::ScalarType> out_dtype_opt) {
   namespace vc = vllm::cusparseLt;
   if (!vc::handle_initialized) {
     TORCH_CUDASPARSE_CHECK(cusparseLtInit(&vc::handle));
@@ -278,18 +309,25 @@ torch::Tensor cslt_mm_semi_structured(
   }
 
   auto input_dtype = compressed_A.scalar_type();
-  auto out_dtype = dense_B.scalar_type();
+  if (out_dtype_opt.has_value()) {
+    TORCH_CHECK(dense_B.scalar_type() == at::ScalarType::Char or
+                    dense_B.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                "out_dtype support only available for int8/fp8 inputs")
+  }
+  auto out_dtype =
+      out_dtype_opt.has_value() ? *out_dtype_opt : dense_B.scalar_type();
   auto compression_factor = (input_dtype == at::ScalarType::Char) ? 10 : 9;
 
   int64_t k = dense_B.size(0);
   int64_t n = dense_B.size(1);
   int64_t m = (compressed_A.numel() * 16 / compression_factor) / k;
 
-  vc::cacheID tuple_id = std::make_tuple(m, k, n, input_dtype);
+  vc::cacheID tuple_id =
+      std::make_tuple(m, k, n, input_dtype, out_dtype, bias_opt.has_value(),
+                      scale_opt.has_value(), dense_B.is_contiguous());
   bool found = vc::cusparseLt_cache.count(tuple_id);
   if (not found) {
-    vc::prepare_mm_semi_structured(tuple_id, out_dtype,
-                                   dense_B.is_contiguous());
+    vc::prepare_mm_semi_structured(tuple_id);
   }
   auto& entry = vc::cusparseLt_cache[tuple_id];
 
@@ -302,10 +340,26 @@ torch::Tensor cslt_mm_semi_structured(
         sizeof(dBias)));
   }
 
-  // float alpha = 1.0;
-  float alpha = alpha_opt.has_value() ? static_cast<float>(*alpha_opt) : 1.0;
+  // float scale = scale_opt.has_value() ? static_cast<float>(*scale_opt) : 1.0;
+  // float beta = 0.0;
+  // auto scale_ptr = &scale;
+
+  float scale = 1.0;
+  auto scale_ptr = &scale;
   float beta = 0.0;
-  auto alpha_ptr = &alpha;
+
+  if (scale_opt.has_value()) {
+    const auto scale_tensor = scale_opt.has_value() ? *scale_opt : at::Tensor{};
+    if (scale_tensor.numel() == 1) {
+      scale = scale_tensor.item<float>();
+    } else {
+      auto tensor_alpha_mode = 1;
+      TORCH_CUDASPARSE_CHECK(cusparseLtMatmulDescSetAttribute(
+          &vc::handle, entry.matmul_p, CUSPARSELT_MATMUL_ALPHA_VECTOR_SCALING,
+          &tensor_alpha_mode, sizeof(tensor_alpha_mode)));
+      scale_ptr = static_cast<float*>(scale_tensor.data_ptr());
+    }
+  }
 
   auto res_tensor_options =
       c10::TensorOptions().dtype(out_dtype).device(dense_B.device());
@@ -314,22 +368,23 @@ torch::Tensor cslt_mm_semi_structured(
 
   if (found) {
     TORCH_CUDASPARSE_CHECK(cusparseLtMatmul(
-        &vc::handle, entry.plan_p, alpha_ptr, compressed_A.data_ptr(),
+        &vc::handle, entry.plan_p, scale_ptr, compressed_A.data_ptr(),
         dense_B.data_ptr(), &beta, res.data_ptr(), res.data_ptr(),
         entry.workspace_ptr, &stream, 1));
   } else {
     TORCH_CUDASPARSE_CHECK(cusparseLtMatmulSearch(
-        &vc::handle, entry.plan_p, alpha_ptr, compressed_A.data_ptr(),
+        &vc::handle, entry.plan_p, scale_ptr, compressed_A.data_ptr(),
         dense_B.data_ptr(), &beta, res.data_ptr(), res.data_ptr(),
         entry.workspace_ptr, &stream, 1));
   }
   return res;
 }
 
-torch::Tensor cslt_mm_fp8_semi_structured2(
+torch::Tensor cslt_mm_semi_structured2(
     const torch::Tensor& compressed_A, const torch::Tensor& dense_B,
-    const c10::optional<double>& alpha_opt,
-    const c10::optional<torch::Tensor>& bias_opt) {
+    const c10::optional<torch::Tensor>& scale_opt,
+    const c10::optional<torch::Tensor>& bias_opt,
+    const std::optional<torch::ScalarType> out_dtype_opt) {
   namespace vc = vllm::cusparseLt;
   if (!vc::handle_initialized) {
     TORCH_CUDASPARSE_CHECK(cusparseLtInit(&vc::handle));
@@ -385,10 +440,65 @@ torch::Tensor cslt_mm_fp8_semi_structured2(
       break;
   }
 
+  auto out_dtype = dense_B.scalar_type();
+  if (out_dtype_opt.has_value()) {
+    out_dtype = out_dtype_opt.value();
+    if (input_type == CUDA_R_8I) {
+      switch (out_dtype) {
+        case at::ScalarType::Char:
+          output_type = CUDA_R_8I;
+          C_type = CUDA_R_8I;
+          break;
+        case at::ScalarType::Half:
+          C_type = CUDA_R_16F;
+          output_type = CUDA_R_16F;
+          break;
+        case at::ScalarType::BFloat16:
+          C_type = CUDA_R_16BF;
+          output_type = CUDA_R_16BF;
+          break;
+        case at::ScalarType::Int:
+          C_type = CUDA_R_32I;
+          output_type = CUDA_R_32I;
+          break;
+        default:
+          TORCH_CHECK(false,
+                      "Unsupported out_dtype passed, must be one of {fp16, "
+                      "bf16, int32} for int8 inputs");
+          break;
+      }
+    } else if (input_type == CUDA_R_8F_E4M3) {
+      switch (out_dtype) {
+        case at::ScalarType::Float8_e4m3fn:
+          output_type = CUDA_R_8F_E4M3;
+          C_type = CUDA_R_16F;
+          break;
+        case at::ScalarType::Half:
+          output_type = CUDA_R_16F;
+          C_type = CUDA_R_16F;
+          break;
+        case at::ScalarType::BFloat16:
+          output_type = CUDA_R_16BF;
+          C_type = CUDA_R_16BF;
+          break;
+        case at::ScalarType::Float:
+          output_type = CUDA_R_32F;
+          C_type = CUDA_R_32F;
+          break;
+        default:
+          TORCH_CHECK(false,
+                      "Unsupported out_dtype passed, must be one of {fp16, "
+                      "bf16, float32} for fp8 inputs");
+          break;
+      }
+    } else {
+      TORCH_CHECK(false,
+                  "out_dtype support only available for int8/fp8 inputs");
+    }
+  }
   int64_t k = dense_B.size(0);
   int64_t n = dense_B.size(1);
   int64_t m = (compressed_A.numel() * 16 / compression_factor) / k;
-  auto out_dtype = dense_B.scalar_type();
 
   // initialize sparse descriptor
   cusparseLtMatDescriptor_t sparse_input_descriptor;
@@ -433,11 +543,22 @@ torch::Tensor cslt_mm_fp8_semi_structured2(
         sizeof(dBias)));
   }
 
+  float scale = 1.0;
+  auto scale_ptr = &scale;
   float beta = 0.0;
-  const float alpha =
-      alpha_opt.has_value() ? static_cast<float>(*alpha_opt) : 1.0;
-  auto alpha_ptr = &alpha;
 
+  if (scale_opt.has_value()) {
+    const auto scale_tensor = scale_opt.has_value() ? *scale_opt : at::Tensor{};
+    if (scale_tensor.numel() == 1) {
+      scale = scale_tensor.item<float>();
+    } else {
+      auto tensor_alpha_mode = 1;
+      TORCH_CUDASPARSE_CHECK(cusparseLtMatmulDescSetAttribute(
+          &vc::handle, &matmul, CUSPARSELT_MATMUL_ALPHA_VECTOR_SCALING,
+          &tensor_alpha_mode, sizeof(tensor_alpha_mode)));
+      scale_ptr = static_cast<float*>(scale_tensor.data_ptr());
+    }
+  }
   TORCH_CUDASPARSE_CHECK(cusparseLtMatmulAlgSelectionInit(
       &vc::handle, &alg_sel, &matmul, CUSPARSELT_MATMUL_ALG_DEFAULT));
   TORCH_CUDASPARSE_CHECK(
@@ -452,7 +573,7 @@ torch::Tensor cslt_mm_fp8_semi_structured2(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   TORCH_CUDASPARSE_CHECK(
-      cusparseLtMatmul(&vc::handle, &plan, alpha_ptr, compressed_A.data_ptr(),
+      cusparseLtMatmul(&vc::handle, &plan, scale_ptr, compressed_A.data_ptr(),
                        dense_B.data_ptr(), &beta, res.data_ptr(),
                        res.data_ptr(), workspace_ptr.get(), &stream, 1));
 

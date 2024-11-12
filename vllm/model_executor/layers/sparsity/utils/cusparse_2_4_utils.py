@@ -4,11 +4,17 @@ from torch.sparse import (SparseSemiStructuredTensor,
                           SparseSemiStructuredTensorCUSPARSELT,
                           to_sparse_semi_structured)
 
-from vllm._custom_ops import (cutlass_scaled_mm, semi_structured_fp8_compress,
-                              semi_structured_fp8_mm2, semi_structured_mm, semi_structured_clear_cache)
+from vllm._custom_ops import (cutlass_scaled_mm, semi_structured_clear_cache,
+                              semi_structured_fp8_compress, semi_structured_mm,
+                              semi_structured_mm2)
 from vllm.platforms import current_platform
 
 SparseSemiStructuredTensor._FORCE_CUTLASS = False
+
+#
+# Allocating a dummy tensor to pass as input_scale
+TORCH_DEVICE_IDENTITY = torch.ones(1).cuda() \
+            if current_platform.is_rocm() else None
 
 
 def compress_to_torch_sparse_semi_structured_mat(pruned_tensor: torch.Tensor):
@@ -62,18 +68,48 @@ def decompress_torch_sparse_semi_structured_mat(packed_tensor: torch.Tensor):
                       device=packed_tensor.device).t())
 
 
+def _pad_dense_input(dense_input: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates padding for dense tensor and pads tensor if necessary.
+    If padding is not required, this function returns the original tensor.
+    """
+    # only 2d matmul
+    assert dense_input.dim() == 2
+    if torch.float8_e4m3fn not in \
+        SparseSemiStructuredTensorCUSPARSELT._DTYPE_SHAPE_CONSTRAINTS:
+        SparseSemiStructuredTensorCUSPARSELT._DTYPE_SHAPE_CONSTRAINTS[
+            torch.float8_e4m3fn] = \
+        SparseSemiStructuredTensorCUSPARSELT._DTYPE_SHAPE_CONSTRAINTS[torch.int8]
+    # check shape
+    m, n = dense_input.shape
+    min_rows = SparseSemiStructuredTensorCUSPARSELT._DTYPE_SHAPE_CONSTRAINTS[
+        dense_input.dtype].dense_min_rows
+    min_cols = SparseSemiStructuredTensorCUSPARSELT._DTYPE_SHAPE_CONSTRAINTS[
+        dense_input.dtype].dense_min_cols
+
+    # calculate padding
+    to_pad_m = -m % min_rows if m < min_rows or m % min_rows else 0
+    to_pad_n = -n % min_cols if n < min_cols or n % min_rows else 0
+    if to_pad_m or to_pad_n:
+        return torch.nn.functional.pad(dense_input, (0, to_pad_n, 0, to_pad_m))
+    else:
+        return dense_input
+
+
 def semi_structured_sparse_dense_gemm(a_packed: torch.Tensor,
                                       b_dense: torch.Tensor,
                                       bias: torch.Tensor = None,
+                                      out_dtype: torch.dtype = None,
                                       cached: bool = True):
     '''
     Performs matrix multiplication (A @ B) of semi-structured sparse (A) and dense (B) matrices.
     In case of int8 and fp8 types, dense matrix B has to be non-contiguous.
     Args:
         a_packed (torch.Tensor) - torch wrapped cusparseLt-packed tensor. Result of compress_to_torch_sparse_semi_structured_mat.
-        b_dense (torch.Tensor) - dense matrix tensor.
+        b_dense (torch.Tensor) - dense matrix tensor. For int8 and fp8 has to be non-contiguous.
         bias (torch.Tensor) - bias to fuse in matrix multiplication. default : None.
-        cached (bool) - whether to use cached (faster) version of cusparseLt wrapper.
+        out_dtype (torch.dtype) - Type of returned tensor for int8 or fp8 matmul. default: None, i.e. quantized output.
+        cached (bool) - use cached (faster) version of cusparseLt wrapper.
 
     Result:
         torch.Tensor - Result of matrix multiplication.
@@ -86,30 +122,39 @@ def semi_structured_sparse_dense_gemm(a_packed: torch.Tensor,
     ]:
         raise ValueError("cuSparseLt does not support"
                          "contiguous dense matrix for int8 and fp8 types")
+    if a_packed.dtype in [torch.float16, torch.bfloat16]:
+        assert out_dtype is None, \
+            "out_dtype is a parameter for quantized inputs"
 
+    row, col = b_dense.shape
+    b_dense = _pad_dense_input(b_dense)
     if cached:
-        return semi_structured_mm(a_packed.packed, b_dense, bias=bias)
+        result = semi_structured_mm(a_packed.packed,
+                                    b_dense,
+                                    bias=bias,
+                                    out_dtype=out_dtype)
     else:
-        if a_packed.dtype == torch.float8_e4m3fn:
-            return semi_structured_fp8_mm2(a_packed.packed, b_dense, bias=bias)
-        else:
-            result = torch.mm(a_packed, b_dense)
-            if bias is not None:
-                result = torch.add(result, bias)
-            return result
+        result = semi_structured_mm2(a_packed.packed,
+                                     b_dense,
+                                     bias=bias,
+                                     out_dtype=out_dtype)
+
+    return result[:, :col]
 
 
 def semi_structured_dense_sparse_T_gemm(a_dense: torch.Tensor,
                                         b_T_packed: torch.Tensor,
                                         bias: torch.Tensor = None,
+                                        out_dtype: torch.dtype = None,
                                         cached: bool = True):
     '''
     Performs matrix multiplication (a @ b_T) of transposed semi-structured sparse and dense matrices
     Args:
-        a_dense (torch.Tensor) - dense matrix tensor.
+        a_dense (torch.Tensor) - dense matrix tensor. For int8 and fp8 has to be contiguous.
         b_T_packed (torch.Tensor) - torch wrapped cusparseLt-packed tensor. Result of compress_to_torch_sparse_semi_structured_mat
         bias (torch.Tensor) - bias to fuse in matrix multiplication. default : None.
-        cached (bool) - whether to use cached (faster) version of cusparseLt wrapper.
+        out_dtype (torch.dtype) - Type of returned tensor for int8 or fp8 matmul. default: None, i.e. quantized output.
+        cached (bool) - use cached (faster) version of cusparseLt wrapper.
     
     Returns:
         torch.Tensor - Result of matrix multiplication.
@@ -117,6 +162,7 @@ def semi_structured_dense_sparse_T_gemm(a_dense: torch.Tensor,
     return (semi_structured_sparse_dense_gemm(b_T_packed,
                                               a_dense.t(),
                                               bias=bias,
+                                              out_dtype=out_dtype,
                                               cached=cached)).t()
 
 
@@ -125,34 +171,68 @@ def semi_structured_sparse_dense_gemm_scaled(a_packed: torch.Tensor,
                                              scale_a: torch.Tensor,
                                              scale_b: torch.Tensor,
                                              bias: torch.Tensor = None,
-                                             cached: bool = False):
+                                             out_dtype: torch.dtype = None,
+                                             cached: bool = True):
     '''
     Performs scaled matrix multiplication (a @ b) of transposed semi-structured sparse and dense fp8 matrices
     Args:
         a_packed (torch.Tensor) - torch wrapped cusparseLt-packed tensor. Result of compress_to_torch_sparse_semi_structured_mat.
-        b_dense (torch.Tensor) - dense matrix tensor.
+        b_dense (torch.Tensor) - dense matrix tensor. For int8 and fp8 has to be non-contiguous.
         scale_a (torch.Tensor) - scaling factor for sparse matrix, must be in float32.
         scale_b (torch.Tensor) - scaling factor for dense matrix, must be in float32.
         bias (torch.Tensor) - bias to fuse in matrix multiplication. default : None.
-        cached (bool) - whether to use cached (faster) version of cusparseLt wrapper.
+        out_dtype (torch.dtype) - Type of returned tensor for int8 or fp8 matmul. default: None, i.e. quantized output.
+        cached (bool) - use cached (faster) version of cusparseLt wrapper.
 
     Returns:
         torch.Tensor - Result of matrix multiplication.
     ''' # noqa: E501
+    assert a_packed.dtype in [
+        torch.float16, torch.bfloat16, torch.int8, torch.float8_e4m3fn
+    ], f"Semi structured sparse-dense matmul does not support {a_packed.dtype}"
 
-    # cusparseLt requires alpha to be float
+    if b_dense.is_contiguous() and a_packed.dtype in [
+            torch.int8, torch.float8_e4m3fn
+    ]:
+        raise ValueError("cuSparseLt does not support"
+                         "contiguous dense matrix for int8 and fp8 types")
+    if a_packed.dtype in [torch.float16, torch.bfloat16]:
+        assert out_dtype is None, \
+            "out_dtype is a parameter for quantized inputs"
+
+    # cusparseLt requires scale to be float
     assert scale_a.dtype == torch.float32 and scale_b.dtype == torch.float32
-    scale = (scale_a * scale_b).item()
-    if cached:
-        return semi_structured_mm(a_packed.packed,
-                                  b_dense,
-                                  scale=scale,
-                                  bias=bias)
+    row, col = b_dense.shape
+    b_dense = _pad_dense_input(b_dense)
+
+    per_tensor_weights = (scale_a.numel() == 1)
+    per_tensor_activations = (scale_b.numel() == 1)
+
+    def matmul_(a, b, **kwargs):
+        if cached:
+            return semi_structured_mm(a, b, **kwargs)
+        else:
+            return semi_structured_mm2(a, b, **kwargs)
+
+    if a_packed.dtype == torch.float8_e4m3fn:
+        scale = scale_a * scale_b
+        result = matmul_(a_packed.packed, b_dense, out_dtype=torch.float32)
+
+        result = torch.narrow(result, 1, 0, col)
+        result = result * scale
+        result = result.to(out_dtype)
+        if bias is not None:
+            result = result + bias
     else:
-        return semi_structured_fp8_mm2(a_packed.packed,
-                                       b_dense,
-                                       bias=bias,
-                                       scale=scale)
+        scale = scale_a * scale_b
+        if per_tensor_weights and per_tensor_activations:
+            scale = scale.repeat(a_packed.shape[0])
+        result = matmul_(a_packed.packed,
+                         b_dense,
+                         scale=scale,
+                         bias=bias,
+                         out_dtype=out_dtype)
+    return result
 
 
 def semi_structured_dense_sparse_T_gemm_scaled(a_dense: torch.Tensor,
@@ -160,27 +240,34 @@ def semi_structured_dense_sparse_T_gemm_scaled(a_dense: torch.Tensor,
                                                scale_a: torch.Tensor = None,
                                                scale_b: torch.Tensor = None,
                                                bias: torch.Tensor = None,
+                                               out_dtype: torch.dtype = None,
                                                cached: bool = True):
     '''
     Performs matrix multiplication (a @ b_T) of transposed semi-structured sparse and dense matrices
     Args:
-        a_dense (torch.Tensor) - dense matrix tensor.
+        a_dense (torch.Tensor) - dense matrix tensor. For int8 and fp8 has to be contiguous.
         b_T_packed (torch.Tensor) - torch wrapped cusparseLt-packed tensor. Result of compress_to_torch_sparse_semi_structured_mat
+        scale_a (torch.Tensor) - scaling factor for sparse matrix, must be in float32.
+        scale_b (torch.Tensor) - scaling factor for dense matrix, must be in float32.
         bias (torch.Tensor) - bias to fuse in matrix multiplication. default : None.
+        out_dtype (torch.dtype) - Type of returned tensor for int8 or fp8 matmul. default: None, i.e. quantized output.
         cached (bool) - whether to use cached(faster) version of cusparseLt wrapper.
     
     Returns:
         torch.Tensor - Result of matrix multiplication.
     '''  # noqa: E501
-    return (semi_structured_sparse_dense_gemm_scaled(b_T_packed,
-                                                     a_dense.t(),
-                                                     scale_a=scale_b,
-                                                     scale_b=scale_a,
-                                                     bias=bias,
-                                                     cached=cached)).t()
+    return (semi_structured_sparse_dense_gemm_scaled(
+        b_T_packed,
+        a_dense.t(),
+        scale_a=scale_b,
+        scale_b=scale_a,
+        bias=bias,
+        cached=cached)).t().contiguous()
+
 
 def clear_cache():
     semi_structured_clear_cache()
+
 
 # test utils
 def dense_matmul(A, B, dtype, scale_a=None, scale_b=None):

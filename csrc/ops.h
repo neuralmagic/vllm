@@ -228,13 +228,15 @@ torch::Tensor cslt_compress_fp8_semi_structured(const torch::Tensor& input);
 
 torch::Tensor cslt_mm_semi_structured(
     const torch::Tensor& compressed_A, const torch::Tensor& dense_B,
-    const c10::optional<double>& scale_opt,
-    const c10::optional<torch::Tensor>& bias_opt);
+    const c10::optional<torch::Tensor>& scale_opt,
+    const c10::optional<torch::Tensor>& bias_opt,
+    const std::optional<torch::ScalarType> out_dtype_opt);
 
-torch::Tensor cslt_mm_fp8_semi_structured2(
+torch::Tensor cslt_mm_semi_structured2(
     const torch::Tensor& compressed_A, const torch::Tensor& dense_B,
-    const c10::optional<double>& scale_opt,
-    const c10::optional<torch::Tensor>& bias_opt);
+    const c10::optional<torch::Tensor>& scale_opt,
+    const c10::optional<torch::Tensor>& bias_opt,
+    const std::optional<torch::ScalarType> out_dtype_opt);
 
 void cslt_clear_cache();
 

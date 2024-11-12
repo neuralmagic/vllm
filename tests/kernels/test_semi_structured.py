@@ -3,14 +3,13 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm.model_executor.layers.sparsity.utils.cusparse_2_4_utils import (
-    compress_to_torch_sparse_semi_structured_mat,
+    clear_cache, compress_to_torch_sparse_semi_structured_mat,
     decompress_torch_sparse_semi_structured_mat, dense_matmul,
     generate_pruned_semi_structured_mat, get_random_mat,
     is_semi_structured_supported, semi_structured_dense_sparse_T_gemm,
     semi_structured_dense_sparse_T_gemm_scaled,
     semi_structured_sparse_dense_gemm,
-    semi_structured_sparse_dense_gemm_scaled,
-    clear_cache)
+    semi_structured_sparse_dense_gemm_scaled)
 
 DTYPES = [torch.float16, torch.bfloat16, torch.int8]
 SIZES = [(128, 128), (1024, 8192)]
@@ -124,16 +123,20 @@ def test_torch_semi_structured_sparse_dense_T_matmul(mnk, dtype):
 def test_torch_semi_structured_sparse_dense_T_fp8_matmul():
     M, N, K = (32, 64, 32)
     dtype = torch.float8_e4m3fn
-    A_pruned = generate_pruned_semi_structured_mat(M, N, dtype=dtype)
+    A_pruned = generate_pruned_semi_structured_mat(M, K, dtype=dtype)
     A = compress_to_torch_sparse_semi_structured_mat(A_pruned)
-    B = torch.full((K, N), .25, device='cuda', dtype=dtype).t()
+    B = torch.full((N, K), .25, device='cuda', dtype=dtype).t()
+    bias = torch.ones(1, N, dtype=torch.float32, device='cuda')
 
-    C = dense_matmul(A_pruned, B, dtype=dtype).to(torch.float32)
-    C_sparse = semi_structured_sparse_dense_gemm(A, B).to(torch.float32)
+    C = dense_matmul(A_pruned, B, dtype=dtype).to(torch.float32) + bias
+    C_sparse = semi_structured_sparse_dense_gemm(A,
+                                                 B,
+                                                 out_dtype=torch.float32,
+                                                 bias=bias)
     torch.testing.assert_close(C, C_sparse, rtol=1e-1, atol=1e-1)
 
     # Cached version
-    B = torch.full((K, N), .25, device='cuda', dtype=dtype).t()
+    B = torch.full((N, K), .25, device='cuda', dtype=dtype).t()
     C = dense_matmul(A_pruned, B, dtype=dtype).to(torch.float32)
     C_sparse = semi_structured_sparse_dense_gemm(A, B).to(torch.float32)
     torch.testing.assert_close(C, C_sparse, rtol=1e-1, atol=1e-1)
@@ -178,11 +181,15 @@ def test_torch_semi_structured_dense_sparse_T_fp8_matmul():
     B_T = compress_to_torch_sparse_semi_structured_mat(B_T_pruned)
     A = torch.full((M, K), .25, device='cuda', dtype=dtype)
 
-    C_sparse = semi_structured_dense_sparse_T_gemm(A, B_T).to(torch.float32)
+    C_sparse = semi_structured_dense_sparse_T_gemm(A,
+                                                   B_T,
+                                                   out_dtype=torch.float32)
     C = dense_matmul(A, B_T_pruned.t(), dtype=dtype).to(torch.float32)
     torch.testing.assert_close(C, C_sparse, rtol=1e-1, atol=1e-1)
 
-    C_sparse = semi_structured_dense_sparse_T_gemm(A, B_T).to(torch.float32)
+    C_sparse = semi_structured_dense_sparse_T_gemm(A,
+                                                   B_T,
+                                                   out_dtype=torch.float32)
     C = dense_matmul(A, B_T_pruned.t(), dtype=dtype).to(torch.float32)
     torch.testing.assert_close(C, C_sparse, rtol=1e-1, atol=1e-1)
     clear_cache()
@@ -216,26 +223,39 @@ def test_torch_semi_structured_sparse_dense_T_fp8_scaled_matmul():
     # cached
     B = torch.rand((K, N), device='cuda').to(torch.float16).t()
     B_fp8, scale_B = to_float8(B)
+    scale_A_vec = scale_A.repeat(M)
 
     C = torch._scaled_mm(A_pruned_fp8,
                          B_fp8,
                          scale_a=scale_A,
                          scale_b=scale_B,
                          out_dtype=torch.float32)
-    C_sparse = semi_structured_sparse_dense_gemm_scaled(A_fp8_sparse,
-                                                        B_fp8,
-                                                        scale_a=scale_A,
-                                                        scale_b=scale_B).to(
-                                                            torch.float32)
+    # tensor-wise
+    C_sparse = semi_structured_sparse_dense_gemm_scaled(
+        A_fp8_sparse,
+        B_fp8,
+        scale_a=scale_A,
+        scale_b=scale_B,
+        out_dtype=torch.float32)
+    torch.testing.assert_close(C, C_sparse, rtol=7e-2, atol=7e-2)
+
+    # channel-wise
+    C_sparse = semi_structured_sparse_dense_gemm_scaled(
+        A_fp8_sparse,
+        B_fp8,
+        scale_a=scale_A_vec,
+        scale_b=scale_B,
+        out_dtype=torch.float32)
     torch.testing.assert_close(C, C_sparse, rtol=7e-2, atol=7e-2)
 
     # noncached
-    C_sparse = semi_structured_sparse_dense_gemm_scaled(A_fp8_sparse,
-                                                        B_fp8,
-                                                        scale_a=scale_A,
-                                                        scale_b=scale_B,
-                                                        cached=False).to(
-                                                            torch.float32)
+    C_sparse = semi_structured_sparse_dense_gemm_scaled(
+        A_fp8_sparse,
+        B_fp8,
+        scale_a=scale_A,
+        scale_b=scale_B,
+        cached=False,
+        out_dtype=torch.float32)
     torch.testing.assert_close(C, C_sparse, rtol=7e-2, atol=7e-2)
     clear_cache()
 
@@ -252,11 +272,12 @@ def test_torch_semi_structured_dense_sparse_T_fp8_scaled_matmul():
     B_T_pruned_fp8, scale_b = to_float8(B_T_pruned)
     B_T_packed = compress_to_torch_sparse_semi_structured_mat(B_T_pruned_fp8)
 
-    C_sparse = semi_structured_dense_sparse_T_gemm_scaled(A_fp8,
-                                                          B_T_packed,
-                                                          scale_a=scale_a,
-                                                          scale_b=scale_b).to(
-                                                              torch.float32)
+    C_sparse = semi_structured_dense_sparse_T_gemm_scaled(
+        A_fp8,
+        B_T_packed,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        out_dtype=torch.float32)
     C = torch._scaled_mm(B_T_pruned_fp8,
                          A_fp8.t(),
                          scale_a=scale_b,
@@ -278,6 +299,7 @@ def test_torch_semi_structured_sparse_dense_t_int8_scaled_matmul():
 
     scale_a = torch.tensor(2.0, dtype=torch.float32, device='cuda')
     scale_b = torch.tensor(2.0, dtype=torch.float32, device='cuda')
+    scale_a_vec = scale_a.repeat(M)
 
     C = dense_matmul(A_pruned,
                      B.t(),
@@ -287,6 +309,13 @@ def test_torch_semi_structured_sparse_dense_t_int8_scaled_matmul():
     C_sparse = semi_structured_sparse_dense_gemm_scaled(A,
                                                         B.t(),
                                                         scale_a=scale_a,
+                                                        scale_b=scale_b).to(
+                                                            torch.float32)
+    torch.testing.assert_close(C, C_sparse, rtol=1e-1, atol=1e-1)
+
+    C_sparse = semi_structured_sparse_dense_gemm_scaled(A,
+                                                        B.t(),
+                                                        scale_a=scale_a_vec,
                                                         scale_b=scale_b).to(
                                                             torch.float32)
     torch.testing.assert_close(C, C_sparse, rtol=1e-1, atol=1e-1)
