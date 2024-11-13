@@ -117,9 +117,10 @@ def semi_structured_sparse_dense_gemm(a_packed: torch.Tensor,
     assert a_packed.dtype in [
         torch.float16, torch.bfloat16, torch.int8, torch.float8_e4m3fn
     ], f"Semi structured sparse-dense matmul does not support {a_packed.dtype}"
-    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1 and b_dense.is_contiguous()) and a_packed.dtype in [
-            torch.int8, torch.float8_e4m3fn
-    ]:
+    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1
+            and b_dense.is_contiguous()) and a_packed.dtype in [
+                torch.int8, torch.float8_e4m3fn
+            ]:
         raise ValueError("cuSparseLt does not support"
                          "contiguous dense matrix for int8 and fp8 types")
     if a_packed.dtype in [torch.float16, torch.bfloat16]:
@@ -128,10 +129,12 @@ def semi_structured_sparse_dense_gemm(a_packed: torch.Tensor,
 
     row, col = b_dense.shape
     b_dense = _pad_dense_input(b_dense)
-    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1 and b_dense.is_contiguous()) and a_packed.dtype in [
-            torch.int8, torch.float8_e4m3fn
-    ]:
-        # We have to provide non-contiguous b_dense to cusparseLt for int8 and fp8
+    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1
+            and b_dense.is_contiguous()) and a_packed.dtype in [
+                torch.int8, torch.float8_e4m3fn
+            ]:
+        # We have to provide non-contiguous b_dense
+        # to cusparseLt for int8 and fp8
         b_dense = b_dense.t().contiguous().t()
 
     if cached:
@@ -197,9 +200,10 @@ def semi_structured_sparse_dense_gemm_scaled(a_packed: torch.Tensor,
         torch.float16, torch.bfloat16, torch.int8, torch.float8_e4m3fn
     ], f"Semi structured sparse-dense matmul does not support {a_packed.dtype}"
 
-    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1 and b_dense.is_contiguous()) and a_packed.dtype in [
-            torch.int8, torch.float8_e4m3fn
-    ]:
+    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1
+            and b_dense.is_contiguous()) and a_packed.dtype in [
+                torch.int8, torch.float8_e4m3fn
+            ]:
         raise ValueError("cuSparseLt does not support "
                          "contiguous dense matrix for int8 and fp8 types")
     if a_packed.dtype in [torch.float16, torch.bfloat16]:
@@ -211,10 +215,12 @@ def semi_structured_sparse_dense_gemm_scaled(a_packed: torch.Tensor,
     row, col = b_dense.shape
     b_dense = _pad_dense_input(b_dense)
 
-    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1 and b_dense.is_contiguous()) and a_packed.dtype in [
-            torch.int8, torch.float8_e4m3fn
-    ]:
-        # We have to provide non-contiguous b_dense to cusparseLt for int8 and fp8
+    if (b_dense.shape[0] > 1 and b_dense.shape[1] > 1
+            and b_dense.is_contiguous()) and a_packed.dtype in [
+                torch.int8, torch.float8_e4m3fn
+            ]:
+        # We have to provide non-contiguous b_dense
+        # to cusparseLt for int8 and fp8
         b_dense = b_dense.t().contiguous().t()
 
     per_tensor_weights = (scale_a.numel() == 1)
