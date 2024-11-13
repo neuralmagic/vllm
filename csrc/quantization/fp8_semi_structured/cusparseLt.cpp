@@ -340,10 +340,6 @@ torch::Tensor cslt_mm_semi_structured(
         sizeof(dBias)));
   }
 
-  // float scale = scale_opt.has_value() ? static_cast<float>(*scale_opt) : 1.0;
-  // float beta = 0.0;
-  // auto scale_ptr = &scale;
-
   float scale = 1.0;
   auto scale_ptr = &scale;
   float beta = 0.0;

@@ -402,13 +402,14 @@ define_gpu_extension_target(
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
 # If cuSparseLt is not installed we skip 2:4 optimizations
-CHECK_INCLUDE_FILE_CXX("cusparseLt.h" HAVE_CUSPARSELT)
-message(STATUS "Result of include cusparseLt ${HAVE_CUSPARSELT}")
-target_compile_definitions(_C PRIVATE VLLM_CUSPARSELT_ENABLED=1)
+find_path(CUSPARSELT_INCLUDE_PATH cusparseLt.h
+  HINTS ${CUSPARSELT_INCLUDE_DIR}
+  PATH_SUFFIXES cuda/include cuda include)
 
-# if(HAVE_CUSPARSELT)
-#   target_compile_definitions(_C PRIVATE VLLM_CUSPARSELT_ENABLED=1)
-# endif()
+if(CUSPARSELT_INCLUDE_PATH)
+  message(STATUS "CuSparseLt header file found ${CUSPARSELT_INCLUDE_PATH}")
+  target_compile_definitions(_C PRIVATE VLLM_CUSPARSELT_ENABLED=1)
+endif()
 #
 # _moe_C extension
 #

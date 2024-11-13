@@ -13,6 +13,8 @@ from vllm.model_executor.layers.sparsity.utils.cusparse_2_4_utils import (
     is_semi_structured_supported, semi_structured_sparse_dense_gemm,
     semi_structured_sparse_dense_gemm_scaled)
 from vllm.utils import FlexibleArgumentParser
+import time
+import pickle
 
 DEFAULT_MODELS = list(WEIGHT_SHAPES.keys())
 DEFAULT_BATCH_SIZES = [32, 64, 128, 256, 512]
@@ -105,15 +107,29 @@ def bench(m: int, k: int, n: int, label: str, sub_label: str,
     a_compressed = compress_to_torch_sparse_semi_structured_mat(a)
     # warmup
     scale = torch.tensor(1.0, dtype=torch.float32, device='cuda')
-    semi_structured_sparse_dense_gemm_scaled(a_compressed,
-                                             b,
-                                             scale_a=scale,
-                                             scale_b=scale)
 
     semi_structured_sparse_dense_gemm(a_compressed, b)
     timers.append(
         bench_fn(label, sub_label, "cusparseLt_i8_i8_2_4",
                  semi_structured_sparse_dense_gemm, a_compressed, b))
+
+
+    semi_structured_sparse_dense_gemm_scaled(a_compressed,
+                                             b,
+                                             scale_a=scale,
+                                             scale_b=scale)
+    timers.append(
+        bench_fn(label, sub_label, "cusparseLt_i8_i8_2_4_scaled",
+                 semi_structured_sparse_dense_gemm_scaled, a_compressed, b, scale, scale))
+    
+    scale_vec = scale.repeat(a_compressed.shape[0])
+    semi_structured_sparse_dense_gemm_scaled(a_compressed,
+                                             b,
+                                             scale_a=scale_vec,
+                                             scale_b=scale)
+    timers.append(
+        bench_fn(label, sub_label, "cusparseLt_i8_i8_2_4_scaled_channel",
+                 semi_structured_sparse_dense_gemm_scaled, a_compressed, b, scale_vec, scale))
 
     timers.append(
         bench_fn(label,
@@ -168,11 +184,6 @@ def print_timers(timers: Iterable[TMeasurement]):
 def run(MKNs: Iterable[Tuple[int, int, int]],
         use_fp8: bool) -> Iterable[TMeasurement]:
     results = []
-    # MKNs = [(1024, 8192, 14336)]
-    # MKNs = [(2048, 8192, 14336)]
-    # MKNs = [(2048, 8192, 14336), (2048, 8192, 14336)]
-    # MKNs = [(32, 11008, 4096)]
-    # MKNs = [(2048, 11008, 14336)]
 
     for m, k, n in MKNs:
         timers = bench(m, k, n, "gemm", f"MKN=({m}x{k}x{n})", use_fp8)
@@ -180,14 +191,6 @@ def run(MKNs: Iterable[Tuple[int, int, int]],
         results.extend(timers)
 
     return results
-
-
-def make_output(data: Iterable[TMeasurement],
-                MKNs: Iterable[Tuple[int, int, int]],
-                base_description: str,
-                timestamp=None):
-    print(f"== All Results {base_description} ====")
-    print_timers(data)
 
 
 def run_model_bench(args):
@@ -227,6 +230,15 @@ def run_model_bench(args):
         print(f"== Results cuSparseLt {model}-TP{tp_size} ====")
         print_timers(data)
 
+    if args.save_results:
+        timestamp = int(time.time())
+
+        all_data = []
+        for d in model_bench_data:
+            all_data.extend(d)
+        # pickle all data
+        with open(f"model_bench-{timestamp}.pkl", "wb") as f:
+            pickle.dump(all_data, f)
 
 if __name__ == '__main__':
 
@@ -238,8 +250,8 @@ Benchmark cuSparseLt 2:4 GEMMs.
         python3 ./benchmarks/cusparseLt_benchmarks/benchmark_24.py --models meta-llama/Llama-2-7b-hf --batch-sizes 16 --tp-sizes 1
     
     
-    Output:
-        - a .pkl file, that is a list of raw torch.benchmark.utils.Measurements for the pytorch and cusparseLt implementations for the various GEMMs.
+    Output if --save-results:
+        - a .pkl file, that is a list of raw torch.benchmark.utils.Measurements for the pytorch, cutlass and cusparseLt implementations for the various GEMMs.
             """,  # noqa: E501
         formatter_class=argparse.RawTextHelpFormatter)
 
@@ -260,6 +272,11 @@ Benchmark cuSparseLt 2:4 GEMMs.
         '--use-fp8',
         action='store_true',
         help='Add benchmarking fp8 matmul (on supporting fp8 platforms)')
+
+    parser.add_argument(
+        '--save-results',
+        action='store_true',
+        help='Save results to a pickle file named model_bench_{timestamp}.pkl')
 
     args = parser.parse_args()
     run_model_bench(args)
