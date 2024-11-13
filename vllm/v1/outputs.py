@@ -1,11 +1,13 @@
-from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import msgspec
 import torch
 
 
-@dataclass
-class SamplerOutput:
+class SamplerOutput(msgspec.Struct,
+                    array_like=True,
+                    omit_defaults=True,
+                    gc=False):
 
     # [num_reqs]
     sampled_token_ids: List[int]
@@ -20,10 +22,12 @@ class SamplerOutput:
     prompt_logprobs: Optional[torch.Tensor]
 
 
-# ModelRunnerOutput is pickeled and sent to the scheduler process.
+# ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use List instead.
-@dataclass
-class ModelRunnerOutput:
+class ModelRunnerOutput(msgspec.Struct,
+                        array_like=True,
+                        omit_defaults=True,
+                        gc=False):
 
     # [num_reqs]
     req_ids: List[str]

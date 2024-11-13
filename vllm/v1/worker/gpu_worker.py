@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+from vllm.v1.core.scheduler_output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -229,7 +230,8 @@ class MultiprocessingWorker:
         ) as p:
 
             while True:
-                scheduler_output = self.scheduler_output_receiver.dequeue()
+                scheduler_output = self.scheduler_output_receiver.dequeue(
+                    SchedulerOutput)
                 output = self.worker.execute_model(scheduler_output)
                 if self.worker.rank == 0:
                     self.model_output_sender.enqueue(output)

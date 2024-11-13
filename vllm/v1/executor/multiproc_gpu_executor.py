@@ -197,7 +197,7 @@ class MultiprocessingGPUExecutor:
             self.workers_in_busy_loop = True
 
         self.scheduler_output_sender.enqueue(scheduler_output)
-        model_output = self.model_output_receiver.dequeue()
+        model_output = self.model_output_receiver.dequeue(ModelRunnerOutput)
         return model_output
 
     def check_health(self) -> None:
