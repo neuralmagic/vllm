@@ -203,12 +203,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
   # Set CUTLASS_REVISION manually -- its revision detection doesn't work in this case.
-  set(CUTLASS_REVISION "v3.5.1" CACHE STRING "CUTLASS revision to use")
+  set(CUTLASS_REVISION "v3.6.0" CACHE STRING "CUTLASS revision to use")
 
   FetchContent_Declare(
         cutlass
         GIT_REPOSITORY https://github.com/nvidia/cutlass.git
-        GIT_TAG v3.5.1
+        GIT_TAG be692b48b01620eedabeef8325df5d4eeed6c2ae
         GIT_PROGRESS TRUE
 
         # Speed up CUTLASS download by retrieving only the specified GIT_TAG instead of the history.
@@ -226,7 +226,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     "csrc/quantization/gguf/gguf_kernel.cu"
     "csrc/custom_all_reduce.cu"
     "csrc/permute_cols.cu"
-    "csrc/quantization/cutlass_w8a8/scaled_mm_entry.cu")
+    "csrc/quantization/cutlass_w8a8/scaled_mm_entry.cu"
+    "csrc/sparse/cutlass/sparse_scaled_mm_entry.cu"
+    "csrc/sparse/cutlass/sparse_compressor.cu")
 
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"
@@ -282,6 +284,63 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # build any 3x kernels
     set(SCALED_MM_3X_ARCHS)
   endif()
+
+  #
+  # The cutlass_scaled_mm kernels for Hopper (c3x, i.e. CUTLASS 3.x) require
+  # CUDA 12.0 or later (and only work on Hopper, 9.0/9.0a for now).
+  cuda_archs_loose_intersection(SCALED_MM_3X_ARCHS "9.0;9.0a" "${CUDA_ARCHS}")
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND SCALED_MM_3X_ARCHS)
+    set(SRCS "csrc/sparse/cutlass/sparse_compressor.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "${SCALED_MM_3X_ARCHS}")
+    list(APPEND VLLM_EXT_SRC "${SRCS}")
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_SCALED_MM_C3X=1")
+    message(STATUS "Building test_util for archs: ${SCALED_MM_3X_ARCHS}")
+  else()
+    if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND SCALED_MM_3X_ARCHS)
+      message(STATUS "Not building test_util as CUDA Compiler version is "
+                     "not >= 12.0, we recommend upgrading to CUDA 12.0 or "
+                     "later if you intend on running FP8 quantized models on "
+                     "Hopper.")
+    else()
+      message(STATUS "Not building test_util as no compatible archs found "
+                     "in CUDA target architectures")
+    endif()
+
+    # clear SCALED_MM_3X_ARCHS so the scaled_mm_c2x kernels know we didn't 
+    # build any 3x kernels
+    set(SCALED_MM_3X_ARCHS)
+  endif()
+  
+  #
+  # The cutlass_scaled_mm kernels for Hopper (c3x, i.e. CUTLASS 3.x) require
+  # CUDA 12.0 or later (and only work on Hopper, 9.0/9.0a for now).
+  cuda_archs_loose_intersection(SCALED_MM_3X_ARCHS "9.0;9.0a" "${CUDA_ARCHS}")
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND SCALED_MM_3X_ARCHS)
+    set(SRCS "csrc/sparse/cutlass/sparse_scaled_mm_c3x.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${SRCS}"
+      CUDA_ARCHS "${SCALED_MM_3X_ARCHS}")
+    list(APPEND VLLM_EXT_SRC "${SRCS}")
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_SCALED_MM_C3X=1")
+    message(STATUS "Building test_mm_c3x for archs: ${SCALED_MM_3X_ARCHS}")
+  else()
+    if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND SCALED_MM_3X_ARCHS)
+      message(STATUS "Not building test_mm_c3x as CUDA Compiler version is "
+                     "not >= 12.0, we recommend upgrading to CUDA 12.0 or "
+                     "later if you intend on running FP8 quantized models on "
+                     "Hopper.")
+    else()
+      message(STATUS "Not building test_mm_c3x as no compatible archs found "
+                     "in CUDA target architectures")
+    endif()
+
+    # clear SCALED_MM_3X_ARCHS so the scaled_mm_c2x kernels know we didn't 
+    # build any 3x kernels
+    set(SCALED_MM_3X_ARCHS)
+  endif()
+
 
   #
   # For the cutlass_scaled_mm kernels we want to build the c2x (CUTLASS 2.x)
@@ -399,14 +458,12 @@ define_gpu_extension_target(
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
-# If cuSparseLt is not installed we skip 2:4 optimizations
-CHECK_INCLUDE_FILE_CXX("cusparseLt.h" HAVE_CUSPARSELT)
-message(STATUS "Result of include cusparseLt ${HAVE_CUSPARSELT}")
-target_compile_definitions(_C PRIVATE VLLM_CUSPARSELT_ENABLED=1)
+include(nm_cutlass_c.cmake)
+build_nm_cutlass_c()
 
-# if(HAVE_CUSPARSELT)
-#   target_compile_definitions(_C PRIVATE VLLM_CUSPARSELT_ENABLED=1)
-# endif()
+include(nm_cutlass_c.cmake)
+build_nm_cutlass_c()
+
 #
 # _moe_C extension
 #
