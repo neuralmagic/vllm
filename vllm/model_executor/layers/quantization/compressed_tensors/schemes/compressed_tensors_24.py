@@ -119,6 +119,7 @@ class CompressedTensors24(CompressedTensorsScheme):
         :param layer: The layer with the weights to be processed
         """
         
+        breakpoint()
         # TODO: right now this is hard coded for 24 compressor
         # replace by a better way to identify targetted params
         # using COMPRESSION_PARAMS defined by sparse compressors
