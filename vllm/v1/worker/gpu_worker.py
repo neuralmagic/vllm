@@ -174,8 +174,10 @@ class Worker:
         return output
 
 
-# Wraps Worker for the multiprocessing, multi-gpu case.
-class MultiprocessingWorker:
+class WorkerProc:
+    """Wrapper that runs one Worker in a separate process."""
+
+    READY_STR = "READY"
 
     def __init__(
         self,
@@ -183,30 +185,144 @@ class MultiprocessingWorker:
         local_rank: int,
         rank: int,
         distributed_init_method: str,
+        input_shm_handle, # TODO: typing
+        output_path: str, # W0 sends ModelRunnerOutput
+        ready_path: str,
+        should_shutdown: Synchronized,
     ):
+        self.rank = rank
         self.worker = Worker(vllm_config, local_rank, rank,
                              distributed_init_method)
 
-    def initialize_message_queues(self, scheduler_output_receiver_handle):
+        # Signal from main process to shutdown (multiprocessing.Value).
+        self.should_shutdown = should_shutdown
+
         # Initialize MessageQueue for receiving SchedulerOutput
-        # Add 1 rank to account for driver process
         self.scheduler_output_receiver = MessageQueue.create_from_handle(
             scheduler_output_receiver_handle, self.worker.rank)
 
-        # Initialize group coordinator for sending the ModelRunnerOutput
-        # to the driver process
-        if self.worker.rank == 0:
-            self.model_output_sender = MessageQueue(1, 1)
-            return self.model_output_sender.export_handle()
-        else:
-            self.model_output_sender = None
-            return None
+        # Worker 0 initializes a message queue for sending the model output
+        if self.rank == 0:
+            self.output_queue = queue.Queue()
+            threading.Thread(target=self.process_output_socket,
+                args=(output_path, ),
+                daemon=True).start()
+
+        # The order of the next two steps (1. sending the ready signal and 
+        # 2. waiting on the shm message queue) must be done in this order
+        # to avoid deadlocks, as the EngineCoreProcess must first initialize
+        # all workers and then wait on the message queue.
+
+        # Send Readiness signal to EngineClient.
+        with self.make_socket(ready_path, zmq.constants.PUSH) as ready_socket:
+            ready_socket.send_string(EngineCoreProc.READY_STR)
+
+        # All processors wait on the shm message queue
+        self.scheduler_output_receiver.wait_until_ready()
+
+        self.worker.initialize()
+        self.worker.load_model()
+
+        my_num_blocks = torch.tensor(self.worker.determine_num_available_blocks())
+        min_num_blocks = torch.distributed.all_reduce(my_num_blocks, op=dist.ReduceOp.MIN)
+        num_gpu_blocks = min_num_blocks[0]
+
+        # Send the number of GPU blocks back to the model executor.
+        if self.rank == 0:
+            self.output_queue.push_back(min_num_blocks)
+
+        if vllm_configcache_config.num_gpu_blocks_override is not None:
+            num_gpu_blocks_override = cache_config.num_gpu_blocks_override
+            logger.info(
+                "Overriding num_gpu_blocks=%d with "
+                "num_gpu_blocks_override=%d", num_gpu_blocks,
+                num_gpu_blocks_override)
+            num_gpu_blocks = num_gpu_blocks_override
+
+        self.worker.initialize_cache(num_gpu_blocks)
+                
+
+
+    @staticmethod
+    def make_worker_core_process(
+        vllm_config: VllmConfig,
+        local_rank: int,
+        rank: int,
+        distributed_init_method: str,
+        input_shm_handle, # Receive SchedulerOutput
+        output_path: str, # W0 sends ModelRunnerOutput
+        ready_path: str,
+        should_shutdown: Synchronized,
+    ) -> BaseProcess:
+        context = multiprocessing.get_context("spawn")
+
+        process_kwargs = {
+            "vllm_config": vllm_config,
+            "local_rank": local_rank,
+            "rank": rank,
+            "distributed_init_method": distributed_init_method,
+            "input_shm_handle": input_shm_handle,
+            "output_path": output_path,
+            "ready_path": ready_path,
+            "should_shutdown": should_shutdown
+        }
+        # Run EngineCore busy loop in background process.
+        proc = context.Process(target=Worker.run_engine_core,
+                               kwargs=process_kwargs)
+        proc.start()
+
+        # Wait for startup
+        Worker.wait_for_startup(proc, ready_path)
+        return proc
+
+    @staticmethod
+    def run_worker(*args, **kwargs):
+        """Launch Worker busy loop in background process."""
+
+        try:
+            worker = WorkerProc(*args, **kwargs)
+            worker.execute_model_busy_loop()
+
+        except KeyboardInterrupt:
+            logger.debug("Worker interrupted.")
+
+        except BaseException as e:
+            logger.exception(e)
+            raise e
+
+    @staticmethod
+    def wait_for_startup(
+        proc: BaseProcess,
+        ready_path: str,
+    ) -> None:
+        """Wait until the Worker is ready."""
+
+        try:
+            sync_ctx = zmq.Context()  # type: ignore[attr-defined]
+            socket = sync_ctx.socket(zmq.constants.PULL)
+            socket.connect(ready_path)
+
+            # Wait for Worker to send Worker.READY_STR.
+            while socket.poll(timeout=POLLING_TIMEOUT_MS) == 0:
+                logger.debug("Waiting for Worker to startup.")
+
+                if not proc.is_alive():
+                    raise RuntimeError("WorkerProc failed to start.")
+
+            message = socket.recv_string()
+            assert message == WorkerProc.READY_STR
+
+        except BaseException as e:
+            logger.exception(e)
+            raise e
+
+        finally:
+            sync_ctx.destroy(linger=0)
 
     # Message queues are not valid until all readers and writers call
     # wait_until_ready()
     def finish_message_queue_initialization(self):
-        self.scheduler_output_receiver.wait_until_ready()
-        if self.worker.rank == 0:
+        if self.rank == 0:
             self.model_output_sender.wait_until_ready()
 
     # Main busy loop for Multiprocessing Workers
