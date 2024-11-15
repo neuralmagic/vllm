@@ -138,7 +138,10 @@ def test_torch_semi_structured_sparse_dense_T_fp8_matmul():
     # Cached version
     B = torch.full((N, K), .25, device='cuda', dtype=dtype).t()
     C = dense_matmul(A_pruned, B, dtype=dtype).to(torch.float32)
-    C_sparse = semi_structured_sparse_dense_gemm(A, B).to(torch.float32)
+    C_sparse = semi_structured_sparse_dense_gemm(A,
+                                                 B,
+                                                 out_dtype=torch.bfloat16).to(
+                                                     torch.float32)
     torch.testing.assert_close(C, C_sparse, rtol=1e-1, atol=1e-1)
 
     # Noncached version
@@ -174,8 +177,9 @@ def test_torch_semi_structured_dense_sparse_T_matmul(mnk, dtype):
     not is_semi_structured_supported()
     or not is_quant_method_supported("modelopt"),
     reason="Semi structured fp8 matmul is not supported on this GPU type.")
-def test_torch_semi_structured_dense_sparse_T_fp8_matmul():
-    M, N, K = (32, 64, 32)
+@pytest.mark.parametrize("mnk", MNK)
+def test_torch_semi_structured_dense_sparse_T_fp8_matmul(mnk):
+    M, N, K = mnk
     dtype = torch.float8_e4m3fn
     B_T_pruned = generate_pruned_semi_structured_mat(N, K, dtype=dtype)
     B_T = compress_to_torch_sparse_semi_structured_mat(B_T_pruned)
@@ -290,9 +294,10 @@ def test_torch_semi_structured_dense_sparse_T_fp8_scaled_matmul():
 @pytest.mark.skipif(
     not is_semi_structured_supported(),
     reason="Semi structured matmul is not supported on this GPU type.")
-def test_torch_semi_structured_sparse_dense_t_int8_scaled_matmul():
+@pytest.mark.parametrize("mnk", MNK)
+def test_torch_semi_structured_sparse_dense_t_int8_scaled_matmul(mnk):
     dtype = torch.int8
-    M, N, K = (32, 64, 32)
+    M, N, K = mnk
     A_pruned = generate_pruned_semi_structured_mat(M, K, dtype)
     A = compress_to_torch_sparse_semi_structured_mat(A_pruned)
     B = get_random_mat(N, K, dtype)

@@ -24,8 +24,8 @@ DEFAULT_TP_SIZES = [1]
 # helpers
 def make_rand_tensors(dtype: torch.dtype, m: int, n: int,
                       k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    a = get_random_mat(m, k, dtype)
-    b = get_random_mat(n, k, dtype).t()
+    a = get_random_mat(n, k, dtype)
+    b = get_random_mat(m, k, dtype).t()
     return a, b
 
 
@@ -213,7 +213,7 @@ def run_model_bench(args):
         KNs = model_shapes(model, tp_size)
         MKNs = []
         for m in Ms:
-            assert m % 32 == 0, "Batch size has to be a multiple of 32"
+            assert m % 16 == 0, "Batch size has to be a multiple of 16"
             for k, n in KNs:
                 if k % 32 or n % 32:
                     continue

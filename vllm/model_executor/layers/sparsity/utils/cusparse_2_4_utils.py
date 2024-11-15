@@ -234,6 +234,8 @@ def semi_structured_sparse_dense_gemm_scaled(a_packed: torch.Tensor,
 
     scale = scale_a * scale_b
     if a_packed.dtype == torch.float8_e4m3fn:
+        if not (per_tensor_activations and per_tensor_weights):
+            scale = scale[:, None]
         result = matmul_(a_packed.packed, b_dense, out_dtype=torch.float32)
         result = torch.narrow(result, 1, 0, col)
         result = result * scale
