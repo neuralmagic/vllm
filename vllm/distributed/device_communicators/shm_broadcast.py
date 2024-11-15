@@ -1,6 +1,7 @@
 import os
 import struct
 import time
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -21,6 +22,13 @@ from vllm.utils import get_ip, get_open_port, is_valid_ipv6_address
 VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
 
 logger = init_logger(__name__)
+
+# We prefer to use os.sched_yield as it results in tighter polling loops,
+# measured to be around 3e-7 seconds. However on python < 3.11.1,
+# os.sched_yield() does not release the GIL, so we fall back to time.sleep(0)
+USE_SCHED_YIELD = False
+if sys.version_info[:3] >= (3, 11, 1):
+    USE_SCHED_YIELD = True
 
 
 class ShmRingBuffer:
@@ -334,7 +342,10 @@ class MessageQueue:
                     # we need to wait until it is read by all readers
 
                     # Release the processor to other threads
-                    os.sched_yield()
+                    if USE_SCHED_YIELD:
+                        os.sched_yield()
+                    else:
+                        time.sleep(0)
 
                     # if we wait for a long time, we should warn the user
                     if (time.monotonic() - start_time >
@@ -388,7 +399,10 @@ class MessageQueue:
                     # we need to wait until it is written
 
                     # Release the processor to other threads
-                    os.sched_yield()
+                    if USE_SCHED_YIELD:
+                        os.sched_yield()
+                    else:
+                        time.sleep(0)
 
                     # if we wait for a long time, we should warn the user
                     if (time.monotonic() - start_time >
