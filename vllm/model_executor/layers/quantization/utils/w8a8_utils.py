@@ -108,6 +108,9 @@ def apply_fp8_linear(
             use_per_token_if_dynamic=use_per_token_if_dynamic)
 
         # Fused GEMM_DQ
+        breakpoint()
+              
+              
         output = ops.cutlass_scaled_mm(qinput,
                                        weight,
                                        out_dtype=input.dtype,
