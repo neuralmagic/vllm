@@ -1,10 +1,16 @@
 """A GPU worker class."""
 import gc
 import os
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, Any, Iterator
+from contextlib import contextmanager
+from multiprocessing.process import BaseProcess
+import queue
+import threading
 
 import torch
 import torch.distributed
+import zmq
+import msgspec
 
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
@@ -188,18 +194,14 @@ class WorkerProc:
         input_shm_handle, # TODO: typing
         output_path: str, # W0 sends ModelRunnerOutput
         ready_path: str,
-        should_shutdown: Synchronized,
     ):
         self.rank = rank
         self.worker = Worker(vllm_config, local_rank, rank,
                              distributed_init_method)
 
-        # Signal from main process to shutdown (multiprocessing.Value).
-        self.should_shutdown = should_shutdown
-
         # Initialize MessageQueue for receiving SchedulerOutput
         self.scheduler_output_receiver = MessageQueue.create_from_handle(
-            scheduler_output_receiver_handle, self.worker.rank)
+            input_shm_handle, self.worker.rank)
 
         # Worker 0 initializes a message queue for sending the model output
         if self.rank == 0:
@@ -215,7 +217,7 @@ class WorkerProc:
 
         # Send Readiness signal to EngineClient.
         with self.make_socket(ready_path, zmq.constants.PUSH) as ready_socket:
-            ready_socket.send_string(EngineCoreProc.READY_STR)
+            ready_socket.send_string(WorkerProc.READY_STR)
 
         # All processors wait on the shm message queue
         self.scheduler_output_receiver.wait_until_ready()
@@ -231,7 +233,7 @@ class WorkerProc:
         if self.rank == 0:
             self.output_queue.push_back(min_num_blocks)
 
-        if vllm_configcache_config.num_gpu_blocks_override is not None:
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
             num_gpu_blocks_override = cache_config.num_gpu_blocks_override
             logger.info(
                 "Overriding num_gpu_blocks=%d with "
@@ -240,6 +242,29 @@ class WorkerProc:
             num_gpu_blocks = num_gpu_blocks_override
 
         self.worker.initialize_cache(num_gpu_blocks)
+
+    @contextmanager
+    def make_socket(self, path: str, type: Any) -> Iterator[zmq.Socket]:
+        """Context manager for use """
+
+        ctx = zmq.Context()
+        try:
+            socket = ctx.socket(type)
+
+            if type == zmq.constants.PULL:
+                socket.connect(path)
+            elif type == zmq.constants.PUSH:
+                socket.bind(path)
+            else:
+                raise ValueError(f"Unknown Socket Type: {type}")
+
+            yield socket
+
+        except KeyboardInterrupt:
+            logger.debug("Worker had Keyboard Interrupt.")
+
+        finally:
+            ctx.destroy(linger=0)
                 
 
 
@@ -252,7 +277,6 @@ class WorkerProc:
         input_shm_handle, # Receive SchedulerOutput
         output_path: str, # W0 sends ModelRunnerOutput
         ready_path: str,
-        should_shutdown: Synchronized,
     ) -> BaseProcess:
         context = multiprocessing.get_context("spawn")
 
@@ -264,7 +288,6 @@ class WorkerProc:
             "input_shm_handle": input_shm_handle,
             "output_path": output_path,
             "ready_path": ready_path,
-            "should_shutdown": should_shutdown
         }
         # Run EngineCore busy loop in background process.
         proc = context.Process(target=Worker.run_engine_core,
@@ -350,9 +373,34 @@ class WorkerProc:
                     SchedulerOutput)
                 output = self.worker.execute_model(scheduler_output)
                 if self.worker.rank == 0:
-                    self.model_output_sender.enqueue(output)
+                    self.model_output_sender.put_nowait(output)
 
                 p.step()
+
+    def process_output_socket(self, output_path: str):
+        """Output socket IO thread to send data to coordinator."""
+        
+        # Msgpack serialization encoding
+        encoder = msgspec.msgpack.Encoder()
+        # Reuse send buffer.
+        buffer = bytearray()
+        
+        with self.make_socket(output_path, zmq.constants.PUSH) as socket:
+            while True:
+                # Get next item to send from output queue
+                output = self.output_queue.get()
+                
+                # Determine the type of the output
+                if isinstance(output, tuple) and len(output) == 2 and all(isinstance(x, int) for x in output):
+                    type_frame = WorkerOutputType.NUM_BLOCKS.value
+                elif isinstance(output, ModelRunnerOutput):
+                    type_frame = WorkerOutputType.MODEL_RUNNER_OUTPUT.value
+                else:
+                    raise ValueError(f"Unknown output type: {type(output)}")
+
+                # Serialize and send to engine core process
+                data_frame = encoder.encode_into(output, buffer)
+                socket.send_multipart([type_frame, buffer], copy=False)
 
     # Wrapper methods defined here
     def initialize(self):

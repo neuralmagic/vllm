@@ -1,3 +1,4 @@
+import enum
 from typing import Dict, List, Optional
 
 import msgspec
@@ -41,3 +42,11 @@ class ModelRunnerOutput(msgspec.Struct,
     logprob_token_ids_cpu: Optional[torch.Tensor]
     # [num_reqs, max_num_logprobs + 1]
     logprobs_cpu: Optional[torch.Tensor]
+
+class WorkerOutputType(enum.Enum):
+    """
+    Request types defined as hex byte strings, so it can be sent over sockets
+    without separate encoding step.
+    """
+    NUM_BLOCKS = b'\x00'
+    MODEL_RUNNER_OUTPUT = b'\x01'
