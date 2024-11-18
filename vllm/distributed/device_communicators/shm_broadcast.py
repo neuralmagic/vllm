@@ -31,7 +31,7 @@ if sys.version_info[:3] >= (3, 11, 1):
     USE_SCHED_YIELD = True
 
 
-class ShmRingBuffer:
+class ShmRingBuffer(msgspec.Struct):
 
     def __init__(self,
                  n_reader: int,

@@ -3,9 +3,9 @@ import gc
 import os
 from typing import TYPE_CHECKING, Optional, Tuple, Any, Iterator
 from contextlib import contextmanager
+import multiprocessing
 from multiprocessing.process import BaseProcess
-import queue
-import threading
+from dataclasses import dataclass
 
 import torch
 import torch.distributed
@@ -16,16 +16,25 @@ from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
-from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+from vllm.distributed.device_communicators.shm_broadcast import (MessageQueue,
+                                                                 Handle)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size,
+                        get_open_zmq_ipc_path)
 from vllm.v1.core.scheduler_output import SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import (ModelRunnerOutput,NumBlocksMsg,
+                             NumGPUBlocks, ShmHandleMsg,
+                             WorkerInitRequestType,
+                             WorkerInitOutputType)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+POLLING_TIMEOUT_MS = 5000
+POLLING_TIMEOUT_S = POLLING_TIMEOUT_MS // 1000
+LOGGING_TIME_S = 5000
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -180,6 +189,14 @@ class Worker:
         return output
 
 
+@dataclass
+class WorkerProcHandle:
+    proc: BaseProcess
+    initialization_input_path: str
+    initialization_output_path: str
+    model_output_shm_mq: Optional[Handle]
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
@@ -191,8 +208,9 @@ class WorkerProc:
         local_rank: int,
         rank: int,
         distributed_init_method: str,
-        input_shm_handle, # TODO: typing
-        output_path: str, # W0 sends ModelRunnerOutput
+        input_shm_handle: Handle,
+        initialization_input_path: str,
+        initialization_output_path: str,
         ready_path: str,
     ):
         self.rank = rank
@@ -203,45 +221,27 @@ class WorkerProc:
         self.scheduler_output_receiver = MessageQueue.create_from_handle(
             input_shm_handle, self.worker.rank)
 
-        # Worker 0 initializes a message queue for sending the model output
-        if self.rank == 0:
-            self.output_queue = queue.Queue()
-            threading.Thread(target=self.process_output_socket,
-                args=(output_path, ),
-                daemon=True).start()
-
-        # The order of the next two steps (1. sending the ready signal and 
-        # 2. waiting on the shm message queue) must be done in this order
-        # to avoid deadlocks, as the EngineCoreProcess must first initialize
-        # all workers and then wait on the message queue.
-
-        # Send Readiness signal to EngineClient.
+        # Send Readiness signal to EngineCore process.
+        logger.info("sending ready.")
         with self.make_socket(ready_path, zmq.constants.PUSH) as ready_socket:
             ready_socket.send_string(WorkerProc.READY_STR)
 
-        # All processors wait on the shm message queue
-        self.scheduler_output_receiver.wait_until_ready()
+        # Worker 0 initializes a message queue for sending the model output
+        if self.rank == 0:
+            self.model_output_shm_mq = MessageQueue(1, 1)
+            output_shm_mq_handle = self.model_output_shm_mq.export_handle()
+            with self.make_socket(initialization_output_path,
+                                  zmq.constants.PUSH) as socket:
+                encoder = msgspec.msgpack.Encoder()
+                msg = encoder.encode(ShmHandleMsg(output_shm_mq_handle))
+                socket.send_multipart(
+                    (WorkerInitOutputType.MODEL_OUTPUT_MSG_QUEUE, msg))
+        else:
+            self.model_output_shm_mq = None
 
+        logger.info("initializing and loading model.")
         self.worker.initialize()
         self.worker.load_model()
-
-        my_num_blocks = torch.tensor(self.worker.determine_num_available_blocks())
-        min_num_blocks = torch.distributed.all_reduce(my_num_blocks, op=dist.ReduceOp.MIN)
-        num_gpu_blocks = min_num_blocks[0]
-
-        # Send the number of GPU blocks back to the model executor.
-        if self.rank == 0:
-            self.output_queue.push_back(min_num_blocks)
-
-        if vllm_config.cache_config.num_gpu_blocks_override is not None:
-            num_gpu_blocks_override = cache_config.num_gpu_blocks_override
-            logger.info(
-                "Overriding num_gpu_blocks=%d with "
-                "num_gpu_blocks_override=%d", num_gpu_blocks,
-                num_gpu_blocks_override)
-            num_gpu_blocks = num_gpu_blocks_override
-
-        self.worker.initialize_cache(num_gpu_blocks)
 
     @contextmanager
     def make_socket(self, path: str, type: Any) -> Iterator[zmq.Socket]:
@@ -265,20 +265,28 @@ class WorkerProc:
 
         finally:
             ctx.destroy(linger=0)
-                
-
 
     @staticmethod
-    def make_worker_core_process(
-        vllm_config: VllmConfig,
-        local_rank: int,
-        rank: int,
-        distributed_init_method: str,
-        input_shm_handle, # Receive SchedulerOutput
-        output_path: str, # W0 sends ModelRunnerOutput
-        ready_path: str,
+    def make_worker_process(
+            vllm_config: VllmConfig,
+            local_rank: int,
+            rank: int,
+            distributed_init_method: str,
+            input_shm_handle,  # Receive SchedulerOutput
     ) -> BaseProcess:
-        context = multiprocessing.get_context("spawn")
+        # The current process might have CUDA context,
+        # so we need to spawn a new process.
+        # NOTE(rob): this is a problem for using EngineCoreProc w/
+        # LLM, since we need a if __name__ == "__main__" guard.
+
+        # TODO(tms): fix before landing
+        context = multiprocessing.get_context("fork")
+
+        # ZMQ paths to send back and forth to worker process
+        # Used for initialization.
+        initialization_input_path = get_open_zmq_ipc_path()
+        initialization_output_path = get_open_zmq_ipc_path()
+        ready_path = get_open_zmq_ipc_path()
 
         process_kwargs = {
             "vllm_config": vllm_config,
@@ -286,24 +294,43 @@ class WorkerProc:
             "rank": rank,
             "distributed_init_method": distributed_init_method,
             "input_shm_handle": input_shm_handle,
-            "output_path": output_path,
             "ready_path": ready_path,
+            "initialization_input_path": initialization_output_path,
+            "initialization_output_path": initialization_input_path,
         }
         # Run EngineCore busy loop in background process.
-        proc = context.Process(target=Worker.run_engine_core,
+        print("Creating process")
+        proc = context.Process(target=WorkerProc.run_worker,
                                kwargs=process_kwargs)
+        print("starting process")
         proc.start()
+        print("start called")
 
         # Wait for startup
-        Worker.wait_for_startup(proc, ready_path)
-        return proc
+        WorkerProc.wait_for_startup(proc, ready_path)
+
+        # Read Shm MessageQueue from rank 0
+        if rank == 0:
+            model_output_mq = WorkerProc.read_model_output_shm_mq_handle(
+                initialization_input_path)
+        else:
+            model_output_mq = None
+
+        print(f"proc {rank} started")
+        return WorkerProcHandle(proc, rank, initialization_input_path,
+                                initialization_output_path, model_output_mq)
 
     @staticmethod
     def run_worker(*args, **kwargs):
         """Launch Worker busy loop in background process."""
+        print("HERE")
 
         try:
+            print(f"constructing worker proc with {args}, {kwargs}")
             worker = WorkerProc(*args, **kwargs)
+            worker.model_initialization_loop(
+                kwargs["initialization_input_path"],
+                kwargs["initialization_output_path"])
             worker.execute_model_busy_loop()
 
         except KeyboardInterrupt:
@@ -326,9 +353,10 @@ class WorkerProc:
             socket.connect(ready_path)
 
             # Wait for Worker to send Worker.READY_STR.
+            i = 0
             while socket.poll(timeout=POLLING_TIMEOUT_MS) == 0:
-                logger.debug("Waiting for Worker to startup.")
-
+                logger.info(f"Waiting for Worker to startup. {i}")
+                i += 1
                 if not proc.is_alive():
                     raise RuntimeError("WorkerProc failed to start.")
 
@@ -342,14 +370,98 @@ class WorkerProc:
         finally:
             sync_ctx.destroy(linger=0)
 
-    # Message queues are not valid until all readers and writers call
-    # wait_until_ready()
-    def finish_message_queue_initialization(self):
-        if self.rank == 0:
-            self.model_output_sender.wait_until_ready()
+    @staticmethod
+    def read_model_output_shm_mq_handle(init_input_path: str, ) -> Handle:
+        with WorkerProc.make_socket(init_input_path,
+                                    zmq.constants.PULL) as recv_socket:
+            type_frame, data_frame = recv_socket.recv_multipart(copy=False)
+            request_type = type_frame.buffer
+            request_data = data_frame.buffer
+
+            if (request_type ==
+                    WorkerInitOutputType.MODEL_OUTPUT_MSG_QUEUE.value):
+                decoder = msgspec.msgpack.Decoder(ShmHandleMsg)
+                handle = decoder.decode(request_data).handle
+                return handle
+            else:
+                raise ValueError(f"Unknown RequestType: {request_type}")
+
+    @staticmethod
+    def determine_num_available_blocks(
+            handle: WorkerProcHandle) -> Tuple[int, int]:
+        with WorkerProc.make_socket(handle.initialization_output_path, zmq.constants.PUSH) as send_socket, \
+             WorkerProc.make_socket(handle.initialization_input_path, zmq.constants.PULL) as recv_socket:
+
+            send_socket.send_multipart(
+                (WorkerInitRequestType.DETERMINE_NUM_BLOCKS, ))
+            type_frame, data_frame = recv_socket.recv_multipart(copy=False)
+
+            request_type = type_frame.buffer
+            request_data = data_frame.buffer
+
+            if request_type == WorkerInitOutputType.NUM_BLOCKS.value:
+                decoder = msgspec.msgpack.Decoder(NumBlocksMsg)
+                num_blocks = decoder.decode(request_data).num_blocks
+                return num_blocks
+            else:
+                raise ValueError(f"Unknown RequestType: {request_type}")
+
+    @staticmethod
+    def initialize_cache(handle: WorkerProcHandle, num_gpu_blocks: int) -> int:
+        with WorkerProc.make_socket(handle.initialization_output_path,
+                                    zmq.constants.PUSH) as socket:
+            encoder = msgspec.msgpack.Encoder()
+            msg = encoder.encode(NumGPUBlocks(num_gpu_blocks))
+            socket.send_multipart((WorkerInitRequestType.INIT_CACHE, msg))
+
+    # Busy loop used for initializing Multiprocessing Workers
+    def model_initialization_loop(self, init_input_path, init_output_path):
+        logger.info("starting initialization loop.")
+
+        # Msgpack serialization encoding.
+        encoder = msgspec.msgpack.Encoder()
+        # Reuse send buffer.
+        buffer = bytearray()
+
+        with WorkerProc.make_socket(init_output_path, zmq.constants.PUSH) as send_socket, \
+             WorkerProc.make_socket(init_input_path, zmq.constants.PULL) as recv_socket:
+            while True:
+                # (RequestType, RequestData)
+                type_frame, data_frame = recv_socket.recv_multipart(copy=False)
+                request_type = type_frame.buffer
+                request_data = data_frame.buffer
+
+                # Deserialize the request data.
+                if request_type == WorkerInitRequestType.DETERMINE_NUM_BLOCKS.value:
+                    num_blocks = self.worker.num_available_blocks()
+                    output = NumBlocksMsg(num_blocks)
+                    encoder.encode_into(output, buffer)
+                    print(f"determining num blocks {num_blocks}")
+                    send_socket.send_multipart(
+                        (WorkerInitOutputType.NUM_BLOCKS, buffer), copy=False)
+                elif request_type == WorkerInitRequestType.INIT_CACHE.value.value:
+                    decoder = msgspec.msgpack.Decoder(NumGPUBlocks)
+                    num_gpu_blocks = decoder.decode(
+                        request_data).num_gpu_blocks
+                    print(f"initializing blocks {num_gpu_blocks}")
+                    self.worker.initialize_cache(num_gpu_blocks)
+                    self.worker.compile_or_warm_up_model()
+                elif request_type == WorkerInitRequestType.BEGIN_MODEL_EXECUTION.value:
+                    print("Finishing initialization loop")
+                    # Make sure message queues are ready.
+                    self.scheduler_output_receiver.wait_until_ready()
+
+                    if self.model_output_shm_mq is not None:
+                        self.model_output_shm_mq.wait_until_ready()
+
+                    # Exit initialization loop to begin model execution loop
+                    return
+                else:
+                    raise ValueError(f"Unknown RequestType: {request_type}")
 
     # Main busy loop for Multiprocessing Workers
     def execute_model_busy_loop(self):
+        logger.info("starting busy loop.")
         with torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -369,6 +481,7 @@ class WorkerProc:
         ) as p:
 
             while True:
+                # TODO: need to receive termination messages
                 scheduler_output = self.scheduler_output_receiver.dequeue(
                     SchedulerOutput)
                 output = self.worker.execute_model(scheduler_output)
@@ -376,47 +489,6 @@ class WorkerProc:
                     self.model_output_sender.put_nowait(output)
 
                 p.step()
-
-    def process_output_socket(self, output_path: str):
-        """Output socket IO thread to send data to coordinator."""
-        
-        # Msgpack serialization encoding
-        encoder = msgspec.msgpack.Encoder()
-        # Reuse send buffer.
-        buffer = bytearray()
-        
-        with self.make_socket(output_path, zmq.constants.PUSH) as socket:
-            while True:
-                # Get next item to send from output queue
-                output = self.output_queue.get()
-                
-                # Determine the type of the output
-                if isinstance(output, tuple) and len(output) == 2 and all(isinstance(x, int) for x in output):
-                    type_frame = WorkerOutputType.NUM_BLOCKS.value
-                elif isinstance(output, ModelRunnerOutput):
-                    type_frame = WorkerOutputType.MODEL_RUNNER_OUTPUT.value
-                else:
-                    raise ValueError(f"Unknown output type: {type(output)}")
-
-                # Serialize and send to engine core process
-                data_frame = encoder.encode_into(output, buffer)
-                socket.send_multipart([type_frame, buffer], copy=False)
-
-    # Wrapper methods defined here
-    def initialize(self):
-        self.worker.initialize()
-
-    def load_model(self):
-        self.worker.load_model()
-
-    def determine_num_available_blocks(self) -> Tuple[int, int]:
-        return self.worker.determine_num_available_blocks()
-
-    def initialize_cache(self, num_gpu_blocks: int) -> None:
-        self.worker.initialize_cache(num_gpu_blocks)
-
-    def compile_or_warm_up_model(self) -> None:
-        self.worker.compile_or_warm_up_model()
 
 
 def init_worker_distributed_environment(

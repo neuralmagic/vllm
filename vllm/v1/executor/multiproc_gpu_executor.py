@@ -1,24 +1,22 @@
 import os
-from functools import partial
-from typing import Any, List, Optional, Tuple, Iterator
-from contextlib import contextmanager
-import queue
-import threading
+from typing import List, Tuple
 
 import torch
-import msgspec
-import zmq 
 
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.triton_utils import maybe_set_triton_cache_manager
-from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
-                        get_vllm_instance_id, get_open_zmq_ipc_path)
+from vllm.utils import (get_distributed_init_method, get_open_port,
+                        get_vllm_instance_id)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import WorkerProc
 
 logger = init_logger(__name__)
+
+POLLING_TIMEOUT_MS = 5000
+POLLING_TIMEOUT_S = POLLING_TIMEOUT_MS // 1000
+LOGGING_TIME_S = 5000
 
 
 class MultiprocessingGPUExecutor:
@@ -80,121 +78,55 @@ class MultiprocessingGPUExecutor:
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
         self.scheduler_output_sender = MessageQueue(world_size, world_size)
-        scheduler_output_sender_handle = self.scheduler_output_sender.export_handle()
-
-        # Background Threads and Queues for IO from Worker 0. 
-        # These enable us to overlap ZMQ socket IO, and to overlap some 
-        # serialization/deserialization with the model forward pass.
-        # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
-        self.output_queue = queue.Queue()
-        input_path = get_open_zmq_ipc_path()
-        ready_path = get_open_zmq_ipc_path()
-        threading.Thread(target=self.process_input_from_worker,
-                         args=(input_path, ),
-                         daemon=True).start()
+        scheduler_output_handle = self.scheduler_output_sender.export_handle()
 
         # Create workers
         self.workers: List[WorkerProc] = []
         for rank in range(world_size):
-            worker = WorkerProc(vllm_config, rank, rank,
-                        distributed_init_method, scheduler_output_sender_handle,
-                        input_path, ready_path)
+            worker = WorkerProc.make_worker_process(vllm_config, rank, rank,
+                                                    distributed_init_method,
+                                                    scheduler_output_handle)
             self.workers.append(worker)
-
-        # Message queues are not valid until all readers and writers call
-        # wait_until_ready()
-        self.model_output_receiver.wait_until_ready()
-
-        # Read the number of KV cache blocks from Worker 0 
-        self.num_available_blocks = _read_num_blocks()
-
-    @contextmanager
-    def make_socket(self, path: str, type: Any) -> Iterator[zmq.Socket]:
-        """Context manager for use """
-
-        ctx = zmq.Context()
-        try:
-            socket = ctx.socket(type)
-
-            if type == zmq.constants.PULL:
-                socket.connect(path)
-            elif type == zmq.constants.PUSH:
-                socket.bind(path)
-            else:
-                raise ValueError(f"Unknown Socket Type: {type}")
-
-            yield socket
-
-        except KeyboardInterrupt:
-            logger.debug("Worker had Keyboard Interrupt.")
-
-        finally:
-            ctx.destroy(linger=0)
-
-    def _read_num_blocks(self):
-        """Busy loop to read the number of KV cache blocks."""
-        request = self.input_queue.get()
-        if isinstance(request, Tuple[int, int]):
-            return request
-        else:
-            raise ValueError(f"Unknown RequestType: {request}")
-
 
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
         underlying worker.
         """
-        return self.num_available_blocks
+        # Get the maximum number of blocks that can be allocated on GPU and CPU.
+        num_blocks = []
+        for w in self.workers:
+            num_blocks.append(
+                WorkerProc.determine_num_available_blocks(w.handle))
+
+        # Since we use a shared centralized controller, we take the minimum
+        # number of blocks across all workers to make sure all the memory
+        # operators can be applied to all workers.
+        num_gpu_blocks = min(b[0] for b in num_blocks)
+        num_cpu_blocks = min(b[1] for b in num_blocks)
+
+        return num_gpu_blocks, num_cpu_blocks
 
     def initialize_cache(self, num_gpu_blocks: int) -> None:
         """Initialize the KV cache by invoking the underlying worker.
         """
         # We've already done this.
-        ...
+        for w in self.workers:
+            WorkerProc.initialize_cache(w.handle, num_gpu_blocks)
 
-    def _read_num_blocks(self):
-        """Busy loop to read the number of KV cache blocks."""
-
-        # 1) Poll the input queue until there is work to do.
-        req = self.input_queue.get(timeout=POLLING_TIMEOUT_S)
-        self._handle_client_request(req)
-
-        if isinstance(request, Tuple[int, int]):
-            return request
-
-        else:
-            raise ValueError(f"Unknown RequestType: {request}")
-
-    def process_input_from_worker(self, input_path: str):
-        """Input socket IO thread."""
-
-        # Msgpack serialization decoding.
-        decoder_num_blocks = msgspec.msgpack.Decoder(Tuple[int, int])
-        decoder_model_runner_output = msgspec.msgpack.Decoder(ModelRunnerOutput)
-
-        with self.make_socket(input_path, zmq.constants.PULL) as socket:
-            while True:
-                # (RequestType, RequestData)
-                type_frame, data_frame = socket.recv_multipart(copy=False)
-                request_type = type_frame.buffer
-                request_data = data_frame.buffer
-
-                # Deserialize the request data.
-                # TODO: refactor so that num blocks is only read once outside of this loop
-                if request_type == WorkerOutputType.NUM_BLOCKS.value:
-                    request = decoder_num_blocks.decode(request_data)
-                elif request_type == WorkerOutputType.MODEL_RUNNER_OUTPUT.value:
-                    request = decoder_model_runner_output.decode(request_data)
-                else:
-                    raise ValueError(f"Unknown RequestType: {request_type}")
-
-                # Push to input queue for core busy loop.
-                self.input_queue.put_nowait(request)
+    def start_workers(self):
+        for w in self.workers:
+            w.start_busy_loop()
+        self.scheduler_output_sender.wait_until_ready()
+        self.model_output_receiver.wait_until_ready()
+        self.workers_in_busy_loop = True
 
     def execute_model(
         self,
         scheduler_output,
     ) -> ModelRunnerOutput:
+        if not self.workers_in_busy_loop:
+            self.start_workers()
+
         self.scheduler_output_sender.enqueue(scheduler_output)
         model_output = self.input_queue.get()
         return model_output

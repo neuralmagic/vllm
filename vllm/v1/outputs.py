@@ -1,8 +1,10 @@
 import enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import torch
+
+from vllm.distributed.device_communicators.shm_broadcast import Handle
 
 
 class SamplerOutput(msgspec.Struct,
@@ -43,10 +45,35 @@ class ModelRunnerOutput(msgspec.Struct,
     # [num_reqs, max_num_logprobs + 1]
     logprobs_cpu: Optional[torch.Tensor]
 
-class WorkerOutputType(enum.Enum):
+
+# Below are data structures used for serializing initiailization-related
+# data structures to send between workers and the core engine process
+class NumBlocksMsg(msgspec.Struct):
+    blocks: Tuple[int, int]
+
+
+class NumGPUBlocks(msgspec.Struct):
+    num_gpu_blocks: int
+
+
+class ShmHandleMsg(msgspec.Struct):
+    handle: Handle
+
+
+class WorkerInitRequestType(enum.Enum):
+    """
+    Request types defined as hex byte strings, so it can be sent over sockets
+    without separate encoding step.
+    """
+    DETERMINE_NUM_BLOCKS = b'\x00'
+    INIT_CACHE = b'\x01'
+    BEGIN_MODEL_EXECUTION = b'\x02'
+
+
+class WorkerInitOutputType(enum.Enum):
     """
     Request types defined as hex byte strings, so it can be sent over sockets
     without separate encoding step.
     """
     NUM_BLOCKS = b'\x00'
-    MODEL_RUNNER_OUTPUT = b'\x01'
+    MODEL_OUTPUT_MSG_QUEUE = b'\x01'

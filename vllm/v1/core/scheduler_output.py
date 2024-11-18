@@ -1,11 +1,11 @@
 import msgspec
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
-from typing import (TYPE_CHECKING, Deque, Dict, Iterable, List, Optional, Set,
-                    Tuple, Union)
+from typing import Dict, List, Optional, Set, Tuple
 
 from vllm.multimodal import MultiModalKwargs
 from vllm.multimodal.base import PlaceholderRange
+
 
 class NewRequestData(msgspec.Struct,
                      array_like=True,
@@ -41,9 +41,9 @@ class NewRequestData(msgspec.Struct,
 
 
 class ResumedRequestData(msgspec.Struct,
-                    array_like=True,
-                    omit_defaults=True,
-                    gc=False):
+                         array_like=True,
+                         omit_defaults=True,
+                         gc=False):
 
     req_id: str
     block_ids: List[int]
@@ -64,9 +64,9 @@ class ResumedRequestData(msgspec.Struct,
 
 
 class RunningRequestData(msgspec.Struct,
-                    array_like=True,
-                    omit_defaults=True,
-                    gc=False):
+                         array_like=True,
+                         omit_defaults=True,
+                         gc=False):
 
     req_id: str
     new_block_ids: List[int]
@@ -85,6 +85,7 @@ class RunningRequestData(msgspec.Struct,
             num_computed_tokens=num_computed_tokens,
         )
 
+
 class SchedulerOutput(msgspec.Struct,
                       array_like=True,
                       omit_defaults=True,
@@ -101,4 +102,3 @@ class SchedulerOutput(msgspec.Struct,
     preempted_req_ids: Set[str]
     finished_req_ids: Set[str]
     free_encoder_input_ids: List[Tuple[str, int]]
-
