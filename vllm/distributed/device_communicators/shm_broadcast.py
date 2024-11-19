@@ -5,7 +5,7 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from unittest.mock import patch
 
 import msgspec
@@ -31,7 +31,7 @@ if sys.version_info[:3] >= (3, 11, 1):
     USE_SCHED_YIELD = True
 
 
-class ShmRingBuffer(msgspec.Struct):
+class ShmRingBuffer:
 
     def __init__(self,
                  n_reader: int,
@@ -123,6 +123,10 @@ class ShmRingBuffer(msgspec.Struct):
                     # and we should suppress the error
                     pass
 
+    def handle(self):
+        return (self.n_reader, self.max_chunk_bytes, self.max_chunks,
+             self.shared_memory.name)
+
     def __reduce__(self):
         return (
             self.__class__,
@@ -156,7 +160,7 @@ class Handle:
     connect_ip: str
     local_reader_ranks: List[int] = field(default_factory=list)
 
-    buffer: Optional[ShmRingBuffer] = None
+    buffer_handle: Optional[Tuple[int, int, int, str]] = None
     local_subscribe_port: Optional[int] = None
     remote_subscribe_port: Optional[int] = None
 
@@ -241,7 +245,7 @@ class MessageQueue:
         self.handle = Handle(
             connect_ip=connect_ip,
             local_reader_ranks=local_reader_ranks,
-            buffer=self.buffer,
+            buffer_handle=self.buffer.handle(),
             local_subscribe_port=local_subscribe_port,
             remote_subscribe_port=remote_subscribe_port,
         )
@@ -260,8 +264,8 @@ class MessageQueue:
         context = Context()
 
         if rank in handle.local_reader_ranks:
-            assert handle.buffer is not None
-            self.buffer = handle.buffer
+            assert handle.buffer_handle is not None
+            self.buffer = ShmRingBuffer(*handle.buffer_handle)
             self.current_idx = 0
             self.local_reader_rank = handle.local_reader_ranks.index(rank)
             self._is_local_reader = True

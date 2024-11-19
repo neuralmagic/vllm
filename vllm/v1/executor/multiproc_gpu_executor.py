@@ -1,5 +1,6 @@
 import os
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -13,11 +14,6 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import WorkerProc
 
 logger = init_logger(__name__)
-
-POLLING_TIMEOUT_MS = 5000
-POLLING_TIMEOUT_S = POLLING_TIMEOUT_MS // 1000
-LOGGING_TIME_S = 5000
-
 
 class MultiprocessingGPUExecutor:
 
@@ -77,8 +73,8 @@ class MultiprocessingGPUExecutor:
 
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
-        self.scheduler_output_sender = MessageQueue(world_size, world_size)
-        scheduler_output_handle = self.scheduler_output_sender.export_handle()
+        self.scheduler_output_mq = MessageQueue(world_size, world_size)
+        scheduler_output_handle = self.scheduler_output_mq.export_handle()
 
         # Create workers
         self.workers: List[WorkerProc] = []
@@ -88,15 +84,20 @@ class MultiprocessingGPUExecutor:
                                                     scheduler_output_handle)
             self.workers.append(worker)
 
+        model_output_mq_handle = self.workers[0].model_output_mq_handle
+        self.model_output_mq = MessageQueue.create_from_handle(
+            model_output_mq_handle, 0)
+        self.workers_in_busy_loop = False
+
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
         underlying worker.
         """
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
         num_blocks = []
-        for w in self.workers:
-            num_blocks.append(
-                WorkerProc.determine_num_available_blocks(w.handle))
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(WorkerProc.determine_num_available_blocks, w) for w in self.workers]
+            num_blocks = [f.result() for f in futures]
 
         # Since we use a shared centralized controller, we take the minimum
         # number of blocks across all workers to make sure all the memory
@@ -107,17 +108,16 @@ class MultiprocessingGPUExecutor:
         return num_gpu_blocks, num_cpu_blocks
 
     def initialize_cache(self, num_gpu_blocks: int) -> None:
-        """Initialize the KV cache by invoking the underlying worker.
-        """
-        # We've already done this.
-        for w in self.workers:
-            WorkerProc.initialize_cache(w.handle, num_gpu_blocks)
+        """Initialize the KV caches by invoking the underlying worker."""
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(WorkerProc.initialize_cache, w, num_gpu_blocks) for w in self.workers]
+            [f.result() for f in futures]  # Wait for all to complete
 
     def start_workers(self):
         for w in self.workers:
-            w.start_busy_loop()
-        self.scheduler_output_sender.wait_until_ready()
-        self.model_output_receiver.wait_until_ready()
+            WorkerProc.start_busy_loop(w)
+        self.scheduler_output_mq.wait_until_ready()
+        self.model_output_mq.wait_until_ready()
         self.workers_in_busy_loop = True
 
     def execute_model(
@@ -127,8 +127,8 @@ class MultiprocessingGPUExecutor:
         if not self.workers_in_busy_loop:
             self.start_workers()
 
-        self.scheduler_output_sender.enqueue(scheduler_output)
-        model_output = self.input_queue.get()
+        self.scheduler_output_mq.enqueue(scheduler_output)
+        model_output = self.model_output_mq.dequeue(ModelRunnerOutput)
         return model_output
 
     def check_health(self) -> None:

@@ -49,7 +49,7 @@ class ModelRunnerOutput(msgspec.Struct,
 # Below are data structures used for serializing initiailization-related
 # data structures to send between workers and the core engine process
 class NumBlocksMsg(msgspec.Struct):
-    blocks: Tuple[int, int]
+    num_blocks: Tuple[int, int]
 
 
 class NumGPUBlocks(msgspec.Struct):
