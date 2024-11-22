@@ -1,6 +1,6 @@
 import os
-from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Tuple
 
 import torch
 
@@ -10,14 +10,19 @@ from vllm.logger import init_logger
 from vllm.triton_utils import maybe_set_triton_cache_manager
 from vllm.utils import (get_distributed_init_method, get_open_port,
                         get_vllm_instance_id)
+from vllm.v1.core.scheduler_output import ExecutorMsg, ExecutorMsgType
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.gpu_worker import WorkerProc
+from vllm.v1.worker.gpu_worker import WorkerProc, WorkerProcHandle
 
 logger = init_logger(__name__)
+
 
 class MultiprocessingGPUExecutor:
 
     def __init__(self, vllm_config: VllmConfig) -> None:
+        # Store early so we can count on using it at shutdown
+        self._TERMINATE_VALUE = ExecutorMsgType.TERMINATE.value
+
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -77,7 +82,7 @@ class MultiprocessingGPUExecutor:
         scheduler_output_handle = self.scheduler_output_mq.export_handle()
 
         # Create workers
-        self.workers: List[WorkerProc] = []
+        self.workers: List[WorkerProcHandle] = []
         for rank in range(world_size):
             worker = WorkerProc.make_worker_process(vllm_config, rank, rank,
                                                     distributed_init_method,
@@ -89,15 +94,32 @@ class MultiprocessingGPUExecutor:
             model_output_mq_handle, 0)
         self.workers_in_busy_loop = False
 
+    def start_workers(self):
+        for w in self.workers:
+            w.start_busy_loop()
+        self.scheduler_output_mq.wait_until_ready()
+        self.model_output_mq.wait_until_ready()
+        self.workers_in_busy_loop = True
+
+    def run_on_workers(self, fn: str, *args):
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(getattr(type(w), fn), w, *args)
+                for w in self.workers
+            ]
+            result = [f.result() for f in futures]  # Wait for all to complete
+        return result
+
+    def initialize_cache(self, num_gpu_blocks: int) -> None:
+        """Initialize the KV caches by invoking the underlying worker."""
+        self.run_on_workers('initialize_cache', num_gpu_blocks)
+
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks by invoking the
         underlying worker.
         """
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
-        num_blocks = []
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(WorkerProc.determine_num_available_blocks, w) for w in self.workers]
-            num_blocks = [f.result() for f in futures]
+        num_blocks = self.run_on_workers('determine_num_available_blocks')
 
         # Since we use a shared centralized controller, we take the minimum
         # number of blocks across all workers to make sure all the memory
@@ -107,19 +129,6 @@ class MultiprocessingGPUExecutor:
 
         return num_gpu_blocks, num_cpu_blocks
 
-    def initialize_cache(self, num_gpu_blocks: int) -> None:
-        """Initialize the KV caches by invoking the underlying worker."""
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(WorkerProc.initialize_cache, w, num_gpu_blocks) for w in self.workers]
-            [f.result() for f in futures]  # Wait for all to complete
-
-    def start_workers(self):
-        for w in self.workers:
-            WorkerProc.start_busy_loop(w)
-        self.scheduler_output_mq.wait_until_ready()
-        self.model_output_mq.wait_until_ready()
-        self.workers_in_busy_loop = True
-
     def execute_model(
         self,
         scheduler_output,
@@ -127,9 +136,21 @@ class MultiprocessingGPUExecutor:
         if not self.workers_in_busy_loop:
             self.start_workers()
 
-        self.scheduler_output_mq.enqueue(scheduler_output)
+        self.scheduler_output_mq.enqueue(
+            ExecutorMsg(ExecutorMsgType.TOIL.value, scheduler_output))
         model_output = self.model_output_mq.dequeue(ModelRunnerOutput)
         return model_output
+
+    def shutdown(self):
+        """Properly shut down the executor and its workers"""
+        termination_msg = ExecutorMsg(self._TERMINATE_VALUE, None)
+        self.scheduler_output_mq.enqueue(termination_msg)
+
+        # Shutdown the worker processes if needed.
+        self.run_on_workers('terminate')
+
+    def __del__(self):
+        self.shutdown()
 
     def check_health(self) -> None:
         # GPUExecutor will always be healthy as long as

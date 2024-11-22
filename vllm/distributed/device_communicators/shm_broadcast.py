@@ -1,7 +1,7 @@
 import os
 import struct
-import time
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -125,7 +125,7 @@ class ShmRingBuffer:
 
     def handle(self):
         return (self.n_reader, self.max_chunk_bytes, self.max_chunks,
-             self.shared_memory.name)
+                self.shared_memory.name)
 
     def __reduce__(self):
         return (

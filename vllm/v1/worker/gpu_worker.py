@@ -1,33 +1,32 @@
 """A GPU worker class."""
 import gc
-import os
-from typing import TYPE_CHECKING, Optional, Tuple, Any, Iterator
-from contextlib import contextmanager
 import multiprocessing
-from multiprocessing.process import BaseProcess
+import os
+import time
 from dataclasses import dataclass
+from multiprocessing.process import BaseProcess
+from typing import TYPE_CHECKING, Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed
 import zmq
-import msgspec
 
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
-from vllm.distributed.device_communicators.shm_broadcast import (MessageQueue,
-                                                                 Handle)
+from vllm.distributed.device_communicators.shm_broadcast import (Handle,
+                                                                 MessageQueue)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size,
-                        get_open_zmq_ipc_path)
-from vllm.v1.core.scheduler_output import SchedulerOutput
-from vllm.v1.outputs import (ModelRunnerOutput,NumBlocksMsg,
-                             NumGPUBlocks, ShmHandleMsg,
-                             WorkerInitRequestType,
-                             WorkerInitOutputType)
+                        get_open_zmq_ipc_path, make_zmq_socket)
+from vllm.v1.core.scheduler_output import ExecutorMsg, ExecutorMsgType
+from vllm.v1.outputs import (ModelRunnerOutput, NumBlocksMsg, NumGPUBlocks,
+                             ShmHandleMsg, WorkerInitOutputType,
+                             WorkerInitRequestType)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
@@ -196,6 +195,51 @@ class WorkerProcHandle:
     initialization_output_path: str
     model_output_mq_handle: Optional[Handle]
 
+    def determine_num_available_blocks(self) -> Tuple[int, int]:
+        with make_zmq_socket(self.initialization_output_path,
+                             zmq.constants.PUSH) as send_socket, \
+             make_zmq_socket(self.initialization_input_path,
+                             zmq.constants.PULL) as recv_socket:
+
+            send_socket.send_multipart(
+                (WorkerInitRequestType.DETERMINE_NUM_BLOCKS.value, ))
+            type_frame, data_frame = recv_socket.recv_multipart(copy=False)
+
+            request_type = type_frame.buffer
+            request_data = data_frame.buffer
+
+            if request_type == WorkerInitOutputType.NUM_BLOCKS.value:
+                decoder = msgspec.msgpack.Decoder(NumBlocksMsg)
+                num_blocks = decoder.decode(request_data).num_blocks
+                return num_blocks
+            else:
+                raise ValueError(f"Unknown RequestType: {request_type}")
+
+    def initialize_cache(self, num_gpu_blocks: int) -> int:
+        with make_zmq_socket(self.initialization_output_path,
+                             zmq.constants.PUSH) as socket:
+            encoder = msgspec.msgpack.Encoder()
+            msg = encoder.encode(NumGPUBlocks(num_gpu_blocks))
+            socket.send_multipart(
+                (WorkerInitRequestType.INIT_CACHE.value, msg))
+
+    def start_busy_loop(self) -> None:
+        with make_zmq_socket(self.initialization_output_path,
+                             zmq.constants.PUSH) as socket:
+            socket.send_multipart(
+                (WorkerInitRequestType.BEGIN_MODEL_EXECUTION.value, ))
+
+    def terminate(self) -> None:
+        self.proc.terminate()
+        start_time = time.time()
+
+        while time.time() - start_time < 5:
+            if not self.proc.is_alive():
+                return  # Process terminated successfully
+            time.sleep(0.1)  # Short sleep to avoid CPU spinning
+
+        self.proc.kill()
+
 
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
@@ -223,15 +267,15 @@ class WorkerProc:
 
         # Send Readiness signal to EngineCore process.
         logger.info("sending ready.")
-        with WorkerProc.make_socket(ready_path, zmq.constants.PUSH) as ready_socket:
+        with make_zmq_socket(ready_path, zmq.constants.PUSH) as ready_socket:
             ready_socket.send_string(WorkerProc.READY_STR)
 
         # Worker 0 initializes a message queue for sending the model output
         if self.rank == 0:
             self.model_output_mq = MessageQueue(1, 1)
             output_mq_handle = self.model_output_mq.export_handle()
-            with WorkerProc.make_socket(initialization_output_path,
-                                  zmq.constants.PUSH) as socket:
+            with make_zmq_socket(initialization_output_path,
+                                 zmq.constants.PUSH) as socket:
                 encoder = msgspec.msgpack.Encoder()
                 msg = encoder.encode(ShmHandleMsg(output_mq_handle))
                 socket.send_multipart(
@@ -243,29 +287,10 @@ class WorkerProc:
         self.worker.initialize()
         self.worker.load_model()
 
-    @contextmanager
-    @staticmethod
-    def make_socket(path: str, type: Any) -> Iterator[zmq.Socket]:
-        """Context manager for use """
-
-        ctx = zmq.Context()
-        try:
-            socket = ctx.socket(type)
-
-            if type == zmq.constants.PULL:
-                socket.connect(path)
-            elif type == zmq.constants.PUSH:
-                socket.bind(path)
-            else:
-                raise ValueError(f"Unknown Socket Type: {type}")
-
-            yield socket
-
-        except KeyboardInterrupt:
-            logger.debug("Worker had Keyboard Interrupt.")
-
-        finally:
-            ctx.destroy(linger=0)
+    # TODO: WHY is this needed?
+    def __del__(self):
+        if hasattr(self, "model_output_mq"):
+            del self.model_output_mq
 
     @staticmethod
     def make_worker_process(
@@ -274,7 +299,7 @@ class WorkerProc:
             rank: int,
             distributed_init_method: str,
             input_shm_handle,  # Receive SchedulerOutput
-    ) -> BaseProcess:
+    ) -> WorkerProcHandle:
         # The current process might have CUDA context,
         # so we need to spawn a new process.
         # NOTE(rob): this is a problem for using EngineCoreProc w/
@@ -309,13 +334,14 @@ class WorkerProc:
 
         # Read Shm MessageQueue from rank 0
         if rank == 0:
-            model_output_mq = WorkerProc.read_model_output_mq_handle(
+            model_output_mq_handle = WorkerProc.read_model_output_mq_handle(
                 initialization_input_path)
         else:
-            model_output_mq = None
+            model_output_mq_handle = None
 
         return WorkerProcHandle(proc, initialization_input_path,
-                                initialization_output_path, model_output_mq)
+                                initialization_output_path,
+                                model_output_mq_handle)
 
     @staticmethod
     def run_worker(*args, **kwargs):
@@ -326,6 +352,7 @@ class WorkerProc:
             worker.model_initialization_loop(
                 kwargs["initialization_input_path"],
                 kwargs["initialization_output_path"])
+
             worker.execute_model_busy_loop()
 
         except KeyboardInterrupt:
@@ -334,6 +361,10 @@ class WorkerProc:
         except BaseException as e:
             logger.exception(e)
             raise e
+        finally:
+            # TODO: Why is this del needed?
+            del worker
+            exit(0)
 
     @staticmethod
     def wait_for_startup(
@@ -348,10 +379,9 @@ class WorkerProc:
             socket.connect(ready_path)
 
             # Wait for Worker to send Worker.READY_STR.
-            i = 0
             while socket.poll(timeout=POLLING_TIMEOUT_MS) == 0:
-                logger.info(f"Waiting for Worker to startup. {i}")
-                i += 1
+                logger.debug("Waiting for WorkerProc to startup.")
+
                 if not proc.is_alive():
                     raise RuntimeError("WorkerProc failed to start.")
 
@@ -367,8 +397,8 @@ class WorkerProc:
 
     @staticmethod
     def read_model_output_mq_handle(init_input_path: str, ) -> Handle:
-        with WorkerProc.make_socket(init_input_path,
-                                    zmq.constants.PULL) as recv_socket:
+        with make_zmq_socket(init_input_path,
+                             zmq.constants.PULL) as recv_socket:
             type_frame, data_frame = recv_socket.recv_multipart(copy=False)
             request_type = type_frame.buffer
             request_data = data_frame.buffer
@@ -381,40 +411,6 @@ class WorkerProc:
             else:
                 raise ValueError(f"Unknown RequestType: {request_type}")
 
-    @staticmethod
-    def determine_num_available_blocks(
-            handle: WorkerProcHandle) -> Tuple[int, int]:
-        with WorkerProc.make_socket(handle.initialization_output_path, zmq.constants.PUSH) as send_socket, \
-             WorkerProc.make_socket(handle.initialization_input_path, zmq.constants.PULL) as recv_socket:
-
-            send_socket.send_multipart(
-                (WorkerInitRequestType.DETERMINE_NUM_BLOCKS.value, ))
-            type_frame, data_frame = recv_socket.recv_multipart(copy=False)
-
-            request_type = type_frame.buffer
-            request_data = data_frame.buffer
-
-            if request_type == WorkerInitOutputType.NUM_BLOCKS.value:
-                decoder = msgspec.msgpack.Decoder(NumBlocksMsg)
-                num_blocks = decoder.decode(request_data).num_blocks
-                return num_blocks
-            else:
-                raise ValueError(f"Unknown RequestType: {request_type}")
-
-    @staticmethod
-    def initialize_cache(handle: WorkerProcHandle, num_gpu_blocks: int) -> int:
-        with WorkerProc.make_socket(handle.initialization_output_path,
-                                    zmq.constants.PUSH) as socket:
-            encoder = msgspec.msgpack.Encoder()
-            msg = encoder.encode(NumGPUBlocks(num_gpu_blocks))
-            socket.send_multipart((WorkerInitRequestType.INIT_CACHE.value, msg))
-
-    @staticmethod
-    def start_busy_loop(handle: WorkerProcHandle) -> None:
-        with WorkerProc.make_socket(handle.initialization_output_path,
-                                    zmq.constants.PUSH) as socket:
-            socket.send_multipart((WorkerInitRequestType.BEGIN_MODEL_EXECUTION.value,))
-
     # Busy loop used for initializing Multiprocessing Workers
     def model_initialization_loop(self, init_input_path, init_output_path):
         # Msgpack serialization encoding.
@@ -422,20 +418,24 @@ class WorkerProc:
         # Reuse send buffer.
         buffer = bytearray()
 
-        with WorkerProc.make_socket(init_output_path, zmq.constants.PUSH) as send_socket, \
-             WorkerProc.make_socket(init_input_path, zmq.constants.PULL) as recv_socket:
+        with make_zmq_socket(init_output_path,
+                             zmq.constants.PUSH) as send_socket, \
+             make_zmq_socket(init_input_path,
+                             zmq.constants.PULL) as recv_socket:
             while True:
                 # (RequestType, RequestData)
                 thing = recv_socket.recv_multipart(copy=False)
                 request_type = thing[0].buffer
 
                 # Deserialize the request data.
-                if request_type == WorkerInitRequestType.DETERMINE_NUM_BLOCKS.value:
+                if (request_type ==
+                        WorkerInitRequestType.DETERMINE_NUM_BLOCKS.value):
                     num_blocks = self.worker.determine_num_available_blocks()
                     output = NumBlocksMsg(num_blocks)
                     encoder.encode_into(output, buffer)
                     send_socket.send_multipart(
-                        (WorkerInitOutputType.NUM_BLOCKS.value, buffer), copy=False)
+                        (WorkerInitOutputType.NUM_BLOCKS.value, buffer),
+                        copy=False)
                 elif request_type == WorkerInitRequestType.INIT_CACHE.value:
                     request_data = thing[1].buffer
                     decoder = msgspec.msgpack.Decoder(NumGPUBlocks)
@@ -443,7 +443,8 @@ class WorkerProc:
                         request_data).num_gpu_blocks
                     self.worker.initialize_cache(num_gpu_blocks)
                     self.worker.compile_or_warm_up_model()
-                elif request_type == WorkerInitRequestType.BEGIN_MODEL_EXECUTION.value:
+                elif (request_type ==
+                      WorkerInitRequestType.BEGIN_MODEL_EXECUTION.value):
                     # Make sure message queues are ready.
                     self.scheduler_output_receiver.wait_until_ready()
 
@@ -476,12 +477,17 @@ class WorkerProc:
         ) as p:
 
             while True:
-                # TODO: need to receive termination messages
-                scheduler_output = self.scheduler_output_receiver.dequeue(
-                    SchedulerOutput)
-                output = self.worker.execute_model(scheduler_output)
-                if self.worker.rank == 0:
-                    self.model_output_mq.enqueue(output)
+                msg = self.scheduler_output_receiver.dequeue(ExecutorMsg)
+
+                if msg.message_type == ExecutorMsgType.TERMINATE:
+                    return
+                elif msg.message_type == ExecutorMsgType.TOIL:
+                    output = self.worker.execute_model(msg.payload)
+                    if self.worker.rank == 0:
+                        self.model_output_mq.enqueue(output)
+                else:
+                    raise ValueError(
+                        f"Unknown RequestType: {msg.message_type}")
 
                 p.step()
 
