@@ -151,7 +151,7 @@ run_serving_tests() {
     dataset_name=$(echo "$common_params" | jq -r '.dataset_name')
     dataset_path=$(echo "$common_params" | jq -r '.dataset_path')
     port=$(echo "$common_params" | jq -r '.port')
-    num_prompts=$(echo "$common_params" | jq -r '.num_prompts')
+    num_secs=$(echo "$common_params" | jq -r '.num_secs')
     reuse_server=$(echo "$common_params" | jq -r '.reuse_server')
 
     # get client and server arguments
@@ -213,7 +213,10 @@ run_serving_tests() {
       if [[ "$qps" == *"inf"* ]]; then
         echo "qps was $qps"
         qps="inf"
+        num_prompts=1000
         echo "now qps is $qps"
+      else
+        num_prompts=$(("$num_secs" * "$qps"))
       fi
 
       new_test_name=$test_name"_qps_"$qps
@@ -305,7 +308,6 @@ run_serving_tests() {
 
   kill_gpu_processes
 }
-
 
 prepare_dataset() {
 

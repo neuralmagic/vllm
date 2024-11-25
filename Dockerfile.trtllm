@@ -1,4 +1,5 @@
-FROM nvcr.io/nvidia/tritonserver:24.07-trtllm-python-py3 AS base
+# FROM nvcr.io/nvidia/tritonserver:24.07-trtllm-python-py3 AS base
+FROM nvcr.io/nvidia/tritonserver:24.10-trtllm-python-py3 AS base
 
 ## Install packages required for bench 
 RUN apt-get update -y \
