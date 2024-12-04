@@ -216,6 +216,10 @@ class PyNcclCommunicator:
                                 ncclDataTypeEnum.from_torch(tensor.dtype), src,
                                 self.comm, cudaStream_t(stream.cuda_stream))
 
+    def __del__(self):
+        self.nccl.ncclCommDestroy(self.comm)
+
+
     @contextmanager
     def change_state(self,
                      enable: Optional[bool] = None,
