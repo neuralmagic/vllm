@@ -199,6 +199,7 @@ set(VLLM_EXT_SRC
   "csrc/quantization/gguf/gguf_kernel.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/prepare_inputs/advance_step.cu"
+  "csrc/quantization/fp8_semi_structured/cusparseLt.cpp"
   "csrc/torch_bindings.cpp")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
@@ -413,6 +414,15 @@ define_gpu_extension_target(
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
+# If cuSparseLt is not installed we skip 2:4 optimizations
+find_path(CUSPARSELT_INCLUDE_PATH cusparseLt.h
+  HINTS ${CUSPARSELT_INCLUDE_DIR}
+  PATH_SUFFIXES cuda/include cuda include)
+
+if(CUSPARSELT_INCLUDE_PATH)
+  message(STATUS "CuSparseLt header file found ${CUSPARSELT_INCLUDE_PATH}")
+  target_compile_definitions(_C PRIVATE VLLM_CUSPARSELT_ENABLED=1)
+endif()
 #
 # _moe_C extension
 #

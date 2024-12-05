@@ -224,3 +224,22 @@ void register_graph_buffers(fptr_t _fa,
                             const std::vector<std::vector<int64_t>>& handles,
                             const std::vector<std::vector<int64_t>>& offsets);
 #endif
+
+#ifndef USE_ROCM
+torch::Tensor cslt_compress_fp8_semi_structured(const torch::Tensor& input);
+
+torch::Tensor cslt_mm_semi_structured(
+    const torch::Tensor& compressed_A, const torch::Tensor& dense_B,
+    const c10::optional<torch::Tensor>& scale_opt,
+    const c10::optional<torch::Tensor>& bias_opt,
+    const std::optional<torch::ScalarType> out_dtype_opt);
+
+torch::Tensor cslt_mm_semi_structured2(
+    const torch::Tensor& compressed_A, const torch::Tensor& dense_B,
+    const c10::optional<torch::Tensor>& scale_opt,
+    const c10::optional<torch::Tensor>& bias_opt,
+    const std::optional<torch::ScalarType> out_dtype_opt);
+
+void cslt_clear_cache();
+
+#endif
