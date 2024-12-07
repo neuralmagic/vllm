@@ -230,6 +230,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         # So if the GIT_TAG above is updated to a commit hash, GIT_SHALLOW must be set to FALSE
         # GIT_SHALLOW FALSE
   )
+  endif()
   FetchContent_MakeAvailable(cutlass)
 
   list(APPEND VLLM_EXT_SRC
