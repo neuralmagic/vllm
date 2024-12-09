@@ -396,10 +396,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                                     sparsity_scheme=sparsity_scheme):
             # Have a valid sparsity scheme
             # Validate layer is supported by Cutlass 2:4 Kernel
-            scheme = CompressedTensors24(quantized=weight_quant is not None
-                                         or input_quant is not None,
-                                         weight_quant=weight_quant,
-                                         input_quant=input_quant)
+            scheme = CompressedTensors24(
+                quantized=weight_quant is not None or input_quant is not None,
+                weight_quant=weight_quant,
+                input_quant=input_quant,
+                model_compression_config=self._get_model_compression_config(
+                    sparsity_scheme),
+            )
         else:
             # Find the quant_scheme
             scheme = self._get_scheme_from_parts(  # type: ignore
@@ -433,8 +436,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         """
         is_valid_sparsity = (sparsity_scheme is not None
                              and sparsity_scheme.sparsity_structure
-                             == SparsityStructure.TWO_FOUR.value
-                             and sparsity_scheme.format == "dense")
+                             == SparsityStructure.TWO_FOUR.value)
         if not is_valid_sparsity:
             return False
 
@@ -464,6 +466,19 @@ class CompressedTensorsConfig(QuantizationConfig):
             return False
 
         return weight_quant.num_bits == input_quant.num_bits == 8
+
+    def _get_model_compression_config(
+            self, sparsity_scheme: Optional[SparsityCompressionConfig] = None):
+        """
+        Get the model compressor config from the sparsity scheme
+
+        :param sparsity_scheme: The sparsity scheme
+        :return: The model compressor config
+        """
+        if sparsity_scheme is None or sparsity_scheme.format == "dense":
+            return None
+
+        return self.config
 
 
 class CompressedTensorsLinearMethod(LinearMethodBase):

@@ -1,6 +1,7 @@
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
+from compressed_tensors import ModelCompressor
 from compressed_tensors.quantization import (QuantizationArgs,
                                              QuantizationStrategy,
                                              QuantizationType)
@@ -23,11 +24,15 @@ class CompressedTensors24(CompressedTensorsScheme):
     def __init__(self,
                  quantized: bool = False,
                  weight_quant: Optional[QuantizationArgs] = None,
-                 input_quant: Optional[QuantizationArgs] = None):
+                 input_quant: Optional[QuantizationArgs] = None,
+                 model_compression_config: Optional[Dict[str, Any]] = None):
 
         self.quantized = quantized
         self.weight_quant = weight_quant
         self.input_quant = input_quant
+        self.model_compressor = (
+            ModelCompressor.from_compression_config(model_compression_config)
+            if model_compression_config is not None else None)
 
     @classmethod
     def get_min_capability(cls) -> int:
