@@ -402,6 +402,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 input_quant=input_quant,
                 model_compression_config=self._get_model_compression_config(
                     sparsity_scheme),
+                layer_name=layer_name,
             )
         else:
             # Find the quant_scheme
