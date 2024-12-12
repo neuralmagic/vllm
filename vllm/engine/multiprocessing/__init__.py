@@ -1,6 +1,3 @@
-import hashlib
-import hmac
-import secrets
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Mapping, Optional, Union, overload
@@ -17,27 +14,11 @@ from vllm.utils import deprecate_kwargs
 
 VLLM_RPC_SUCCESS_STR = "SUCCESS"
 
-# TODO: switch to SECRET_KEY = secrets.token_bytes(16) 
-# and pass the SECRET_KEY to the background process.
-SECRET_KEY = b"my_key"
+
 IPC_INPUT_EXT = "_input_socket"
 IPC_OUTPUT_EXT = "_output_socket"
 IPC_HEALTH_EXT = "_health_socket"
 IPC_DATA_EXT = "_data_socket"
-
-
-def sign(msg: bytes) -> bytes:
-    """Compute the HMAC digest of msg, given signing key `key`"""
-    return hmac.HMAC(
-        SECRET_KEY,
-        msg,
-        digestmod=hashlib.sha256,
-    ).digest()
-
-
-def check_signed(sig: bytes, msg: bytes) -> bool:
-    correct_sig = sign(msg)
-    return hmac.compare_digest(sig, correct_sig)
 
 
 class MQEngineDeadError(RuntimeError):

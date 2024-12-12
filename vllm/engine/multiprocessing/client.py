@@ -21,13 +21,16 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 # yapf: disable
 from vllm.engine.async_llm_engine import (
     build_guided_decoding_logits_processor_async)
-from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT, check_signed,
+from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          IPC_HEALTH_EXT, IPC_INPUT_EXT,
                                          IPC_OUTPUT_EXT, RPC_REQUEST_T,
                                          VLLM_RPC_SUCCESS_STR, RPCAbortRequest,
                                          RPCError, RPCProcessRequest,
                                          RPCStartupRequest, RPCStartupResponse,
                                          RPCUProfileRequest)
+from vllm.engine.multiprocessing.ipc import (send_signed_async, 
+                                             recv_signed_async)
+
 from vllm.engine.protocol import EngineClient
 # yapf: enable
 from vllm.envs import VLLM_RPC_TIMEOUT
@@ -192,9 +195,7 @@ class MQLLMEngineClient(EngineClient):
                                 ENGINE_DEAD_ERROR(self._errored_with))
                         return
 
-                sig, message = await self.output_socket.recv_multipart(copy=False)
-                if not check_signed(sig, message):
-                    raise Exception
+                message = await recv_signed_async(self.output_socket)
                 request_outputs = pickle.loads(message)
 
                 is_error = isinstance(request_outputs,
@@ -293,7 +294,7 @@ class MQLLMEngineClient(EngineClient):
         """Send an RPC request that is expecting data back."""
 
         # Ping RPCServer with a request.
-        await socket.send_multipart((pickle.dumps(request), ), copy=False)
+        await send_signed_async(socket, pickle.dumps(request))
 
         # Make sure the server responds in time.
         if await socket.poll(timeout=VLLM_RPC_TIMEOUT) == 0:
@@ -301,7 +302,7 @@ class MQLLMEngineClient(EngineClient):
                                f"{VLLM_RPC_TIMEOUT} ms")
 
         # Await the data from the Server.
-        frame = await socket.recv(copy=False)
+        frame = await recv_signed_async(socket)
         data = pickle.loads(frame.buffer)
 
         if isinstance(data, BaseException):
@@ -319,7 +320,7 @@ class MQLLMEngineClient(EngineClient):
         if socket.closed:
             raise MQClientClosedError()
 
-        await socket.send_multipart((pickle.dumps(request), ))
+        await send_signed_async(socket, pickle.dumps(request))
 
     async def _await_ack(self, error_message: str, socket: Socket):
         """Await acknowledgement that a request succeeded."""
@@ -340,7 +341,7 @@ class MQLLMEngineClient(EngineClient):
         if socket.closed:
             raise MQClientClosedError()
 
-        frame = await socket.recv(copy=False)
+        frame = await recv_signed_async(socket, error_message)
         response = pickle.loads(frame.buffer)
 
         # Raise error if unsuccessful
@@ -628,7 +629,7 @@ class MQLLMEngineClient(EngineClient):
             # 3) Send the RPCGenerateRequest to the MQLLMEngine.
             parts = (request_bytes,
                      lp_bytes) if lp_bytes else (request_bytes, )
-            await self.input_socket.send_multipart(parts, copy=False)
+            await send_signed_async(self.input_socket, parts)
 
             # 4) Stream the RequestOutputs from the output queue. Note
             # that the output_loop pushes RequestOutput objects to this
