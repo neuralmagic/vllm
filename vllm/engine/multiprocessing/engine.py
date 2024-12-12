@@ -15,10 +15,9 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          IPC_OUTPUT_EXT, REQUEST_OUTPUTS_T,
                                          VLLM_RPC_SUCCESS_STR, RPCAbortRequest,
                                          RPCError, RPCProcessRequest,
-                                         RPCStartupRequest, RPCStartupResponse,
+                                         RPCStartupResponse,
                                          RPCUProfileRequest)
-from vllm.engine.multiprocessing.ipc import (send_signed, recv_signed,
-                                             check_signed, sign)
+from vllm.engine.multiprocessing.ipc import (send_signed, recv_signed)
 
 # yapf: enable
 from vllm.executor.gpu_executor import GPUExecutor
@@ -95,7 +94,7 @@ class MQLLMEngine:
         self.heartbeat_socket = self.ctx.socket(zmq.constants.PUSH)
         self.heartbeat_socket.bind(f"{ipc_path}{IPC_HEALTH_EXT}")
 
-        # IPC path for the data socket.
+        # Send notification that we are ready.
         self.data_ipc_path = f"{ipc_path}{IPC_DATA_EXT}"
 
         # Error state.
@@ -135,8 +134,6 @@ class MQLLMEngine:
     def start(self):
         try:
             try:
-                logger.debug("Starting Startup Loop.")
-                self.run_startup_loop()
                 logger.debug("Starting Engine Loop.")
                 self.run_engine_loop()
             except Exception as e:
@@ -154,41 +151,24 @@ class MQLLMEngine:
         del self.engine
 
     @contextmanager
-    def make_data_socket(
-            self) -> Iterator[zmq.Socket]:  # type: ignore[name-defined]
-        socket = self.ctx.socket(zmq.constants.ROUTER)
+    def make_push_socket(
+            self, path: str) -> Iterator[zmq.Socket]:  # type: ignore[name-defined]
+        socket = self.ctx.socket(zmq.constants.PUSH)
         try:
-            socket.bind(self.data_ipc_path)
+            socket.bind(path)
             yield socket
         finally:
-            socket.close(linger=0)
-
-    def run_startup_loop(self) -> None:
-        """Startup loop for sending data from Engine -> Client."""
-
-        with self.make_data_socket() as socket:
-            response: Union[RPCStartupResponse, BaseException]
-            try:
-                identity, sig, message = socket.recv_multipart(copy=False)
-                if not check_signed(self.secret_key, sig, message.buffer):
-                    raise ValueError("Message Signature is invalid.")
-                request: RPCStartupRequest = pickle.loads(message.buffer)
-
-                # Handle the query from the Client.
-                if request == RPCStartupRequest.IS_SERVER_READY:
-                    tracing_enabled = self.engine.is_tracing_enabled()
-                    response = RPCStartupResponse(
-                        tracing_enabled=tracing_enabled)
-
-            except Exception as e:
-                response = e
-
-            response_bytes = pickle.dumps(response)
-            sig = sign(self.secret_key, response_bytes)
-            socket.send_multipart((identity, sig, response_bytes), copy=False)
+            socket.close(linger=0)        
 
     def run_engine_loop(self):
         """Core busy loop of the LLMEngine."""
+
+        # Alert that we are ready.
+        with self.make_push_socket(self.data_ipc_path) as socket:
+            response = RPCStartupResponse(
+                tracing_enabled=self.engine.is_tracing_enabled())
+            response_bytes = pickle.dumps(response)
+            send_signed(socket, self.secret_key, response_bytes)
 
         while True:
             if not self.engine.has_unfinished_requests():
