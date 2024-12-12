@@ -387,7 +387,9 @@ class MQLLMEngineClient(EngineClient):
 
         with suppress(MQClientClosedError):
             await self._send_one_way_rpc_request(
-                request=RPCAbortRequest(request_id), socket=self.input_socket)
+                request=RPCAbortRequest(request_id),
+                secret_key=self.secret_key,
+                socket=self.input_socket)
 
     async def do_log_stats(
         self,
