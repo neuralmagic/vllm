@@ -14,7 +14,6 @@ from vllm.utils import deprecate_kwargs
 
 VLLM_RPC_SUCCESS_STR = "SUCCESS"
 
-
 IPC_INPUT_EXT = "_input_socket"
 IPC_OUTPUT_EXT = "_output_socket"
 IPC_HEALTH_EXT = "_health_socket"

@@ -5,6 +5,7 @@ import inspect
 import multiprocessing
 import os
 import re
+import secrets
 import signal
 import socket
 import tempfile
@@ -188,10 +189,13 @@ async def build_async_engine_client_from_engine_args(
         # not actually result in an exitcode being reported. As a result
         # we use a shared variable to communicate the information.
         engine_alive = multiprocessing.Value('b', True, lock=False)
+        secret_key = secrets.token_bytes(16)
         engine_process = context.Process(target=run_mp_engine,
                                          args=(engine_args,
                                                UsageContext.OPENAI_API_SERVER,
-                                               ipc_path, engine_alive))
+                                               ipc_path, 
+                                               secret_key,
+                                               engine_alive))
         engine_process.start()
         engine_pid = engine_process.pid
         assert engine_pid is not None, "Engine process failed to start."
@@ -208,7 +212,7 @@ async def build_async_engine_client_from_engine_args(
         # Build RPCClient, which conforms to EngineClient Protocol.
         engine_config = engine_args.create_engine_config()
         build_client = partial(MQLLMEngineClient, ipc_path, engine_config,
-                               engine_pid)
+                               engine_pid, secret_key)
         mq_engine_client = await asyncio.get_running_loop().run_in_executor(
             None, build_client)
         try:

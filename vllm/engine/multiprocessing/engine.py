@@ -1,6 +1,5 @@
 import pickle
 import signal
-import hmac
 from contextlib import contextmanager
 from typing import Iterator, List, Optional, Union
 
@@ -18,7 +17,8 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCError, RPCProcessRequest,
                                          RPCStartupRequest, RPCStartupResponse,
                                          RPCUProfileRequest)
-from vllm.engine.multiprocessing.ipc import send
+from vllm.engine.multiprocessing.ipc import (send_signed, recv_signed,
+                                             check_signed, sign)
 
 # yapf: enable
 from vllm.executor.gpu_executor import GPUExecutor
@@ -29,7 +29,7 @@ from vllm.usage.usage_lib import UsageContext
 logger = init_logger(__name__)
 
 POLLING_TIMEOUT_MS = 10000
-HEALTHY_RESPONSE = (pickle.dumps(VLLM_RPC_SUCCESS_STR), )
+HEALTHY_RESPONSE = pickle.dumps(VLLM_RPC_SUCCESS_STR)
 
 
 class MQLLMEngine:
@@ -63,6 +63,7 @@ class MQLLMEngine:
     def __init__(self,
                  ipc_path: str,
                  use_async_sockets: bool,
+                 secret_key: bytes,
                  *args,
                  log_requests: bool = True,
                  **kwargs) -> None:
@@ -80,6 +81,7 @@ class MQLLMEngine:
                 self._async_socket_engine_callback
 
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
+        self.secret_key = secret_key
 
         # Receive input from the client.
         self.input_socket = self.ctx.socket(zmq.constants.PULL)
@@ -108,8 +110,10 @@ class MQLLMEngine:
 
     @classmethod
     def from_engine_args(cls, engine_args: AsyncEngineArgs,
-                         usage_context: UsageContext, ipc_path: str):
+                         usage_context: UsageContext, ipc_path: str,
+                         secret_key: bytes):
         """Creates an MQLLMEngine from the engine arguments."""
+
         # Setup plugins for each process
         from vllm.plugins import load_general_plugins
         load_general_plugins()
@@ -121,6 +125,7 @@ class MQLLMEngine:
 
         return cls(ipc_path=ipc_path,
                    use_async_sockets=use_async_sockets,
+                   secret_key=secret_key,
                    vllm_config=engine_config,
                    executor_class=executor_class,
                    log_requests=not engine_args.disable_log_requests,
@@ -164,7 +169,9 @@ class MQLLMEngine:
         with self.make_data_socket() as socket:
             response: Union[RPCStartupResponse, BaseException]
             try:
-                identity, message = socket.recv_multipart(copy=False)
+                identity, sig, message = socket.recv_multipart(copy=False)
+                if not check_signed(self.secret_key, sig, message.buffer):
+                    raise ValueError("Message Signature is invalid.")
                 request: RPCStartupRequest = pickle.loads(message.buffer)
 
                 # Handle the query from the Client.
@@ -176,8 +183,9 @@ class MQLLMEngine:
             except Exception as e:
                 response = e
 
-            socket.send_multipart((identity, pickle.dumps(response)),
-                                  copy=False)
+            response_bytes = pickle.dumps(response)
+            sig = sign(self.secret_key, response_bytes)
+            socket.send_multipart((identity, sig, response_bytes), copy=False)
 
     def run_engine_loop(self):
         """Core busy loop of the LLMEngine."""
@@ -220,15 +228,16 @@ class MQLLMEngine:
         """Handle new input from the socket"""
         try:
             while self.input_socket.poll(timeout=0) != 0:
-                frames = self.input_socket.recv_multipart(copy=False)
-                request = pickle.loads(frames[0].buffer)
+                message = recv_signed(self.input_socket, self.secret_key)
+                request = pickle.loads(message)
 
                 if isinstance(request, RPCProcessRequest):
-                    if len(frames) > 1:
-                        # Use cloudpickle for logits processors
-                        assert isinstance(request.params, SamplingParams)
-                        lprocs = cloudpickle.loads(frames[1].buffer)
-                        request.params.logits_processors = lprocs
+                    # TODO: handle cp case.
+                    # if len(frames) > 1:
+                    #     # Use cloudpickle for logits processors
+                    #     assert isinstance(request.params, SamplingParams)
+                    #     lprocs = cloudpickle.loads(frames[1].buffer)
+                    #     request.params.logits_processors = lprocs
                     self._handle_process_request(request)
                 elif isinstance(request, RPCAbortRequest):
                     self._handle_abort_request(request)
@@ -313,18 +322,18 @@ class MQLLMEngine:
                 pass
 
             output_bytes = pickle.dumps(outputs)
-            send(self.output_socket, output_bytes)
+            send_signed(self.output_socket, self.secret_key, output_bytes)
 
     def _send_healthy(self):
         """Send HEALTHY message to RPCClient."""
         if not self.heartbeat_socket.closed:
-            send(self.heartbeat_socket, HEALTHY_RESPONSE)
+            send_signed(self.heartbeat_socket, self.secret_key, HEALTHY_RESPONSE)
 
     def _send_unhealthy(self, error: BaseException):
         """Send UNHEALTHY message to RPCClient."""
         if not self.heartbeat_socket.closed:
             error_bytes = pickle.dumps(error)
-            send(self.heartbeat_socket, error_bytes)
+            send_signed(self.heartbeat_socket, self.secret_key, error_bytes)
 
     def _async_socket_engine_callback(self,
                                       request_outputs: REQUEST_OUTPUTS_T):
@@ -355,11 +364,12 @@ def signal_handler(*_) -> None:
 
 
 def run_mp_engine(engine_args: AsyncEngineArgs, usage_context: UsageContext,
-                  ipc_path: str, engine_alive):
+                  ipc_path: str, secret_key: bytes, engine_alive):
     try:
         engine = MQLLMEngine.from_engine_args(engine_args=engine_args,
                                               usage_context=usage_context,
-                                              ipc_path=ipc_path)
+                                              ipc_path=ipc_path,
+                                              secret_key=secret_key)
 
         signal.signal(signal.SIGTERM, signal_handler)
 

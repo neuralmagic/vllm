@@ -1,50 +1,55 @@
 import hashlib
 import hmac
-import secrets
 
 import zmq
 import zmq.asyncio
 
-# TODO: switch to SECRET_KEY = secrets.token_bytes(16) 
-# and pass the SECRET_KEY to the background process.
-SECRET_KEY = b"my_key"
 
-def sign(msg: bytes) -> bytes:
-    """Compute the HMAC digest of msg, given signing key `key`"""
+def sign(key: bytes, msg: bytes) -> bytes:
+    """Compute the HMAC digest of msg, given signing key"""
+
     return hmac.HMAC(
-        SECRET_KEY,
+        key,
         msg,
         digestmod=hashlib.sha256,
     ).digest()
 
-def check_signed(sig: bytes, msg: bytes) -> bool:
-    correct_sig = sign(msg)
+
+def check_signed(key: bytes, sig: bytes, msg: bytes) -> bool:
+    """Check if signature (HMAC digest) matches."""
+
+    correct_sig = sign(key, msg)
     return hmac.compare_digest(sig, correct_sig)
 
-def send_signed(socket: zmq.Socket, msg: bytes):
+
+def send_signed(socket: zmq.Socket, key: bytes, msg: bytes):
     """Send signed message to socket."""
 
-    sig = sign(msg)
+    sig = sign(key, msg)
     socket.send_multipart((sig, msg), copy=False)
 
-def recv_signed(socket: zmq.Socket):
+
+def recv_signed(socket: zmq.Socket, key: bytes) -> bytes:
     """Get signed message from socket."""
 
     sig, msg = socket.recv_multipart(copy=False)
-    if not check_signed(sig, msg):
+    if not check_signed(key, sig, msg.buffer):
         raise ValueError("Message signature is invalid.")
-    return msg
+    return msg.buffer
 
-async def send_signed_async(socket: zmq.asyncio.Socket, msg: bytes):
+
+async def send_signed_async(socket: zmq.asyncio.Socket, key: bytes,
+                            msg: bytes):
     """Send signed message to asyncio socket."""
 
-    sig = sign(msg)
+    sig = sign(key, msg)
     await socket.send_multipart((sig, msg), copy=False)
 
-async def recv_signed_async(socket: zmq.asyncio.Socket):
+
+async def recv_signed_async(socket: zmq.asyncio.Socket, key: bytes) -> bytes:
     """Get signed message from asyncio socket."""
 
     sig, msg = await socket.recv_multipart(copy=False)
-    if not check_signed(sig, msg):
+    if not check_signed(key, sig, msg.buffer):
         raise ValueError("Message signature is invalid.")
-    return msg
+    return msg.buffer
