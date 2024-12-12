@@ -1,5 +1,6 @@
 import pickle
 import signal
+import hmac
 from contextlib import contextmanager
 from typing import Iterator, List, Optional, Union
 
@@ -10,7 +11,7 @@ from vllm import AsyncEngineArgs, SamplingParams
 from vllm.engine.llm_engine import LLMEngine
 # yapf conflicts with isort for this block
 # yapf: disable
-from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
+from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, sign, IPC_DATA_EXT,
                                          IPC_HEALTH_EXT, IPC_INPUT_EXT,
                                          IPC_OUTPUT_EXT, REQUEST_OUTPUTS_T,
                                          VLLM_RPC_SUCCESS_STR, RPCAbortRequest,
@@ -310,7 +311,8 @@ class MQLLMEngine:
                 pass
 
             output_bytes = pickle.dumps(outputs)
-            self.output_socket.send_multipart((output_bytes, ), copy=False)
+            sig = sign(output_bytes)
+            self.output_socket.send_multipart((sig, output_bytes), copy=False)
 
     def _send_healthy(self):
         """Send HEALTHY message to RPCClient."""

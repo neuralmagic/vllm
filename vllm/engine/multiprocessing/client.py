@@ -21,7 +21,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 # yapf: disable
 from vllm.engine.async_llm_engine import (
     build_guided_decoding_logits_processor_async)
-from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
+from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT, check_signed,
                                          IPC_HEALTH_EXT, IPC_INPUT_EXT,
                                          IPC_OUTPUT_EXT, RPC_REQUEST_T,
                                          VLLM_RPC_SUCCESS_STR, RPCAbortRequest,
@@ -192,8 +192,10 @@ class MQLLMEngineClient(EngineClient):
                                 ENGINE_DEAD_ERROR(self._errored_with))
                         return
 
-                message: Frame = await self.output_socket.recv(copy=False)
-                request_outputs = pickle.loads(message.buffer)
+                sig, message = await self.output_socket.recv_multipart(copy=False)
+                if not check_signed(sig, message):
+                    raise Exception
+                request_outputs = pickle.loads(message)
 
                 is_error = isinstance(request_outputs,
                                       (BaseException, RPCError))
