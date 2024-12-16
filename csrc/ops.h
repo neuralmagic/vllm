@@ -151,7 +151,9 @@ void cutlass_grouped_mm(torch::Tensor& out, torch::Tensor const& a,
                         torch::Tensor const& problem_sizes,
                         torch::Tensor const& out_offsets,
                         torch::Tensor const& a_offsets,
-                        torch::Tensor const& b_offsets);
+                        torch::Tensor const& b_offsets,
+                        torch::Tensor const& a_scales_offsets,
+                        torch::Tensor const& b_scales_offsets);
 
 void cutlass_scaled_mm_azp(torch::Tensor& out, torch::Tensor const& a,
                            torch::Tensor const& b,

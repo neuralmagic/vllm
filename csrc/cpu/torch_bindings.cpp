@@ -123,7 +123,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "cutlass_grouped_mm(Tensor! out, Tensor a, Tensor b, Tensor a_scales, "
       "                   Tensor b_scales, Tensor problem_sizes, "
       "                   Tensor out_offsets, Tensor a_offsets, "
-      "                   Tensor b_offsets) -> ()");
+      "                   Tensor b_offsets, Tensor a_scales_offsets, "
+      "                   Tensor b_scales_offsets) -> ()");
   ops.impl("cutlass_grouped_mm", torch::kCUDA, &cutlass_grouped_mm);
   // w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
   // quantization.

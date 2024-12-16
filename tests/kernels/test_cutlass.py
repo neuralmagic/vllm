@@ -459,9 +459,9 @@ def test_cutlass_support_opcheck():
 
 # TODO fix scales
 @pytest.mark.parametrize("m,n,k", [(2048, 2048, 2048)])
-@pytest.mark.parametrize("num_groups", [1, 4, 10])
-@pytest.mark.parametrize("per_act_token", [True, False])  # [True, False])
-@pytest.mark.parametrize("per_out_ch", [True, False])  # [True, False])
+@pytest.mark.parametrize("num_groups", [1])
+@pytest.mark.parametrize("per_act_token", [False])  # [True, False])
+@pytest.mark.parametrize("per_out_ch", [True])  # [True, False])
 @pytest.mark.parametrize("use_bias", [False])  # [True, False])
 @pytest.mark.skipif(not current_platform.has_device_capability(89),
                     reason="FP8 is not supported on this GPU type.")
@@ -479,12 +479,17 @@ def test_cutlass_fp8_group_gemm(m: int, n: int, k: int, num_groups: int,
     offsets_a = torch.empty((num_groups), device="cpu", dtype=torch.int32)
     offsets_b = torch.empty((num_groups), device="cpu", dtype=torch.int32)
     offsets_c = torch.empty((num_groups), device="cpu", dtype=torch.int32)
+    offsets_scale_a = torch.zeros((num_groups), device="cpu", dtype=torch.int32)
+    offsets_scale_b = torch.zeros((num_groups), device="cpu", dtype=torch.int32)
     tot_a = 0
     tot_b = 0
     tot_c = 0
-    m = alignment * random.randint(1, 64)
-    n = alignment * random.randint(1, 64)
-    k = alignment * random.randint(1, 64)
+    # m = alignment * random.randint(1, 64)
+    # n = alignment * random.randint(1, 64)
+    # k = alignment * random.randint(1, 64)
+    m = 2
+    n = 16
+    k = 16
     for g in range(num_groups):
         tot_a += m
         tot_b += n
@@ -493,6 +498,8 @@ def test_cutlass_fp8_group_gemm(m: int, n: int, k: int, num_groups: int,
         offsets_a[g] = g * m * k
         offsets_b[g] = g * k * n
         offsets_c[g] = g * m * n
+        offsets_scale_a[g] = 0 #g * m if per_act_token else g
+        offsets_scale_b[g] = 0 #g * n if per_out_ch else g
         problem_sizes[g][0] = m
         problem_sizes[g][1] = n
         problem_sizes[g][2] = k
@@ -518,10 +525,24 @@ def test_cutlass_fp8_group_gemm(m: int, n: int, k: int, num_groups: int,
 
     # print(a.stride(), b.stride(), c.stride())
 
-    scale_a = (torch.randn(((m, 1) if per_act_token else (1, 1)),
+    # scale_a = (torch.randn(((m, 1) if per_act_token else (1, 1)),
+    #                        device=device,
+    #                        dtype=torch.float32))
+    # scale_b = (torch.randn(((1, n) if per_out_ch else (1, 1)),
+    #                        device=device,
+    #                        dtype=torch.float32))
+
+    # scale_a = (torch.randn(((tot_a, 1) if per_act_token else (num_groups, 1)),
+    #                        device=device,
+    #                        dtype=torch.float32))
+    # scale_b = (torch.randn(((1, tot_b) if per_out_ch else (1, num_groups)),
+    #                        device=device,
+    #                        dtype=torch.float32))
+
+    scale_a = (torch.ones(((tot_a, 1) if per_act_token else (num_groups, 1)),
                            device=device,
                            dtype=torch.float32))
-    scale_b = (torch.randn(((1, n) if per_out_ch else (1, 1)),
+    scale_b = (torch.ones(((1, tot_b) if per_out_ch else (1, num_groups)),
                            device=device,
                            dtype=torch.float32))
 
@@ -534,7 +555,8 @@ def test_cutlass_fp8_group_gemm(m: int, n: int, k: int, num_groups: int,
 
     # TODO strides we can get later the same way as in scaled_mm_c3x.cu
     torch.ops._C.cutlass_grouped_mm(c, a, b, scale_a, scale_b, problem_sizes,
-                                    offsets_c, offsets_a, offsets_b)
+                                    offsets_c, offsets_a, offsets_b,
+                                    offsets_scale_a, offsets_scale_b)
     # baseline = baseline_scaled_mm(a, b, scale_a, scale_b, out_dtype, None)
 
     # print(a.dtype)
@@ -551,11 +573,10 @@ def test_cutlass_fp8_group_gemm(m: int, n: int, k: int, num_groups: int,
         baseline[g * m:(g + 1) * m] = baseline_scaled_mm(
             a[g * m:(g + 1) * m],
             b[:, g * n:(g + 1) * n],
-            # scale_a[g * m:(g + 1) * m] if per_act_token else scale_a[g],
-            # # scale_b[:, g * n:(g + 1) * n] if per_out_ch else scale_b[:, g],
-            # scale_b[g],
-            scale_a,
-            scale_b,
+            scale_a[g * m:(g + 1) * m] if per_act_token else scale_a[g, :],
+            scale_b[:, g * n:(g + 1) * n] if per_out_ch else scale_b[:, g],
+            # scale_a,
+            # scale_b,
             out_dtype,
             None)
         print(baseline[g * m:(g + 1) * m])

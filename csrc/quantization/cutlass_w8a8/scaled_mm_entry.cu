@@ -32,7 +32,8 @@ void cutlass_grouped_mm_sm90(
     torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     torch::Tensor const& a_scales, torch::Tensor const& b_scales,
     torch::Tensor const& problem_sizes, torch::Tensor const& out_offsets,
-    torch::Tensor const& a_offsets, torch::Tensor const& b_offsets);
+    torch::Tensor const& a_offsets, torch::Tensor const& b_offsets,
+    torch::Tensor const& a_scales_offsets, torch::Tensor const& b_scales_offsets);
 
 #endif
 
@@ -164,9 +165,12 @@ void cutlass_grouped_mm(torch::Tensor& out, torch::Tensor const& a,
                         torch::Tensor const& problem_sizes,
                         torch::Tensor const& out_offsets,
                         torch::Tensor const& a_offsets,
-                        torch::Tensor const& b_offsets) {
+                        torch::Tensor const& b_offsets,
+                        torch::Tensor const& a_scales_offsets,
+                        torch::Tensor const& b_scales_offsets) {
   cutlass_grouped_mm_sm90(out, a, b, a_scales, b_scales, problem_sizes,
-                          out_offsets, a_offsets, b_offsets);
+                          out_offsets, a_offsets, b_offsets,
+                          a_scales_offsets, b_scales_offsets);
 }
 
 void cutlass_scaled_mm_azp(torch::Tensor& c, torch::Tensor const& a,

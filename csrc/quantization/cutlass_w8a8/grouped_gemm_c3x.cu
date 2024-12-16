@@ -154,14 +154,65 @@ void print(const std::tuple<T...>& _tup) {
 }
 ////////////
 
-template <typename Gemm, typename... EpilogueArgs>
+// template <typename GemmKernel, typename ElementAB, typename ElementC,
+//           typename StrideA, typename StrideB, typename StrideC,
+//           typename... EpilogueArgs>
+// void run_gemm_op(torch::Device device,
+//                  ElementAB** a_ptrs,
+//                  ElementAB** b_ptrs,
+//                  ElementC** c_ptrs,
+//                  const ElementD** d_ptrs,
+//                  StrideA* a_stride,
+//                  StrideB* b_stride,
+//                  StrideC* c_stride,
+//                  ProblemShape& prob_shape,
+//                  EpilogueArgs&&... epilogue_params) {
+//   using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+//   cutlass::KernelHardwareInfo hw_info;
+//   // Change device_id to another value if you are running on a machine with
+//   // multiple GPUs and wish to use a GPU other than that with device ID 0.
+//   hw_info.device_id = 0;
+//   hw_info.sm_count =
+//       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+//           hw_info.device_id);
+
+//   typename GemmKernel::MainloopArguments mainloop_args{
+//       a_ptrs, a_stride, b_ptrs, b_stride};
+//   typename GemmKernel::EpilogueArguments epilogue_args{
+//       Gemm::Epilogue::prepare_args(epilogue_params),
+//       c_ptrs, c_stride, d_ptrs, c_stride};
+
+//   typename GemmKernel::Arguments args{
+//       cutlass::gemm::GemmUniversalMode::kGrouped, prob_shape, mainloop_args,
+//       epilogue_args, hw_info};
+
+//   // Launch the CUTLASS GEMM kernel.
+//   GemmOp gemm_op;
+//   CUTLASS_CHECK(gemm_op.can_implement(args));
+
+//   size_t workspace_size = gemm_op.get_workspace_size(args);
+//   auto const workspace_options =
+//       torch::TensorOptions().dtype(torch::kUInt8).device(device);
+//   auto workspace = torch::empty(workspace_size, workspace_options);
+
+//   auto stream = at::cuda::getCurrentCUDAStream(device);
+
+//   cutlass::Status status = gemm_op.run(args, workspace.data_ptr(), stream);
+//   CUTLASS_CHECK(status);
+// }
+
+template <typename Gemm>
 void cutlass_group_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
                                torch::Tensor const& b,
                                torch::Tensor const& problem_sizes,
                                torch::Tensor const& out_offsets,
                                torch::Tensor const& a_offsets,
                                torch::Tensor const& b_offsets,
-                               EpilogueArgs&&... epilogue_params) {
+                               torch::Tensor const& a_scales,
+                               torch::Tensor const& b_scales,
+                               torch::Tensor const& a_scales_offsets,
+                               torch::Tensor const& b_scales_offsets) {
   using ElementAB = typename Gemm::ElementAB;
   using ElementC = typename Gemm::ElementC;
   using ElementAcc = float;
@@ -171,6 +222,8 @@ void cutlass_group_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
   std::vector<const ElementAB*> b_ptrs_host(groups);
   std::vector<const ElementC*> c_ptrs_host(groups);
   std::vector<ElementC*> d_ptrs_host(groups);
+  std::vector<const ElementAcc*> a_scales_ptrs_host(groups);
+  std::vector<const ElementAcc*> b_scales_ptrs_host(groups);
 
   for (int g = 0; g < groups; ++g) {
     a_ptrs_host.at(g) = static_cast<const ElementAB*>(a.data_ptr()) +
@@ -181,6 +234,10 @@ void cutlass_group_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
                         out_offsets[g].item<int32_t>();
     d_ptrs_host.at(g) =
         static_cast<ElementC*>(out.data_ptr()) + out_offsets[g].item<int32_t>();
+    a_scales_ptrs_host.at(g) = static_cast<const ElementAcc*>(a_scales.data_ptr()) +
+                        a_scales_offsets[g].item<int32_t>();
+    b_scales_ptrs_host.at(g) = static_cast<const ElementAcc*>(b_scales.data_ptr()) +
+                        b_scales_offsets[g].item<int32_t>();
     printf("off: %d %d %d\n", a_offsets[g].item<int32_t>(),
            b_offsets[g].item<int32_t>(), out_offsets[g].item<int32_t>());
   }
@@ -229,14 +286,6 @@ void cutlass_group_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
   //                                                                   // row
   // }
 
-  cutlass::KernelHardwareInfo hw_info;
-  // Change device_id to another value if you are running on a machine with
-  // multiple GPUs and wish to use a GPU other than that with device ID 0.
-  hw_info.device_id = 0;
-  hw_info.sm_count =
-      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
-          hw_info.device_id);
-
   using SingleProblemShape = typename ProblemShape::UnderlyingProblemShape;
 
   std::vector<SingleProblemShape> problem_sizes_host;
@@ -267,16 +316,33 @@ void cutlass_group_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
   auto c_ptrs_ptr = make_device_ptr<const ElementC*>(c_ptrs_host);
   auto d_ptrs_ptr = make_device_ptr<ElementC*>(d_ptrs_host);
 
+  auto a_scales_ptrs_ptr = make_device_ptr<const ElementAcc*>(a_scales_ptrs_host);
+  auto b_scales_ptrs_ptr = make_device_ptr<const ElementAcc*>(b_scales_ptrs_host);
+
   auto a_stride_ptr = make_device_ptr<StrideA>(a_stride_host);
   auto b_stride_ptr = make_device_ptr<StrideB>(b_stride_host);
   auto c_stride_ptr = make_device_ptr<StrideC>(c_stride_host);
+
+  cutlass::KernelHardwareInfo hw_info;
+  // Change device_id to another value if you are running on a machine with
+  // multiple GPUs and wish to use a GPU other than that with device ID 0.
+  hw_info.device_id = 0;
+  hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+          hw_info.device_id);
+
+//   run_gemm_op(a.get_device(), a_ptrs_ptr.get(), b_ptrs_ptr.get(),
+//               c_ptrs_ptr.get(), d_ptrs_ptr.get(), a_stride_ptr.get(),
+//               b_stride_ptr.get(), c_stride_ptr.get(), prob_shape,
+//               a_scales_ptrs_ptr.get(), b_scales_ptrs_ptr.get());
+
+  using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   typename GemmKernel::MainloopArguments mainloop_args{
       a_ptrs_ptr.get(), a_stride_ptr.get(), b_ptrs_ptr.get(),
       b_stride_ptr.get()};
   typename GemmKernel::EpilogueArguments epilogue_args{
-      Gemm::Epilogue::prepare_args(
-          std::forward<EpilogueArgs>(epilogue_params)...),
+      Gemm::Epilogue::prepare_args(a_scales_ptrs_ptr.get(), b_scales_ptrs_ptr.get()),
       c_ptrs_ptr.get(), c_stride_ptr.get(), d_ptrs_ptr.get(),
       c_stride_ptr.get()};
 
@@ -285,7 +351,6 @@ void cutlass_group_gemm_caller(torch::Tensor& out, torch::Tensor const& a,
       epilogue_args, hw_info};
 
   // Launch the CUTLASS GEMM kernel.
-  using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   GemmOp gemm_op;
   CUTLASS_CHECK(gemm_op.can_implement(args));
 
@@ -359,36 +424,15 @@ void cutlass_grouped_mm_sm90(
     torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     torch::Tensor const& a_scales, torch::Tensor const& b_scales,
     torch::Tensor const& problem_sizes, torch::Tensor const& out_offsets,
-    torch::Tensor const& a_offsets, torch::Tensor const& b_offsets) {
+    torch::Tensor const& a_offsets, torch::Tensor const& b_offsets,
+    torch::Tensor const& a_scales_offsets, torch::Tensor const& b_scales_offsets) {
   TORCH_CHECK(a.dtype() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(b.dtype() == torch::kFloat8_e4m3fn);
-  // int32_t m = a.size(1);
 
   using Cutlass3xGemmDefault = typename sm90_fp8_config_default<
-      ElementAB_Type, ElementC_Type, vllm::c3x::ScaledEpilogue>::Cutlass3xGemm;
-  // using Cutlass3xGemmM64 =
-  //     typename sm90_fp8_config_M64<ElementAB_Type, ElementC_Type,
-  //     vllm::c3x::ScaledEpilogue>::Cutlass3xGemm;
-  // using Cutlass3xGemmM128 =
-  //     typename sm90_fp8_config_M128<ElementAB_Type, ElementC_Type,
-  //     vllm::c3x::ScaledEpilogue>::Cutlass3xGemm;
+      ElementAB_Type, ElementC_Type, vllm::c3x::ScaledEpiloguePtrArray>::Cutlass3xGemm;
 
-  // // uint32_t const m = a.size(0);
-  // uint32_t const mp2 =
-  //     std::max(static_cast<uint32_t>(64), next_pow_2(m));  // next power of 2
-
-  // if (mp2 <= 64) {
-  //   // m in [1, 64]
-  //   cutlass_group_gemm_caller<Cutlass3xGemmM64>(out, a, b, a_scales,
-  //   b_scales);
-  // } else if (mp2 <= 128) {
-  //   // m in (64, 128]
-  //   cutlass_group_gemm_caller<Cutlass3xGemmM128>(out, a, b, a_scales,
-  //   b_scales);
-  // } else {
-  //   // m in (128, inf)
   cutlass_group_gemm_caller<Cutlass3xGemmDefault>(
       out, a, b, problem_sizes, out_offsets, a_offsets, b_offsets, a_scales,
-      b_scales);
-  // }
+      b_scales, a_scales_offsets, b_scales_offsets);
 }
