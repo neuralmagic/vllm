@@ -103,7 +103,8 @@ class Fp8LinearMethod(LinearMethodBase):
     the model weights are loaded.
 
     Limitations:
-    1. The layer weight shape must be a multiple of 16. Due to limitations in the cutlass_scaled_mm kernel and torch._scaled_mm.
+    1. The layer weight shape must be a multiple of 16. Due to limitations in
+     the cutlass_scaled_mm kernel and torch._scaled_mm.
     2. Only support float8_e4m3fn data type.
        - torch._scaled_mm (https://github.com/pytorch/pytorch/blob/2e48b39603411a41c5025efbe52f89560b827825/aten/src/ATen/native/cuda/Blas.cpp#L854-L856)
        - cutlass_scaled_mm does not support other fp8 datatypes yet.
@@ -151,11 +152,13 @@ class Fp8LinearMethod(LinearMethodBase):
 
         weight_shape = (output_size_per_partition, input_size_per_partition)
         if not all([s % 16 == 0 for s in weight_shape]):
-            raise ValueError(f"FP8 Linear method expects weight shape to be a multiple of 16. Got K, N {weight_shape[1], weight_shape[0]} instead.")
+            raise ValueError(
+                "FP8LinearMethod expects weight shape to be a multiple of 16"
+                "due to limitations in the kernels used."
+                f"Got K, N {weight_shape[1], weight_shape[0]} instead.")
 
-        weight = ModelWeightParameter(data=torch.empty(
-            weight_shape,
-            dtype=weight_dtype),
+        weight = ModelWeightParameter(data=torch.empty(weight_shape,
+                                                       dtype=weight_dtype),
                                       input_dim=1,
                                       output_dim=0,
                                       weight_loader=weight_loader)
