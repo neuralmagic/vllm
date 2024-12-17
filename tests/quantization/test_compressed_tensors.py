@@ -224,16 +224,27 @@ def _test_2of4_quant_models(qkv_proj, weight_strategy, input_strategy):
     assert sparsity_map.get("Linear").sparsity_structure == "2:4"
 
 
-@pytest.mark.parametrize("args_2of4", [
-    ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Dynamic-2of4-testing", "channel",
-     "token"),
-    ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Static-Per-Tensor-testing",
-     "channel", "tensor"),
-    ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Static-testing", "tensor",
-     "tensor"),
-    ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Dynamic-IA-Per-Tensor-Weight-testing",
-     "tensor", "token"),
-])
+@pytest.mark.parametrize(
+    "args_2of4",
+    [
+        ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Dynamic-2of4-testing",
+         "channel", "token"),
+        ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Static-Per-Tensor-testing",
+         "channel", "tensor"),
+        ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Static-testing", "tensor",
+         "tensor"),
+        ("nm-testing/Meta-Llama-3-8B-Instruct-FP8-Dynamic-IA-Per-Tensor-Weight-testing",
+         "tensor", "token"),
+        # compressed cases
+        ("nm-testing/SparseLlama-3.1-8B-gsm8k-pruned.2of4-chnl_wts_per_tok_dyn_act_fp8-BitM",
+         "channel", "token"),
+        ("nm-testing/SparseLlama-3.1-8B-gsm8k-pruned.2of4-tensor_wts_tensor_act_fp8-BitM",
+         "tensor", "tensor"),
+        ("nm-testing/SparseLlama-3.1-8B-gsm8k-pruned.2of4-tensor_wts_per_tok_dyn_act_fp8-BitM",
+         "tensor", "token"),
+        ("nm-testing/SparseLlama-3.1-8B-gsm8k-pruned.2of4-chnl_wts_tensor_act_fp8-BitM",
+         "channel", "tensor"),
+    ])
 def test_compressed_tensors_2of4_quant_fp8(vllm_runner, args_2of4):
     model, weight_strategy, input_strategy = args_2of4
     with vllm_runner(model) as llm:
@@ -249,14 +260,25 @@ def test_compressed_tensors_2of4_quant_fp8(vllm_runner, args_2of4):
         assert output
 
 
-@pytest.mark.parametrize("args_2of4", [
-    ("nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Dynamic-IA-Per-Channel-Weight-testing",
-     "channel", "token"),
-    ("nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Static-testing", "tensor",
-     "tensor"),
-    ("nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Dynamic-IA-Per-Tensor-Weight-testing",
-     "tensor", "token"),
-])
+@pytest.mark.parametrize(
+    "args_2of4",
+    [
+        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Dynamic-IA-Per-Channel-Weight-testing",
+         "channel", "token"),
+        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Static-testing", "tensor",
+         "tensor"),
+        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-INT8-Dynamic-IA-Per-Tensor-Weight-testing",
+         "tensor", "token"),
+        # compressed cases
+        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-chnl_wts_per_tok_dyn_act_int8-BitM",
+         "channel", "token"),
+        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-tensor_wts_tensor_act_int8-BitM",
+         "tensor", "tensor"),
+        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-tensor_wts_per_tok_dyn_act_int8-BitM",
+         "tensor", "token"),
+        ("nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-chnl_wts_tensor_act_int8-BitM",
+         "channel", "tensor"),
+    ])
 def test_compressed_tensors_2of4_quant_int8(vllm_runner, args_2of4):
     model, weight_strategy, input_strategy = args_2of4
     with vllm_runner(model) as llm:
@@ -272,9 +294,11 @@ def test_compressed_tensors_2of4_quant_int8(vllm_runner, args_2of4):
         assert output
 
 
-@pytest.mark.parametrize(
-    "args_2of4",
-    [("nm-testing/TinyLlama-1.1B-Chat-v1.0-2of4-Sparse-Dense-Compressor")])
+@pytest.mark.parametrize("args_2of4", [
+    "nm-testing/TinyLlama-1.1B-Chat-v1.0-2of4-Sparse-Dense-Compressor",
+    "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-tensor_wts_per_tok_dyn_act_int8-BitM",
+    "nm-testing/TinyLlama-1.1B-Chat-v1.0-gsm8k-pruned.2of4-chnl_wts_per_tok_dyn_act_fp8-BitM",
+])
 def test_compressed_tensors_2of4_sparse(vllm_runner, args_2of4):
     model = args_2of4
     with vllm_runner(model) as llm:
