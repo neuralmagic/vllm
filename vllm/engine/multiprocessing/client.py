@@ -26,8 +26,11 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          IPC_OUTPUT_EXT, RPC_REQUEST_T,
                                          VLLM_RPC_SUCCESS_STR, RPCAbortRequest,
                                          RPCError, RPCProcessRequest,
-                                         RPCStartupRequest, RPCStartupResponse,
+                                         RPCStartupResponse,
                                          RPCUProfileRequest)
+from vllm.engine.multiprocessing.ipc import (send_signed_async,
+                                             recv_signed_async)
+
 from vllm.engine.protocol import EngineClient
 # yapf: enable
 from vllm.envs import VLLM_RPC_TIMEOUT
@@ -81,8 +84,9 @@ class MQLLMEngineClient(EngineClient):
     """
 
     def __init__(self, ipc_path: str, engine_config: VllmConfig,
-                 engine_pid: int):
+                 engine_pid: int, secret_key: bytes):
         self.context = zmq.asyncio.Context()
+        self.secret_key = secret_key
         self._errored_with: Optional[BaseException] = None
 
         # Get the configs.
@@ -133,7 +137,7 @@ class MQLLMEngineClient(EngineClient):
 
     @contextmanager
     def get_data_socket(self) -> Iterator[Socket]:
-        socket = self.context.socket(zmq.constants.DEALER)
+        socket = self.context.socket(zmq.constants.PULL)
         try:
             socket.connect(self.data_ipc_path)
             yield socket
@@ -160,6 +164,7 @@ class MQLLMEngineClient(EngineClient):
                     # Heartbeat received- check the message
                     await self._check_success(
                         error_message="Heartbeat failed.",
+                        secret_key=self.secret_key,
                         socket=self.heartbeat_socket)
 
                 logger.debug("Heartbeat successful.")
@@ -192,8 +197,9 @@ class MQLLMEngineClient(EngineClient):
                                 ENGINE_DEAD_ERROR(self._errored_with))
                         return
 
-                message: Frame = await self.output_socket.recv(copy=False)
-                request_outputs = pickle.loads(message.buffer)
+                message = await recv_signed_async(self.output_socket,
+                                                  self.secret_key)
+                request_outputs = pickle.loads(message)
 
                 is_error = isinstance(request_outputs,
                                       (BaseException, RPCError))
@@ -259,7 +265,7 @@ class MQLLMEngineClient(EngineClient):
 
         with self.get_data_socket() as socket:
             # Wait until server is ready.
-            response = await self._wait_for_server_rpc(socket)
+            response = await self._wait_for_server(socket)
 
             self.tracing_flag = response.tracing_enabled
 
@@ -282,42 +288,18 @@ class MQLLMEngineClient(EngineClient):
         logger.exception(repr(e))
         if self._errored_with is None:
             self._errored_with = e
-
-    @staticmethod
-    async def _send_get_data_rpc_request(request: RPCStartupRequest,
-                                         expected_type: Any,
-                                         error_message: str,
-                                         socket: Socket) -> Any:
-        """Send an RPC request that is expecting data back."""
-
-        # Ping RPCServer with a request.
-        await socket.send_multipart((pickle.dumps(request), ), copy=False)
-
-        # Make sure the server responds in time.
-        if await socket.poll(timeout=VLLM_RPC_TIMEOUT) == 0:
-            raise TimeoutError("RPCServer didn't reply within "
-                               f"{VLLM_RPC_TIMEOUT} ms")
-
-        # Await the data from the Server.
-        frame = await socket.recv(copy=False)
-        data = pickle.loads(frame.buffer)
-
-        if isinstance(data, BaseException):
-            raise data
-        elif not isinstance(data, expected_type):
-            raise ValueError(error_message)
-
-        return data
+        
 
     @staticmethod
     async def _send_one_way_rpc_request(request: RPC_REQUEST_T,
-                                        socket: Socket):
+                                        socket: Socket,
+                                        secret_key: bytes):
         """Send one-way RPC request to trigger an action."""
 
         if socket.closed:
             raise MQClientClosedError()
 
-        await socket.send_multipart((pickle.dumps(request), ))
+        await send_signed_async(socket, secret_key, pickle.dumps(request))
 
     async def _await_ack(self, error_message: str, socket: Socket):
         """Await acknowledgement that a request succeeded."""
@@ -329,17 +311,18 @@ class MQLLMEngineClient(EngineClient):
             raise TimeoutError("MQLLMEngine didn't reply within "
                                f"{VLLM_RPC_TIMEOUT}ms")
 
-        await self._check_success(error_message, socket)
+        await self._check_success(error_message, self.secret_key, socket)
 
     @staticmethod
-    async def _check_success(error_message: str, socket: Socket):
+    async def _check_success(error_message: str, secret_key: bytes,
+                             socket: Socket):
         """Confirm that socket has a VLLM_RPC_SUCCESS_STR message"""
 
         if socket.closed:
             raise MQClientClosedError()
 
-        frame = await socket.recv(copy=False)
-        response = pickle.loads(frame.buffer)
+        message = await recv_signed_async(socket, secret_key)
+        response = pickle.loads(message)
 
         # Raise error if unsuccessful
         if isinstance(response, BaseException):
@@ -363,21 +346,33 @@ class MQLLMEngineClient(EngineClient):
     async def is_tracing_enabled(self) -> bool:
         return self.tracing_flag
 
-    async def _wait_for_server_rpc(self, socket: Socket) -> RPCStartupResponse:
+    async def _wait_for_server(self, socket: Socket) -> RPCStartupResponse:
         """Wait for the RPCServer to start up."""
 
-        return await self._send_get_data_rpc_request(
-            request=RPCStartupRequest.IS_SERVER_READY,
-            expected_type=RPCStartupResponse,
-            error_message="Unable to start RPC Server",
-            socket=socket)
+        # Raise error if the server does not respond in time.
+        if await socket.poll(timeout=VLLM_RPC_TIMEOUT) == 0:
+            raise TimeoutError("RPCServer didn't reply within "
+                               f"{VLLM_RPC_TIMEOUT} ms")
+
+        # Await the data from the Server.
+        message = await recv_signed_async(socket, self.secret_key)
+        data = pickle.loads(message)
+
+        if isinstance(data, BaseException):
+            raise data
+        elif not isinstance(data, RPCStartupResponse):
+            raise ValueError("RPCServer failed to start.")
+
+        return data
 
     async def abort(self, request_id: str):
         """Send an ABORT_REQUEST signal to the RPC Server"""
 
         with suppress(MQClientClosedError):
             await self._send_one_way_rpc_request(
-                request=RPCAbortRequest(request_id), socket=self.input_socket)
+                request=RPCAbortRequest(request_id),
+                secret_key=self.secret_key,
+                socket=self.input_socket)
 
     async def do_log_stats(
         self,
@@ -624,9 +619,11 @@ class MQLLMEngineClient(EngineClient):
                 ))
 
             # 3) Send the RPCGenerateRequest to the MQLLMEngine.
-            parts = (request_bytes,
-                     lp_bytes) if lp_bytes else (request_bytes, )
-            await self.input_socket.send_multipart(parts, copy=False)
+
+            # parts = (request_bytes,
+            #          lp_bytes) if lp_bytes else (request_bytes, )
+            await send_signed_async(self.input_socket, self.secret_key,
+                                    request_bytes)
 
             # 4) Stream the RequestOutputs from the output queue. Note
             # that the output_loop pushes RequestOutput objects to this
@@ -652,10 +649,14 @@ class MQLLMEngineClient(EngineClient):
         """Start profiling the engine"""
 
         await self._send_one_way_rpc_request(
-            request=RPCUProfileRequest.START_PROFILE, socket=self.input_socket)
+            request=RPCUProfileRequest.START_PROFILE,
+            secret_key=self.secret_key,
+            socket=self.input_socket)
 
     async def stop_profile(self) -> None:
         """Stop profiling the engine"""
 
         await self._send_one_way_rpc_request(
-            request=RPCUProfileRequest.STOP_PROFILE, socket=self.input_socket)
+            request=RPCUProfileRequest.STOP_PROFILE,
+            secret_key=self.secret_key,
+            socket=self.input_socket)
