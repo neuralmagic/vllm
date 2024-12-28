@@ -6,9 +6,11 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+from tqdm import tqdm
 
 from vllm.config import CompilationLevel, VllmConfig
-from vllm.distributed.parallel_state import graph_capture
+from vllm.distributed.parallel_state import (get_tensor_model_parallel_rank,
+                                             graph_capture)
 from vllm.forward_context import set_forward_context
 from vllm.inputs import INPUT_REGISTRY
 from vllm.logger import init_logger
@@ -728,8 +730,14 @@ class GPUModelRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        # Only rank 0 should print progress bar during capture.
+        capture_sizes = (tqdm(
+            reversed(self.cudagraph_batch_sizes),
+            desc="Capturing CUDA graph shapes",
+        ) if get_tensor_model_parallel_rank() == 0 else reversed(
+            self.cudagraph_batch_sizes))
         with graph_capture():
-            for num_tokens in reversed(self.cudagraph_batch_sizes):
+            for num_tokens in capture_sizes:
                 for _ in range(self.vllm_config.compilation_config.
                                cudagraph_num_of_warmups):
                     self._dummy_run(self.model, num_tokens, self.kv_caches)
