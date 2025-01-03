@@ -88,7 +88,10 @@ torch::Tensor run_impl(MMArgs args) {
                      torch::TensorOptions().dtype(torch::kU8).device(device));
   }
 
-  arguments.scheduler.barrier_workspace = barrier_workspace.mutable_data_ptr();
+  if constexpr (MacheteKernel::scheduler_supports_seperate_barrier_array) {
+    arguments.scheduler.barrier_workspace =
+        barrier_workspace.mutable_data_ptr();
+  }
   MacheteKernel::run(arguments, workspace.mutable_data_ptr(), stream);
 
   return D;

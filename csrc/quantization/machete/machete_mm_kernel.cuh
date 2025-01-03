@@ -51,6 +51,9 @@ struct MacheteKernelTemplate {
   static constexpr bool with_channel_scales =
       !std::is_same_v<ChannelScaleT, void>;
   static constexpr bool with_token_scales = !std::is_same_v<TokenScaleT, void>;
+  static constexpr bool scheduler_supports_seperate_barrier_array =
+      std::is_same_v<typename ScheduleConfig::TileScheduler,
+                     cutlass::gemm::vLLMStreamKSchedulerWithReset>;
 
   using MmaType = ElementA_;
   using ElementA = ElementA_;
@@ -299,7 +302,7 @@ struct MacheteKernelTemplate {
           MainloopArguments{B_ptr, _StrideB{}, A_ptr, stride_At};
     }
 
-    auto tile_scheduler_arguments = TileSchedulerArguments{{}, nullptr};
+    auto tile_scheduler_arguments = TileSchedulerArguments{};
 
     return Arguments{cutlass::gemm::GemmUniversalMode::kGemm,
                      {N, M, K, 1},
@@ -314,10 +317,14 @@ struct MacheteKernelTemplate {
   }
 
   static size_t get_barrier_workspace_size(Arguments const& args) {
-    return GemmKernel::TileScheduler::template get_barrier_workspace_size<
-        decltype(args.problem_shape), ElementAccumulator>(
-        args.scheduler, args.problem_shape, args.hw_info,
-        GemmKernel::NumMmaWarpGroups);
+    if constexpr (scheduler_supports_seperate_barrier_array) {
+      return GemmKernel::TileScheduler::template get_barrier_workspace_size<
+          decltype(args.problem_shape), ElementAccumulator>(
+          args.scheduler, args.problem_shape, args.hw_info,
+          GemmKernel::NumMmaWarpGroups);
+    } else {
+      return 0;
+    }
   }
 
   static bool can_implement(Arguments const& args) {
