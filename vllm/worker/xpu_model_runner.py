@@ -37,10 +37,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
-_BATCH_SIZE_ALIGNMENT = 8
-_BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
-    _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
-]
 
 TModelInputForXPU = TypeVar('TModelInputForXPU', bound="ModelInputForXPU")
 
@@ -160,7 +156,7 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         input_positions: List[int] = []
         slot_mapping: List[int] = []
         seq_lens: List[int] = []
-        multi_model_kwargs_list: List[MultiModalKwargs] = []
+        multi_modal_kwargs_list: List[MultiModalKwargs] = []
         multi_modal_placeholder_maps: Dict[
             str,
             MultiModalPlaceholderMap] = defaultdict(MultiModalPlaceholderMap)
@@ -191,8 +187,16 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
                 mm_data, placeholder_maps = MultiModalPlaceholderMap \
                     .from_seq_group(seq_group_metadata, positions_range)
 
-                mm_kwargs = self.runner.multi_modal_input_mapper(mm_data)
-                multi_model_kwargs_list.append(mm_kwargs)
+                if self.runner.mm_registry.has_processor(
+                        self.runner.model_config):
+                    mm_kwargs = mm_data
+                else:
+                    mm_kwargs = self.runner.multi_modal_input_mapper(
+                        mm_data,
+                        seq_group_metadata.mm_processor_kwargs,
+                    )
+
+                multi_modal_kwargs_list.append(mm_kwargs)
 
                 for modality, placeholder_map in placeholder_maps.items():
                     multi_modal_placeholder_maps[modality].extend(
@@ -264,7 +268,7 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
             block_tables=torch.tensor([], device=self.device, dtype=torch.int),
         )
 
-        multi_modal_kwargs = MultiModalKwargs.batch(multi_model_kwargs_list)
+        multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
 
         return (input_tokens, input_positions, attn_metadata, seq_lens,
                 multi_modal_kwargs)

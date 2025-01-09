@@ -10,7 +10,8 @@ from fastapi import Request
 
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import ConversationMessage, load_chat_template
+from vllm.entrypoints.chat_utils import (ChatTemplateContentFormatOption,
+                                         ConversationMessage)
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionLogProb, ChatCompletionLogProbs,
@@ -18,49 +19,47 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse, ChatMessage, DeltaFunctionCall, DeltaMessage,
-    DeltaToolCall, ErrorResponse, FunctionCall, RequestResponseMetadata,
-    ToolCall, UsageInfo)
-from vllm.entrypoints.openai.serving_engine import (BaseModelPath,
-                                                    LoRAModulePath,
-                                                    OpenAIServing,
-                                                    PromptAdapterPath)
+    DeltaToolCall, ErrorResponse, FunctionCall, PromptTokenUsageInfo,
+    RequestResponseMetadata, ToolCall, UsageInfo)
+from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParser, ToolParserManager
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.sequence import Logprob
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
-from vllm.utils import iterate_with_cancellation
+from vllm.transformers_utils.tokenizers import maybe_serialize_tool_calls
 
 logger = init_logger(__name__)
 
 
 class OpenAIServingChat(OpenAIServing):
 
-    def __init__(self,
-                 engine_client: EngineClient,
-                 model_config: ModelConfig,
-                 base_model_paths: List[BaseModelPath],
-                 response_role: str,
-                 *,
-                 lora_modules: Optional[List[LoRAModulePath]],
-                 prompt_adapters: Optional[List[PromptAdapterPath]],
-                 request_logger: Optional[RequestLogger],
-                 chat_template: Optional[str],
-                 return_tokens_as_token_ids: bool = False,
-                 enable_auto_tools: bool = False,
-                 tool_parser: Optional[str] = None):
+    def __init__(
+        self,
+        engine_client: EngineClient,
+        model_config: ModelConfig,
+        models: OpenAIServingModels,
+        response_role: str,
+        *,
+        request_logger: Optional[RequestLogger],
+        chat_template: Optional[str],
+        chat_template_content_format: ChatTemplateContentFormatOption,
+        return_tokens_as_token_ids: bool = False,
+        enable_auto_tools: bool = False,
+        tool_parser: Optional[str] = None,
+        enable_prompt_tokens_details: bool = False,
+    ) -> None:
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
-                         base_model_paths=base_model_paths,
-                         lora_modules=lora_modules,
-                         prompt_adapters=prompt_adapters,
+                         models=models,
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)
 
         self.response_role = response_role
-        self.use_tool_use_model_template = False
-        self.chat_template = load_chat_template(chat_template)
+        self.chat_template = chat_template
+        self.chat_template_content_format: Final = chat_template_content_format
 
         # set up tool use
         self.enable_auto_tools: bool = enable_auto_tools
@@ -73,12 +72,23 @@ class OpenAIServingChat(OpenAIServing):
         self.tool_parser: Optional[Callable[[AnyTokenizer], ToolParser]] = None
         if self.enable_auto_tools:
             try:
+                if (tool_parser == "pythonic" and
+                        model_config.model.startswith("meta-llama/Llama-3.2")):
+                    logger.warning(
+                        "Llama3.2 models may struggle to emit valid pythonic"
+                        " tool calls")
                 self.tool_parser = ToolParserManager.get_tool_parser(
                     tool_parser)
             except Exception as e:
                 raise TypeError("Error: --enable-auto-tool-choice requires "
                                 f"tool_parser:'{tool_parser}' which has not "
                                 "been registered") from e
+
+        self.enable_prompt_tokens_details = enable_prompt_tokens_details
+        diff_sampling_param = self.model_config.get_diff_sampling_param()
+        if diff_sampling_param:
+            logger.info("Overwriting default chat sampling param with: %s",
+                        diff_sampling_param)
 
     async def create_chat_completion(
         self,
@@ -110,7 +120,10 @@ class OpenAIServingChat(OpenAIServing):
                 prompt_adapter_request,
             ) = self._maybe_get_adapters(request)
 
+            model_name = self.models.model_name(lora_request)
+
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
+
             tool_parser = self.tool_parser
 
             # validation for OpenAI tools
@@ -118,6 +131,12 @@ class OpenAIServingChat(OpenAIServing):
             if request.tool_choice == "required":
                 return self.create_error_response(
                     "tool_choice = \"required\" is not supported!")
+
+            # because of issues with pydantic we need to potentially
+            # re-serialize the tool_calls field of the request
+            # for more info: see comment in `maybe_serialize_tool_calls`
+            if isinstance(tokenizer, MistralTokenizer):
+                maybe_serialize_tool_calls(request)
 
             if (request.tool_choice == "auto" and
                     not (self.enable_auto_tools and tool_parser is not None)
@@ -142,6 +161,7 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 request.messages,
                 chat_template=request.chat_template or self.chat_template,
+                chat_template_content_format=self.chat_template_content_format,
                 add_generation_prompt=request.add_generation_prompt,
                 continue_final_message=request.continue_final_message,
                 tool_dicts=tool_dicts,
@@ -155,7 +175,8 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
 
-        request_id = f"chatcmpl-{request.request_id}"
+        request_id = "chatcmpl-" \
+                     f"{self._base_request_id(raw_request, request.request_id)}"
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -168,12 +189,17 @@ class OpenAIServingChat(OpenAIServing):
                 sampling_params: Union[SamplingParams, BeamSearchParams]
                 default_max_tokens = self.max_model_len - len(
                     engine_prompt["prompt_token_ids"])
+                # Build default sampling params
+                default_sampling_params = (
+                    self.model_config.get_diff_sampling_param())
                 if request.use_beam_search:
                     sampling_params = request.to_beam_search_params(
-                        default_max_tokens)
+                        default_max_tokens, default_sampling_params)
                 else:
                     sampling_params = request.to_sampling_params(
-                        default_max_tokens)
+                        default_max_tokens,
+                        self.model_config.logits_processor_pattern,
+                        default_sampling_params)
 
                 self._log_inputs(request_id,
                                  request_prompts[i],
@@ -187,7 +213,6 @@ class OpenAIServingChat(OpenAIServing):
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.engine_client.beam_search(
                         prompt=engine_prompt,
-                        model_config=self.model_config,
                         request_id=request_id,
                         params=sampling_params,
                     )
@@ -210,20 +235,16 @@ class OpenAIServingChat(OpenAIServing):
         assert len(generators) == 1
         result_generator, = generators
 
-        if raw_request:
-            result_generator = iterate_with_cancellation(
-                result_generator, raw_request.is_disconnected)
-
         # Streaming response
         if request.stream:
             return self.chat_completion_stream_generator(
-                request, result_generator, request_id, conversation, tokenizer,
-                request_metadata)
+                request, result_generator, request_id, model_name,
+                conversation, tokenizer, request_metadata)
 
         try:
             return await self.chat_completion_full_generator(
-                request, result_generator, request_id, conversation, tokenizer,
-                request_metadata)
+                request, result_generator, request_id, model_name,
+                conversation, tokenizer, request_metadata)
         except ValueError as e:
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
@@ -238,11 +259,11 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         result_generator: AsyncIterator[RequestOutput],
         request_id: str,
+        model_name: str,
         conversation: List[ConversationMessage],
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
     ) -> AsyncGenerator[str, None]:
-        model_name = self.base_model_paths[0].name
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
@@ -252,6 +273,7 @@ class OpenAIServingChat(OpenAIServing):
         previous_num_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
+        num_cached_tokens = None
 
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
             tool_choice_function_name = request.tool_choice.function.name
@@ -279,7 +301,7 @@ class OpenAIServingChat(OpenAIServing):
                 ] * num_choices
             else:
                 tool_parsers = [None] * num_choices
-        except RuntimeError as e:
+        except Exception as e:
             logger.exception("Error in tool parser creation.")
             data = self.create_streaming_error_response(str(e))
             yield f"data: {data}\n\n"
@@ -305,6 +327,7 @@ class OpenAIServingChat(OpenAIServing):
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration:
+                    num_cached_tokens = res.num_cached_tokens
                     # Send first response for each request.n (index) with
                     # the role
                     role = self.get_chat_request_role(request)
@@ -339,7 +362,7 @@ class OpenAIServingChat(OpenAIServing):
 
                     # Send response to echo the input portion of the
                     # last message
-                    if request.echo or request.continue_final_message:
+                    if request.echo:
                         last_msg_content: Union[str, List[Dict[str, str]]] = ""
                         if conversation and "content" in conversation[
                                 -1] and conversation[-1].get("role") == role:
@@ -473,21 +496,33 @@ class OpenAIServingChat(OpenAIServing):
 
                         if self._should_check_for_unstreamed_tool_arg_tokens(
                                 delta_message, output) and tool_parser:
+                            latest_delta_len = 0
+                            if ((isinstance(
+                                    delta_message.tool_calls[0].function,
+                                    DeltaFunctionCall)) and isinstance(
+                                        delta_message.tool_calls[0].function.
+                                        arguments, str)):
+                                latest_delta_len = len(
+                                    delta_message.tool_calls[0].function.
+                                    arguments)
+
                             # get the expected call based on partial JSON
                             # parsing which "autocompletes" the JSON
                             expected_call = json.dumps(
                                 tool_parser.prev_tool_call_arr[index].get(
-                                    "arguments", {}))
+                                    "arguments", {}),
+                                ensure_ascii=False)
 
                             # get what we've streamed so far for arguments
                             # for the current tool
                             actual_call = tool_parser.streamed_args_for_tool[
                                 index]
+                            if (latest_delta_len > 0):
+                                actual_call = actual_call[:-latest_delta_len]
 
                             # check to see if there's anything left to stream
                             remaining_call = expected_call.replace(
                                 actual_call, "", 1)
-
                             # set that as a delta message
                             delta_message = DeltaMessage(tool_calls=[
                                 DeltaToolCall(index=index,
@@ -530,11 +565,13 @@ class OpenAIServingChat(OpenAIServing):
             # is sent, send the usage
             if include_usage:
                 completion_tokens = sum(previous_num_tokens)
-                final_usage = UsageInfo(
-                    prompt_tokens=num_prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=num_prompt_tokens + completion_tokens,
-                )
+                final_usage = UsageInfo(prompt_tokens=num_prompt_tokens,
+                                        completion_tokens=completion_tokens,
+                                        total_tokens=num_prompt_tokens +
+                                        completion_tokens)
+                if self.enable_prompt_tokens_details and num_cached_tokens:
+                    final_usage.prompt_tokens_details = PromptTokenUsageInfo(
+                        cached_tokens=num_cached_tokens)
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
@@ -554,7 +591,7 @@ class OpenAIServingChat(OpenAIServing):
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens)
 
-        except ValueError as e:
+        except Exception as e:
             # TODO: Use a vllm-specific Validation Error
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(str(e))
@@ -567,12 +604,12 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         result_generator: AsyncIterator[RequestOutput],
         request_id: str,
+        model_name: str,
         conversation: List[ConversationMessage],
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
     ) -> Union[ErrorResponse, ChatCompletionResponse]:
 
-        model_name = self.base_model_paths[0].name
         created_time = int(time.time())
         final_res: Optional[RequestOutput] = None
 
@@ -682,7 +719,7 @@ class OpenAIServingChat(OpenAIServing):
                 stop_reason=output.stop_reason)
             choices.append(choice_data)
 
-        if request.echo or request.continue_final_message:
+        if request.echo:
             last_msg_content: Union[str, List[Dict[str, str]]] = ""
             if conversation and "content" in conversation[-1] and conversation[
                     -1].get("role") == role:
@@ -702,11 +739,13 @@ class OpenAIServingChat(OpenAIServing):
             num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
         num_generated_tokens = sum(
             len(output.token_ids) for output in final_res.outputs)
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
-            total_tokens=num_prompt_tokens + num_generated_tokens,
-        )
+        usage = UsageInfo(prompt_tokens=num_prompt_tokens,
+                          completion_tokens=num_generated_tokens,
+                          total_tokens=num_prompt_tokens +
+                          num_generated_tokens)
+        if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
+            usage.prompt_tokens_details = PromptTokenUsageInfo(
+                cached_tokens=final_res.num_cached_tokens)
 
         request_metadata.final_usage_info = usage
 

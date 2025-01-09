@@ -1,7 +1,8 @@
-from .base import (BatchedTensorInputs, MultiModalDataBuiltins,
-                   MultiModalDataDict, MultiModalKwargs,
-                   MultiModalPlaceholderDict, MultiModalPlaceholderMap,
-                   MultiModalPlugin, NestedTensors)
+from .base import MultiModalPlaceholderMap, MultiModalPlugin
+from .hasher import MultiModalHashDict, MultiModalHasher
+from .inputs import (BatchedTensorInputs, ModalityData, MultiModalDataBuiltins,
+                     MultiModalDataDict, MultiModalKwargs,
+                     MultiModalPlaceholderDict, NestedTensors)
 from .registry import MultiModalRegistry
 
 MULTIMODAL_REGISTRY = MultiModalRegistry()
@@ -10,13 +11,16 @@ The global :class:`~MultiModalRegistry` is used by model runners to
 dispatch data processing according to its modality and the target model.
 
 See also:
-    :ref:`input_processing_pipeline`
+    :ref:`input-processing-pipeline`
 """
 
 __all__ = [
     "BatchedTensorInputs",
+    "ModalityData",
     "MultiModalDataBuiltins",
     "MultiModalDataDict",
+    "MultiModalHashDict",
+    "MultiModalHasher",
     "MultiModalKwargs",
     "MultiModalPlaceholderDict",
     "MultiModalPlaceholderMap",
@@ -25,18 +29,3 @@ __all__ = [
     "MULTIMODAL_REGISTRY",
     "MultiModalRegistry",
 ]
-
-
-def __getattr__(name: str):
-    import warnings
-
-    if name == "MultiModalInputs":
-        msg = ("MultiModalInputs has been renamed to MultiModalKwargs. "
-               "The original name will take another meaning in an upcoming "
-               "version.")
-
-        warnings.warn(DeprecationWarning(msg), stacklevel=2)
-
-        return MultiModalKwargs
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
