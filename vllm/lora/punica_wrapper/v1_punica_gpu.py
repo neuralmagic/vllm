@@ -364,15 +364,15 @@ class V1PunicaWrapperGPU(PunicaWrapperBase):
         if buffer is None:
             # We set the buffer to be float32 by default ,refer to:
             # https://github.com/triton-lang/triton/issues/1387
-            buffer = torch.zeros((x.size(0), r),
+            buffer = torch.zeros((1, x.size(0), r),
                                  dtype=torch.float32,
                                  device=x.device)
 
-        v1_shrink(x, lora_a_stacked, buffer,
+        v1_shrink(x, [lora_a_stacked], buffer,
                     *self.prompt_mapping_v1_meta.meta_args(x.size(0)), scale)
         v1_expand(buffer,
-                    lora_b_stacked,
-                    y,
-                    *self.prompt_mapping_v1_meta.meta_args(x.size(0)),
-                    add_inputs=True)
+                  [lora_b_stacked],
+                  y,
+                  *self.prompt_mapping_v1_meta.meta_args(x.size(0)),
+                  add_inputs=True)
         y = y.view_as(y_org)
