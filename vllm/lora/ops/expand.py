@@ -178,8 +178,6 @@ def _expand(
     # TODO tuning this config
     K = lora_b_weights[0].shape[-1]  # K= rank
 
-    print (f"Running v1_expand ...")
-
     M = inputs.size(1)
     BLOCK_M = 64
     BLOCK_N = 128
