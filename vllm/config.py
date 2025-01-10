@@ -2022,9 +2022,14 @@ class LoRAConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        # no factors to consider.
-        # LoRA is not compatible with `torch.compile` .
         factors: List[Any] = []
+        factors.append(self.max_lora_rank)
+        factors.append(self.max_loras)
+        factors.append(self.fully_sharded_loras)
+        factors.append(self.lora_dtype)
+        factors.append(self.lora_extra_vocab_size)
+        factors.append(self.long_lora_scaling_factors)
+        factors.append(self.bias_enabled)
         hash_str = hashlib.md5(str(factors).encode()).hexdigest()
         return hash_str
 
