@@ -3179,11 +3179,11 @@ class VllmConfig:
                 " Disabling `torch.compile`.")
             self.compilation_config.level = CompilationLevel.NO_COMPILATION
 
-        if self.lora_config is not None and self.compilation_config.level !=\
-             CompilationLevel.NO_COMPILATION:
-            logger.warning("LoRA is not supported with `torch.compile` yet. "
-                           "Disabling `torch.compile`.")
-            self.compilation_config.level = CompilationLevel.NO_COMPILATION
+        #if self.lora_config is not None and self.compilation_config.level !=\
+        #     CompilationLevel.NO_COMPILATION:
+        #    logger.warning("LoRA is not supported with `torch.compile` yet. "
+        #                   "Disabling `torch.compile`.")
+        #    self.compilation_config.level = CompilationLevel.NO_COMPILATION
 
         current_platform.check_and_update_config(self)
 
