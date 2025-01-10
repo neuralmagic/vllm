@@ -167,7 +167,7 @@ class PunicaWrapperBase(PunicaWrapperABC):
         self.is_prefill = False
         self.no_lora = False
 
-    def _update_base_metadata(
+    def update_base_metadata(
         self,
         mapping: "LoRAMapping",
         lora_index_to_id: List[Optional[int]],
@@ -328,7 +328,7 @@ class PunicaWrapperBase(PunicaWrapperABC):
             long_lora_context: Optional["LongContextLoRAContext"] = None,
             **kwargs):
 
-        self._update_base_metadata(mapping, lora_index_to_id, max_loras,
+        self.update_base_metadata(mapping, lora_index_to_id, max_loras,
                                    vocab_size, extra_vocab_size,
                                    long_lora_context)
         if mapping.is_prefill:
