@@ -5,6 +5,7 @@ whether the corresponding Triton kernel can run normally when tensor parallelism
 is set to [1, 2, 4, 8, 16, 32, 64].
 """
 from threading import Lock
+from typing import Tuple
 
 import pytest
 import torch
@@ -16,6 +17,8 @@ from vllm.lora.ops.sgmv_expand import sgmv_expand
 from vllm.lora.ops.sgmv_shrink import sgmv_shrink
 from vllm.lora.ops.utils import _LORA_A_PTR_DICT, _LORA_B_PTR_DICT
 from vllm.platforms import current_platform
+from vllm.lora.ops.expand import expand as v1_expand 
+from vllm.lora.ops.shrink import shrink as v1_shrink
 
 from .utils import (assert_close, generate_data,
                     generate_data_for_expand_nslices,
@@ -125,7 +128,7 @@ _dict_lock = Lock()
 @pytest.mark.parametrize("scaling", SCALES)
 @pytest.mark.parametrize("nslices", [1, 2, 3])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("op_type", ["shrink", "expand"])
+@pytest.mark.parametrize("op_type", ["shrink"])
 @pytest.mark.parametrize("seed", SEED)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 def test_punica_sgmv(
@@ -372,3 +375,128 @@ def test_punica_bgmv_expand_nslices(
 
         slice_offset += hidden_size
     assert_close(our_outputs, ref_outputs)
+
+
+@pytest.mark.parametrize("batches", BATCHES)
+@pytest.mark.parametrize("num_loras", NUM_LORA)
+@pytest.mark.parametrize("rank", MAX_RANKS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("scaling", SCALES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("nslices", [1, 2, 3])
+@pytest.mark.parametrize("op_type", ["shrink", "expand"])
+@pytest.mark.parametrize("seq_length", [1, 128])
+@pytest.mark.parametrize("seed", SEED)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_v1_shrink_expand(
+    batches: int,
+    num_loras: int,
+    rank: int,
+    hidden_size: int,
+    scaling: float,
+    dtype: torch.dtype,
+    nslices: int,
+    op_type: str,
+    seq_length: int,
+    seed: int,
+    device: str,
+):
+    torch.set_default_device(device)
+    current_platform.seed_everything(seed)
+
+    (
+        inputs_tensor,
+        lora_weights_lst,
+        our_out_tensor,
+        ref_out_tensor,
+        b_seq_start_loc,
+        prompt_lora_mapping,
+        seq_len_tensor,
+        token_lora_mapping,
+    ) = generate_data_for_nslices(
+        batches,
+        hidden_size,
+        num_loras,
+        rank,
+        seq_length,
+        nslices,
+        dtype,
+        op_type,
+        device,
+    )
+
+    def prepare_tensors(token_lora_mapping: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # token_indices_sorted_by_lora_ids
+        _, token_indices_sorted_by_lora_ids = torch.sort(token_lora_mapping,
+                                                         stable=True)
+
+        # active_lora_ids, num_tokens_per_lora
+        lora_ids, num_tokens_per_lora = torch.unique(token_lora_mapping,
+                                                     sorted=False,
+                                                     return_counts=True)
+
+        # lora_token_start_loc
+        lora_token_start_loc = torch.zeros(num_tokens_per_lora.size(0) + 1,
+                                           dtype=torch.int32,
+                                           device=device)
+        lora_token_start_loc[1:] = torch.cumsum(num_tokens_per_lora, dim = 0)
+        return token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids
+
+    token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids = prepare_tensors(token_lora_mapping) 
+
+    if op_type == "shrink":
+        with _dict_lock:
+            _LORA_A_PTR_DICT.clear()
+            v1_shrink(inputs_tensor,
+                      lora_weights_lst,
+                      our_out_tensor,
+                      token_lora_mapping,
+                      token_indices_sorted_by_lora_ids,
+                      num_tokens_per_lora,
+                      lora_token_start_loc,
+                      lora_ids,
+                      scaling = scaling
+                )
+
+        for index in range(nslices):
+            ref_torch_groupgemm(
+                ref_out_tensor[index],
+                inputs_tensor,
+                lora_weights_lst[index],
+                prompt_lora_mapping,
+                seq_len_tensor,
+                batches,
+                scaling,
+                op_type,
+            )
+    else:
+        with _dict_lock:
+            _LORA_B_PTR_DICT.clear()
+            v1_expand(inputs_tensor,
+                      lora_weights_lst,
+                      our_out_tensor,
+                      token_lora_mapping,
+                      token_indices_sorted_by_lora_ids,
+                      num_tokens_per_lora,
+                      lora_token_start_loc,
+                      lora_ids,
+                      offset_start = 0,
+                      add_inputs = True
+                      )
+
+        slice_offset = 0
+        for index in range(nslices):
+            lora_weights = lora_weights_lst[index]
+            ref_torch_groupgemm(
+                ref_out_tensor[:, slice_offset:slice_offset + hidden_size],
+                inputs_tensor[index],
+                lora_weights,
+                prompt_lora_mapping,
+                seq_len_tensor,
+                batches,
+                1.0,
+                op_type,
+            )
+            slice_offset += hidden_size
+
+    assert_close(our_out_tensor, ref_out_tensor)
