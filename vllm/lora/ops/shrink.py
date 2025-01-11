@@ -170,8 +170,18 @@ def _shrink(
     M = inputs.size(0)
     BLOCK_M = 32
     BLOCK_N = 16
-    BLOCK_K = 32
-    SPLIT_K = 8
+
+    #BLOCK_K = 32
+    #SPLIT_K = 8
+
+    if M < 128:
+        BLOCK_K = 256
+        SPLIT_K = 64
+    else:
+        BLOCK_K = 32
+        SPLIT_K = 8
+
+
     EVEN_K = K % (BLOCK_K * SPLIT_K) == 0
     MAX_LORAS = lora_ids.size(0)
     grid = (
