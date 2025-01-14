@@ -33,7 +33,6 @@ launch_trt_server() {
   max_input_len=$(echo "$server_params" | jq -r '.max_input_len')
   max_seq_len=$(echo "$server_params" | jq -r '.max_seq_len')
   max_num_tokens=$(echo "$server_params" | jq -r '.max_num_tokens')
-  trt_llm_version=$(echo "$server_params" | jq -r '.trt_llm_version')
 
   # create model caching directory
   cd ${HOME}
@@ -44,17 +43,7 @@ launch_trt_server() {
   trt_model_path=${models_dir}/${model_name}-trt-ckpt
   trt_engine_path=${models_dir}/${model_name}-trt-engine
 
-  # clone tensorrt backend
-  cd ${HOME}
-  rm -rf tensorrtllm_backend
-  git clone https://github.com/triton-inference-server/tensorrtllm_backend.git
-  git lfs install
-  cd tensorrtllm_backend
-  git checkout $trt_llm_version
-  tensorrtllm_backend_dir=$(pwd)
-  git submodule update --init --recursive
-
-  # build trtllm engine
+  # convert checkpoint
   cd ${HOME}/tensorrtllm_backend
   cd ./tensorrt_llm/examples/${model_type}
   python3 convert_checkpoint.py \
@@ -62,22 +51,25 @@ launch_trt_server() {
     --dtype ${model_dtype} \
     --tp_size ${model_tp_size} \
     --output_dir ${trt_model_path}
+
+  # build engine
   trtllm-build \
     --checkpoint_dir ${trt_model_path} \
-    --use_fused_mlp \
+    --use_fused_mlp enable \
     --reduce_fusion disable \
     --workers 8 \
     --gpt_attention_plugin ${model_dtype} \
     --gemm_plugin ${model_dtype} \
-    --tp_size ${model_tp_size} \
     --max_batch_size ${max_batch_size} \
     --max_input_len ${max_input_len} \
     --max_seq_len ${max_seq_len} \
     --max_num_tokens ${max_num_tokens} \
     --output_dir ${trt_engine_path} \
-    --paged_kv_cache enable \
+    --kv_cache_type paged \
     --use_paged_context_fmha enable \
     --multiple_profiles enable
+    # --tp_size ${model_tp_size} \
+    # --multiple_profiles disable
 
   # handle triton protobuf files and launch triton server
   cd ${HOME}/tensorrtllm_backend
@@ -94,7 +86,7 @@ launch_trt_server() {
   cd ${HOME}/tensorrtllm_backend
   python3 scripts/launch_triton_server.py \
     --world_size=${model_tp_size} \
-    --model_repo=${HOME}/tensorrtllm_backend/triton_model_repo &
+    --model_repo=${HOME}/tensorrtllm_backend/triton_model_repo
 
 }
 

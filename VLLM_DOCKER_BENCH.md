@@ -68,7 +68,7 @@ docker build -t trtllm_bench -f Dockerfile.trtllm --build-arg UID=$(id -u) --bui
 ```bash
 GPUS='"device=0"'
 GPUS='"device=0,1,2,3"'
-docker run --shm-size=2g  -it -d --net host --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus $GPUS -e HF_TOKEN=$HF_TOKEN -v $(pwd)/models:/models -v $(pwd)/.buildkite:/home/docker-user/.buildkite -v $(pwd)/benchmarks:/home/docker-user/benchmarks  --name trtllm_bench trtllm_bench:latest
+docker run --shm-size=2g  -it -d --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus $GPUS -e HF_TOKEN=$HF_TOKEN -v $(pwd)/models:/models -v $(pwd)/.buildkite:/home/docker-user/.buildkite -v $(pwd)/benchmarks:/home/docker-user/benchmarks  --name trtllm_bench trtllm_bench:latest
 ```
 
 ### Enter the docker shell
@@ -82,7 +82,37 @@ docker exec -it trtllm_bench /bin/bash
 - Export CUDA_VISIBLE_DEVICES
 
 ```bash
-CONFIG_PATH=/home/docker-user/.buildkite/config-8b.json
-CONFIG_PATH=/home/docker-user/.buildkite/config-70b.json
+CONFIG_PATH=/home/docker-user/.buildkite/trt-configs/llama-8b.json
 VLLM_SOURCE_CODE_LOC=$(pwd) bash .buildkite/nightly-benchmarks/scripts/run-nightly-benchmarks.sh $CONFIG_PATH
+```
+
+
+# ROB VERSION
+
+### Build the Docker image
+```bash
+docker build -t trtllm_bench -f Dockerfile.trtllm --build-arg UID=$(id -u) --build-arg GID=$(id -g) .
+``` 
+
+### Run the docker image
+
+```bash
+GPUS='"device=0"'
+GPUS='"device=0,1,2,3"'
+docker run --shm-size=2g  -it -d --ulimit memlock=-1 --ulimit stack=67108864 --runtime=nvidia --gpus $GPUS -e HF_TOKEN=$HF_TOKEN -v $(pwd)/models:/models -v $(pwd)/.buildkite:/home/docker-user/.buildkite -v $(pwd)/benchmarks:/home/docker-user/benchmarks  --name trtllm_bench trtllm_bench:latest
+```
+
+### Enter the docker shell
+
+```bash
+docker exec -it trtllm_bench /bin/bash
+```
+
+### Build TRT Engine
+
+```bash
+CONFIG_PATH=/home/docker-user/.buildkite/trt-configs/llama-8b.json
+
+bash .buildkite/nightly-benchmarks/scripts/build-trt.sh $CONFIG_PATH
+bash .buildkite/nightly-benchmarks/scripts/launch-trt.sh $CONFIG_PATH
 ```

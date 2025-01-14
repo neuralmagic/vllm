@@ -1,5 +1,4 @@
-FROM nvcr.io/nvidia/tritonserver:24.07-trtllm-python-py3 AS base
-# FROM nvcr.io/nvidia/tritonserver:24.10-trtllm-python-py3 AS base
+FROM nvcr.io/nvidia/tritonserver:24.10-trtllm-python-py3 AS base
 
 ## Install packages required for bench 
 RUN apt-get update -y \
@@ -24,3 +23,12 @@ WORKDIR /home/${UNAME}
 
 # Switch to the custom user
 USER docker-user
+
+RUN rm -rf tensorrtllm_backend
+RUN git clone https://github.com/triton-inference-server/tensorrtllm_backend.git
+RUN git lfs install
+WORKDIR /home/${UNAME}/tensorrtllm_backend
+RUN git checkout v0.14.0
+RUN git submodule update --init --recursive
+
+WORKDIR /home/${UNAME}
