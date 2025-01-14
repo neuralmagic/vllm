@@ -78,35 +78,35 @@ class V1KernelMeta:
 
         # copy token lora mapping
         self.token_lora_mapping[:num_tokens].copy_(token_lora_mapping,
-                                                   non_blocking=True)
+                                                   non_blocking=False)
 
         # token_indices_sorted_by_lora_ids
         _, token_indices_sorted_by_lora_ids = torch.sort(token_lora_mapping,
                                                          stable=True)
         # start gpu transfer
         self.token_indices_sorted_by_lora_ids[:num_tokens].copy_(
-            token_indices_sorted_by_lora_ids, non_blocking=True)
+            token_indices_sorted_by_lora_ids, non_blocking=False)
 
         # active_lora_ids, num_tokens_per_lora
         lora_ids, num_tokens_per_lora = torch.unique(token_lora_mapping,
                                                      sorted=False,
                                                      return_counts=True)
         self.active_lora_ids[:lora_ids.size(0)].copy_(lora_ids,
-                                                      non_blocking=True)
+                                                      non_blocking=False)
         self.num_tokens_per_lora[:num_tokens_per_lora.size(0)].copy_(
-            num_tokens_per_lora, non_blocking=True)
+            num_tokens_per_lora, non_blocking=False)
 
         # lora_token_start_loc
         lora_token_start_loc = torch.cumsum(num_tokens_per_lora, dim=0)
         self.lora_token_start_loc[1:1 + lora_token_start_loc.size(0)].copy_(
-            lora_token_start_loc, non_blocking=True)
+            lora_token_start_loc, non_blocking=False)
 
     def meta_args(
-        self, num_tokens: int
+        self, num_tokens :int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor]:
-        return (self.token_lora_mapping[:num_tokens],
-                self.token_indices_sorted_by_lora_ids[:num_tokens],
+        return (torch.narrow(self.token_lora_mapping, 0, 0, num_tokens),
+                torch.narrow(self.token_indices_sorted_by_lora_ids, 0, 0, num_tokens),
                 self.num_tokens_per_lora, self.lora_token_start_loc,
                 self.active_lora_ids)
 
@@ -124,6 +124,8 @@ class V1PunicaWrapperGPU(PunicaWrapperBase):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches,
                                    device)
         self.max_loras = kwargs['max_loras']
+
+        print (f"setting up V1PunicaWapperGPU | max loras {self.max_loras} | max num batched tokens {max_num_batched_tokens} | max_batches {max_batches}")
         self.token_mapping_v1_meta = V1KernelMeta.make(self.max_loras,
                                                        max_num_batched_tokens,
                                                        device=device)
@@ -149,7 +151,12 @@ class V1PunicaWrapperGPU(PunicaWrapperBase):
                                   long_lora_context)
 
         self.token_mapping_v1_meta.prepare_tensors(self.token_lora_indices)
+
+        #print (f"setting up prompt mapping v1 meta | sampler indices {self.sampler_indices.shape} {self.sampler_indices} ")
+
         self.prompt_mapping_v1_meta.prepare_tensors(self.sampler_indices)
+
+        #self._sampler_indices[:sampler_indices.shape[0]].copy_(sampler_indices)
 
     def _apply_shrink(
         self,
@@ -357,10 +364,32 @@ class V1PunicaWrapperGPU(PunicaWrapperBase):
             scale (float): Scaling factor.
             buffer (Optional[torch.Tensor]):Default to None.
         """
+
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
         r = lora_b_stacked.size(-1)
+
+        #token_lora_mapping = torch.narrow(self.prompt_mapping_v1_meta.token_lora_mapping, 0, 0, x.size(0))
+        #token_indices_sorted_by_lora_ids = torch.narrow(self.prompt_mapping_v1_meta.token_indices_sorted_by_lora_ids, 0, 0, x.size(0))
+        #v1_shrink(x, [lora_a_stacked], buffer,
+        #          token_lora_mapping,
+        #          token_indices_sorted_by_lora_ids,
+        #          self.prompt_mapping_v1_meta.num_tokens_per_lora,
+        #          self.prompt_mapping_v1_meta.lora_token_start_loc,
+        #          self.prompt_mapping_v1_meta.active_lora_ids,
+        #          scale)
+        #          #*self.prompt_mapping_v1_meta.meta_args(x.size(0)), scale)
+        #v1_expand(buffer,
+        #          [lora_b_stacked],
+        #          y,
+        #          token_lora_mapping,
+        #          token_indices_sorted_by_lora_ids,
+        #          self.prompt_mapping_v1_meta.num_tokens_per_lora,
+        #          self.prompt_mapping_v1_meta.lora_token_start_loc,
+        #          self.prompt_mapping_v1_meta.active_lora_ids,
+        #          offset_start=0,
+        #          add_inputs=True)
 
         #if buffer is None:
         #    # We set the buffer to be float32 by default ,refer to:
@@ -368,17 +397,23 @@ class V1PunicaWrapperGPU(PunicaWrapperBase):
         #    buffer = torch.zeros((1, x.size(0), r),
         #                         dtype=torch.float32,
         #                         device=x.device)
+
+
+        #print (f"lora logits | x {x.shape} | \n meta args {self.prompt_mapping_v1_meta.meta_args(x.size(0))}")
+
         #v1_shrink(x, [lora_a_stacked], buffer,
-        #            *self.prompt_mapping_v1_meta.meta_args(x.size(0)), scale)
+        #          *self.prompt_mapping_v1_meta.meta_args(x.size(0)),
+        #          scale)
         #v1_expand(buffer,
         #          [lora_b_stacked],
         #          y,
         #          *self.prompt_mapping_v1_meta.meta_args(x.size(0)),
+        #          offset_start=0,
         #          add_inputs=True)
+
 
         from vllm.lora.ops.bgmv_shrink import bgmv_shrink
         from vllm.lora.ops.bgmv_expand import bgmv_expand
-
         if buffer is None:
             # We set the buffer to be float32 by default ,refer to:
             # https://github.com/triton-lang/triton/issues/1387

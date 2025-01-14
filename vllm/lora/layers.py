@@ -138,6 +138,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.embeddings_slice: Optional[Tuple[int, int]]
         self.embeddings_weights: Optional[torch.Tensor]
 
+        print (f" base layer : original vocab size {self.base_layer.org_vocab_size}")
+
     def create_lora_weights(
             self,
             max_loras: int,
@@ -232,27 +234,36 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
         added_tokens_mask = torch.where(x > self.base_layer.org_vocab_size - 1,
-                                        1, 0)
+                                        True, False)
+
+        #assert x.size(0) == self.punica_wrapper.indices_len[3]
+
+        #print (f" x {x.shape} | embedding inds {self.punica_wrapper.embeddings_indices.shape}")
         embeddings_indices = torch.narrow(
             self.punica_wrapper._embeddings_indices, 1, 0, x.size(0))
 
-        indices = embeddings_indices[1].view_as(x)
+        #indices = embeddings_indices[1].view_as(x)
+        indices = torch.select(embeddings_indices, dim = 0, index = 1)
         full_lora_a_embeddings = F.embedding(
             x + indices,
             self.lora_a_stacked_2d,
         )
-        indices = embeddings_indices[0].view_as(x)
+        #indices = embeddings_indices[0].view_as(x)
+        indices = torch.select(embeddings_indices, dim = 0, index = 0)
+        #full_output = self.base_layer.forward(
+        #    x.add_(indices * added_tokens_mask))
+
         full_output = self.base_layer.forward(
-            x.add_(indices * added_tokens_mask))
+            x + (indices * added_tokens_mask))
 
         full_output_org = full_output
         if full_output.ndim == 3:
             full_output = full_output.view(
-                full_output.shape[0] * full_output.shape[1], -1)
+                full_output.size(0) * full_output.size(1), -1)
         if full_lora_a_embeddings.ndim == 3:
             full_lora_a_embeddings = full_lora_a_embeddings.view(
-                full_lora_a_embeddings.shape[0] *
-                full_lora_a_embeddings.shape[1],
+                full_lora_a_embeddings.size(0) *
+                full_lora_a_embeddings.size(1),
                 -1,
             )
         self.punica_wrapper.add_lora_embedding(full_output,

@@ -62,12 +62,9 @@ class LoRAModelRunnerMixin:
         if not self.lora_manager:
             raise RuntimeError("LoRA is not enabled.")
 
-        # We dont make any distinction between prefills and decodes in the
-        # scheduler. To that effect, set is_prefill to True so we use the
-        # sgmv punica kernels always.
         lora_mapping = LoRAMapping(token_lora_mapping,
                                    prompt_lora_mapping,
-                                   is_prefill=True)
+                                   is_prefill=None)
         self.lora_manager.set_active_adapters(lora_requests, lora_mapping)
 
     def set_active_loras(self, input_batch: InputBatch,
