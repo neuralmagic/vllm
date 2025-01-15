@@ -250,11 +250,16 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         )
         #indices = embeddings_indices[0].view_as(x)
         indices = torch.select(embeddings_indices, dim = 0, index = 0)
-        #full_output = self.base_layer.forward(
-        #    x.add_(indices * added_tokens_mask))
+
+        #mul = (indices * added_tokens_mask)
+        #print (f"indices {indices.dtype} |  added tokens mask {added_tokens_mask.dtype} | x {x.dtype} | mul {mul.dtype} | max indices {torch.max(indices)}")
 
         full_output = self.base_layer.forward(
-            x + (indices * added_tokens_mask))
+            x.add_(indices * added_tokens_mask))
+
+        #x.add_(indices * added_tokens_mask)
+        #full_output = self.base_layer.forward(
+        #    x + (indices * added_tokens_mask))
 
         full_output_org = full_output
         if full_output.ndim == 3:
