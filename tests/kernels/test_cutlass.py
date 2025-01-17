@@ -2,6 +2,7 @@
 
 Run `pytest tests/kernels/test_cutlass.py`.
 """
+import random
 from typing import Optional, Type
 
 import pytest
@@ -61,6 +62,7 @@ def baseline_scaled_mm(a: torch.Tensor,
                        scale_b: torch.Tensor,
                        out_dtype: Type[torch.dtype],
                        bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    print(a.shape, b.shape, scale_a.shape, scale_b.shape)
     output = (scale_a * (scale_b * (torch.mm(
         a.to(dtype=torch.float32), b.to(dtype=torch.float32))))).to(out_dtype)
     if bias is not None:
@@ -453,3 +455,72 @@ def test_cutlass_cuda_graph(per_act_token: bool, per_out_ch: bool):
 
 def test_cutlass_support_opcheck():
     opcheck(torch.ops._C.cutlass_scaled_mm_supports_fp8, (capability, ))
+
+
+# TODO add bias
+@pytest.mark.parametrize("num_groups", [8])
+@pytest.mark.parametrize("per_act_token", [True, False])
+@pytest.mark.parametrize("per_out_ch", [True, False])
+@pytest.mark.parametrize("use_bias", [False])
+@pytest.mark.skipif(not current_platform.has_device_capability(89),
+                    reason="FP8 is not supported on this GPU type.")
+def test_cutlass_fp8_group_gemm(num_groups: int, per_act_token: bool,
+                                per_out_ch: bool, use_bias: bool):
+
+    # Device and dtype setup
+    device = "cuda"
+    out_dtype = torch.half
+
+    # Create separate A, B, C tensors for each group
+    a_tensors = []
+    b_tensors = []
+    a_scales_tensors = []
+    b_scales_tensors = []
+    out_tensors = []
+    baseline_tensors = []
+
+    alignment = 16  # 128 // 8
+    # For variation, each group has dimensions
+    # (m_g = m/(g+1), n_g = n/(g+1), k_g = k/(g+1))
+    for _ in range(num_groups):
+        m_g = alignment * random.randint(1, 64)
+        n_g = alignment * random.randint(1, 64)
+        k_g = alignment * random.randint(1, 64)
+
+        m_a_scales = m_g if per_act_token else 1
+        n_b_scales = n_g if per_out_ch else 1
+
+        print(m_g, n_g, k_g)
+
+        # Create group-specific A and B (FP8) and output (FP16/FP32)
+        a_g = to_fp8(torch.randn((m_g, k_g), device=device))
+        b_g = to_fp8(torch.randn((n_g, k_g), device=device).t())
+        c_g = torch.zeros((m_g, n_g), device=device, dtype=out_dtype)
+        # Set up A/B scales
+        scale_a = torch.randn((m_a_scales, 1),
+                              device=device,
+                              dtype=torch.float32)
+        scale_b = torch.randn((1, n_b_scales),
+                              device=device,
+                              dtype=torch.float32)
+
+        a_tensors.append(a_g)
+        b_tensors.append(b_g)
+        out_tensors.append(c_g)
+        a_scales_tensors.append(scale_a)
+        b_scales_tensors.append(scale_b)
+
+        # Compute baseline result for this group
+        baseline_g = baseline_scaled_mm(a_g, b_g, scale_a, scale_b, out_dtype,
+                                        None)
+        baseline_tensors.append(baseline_g)
+
+    torch.ops._C.cutlass_grouped_mm(out_tensors, a_tensors, b_tensors,
+                                    a_scales_tensors, b_scales_tensors)
+
+    # Validate each group's result against the baseline
+    for c_g, baseline_g in zip(out_tensors, baseline_tensors):
+        print(baseline_g)
+        print(c_g)
+        print("*")
+        torch.testing.assert_close(c_g, baseline_g, rtol=1e-2, atol=5e-2)
