@@ -146,7 +146,7 @@ def prepare_v1_meta(token_lora_mapping: torch.Tensor) -> Tuple[torch.Tensor, tor
     # lora_token_start_loc
     lora_token_start_loc = torch.zeros(num_tokens_per_lora.size(0) + 1,
                                        dtype=torch.int32,
-                                       device=device)
+                                       device="cuda")
     lora_token_start_loc[1:] = torch.cumsum(num_tokens_per_lora, dim = 0)
     return token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids
 
