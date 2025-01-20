@@ -20,6 +20,8 @@ from vllm.lora.ops.triton_ops.bgmv_expand_slice import bgmv_expand_slice
 from vllm.lora.ops.triton_ops.bgmv_shrink import bgmv_shrink
 from vllm.lora.ops.triton_ops.sgmv_expand import sgmv_expand
 from vllm.lora.ops.triton_ops.sgmv_shrink import sgmv_shrink
+from vllm.lora.ops.triton_ops.v1_expand import v1_expand
+from vllm.lora.ops.triton_ops.v1_shrink import v1_shrink
 from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT, _LORA_B_PTR_DICT
 from vllm.utils import FlexibleArgumentParser
 
@@ -131,6 +133,23 @@ def make_token_lora_mapping(num_tokens: int, num_prompts: int,
 
     return torch.tensor(token_lora_mapping, dtype=torch.long, device=device)
 
+def prepare_v1_meta(token_lora_mapping: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # token_indices_sorted_by_lora_ids
+    _, token_indices_sorted_by_lora_ids = torch.sort(token_lora_mapping,
+                                                     stable=True)
+
+    # active_lora_ids, num_tokens_per_lora
+    lora_ids, num_tokens_per_lora = torch.unique(token_lora_mapping,
+                                                 sorted=False,
+                                                 return_counts=True)
+
+    # lora_token_start_loc
+    lora_token_start_loc = torch.zeros(num_tokens_per_lora.size(0) + 1,
+                                       dtype=torch.int32,
+                                       device=device)
+    lora_token_start_loc[1:] = torch.cumsum(num_tokens_per_lora, dim = 0)
+    return token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids
+
 
 def ref_group_gemm(ref_out: torch.Tensor, input: torch.Tensor,
                    lora_weights: List[torch.Tensor],
@@ -170,6 +189,8 @@ class OpType(Enum):
     SGMV_EXPAND = auto()
     BGMV_EXPAND = auto()
     BGMV_EXPAND_SLICE = auto()
+    V1_EXPAND = auto()
+    V1_SHRINK = auto()
 
     @staticmethod
     def from_str(s: str) -> "OpType":
@@ -183,27 +204,31 @@ class OpType(Enum):
             return OpType.BGMV_EXPAND
         if s.lower() == "bgmv_expand_slice":
             return OpType.BGMV_EXPAND_SLICE
+        if s.lower() == "v1_expand":
+            return OpType.V1_EXPAND
+        if s.lower() == "v1_shrink":
+            return OpType.V1_SHRINK
         raise ValueError(f"Unrecognized str {s} to convert to OpType")
 
     def is_shrink_fn(self) -> bool:
-        return self in [OpType.SGMV_SHRINK, OpType.BGMV_SHRINK]
+        return self in [OpType.SGMV_SHRINK, OpType.BGMV_SHRINK, OpType.V1_SHRINK]
 
     def is_expand_fn(self) -> bool:
-        return self in [OpType.SGMV_EXPAND, OpType.BGMV_EXPAND]
+        return self in [OpType.SGMV_EXPAND, OpType.BGMV_EXPAND, OpType.V1_EXPAND]
 
     def is_prefill_op(self) -> bool:
-        return self in [OpType.SGMV_SHRINK, OpType.SGMV_EXPAND]
+        return self in [OpType.SGMV_SHRINK, OpType.SGMV_EXPAND, OpType.V1_SHRINK, OpType.V1_EXPAND]
 
     def is_decode_op(self) -> bool:
         return self in [
-            OpType.BGMV_SHRINK, OpType.BGMV_EXPAND, OpType.BGMV_EXPAND_SLICE
+            OpType.BGMV_SHRINK, OpType.BGMV_EXPAND, OpType.BGMV_EXPAND_SLICE, OpType.V1_SHRINK, OpType.V1_EXPAND
         ]
 
     def is_expand_slice_fn(self) -> bool:
         return self in [OpType.BGMV_EXPAND_SLICE]
 
     def num_slices(self) -> List[int]:
-        if self in [OpType.SGMV_EXPAND, OpType.SGMV_SHRINK]:
+        if self in [OpType.SGMV_EXPAND, OpType.SGMV_SHRINK, OpType.V1_EXPAND, OpType.V1_SHRINK]:
             # SGMV kernels supports slices
             return [1, 2, 3]
         if self in [OpType.BGMV_SHRINK, OpType.BGMV_EXPAND]:
@@ -249,10 +274,10 @@ class OpType(Enum):
         m, k, n = self.mkn(batch_size, seq_length, hidden_size, lora_rank)
 
         b_shape = (num_loras, n, k)  # col-major
-        if self == OpType.SGMV_SHRINK:
+        if self in [OpType.SGMV_SHRINK, OpType.V1_SHRINK]:
             # SGMV shrink supports num_slices inherently in the kernel
             return ((m, k), b_shape, (num_slices, m, n))
-        if self == OpType.SGMV_EXPAND:
+        if self in [OpType.SGMV_EXPAND, OpType.V1_EXPAND]:
             # SGMV expand supports num_slices inherently in the kernel
             return ((num_slices, m, k), b_shape, (m, n * num_slices))
         if self == OpType.BGMV_SHRINK:
@@ -280,6 +305,10 @@ class OpType(Enum):
             return bgmv_expand
         if self == OpType.BGMV_EXPAND_SLICE:
             return emulate_bgmv_expand_slice
+        if self == OpType.V1_SHRINK:
+            return v1_shrink
+        if self == OpType.V1_EXPAND:
+            return v1_expand
         raise ValueError(f"Unrecognized optype {self}")
 
     def run_ref_group_gemm(self, output: torch.Tensor, input: torch.Tensor,
@@ -292,13 +321,13 @@ class OpType(Enum):
         """
         w_dtype = lora_weights[0].dtype
         num_slices = len(lora_weights)
-        if self == OpType.SGMV_SHRINK:
+        if self in [OpType.SGMV_SHRINK, OpType.V1_SHRINK]:
             for slice_idx in range(num_slices):
                 ref_group_gemm(ref_out=output[slice_idx, :],
                                input=input,
                                lora_weights=lora_weights[slice_idx],
                                **kwargs)
-        if self == OpType.SGMV_EXPAND:
+        if self in [OpType.SGMV_EXPAND, OpType.V1_EXPAND]:
             hidden_size = lora_weights[0].shape[1]
             for slice_idx in range(num_slices):
                 slice_offset = slice_idx * hidden_size
@@ -666,6 +695,79 @@ class BenchmarkTensors:
             })
         return {'kwargs_list': kwargs_list}
 
+    def as_v1_shrink_kwargs(self) -> Dict[str, Any]:
+        self.sanity_check()
+        self.to_device(self.input.device)
+
+        num_seqs, num_tokens, max_seq_len, num_slices = self.metadata()
+        # Sanity check matrix shapes.
+        i_shape, lw_shape, o_shape = self.input.shape, self.lora_weights_lst[
+            0].shape, self.output.shape
+        # Expected input shape [num_tokens, hidden_size]
+        assert len(i_shape) == 2
+        assert i_shape[0] == num_tokens
+        hidden_size = i_shape[1]
+        # Expected lora weight shape [num_loras, lora_rank, hidden_size]
+        assert len(lw_shape) == 3
+        assert lw_shape[2] == hidden_size
+        lora_rank = lw_shape[1]
+        # Expected output shape [num_slices, num_tokens, lora_rank]
+        assert len(o_shape) == 3
+        assert o_shape == (num_slices, num_tokens, lora_rank)
+
+        token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids = \
+            prepare_v1_meta(self.token_lora_mapping)
+
+        return {
+            'inputs': self.input,
+            'lora_a_weights' : self.lora_weights_lst,
+            'output_tensor' : self.output,
+            'token_lora_mapping' : self.token_lora_mapping,
+            'token_indices_sorted_by_lora_ids' : token_indices_sorted_by_lora_ids,
+            'num_tokens_per_lora' : num_tokens_per_lora,
+            'lora_token_start_loc' : lora_token_start_loc,
+            'lora_ids' : lora_ids,
+            'scaling' : 1.0,
+        }
+
+    def as_v1_expand_kwargs(self, add_inputs: bool) -> Dict[str, Any]:
+        self.sanity_check()
+        self.to_device(self.input.device)
+
+        num_seqs, num_tokens, max_seq_len, num_slices = self.metadata()
+
+        # Sanity check matrix shapes.
+        i_shape, lw_shape, o_shape = self.input.shape, self.lora_weights_lst[
+            0].shape, self.output.shape
+        # Expected input shape : [num_slices, num_tokens, lora_rank]
+        assert len(i_shape) == 3
+        assert i_shape[0] == num_slices
+        assert i_shape[1] == num_tokens
+        lora_rank = i_shape[2]
+        # Expected lora weight shape : [num_lora, hidden_size, lora_rank]
+        assert len(lw_shape) == 3
+        assert lw_shape[2] == lora_rank
+        hidden_size = lw_shape[1]
+        # Expected output shape : [num_tokens, hidden_size * num_slices]
+        assert len(o_shape) == 2
+        assert o_shape == (num_tokens, hidden_size * num_slices)
+
+        token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids = \
+            prepare_v1_meta(self.token_lora_mapping)
+
+        return {
+            'inputs': self.input,
+            'lora_b_weights': self.lora_weights_lst,
+            'output_tensor': self.output,
+            'token_lora_mapping' : self.token_lora_mapping,
+            'token_indices_sorted_by_lora_ids': token_indices_sorted_by_lora_ids,
+            'num_tokens_per_lora' : num_tokens_per_lora,
+            'lora_token_start_loc' : lora_token_start_loc,
+            'lora_ids' : lora_ids,
+            'offset_start': 0,
+            'add_inputs': add_inputs,
+        }
+
     def bench_fn_kwargs(self,
                         op_type: OpType,
                         add_inputs: Optional[bool] = None) -> Dict[str, Any]:
@@ -684,6 +786,10 @@ class BenchmarkTensors:
             return self.as_bgmv_expand_kwargs(add_inputs)
         if op_type == OpType.BGMV_EXPAND_SLICE:
             return self.as_bgmv_expand_slice_kwargs(add_inputs)
+        if op_type == OpType.V1_SHRINK:
+            return self.as_v1_shrink_kwargs()
+        if op_type == OpType.V1_EXPAND:
+            return self.as_v1_expand_kwargs(add_inputs)
         raise ValueError(f"Unrecognized optype {self}")
 
     def test_correctness(self, op_type: OpType,
