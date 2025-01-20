@@ -16,8 +16,28 @@ from vllm.utils import direct_register_custom_op
 from .utils import _get_lora_a_ptr
 from .kernel_utils import do_shrink_kernel
 
+from itertools import product
 
+def split_k_ranges():
+    return [8, 32, 64, 128]
+def block_m_ranges():
+    return [16, 32, 64, 128, 256, 512]
+def block_n_ranges():
+    return [16]
+def block_k_ranges():
+    return [32, 64, 128, 256, 512, 1024]
+def warp_ranges():
+    return [4, 8]
+def cta_ranges():
+    return [1]
 
+def autotune_configs():
+    return [triton.Config(kwargs={'BLOCK_M' : bm, 'BLOCK_N' : bn, 'BLOCK_K' : bk, 'SPLIT_K' : sk}, num_warps = nw, num_ctas=nc) \
+            for bm, bn, bk, sk, nw, nc in product(block_m_ranges(), block_n_ranges(), block_k_ranges(), split_k_ranges(), warp_ranges(), cta_ranges()) ]
+
+@triton.autotune(configs=autotune_configs(),
+  key=['M', 'N', 'K']
+)
 @triton.jit
 def _v1_shrink_kernel(
         input_ptr,
@@ -39,12 +59,13 @@ def _v1_shrink_kernel(
         output_d0_stride,
         output_d1_stride,
         output_d2_stride,  # 1 
+        EVEN_K: tl.constexpr,
+        SLICE_NUM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
-        EVEN_K: tl.constexpr,
         SPLIT_K: tl.constexpr,
-        SLICE_NUM: tl.constexpr):
+        ):
     """
     The sgmv's shrink triton kernel is based on GroupGEMM+SPLIT-K.
     The GEMM of Multi-LoRA can be considered as GroupGEMM. Additionally,
@@ -184,10 +205,16 @@ def _v1_shrink(
 
     EVEN_K = K % (BLOCK_K * SPLIT_K) == 0
     MAX_LORAS = lora_ids.size(0)
-    grid = (
-        MAX_LORAS * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-        SPLIT_K * len(lora_a_weights),
-    )
+
+    #grid = (
+    #    MAX_LORAS * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+    #    SPLIT_K * len(lora_a_weights),
+    #)
+    #grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+
+    grid = lambda meta: (MAX_LORAS * triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']),
+                         meta['SPLIT_K'] * len(lora_a_weights), )
+
 
     _v1_shrink_kernel[grid](
         inputs,
@@ -211,11 +238,7 @@ def _v1_shrink(
         output_tensor.stride(0),
         output_tensor.stride(1),
         output_tensor.stride(2),
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
         EVEN_K,
-        SPLIT_K,
         len(lora_a_weights),
     )
     return

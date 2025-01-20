@@ -15,7 +15,27 @@ from vllm.utils import direct_register_custom_op
 
 from .utils import _get_lora_b_ptr
 from .kernel_utils import do_expand_kernel
+from itertools import product
 
+
+def block_m_ranges():
+    return [16, 32, 64, 128, 256, 512]
+def block_k_ranges():
+    return [16]
+def block_n_ranges():
+    return [32, 64, 128, 256, 512, 1024]
+def warp_ranges():
+    return [4, 8]
+def cta_ranges():
+    return [1]
+
+def autotune_configs():
+    return [triton.Config(kwargs={'BLOCK_M' : bm, 'BLOCK_N' : bn, 'BLOCK_K' : bk}, num_warps = nw, num_ctas = nc) \
+            for bm, bn, bk, nw, nc in product(block_m_ranges(), block_n_ranges(), block_k_ranges(), warp_ranges(), cta_ranges()) ]
+
+@triton.autotune(configs=autotune_configs(),
+  key=['M', 'N', 'K', 'SLICE_NUM']
+)
 
 @triton.jit
 def _v1_expand_kernel(
@@ -39,14 +59,14 @@ def _v1_expand_kernel(
         output_d0_stride,
         output_d1_stride,  # 1
         output_hs_ptr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
         EVEN_K: tl.constexpr,
         ADD_INPUTS: tl.constexpr,
         CAST_TYPE: tl.constexpr,
         SLICE_NUM: tl.constexpr,
-        SAME_STRIDE: tl.constexpr):
+        SAME_STRIDE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr):
     """
 
     Similar to the 'sgmv_expand' operator, but with an added parameter
@@ -221,9 +241,6 @@ def _v1_expand(
         output_tensor.stride(0),
         output_tensor.stride(1),
         hidden_sizes_tensor,
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
         EVEN_K,
         ADD_INPUTS,
         CAST_TYPE,
