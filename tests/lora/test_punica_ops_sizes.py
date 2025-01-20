@@ -5,6 +5,7 @@ whether the corresponding Triton kernel can run normally when tensor parallelism
 is set to [1, 2, 4, 8, 16, 32, 64].
 """
 from threading import Lock
+from typing import Tuple
 
 import pytest
 import torch
@@ -12,7 +13,8 @@ import torch
 import vllm.lora.ops.triton_ops  # noqa: F401
 from vllm.lora.ops.torch_ops import (bgmv_expand, bgmv_expand_slice,
                                      bgmv_shrink, sgmv_expand,
-                                     sgmv_expand_slice, sgmv_shrink)
+                                     sgmv_expand_slice, sgmv_shrink,
+                                     )
 from vllm.lora.ops.triton_ops.utils import _LORA_A_PTR_DICT, _LORA_B_PTR_DICT
 from vllm.platforms import current_platform
 
@@ -398,3 +400,159 @@ def test_punica_bgmv_expand_nslices(
 
         slice_offset += hidden_size
     assert_close(our_outputs, ref_outputs)
+
+
+@pytest.mark.parametrize("batches", BATCHES)
+@pytest.mark.parametrize("num_loras", NUM_LORA)
+@pytest.mark.parametrize("rank", MAX_RANKS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("scaling", SCALES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("nslices", [1, 2, 3])
+@pytest.mark.parametrize("op_type", ["shrink", "expand"])
+@pytest.mark.parametrize("seq_length", [1, 128])
+@pytest.mark.parametrize("seed", SEED)
+@pytest.mark.parametrize("device", DEVICES)
+def test_v1_shrink_expand(
+    batches: int,
+    num_loras: int,
+    rank: int,
+    hidden_size: int,
+    scaling: float,
+    dtype: torch.dtype,
+    nslices: int,
+    op_type: str,
+    seq_length: int,
+    seed: int,
+    device: str,
+):
+    torch.set_default_device(device)
+    current_platform.seed_everything(seed)
+
+    (
+        inputs_tensor,
+        lora_weights_lst,
+        our_out_tensor,
+        ref_out_tensor,
+        b_seq_start_loc,
+        prompt_lora_mapping,
+        seq_len_tensor,
+        token_lora_mapping,
+    ) = generate_data_for_nslices(
+        batches,
+        hidden_size,
+        num_loras,
+        rank,
+        seq_length,
+        nslices,
+        dtype,
+        op_type,
+        device,
+    )
+
+    def prepare_tensors(token_lora_mapping: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # token_indices_sorted_by_lora_ids
+        _, token_indices_sorted_by_lora_ids = torch.sort(token_lora_mapping,
+                                                         stable=True)
+
+        # active_lora_ids, num_tokens_per_lora
+        lora_ids, num_tokens_per_lora = torch.unique(token_lora_mapping,
+                                                     sorted=False,
+                                                     return_counts=True)
+
+        # lora_token_start_loc
+        lora_token_start_loc = torch.zeros(num_tokens_per_lora.size(0) + 1,
+                                           dtype=torch.int32,
+                                           device=device)
+        lora_token_start_loc[1:] = torch.cumsum(num_tokens_per_lora, dim = 0)
+        return token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids
+
+    token_indices_sorted_by_lora_ids, num_tokens_per_lora, lora_token_start_loc, lora_ids = prepare_tensors(token_lora_mapping)
+
+    max_seq_length = seq_len_tensor.max()
+    token_nums = seq_len_tensor.sum().item()
+    if isinstance(max_seq_length, tuple):
+        max_seq_length = max_seq_length[0].item()
+    else:
+        max_seq_length = max_seq_length.item()
+
+    if op_type == "shrink":
+        with _dict_lock:
+            _LORA_A_PTR_DICT.clear()
+            torch.ops.vllm.v1_shrink(inputs_tensor,
+                      lora_weights_lst,
+                      our_out_tensor,
+                      token_lora_mapping,
+                      token_indices_sorted_by_lora_ids,
+                      num_tokens_per_lora,
+                      lora_token_start_loc,
+                      lora_ids,
+                      scaling = scaling
+                )
+
+        for index in range(nslices):
+            sgmv_shrink(
+                inputs_tensor,
+                lora_weights_lst[index],
+                ref_out_tensor[index],
+                b_seq_start_loc,
+                seq_len_tensor,
+                prompt_lora_mapping,
+                batches,
+                max_seq_length,
+                token_nums,
+                scaling,
+            )
+
+    else:
+        with _dict_lock:
+            _LORA_B_PTR_DICT.clear()
+            torch.ops.vllm.v1_expand(inputs_tensor,
+                      lora_weights_lst,
+                      our_out_tensor,
+                      token_lora_mapping,
+                      token_indices_sorted_by_lora_ids,
+                      num_tokens_per_lora,
+                      lora_token_start_loc,
+                      lora_ids,
+                      offset_start = 0,
+                      add_inputs = True,
+                    )
+
+        if nslices == 1:
+            # Verify the torch's sgmv_expand op
+            sgmv_expand(
+                inputs_tensor[0],
+                lora_weights_lst[0],
+                ref_out_tensor,
+                b_seq_start_loc,
+                seq_len_tensor,
+                prompt_lora_mapping,
+                batches,
+                max_seq_length,
+                token_nums,
+                add_inputs=True,
+            )
+        else:
+            slice_offset = 0
+            for index in range(nslices):
+                lora_weights = lora_weights_lst[index]
+                sgmv_expand_slice(
+                    inputs_tensor[index],
+                    lora_weights,
+                    ref_out_tensor,
+                    b_seq_start_loc,
+                    seq_len_tensor,
+                    prompt_lora_mapping,
+                    batches,
+                    max_seq_length,
+                    token_nums,
+                    slice_offset,
+                    hidden_size,
+                    add_inputs=True,
+                )
+                slice_offset += hidden_size
+
+    assert_close(our_out_tensor, ref_out_tensor)
+
+
