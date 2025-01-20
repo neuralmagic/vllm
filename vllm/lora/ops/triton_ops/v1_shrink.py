@@ -31,6 +31,19 @@ def warp_ranges():
 def cta_ranges():
     return [1]
 
+#def split_k_ranges():
+#    return [8, 32]
+#def block_m_ranges():
+#    return [16, 32]
+#def block_n_ranges():
+#    return [16]
+#def block_k_ranges():
+#    return [128]
+#def warp_ranges():
+#    return [8]
+#def cta_ranges():
+#    return [1]
+
 def autotune_configs():
     return [triton.Config(kwargs={'BLOCK_M' : bm, 'BLOCK_N' : bn, 'BLOCK_K' : bk, 'SPLIT_K' : sk}, num_warps = nw, num_ctas=nc) \
             for bm, bn, bk, sk, nw, nc in product(block_m_ranges(), block_n_ranges(), block_k_ranges(), split_k_ranges(), warp_ranges(), cta_ranges()) ]
