@@ -2291,6 +2291,13 @@ def _get_and_verify_dtype(
                     "using float16 by default. Please specify `dtype` if you "
                     "want to use float16.")
                 torch_dtype = torch.bfloat16
+
+            if current_platform.is_tpu():
+                logger.info(
+                    "For TPU, we cast models to bfloat16 instead of"
+                    "using float16 by default. Please specify `dtype` if you "
+                    "want to use float16.")
+                torch_dtype = torch.bfloat16
         else:
             if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
                 raise ValueError(f"Unknown dtype: {dtype}")
