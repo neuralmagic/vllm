@@ -680,7 +680,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
     ]
 
     num_tokens, _ = hidden_states.shape
-    E, N, _ = w1.shape
+    E, N, K = w1.shape
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
     CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
@@ -878,3 +878,58 @@ def fused_moe(
                          a1_scale=a1_scale,
                          a2_scale=a2_scale,
                          block_shape=block_shape)
+
+
+def cutlass_moe(
+    a_q: torch.Tensor,
+    a_scale: torch.Tensor,
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    num_groups: int,
+):
+    topk = topk_ids.shape[1]
+
+    expert_offsets = torch.empty((num_groups + 1),
+                                 dtype=torch.int32,
+                                 device="cuda")
+    problem_sizes1 = torch.empty((num_groups, 3),
+                                 dtype=torch.int32,
+                                 device="cuda")
+    problem_sizes2 = torch.empty((num_groups, 3),
+                                 dtype=torch.int32,
+                                 device="cuda")
+
+    a_map = topk_ids.flatten().argsort()
+    rep_a_q = a_q.repeat_interleave(
+        topk, dim=0).view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
+    rep_a_scales = a_scale.repeat((num_groups, 1))
+
+    torch.ops._C.compute_expert_offsets(topk_ids.cuda(), expert_offsets,
+                                        problem_sizes1, problem_sizes2,
+                                        num_groups, n, k)
+
+    c1 = torch.zeros((m * topk, n * 2), device="cuda", dtype=torch.half)
+    c2 = torch.zeros((m * topk, k), device="cuda", dtype=torch.half)
+
+    torch.ops._C.cutlass_grouped_mm(c1, rep_a_q, w1_q, rep_a_scales, w1_scale,
+                                    expert_offsets[:-1], problem_sizes1)
+
+    intermediate = torch.empty((m * topk, n), device="cuda", dtype=torch.half)
+    torch.ops._C.silu_and_mul(intermediate, c1)
+
+    intemediate_q, intermediate_scales = ops.scaled_fp8_quant(intermediate)
+    rep_intermediate_scales = intermediate_scales.repeat((num_groups, 1))
+
+    torch.ops._C.cutlass_grouped_mm(c2, intemediate_q, w2_q,
+                                    rep_intermediate_scales, w2_scale,
+                                    expert_offsets[:-1], problem_sizes2)
+
+    return (c2[a_map.argsort()].view(m, topk, k) *
+            topk_weights.view(m, topk, 1).half()).sum(dim=1)

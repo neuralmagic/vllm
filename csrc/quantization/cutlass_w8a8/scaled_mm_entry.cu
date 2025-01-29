@@ -29,6 +29,22 @@ void cutlass_scaled_mm_sm90(torch::Tensor& c, torch::Tensor const& a,
                             torch::Tensor const& a_scales,
                             torch::Tensor const& b_scales,
                             std::optional<torch::Tensor> const& bias);
+
+void cutlass_grouped_mm_sm90(torch::Tensor& out_tensors,
+                             torch::Tensor const& a_tensors,
+                             torch::Tensor const& b_tensors,
+                             torch::Tensor const& a_scales,
+                             torch::Tensor const& b_scales,
+                             torch::Tensor const& expert_offsets,
+                             torch::Tensor const& problem_sizes);
+
+void compute_expert_offsets_caller(const torch::Tensor& topk_ids,
+                                   torch::Tensor& expert_offsets,
+                                   torch::Tensor& problem_sizes1,
+                                   torch::Tensor& problem_sizes2,
+                                   const int64_t num_experts, const int64_t n,
+                                   const int64_t k);
+
 #endif
 
 void cutlass_scaled_mm_azp_sm75(torch::Tensor& c, torch::Tensor const& a,
@@ -141,6 +157,27 @@ void cutlass_scaled_mm(torch::Tensor& c, torch::Tensor const& a,
       "No compiled cutlass_scaled_mm for a compute capability less than "
       "CUDA device capability: ",
       version_num);
+}
+
+void cutlass_grouped_mm(torch::Tensor& out_tensors,
+                        torch::Tensor const& a_tensors,
+                        torch::Tensor const& b_tensors,
+                        torch::Tensor const& a_scales,
+                        torch::Tensor const& b_scales,
+                        torch::Tensor const& expert_offsets,
+                        torch::Tensor const& problem_sizes) {
+  cutlass_grouped_mm_sm90(out_tensors, a_tensors, b_tensors, a_scales, b_scales,
+                          expert_offsets, problem_sizes);
+}
+
+void compute_expert_offsets(const torch::Tensor& topk_ids,
+                            torch::Tensor& expert_offsets,
+                            torch::Tensor& problem_sizes1,
+                            torch::Tensor& problem_sizes2,
+                            const int64_t num_experts, const int64_t n,
+                            const int64_t k) {
+  compute_expert_offsets_caller(topk_ids, expert_offsets, problem_sizes1,
+                                problem_sizes2, num_experts, n, k);
 }
 
 void cutlass_scaled_mm_azp(torch::Tensor& c, torch::Tensor const& a,
