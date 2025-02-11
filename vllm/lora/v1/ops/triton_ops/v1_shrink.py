@@ -6,6 +6,7 @@ Punica: Multi-Tenant LoRA Serving.
 https://arxiv.org/abs/2310.18547
 """
 
+from itertools import product
 from typing import List
 
 import torch
@@ -19,16 +20,80 @@ from vllm.utils import direct_register_custom_op
 from .utils import get_v1_op_configs
 
 
+def split_k_ranges():
+    return [8, 32, 64, 128]
+
+
+def block_m_ranges():
+    return [16, 32, 64, 128, 256, 512]
+
+
+def block_n_ranges():
+    return [16]
+
+
+def block_k_ranges():
+    return [32, 64, 128, 256, 512, 1024]
+
+
+def warp_ranges():
+    return [4, 8]
+
+
+def cta_ranges():
+    return [1]
+
+
+def cta_num_stages():
+    return [2, 4]
+
+
+def autotune_configs():
+    return [triton.Config(kwargs={'BLOCK_M' : bm, 'BLOCK_N' : bn, 'BLOCK_K' : bk, 'SPLIT_K' : sk}, num_warps = nw, num_ctas=nc, num_stages=ns) \
+            for bm, bn, bk, sk, nw, nc, ns in product(block_m_ranges(), block_n_ranges(), block_k_ranges(), split_k_ranges(), warp_ranges(), cta_ranges(), cta_num_stages())]
+
+
+def prune_fn(*args, **kwargs):
+    configs_list, kernel_kwargs = args
+    # prune such that EVEN_K is true
+    pruned = filter(
+        lambda x: kernel_kwargs['K'] %
+        (x.kwargs['BLOCK_K'] * x.kwargs['SPLIT_K']) == 0, configs_list)
+    return list(pruned)
+
+
+@triton.autotune(configs=autotune_configs(),
+                 key=['M', 'N', 'K', 'SLICE_NUM'],
+                 restore_value=["out_ptr"],
+                 prune_configs_by={'early_config_prune': prune_fn})
 @triton.jit
-def _v1_shrink_kernel(input_ptr, lora_ptr, out_ptr, M, N, K,
-                      token_indices_sorted_by_lora_ids, num_tokens_per_lora,
-                      lora_token_start_loc, lora_ids, scaling, input_d0_stride,
-                      input_d1_stride, lora_d0_stride, lora_d1_stride,
-                      lora_d2_stride, output_d0_stride, output_d1_stride,
-                      output_d2_stride, BLOCK_M: tl.constexpr,
-                      BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                      EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr,
-                      SLICE_NUM: tl.constexpr):
+def _v1_shrink_kernel(
+    input_ptr,
+    lora_ptr,
+    out_ptr,
+    M,
+    N,
+    K,
+    token_indices_sorted_by_lora_ids,
+    num_tokens_per_lora,
+    lora_token_start_loc,
+    lora_ids,
+    scaling,
+    input_d0_stride,
+    input_d1_stride,
+    lora_d0_stride,
+    lora_d1_stride,
+    lora_d2_stride,
+    output_d0_stride,
+    output_d1_stride,
+    output_d2_stride,
+    EVEN_K: tl.constexpr,
+    SLICE_NUM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
 
     cta_n_num = tl.cdiv(N, BLOCK_N)
     cta_m_num = tl.cdiv(M, BLOCK_M)
@@ -164,17 +229,20 @@ def _v1_shrink(
     EVEN_K = K % (BLOCK_K * SPLIT_K) == 0
     MAX_LORAS = lora_ids.size(0)
 
-    # TODO (varun): This grid formulation maximizes parallelization at the
-    # cost of wasteful thread block launch when only few of the input tokens
-    # require LoRA. This might not be the best in all cases.
-    grid = (
-        SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-        NUM_SLICES,
-        # Each LoRA receives its own set of thread blocks for output
-        # computation. If some LoRA doesn't have any tokens to process, its
-        # thread blocks exit early.
-        MAX_LORAS,
-    )
+    ## TODO (varun): This grid formulation maximizes parallelization at the
+    ## cost of wasteful thread block launch when only few of the input tokens
+    ## require LoRA. This might not be the best in all cases.
+    #grid = (
+    #    SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+    #    NUM_SLICES,
+    #    # Each LoRA receives its own set of thread blocks for output
+    #    # computation. If some LoRA doesn't have any tokens to process, its
+    #    # thread blocks exit early.
+    #    MAX_LORAS,
+    #)
+
+    grid = lambda meta: (meta['SPLIT_K'] * triton.cdiv(M, meta[
+        'BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N']), NUM_SLICES, MAX_LORAS)
 
     _v1_shrink_kernel[grid](
         inputs,
@@ -196,16 +264,8 @@ def _v1_shrink(
         output_tensor.stride(0),
         output_tensor.stride(1),
         output_tensor.stride(2),
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
-        EVEN_K,
-        SPLIT_K,
+        True,  # EVEN_K
         NUM_SLICES,
-        num_warps=kernel_config['num_warps'],
-        num_ctas=kernel_config['num_ctas'],
-        num_stages=kernel_config['num_stages'],
-        maxnreg=kernel_config['max_nreg'],
     )
 
     return
