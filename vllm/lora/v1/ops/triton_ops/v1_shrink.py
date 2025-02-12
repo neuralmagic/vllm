@@ -17,8 +17,6 @@ from vllm.lora.ops.triton_ops.kernel_utils import do_shrink_kernel
 from vllm.lora.ops.triton_ops.utils import _get_lora_a_ptr
 from vllm.utils import direct_register_custom_op
 
-from .utils import get_v1_op_configs
-
 
 def split_k_ranges():
     return [8, 32, 64, 128]
@@ -49,21 +47,45 @@ def cta_num_stages():
 
 
 def autotune_configs():
-    return [triton.Config(kwargs={'BLOCK_M' : bm, 'BLOCK_N' : bn, 'BLOCK_K' : bk, 'SPLIT_K' : sk}, num_warps = nw, num_ctas=nc, num_stages=ns) \
-            for bm, bn, bk, sk, nw, nc, ns in product(block_m_ranges(), block_n_ranges(), block_k_ranges(), split_k_ranges(), warp_ranges(), cta_ranges(), cta_num_stages())]
+    return [
+        triton.Config(kwargs={
+            'BLOCK_M': bm,
+            'BLOCK_N': bn,
+            'BLOCK_K': bk,
+            'SPLIT_K': sk
+        },
+                      num_warps=nw,
+                      num_ctas=nc,
+                      num_stages=ns)
+        for bm, bn, bk, sk, nw, nc, ns in product(
+            block_m_ranges(), block_n_ranges(), block_k_ranges(),
+            split_k_ranges(), warp_ranges(), cta_ranges(), cta_num_stages())
+    ]
 
 
 def prune_fn(*args, **kwargs):
     configs_list, kernel_kwargs = args
+
     # prune such that EVEN_K is true
+
+    def is_even_k_good(config, kkwargs):
+        return kkwargs['K'] % (config.kwargs['BLOCK_K'] *
+                               config.kwargs['SPLIT_K']) == 0
+
+    def is_m_good(config, kkwargs):
+        return config.kwargs['BLOCK_M'] == 16 or config.kwargs[
+            'BLOCK_M'] <= kkwargs['M']
+
     pruned = filter(
-        lambda x: kernel_kwargs['K'] %
-        (x.kwargs['BLOCK_K'] * x.kwargs['SPLIT_K']) == 0, configs_list)
-    return list(pruned)
+        lambda x: is_even_k_good(x, kernel_kwargs) and is_m_good(
+            x, kernel_kwargs), configs_list)
+    pruned = list(pruned)
+    print(f"Trying #configs {len(pruned)}")
+    return pruned
 
 
 @triton.autotune(configs=autotune_configs(),
-                 key=['M', 'N', 'K', 'SLICE_NUM'],
+                 key=['M', 'N', 'K', 'SLICE_NUM', 'MAX_LORAS'],
                  restore_value=["out_ptr"],
                  prune_configs_by={'early_config_prune': prune_fn})
 @triton.jit
@@ -89,6 +111,7 @@ def _v1_shrink_kernel(
     output_d2_stride,
     EVEN_K: tl.constexpr,
     SLICE_NUM: tl.constexpr,
+    MAX_LORAS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -216,17 +239,6 @@ def _v1_shrink(
     M = inputs.size(0)
     NUM_SLICES = len(lora_a_weights)
 
-    kernel_config = get_v1_op_configs("shrink",
-                                      batch=M,
-                                      hidden_size=K,
-                                      rank=N,
-                                      num_slices=NUM_SLICES)
-    BLOCK_M = kernel_config['block_m']
-    BLOCK_N = kernel_config['block_n']
-    BLOCK_K = kernel_config['block_k']
-    SPLIT_K = kernel_config['split_k']
-
-    EVEN_K = K % (BLOCK_K * SPLIT_K) == 0
     MAX_LORAS = lora_ids.size(0)
 
     ## TODO (varun): This grid formulation maximizes parallelization at the
@@ -266,6 +278,7 @@ def _v1_shrink(
         output_tensor.stride(2),
         True,  # EVEN_K
         NUM_SLICES,
+        MAX_LORAS,
     )
 
     return

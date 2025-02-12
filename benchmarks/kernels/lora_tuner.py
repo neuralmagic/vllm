@@ -51,7 +51,6 @@ def tune_optype(ctx: BenchmarkContext,
 
 def run(args: argparse.Namespace, bench_ctxs: List[BenchmarkContext]):
 
-    timers = []
     for bench_ctx in bench_ctxs:
         for seq_len in args.seq_lengths:
             bench_ops: List[OpType] = [OpType.V1_EXPAND, OpType.V1_SHRINK]
@@ -152,7 +151,7 @@ if __name__ == '__main__':
         p.add_argument(
             "--arg-pool-size",
             type=int,
-            default=32,
+            default=1,
             help="Run profiles with a pool of input/output/meta tensors instead"
             "of simply reusing the same tensors for all runs. A bigger arg-pool"
             "mitigates hardware caching effects during benchmarking.")
@@ -207,7 +206,7 @@ if __name__ == '__main__':
                   "for correctness before the actual benchmarking"))
 
     parser = FlexibleArgumentParser(
-        description=f"""
+        description="""
 Benchmark LoRA kernels:
 
     list_bench example:
