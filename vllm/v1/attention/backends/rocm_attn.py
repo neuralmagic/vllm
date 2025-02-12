@@ -6,6 +6,7 @@ import torch
 
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType)
+from vllm.attention.ops.new_kernel import extend_attention_fwd
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.attention.ops.prefix_prefill import context_attention_fwd
 from vllm.logger import init_logger
@@ -149,17 +150,20 @@ class ROCmAttentionImpl(AttentionImpl):
             layer._k_scale,
             layer._v_scale,
         )
+        # key_cache, value_cache = kv_cache.unbind(0)
+        # torch.ops._C_cache_ops.reshape_and_cache_flash(
+        #     key,
+        #     value,
+        #     key_cache,
+        #     value_cache,
+        #     attn_metadata.slot_mapping,
+        #     self.kv_cache_dtype,
+        #     layer._k_scale,
+        #     layer._v_scale,
+        # )
 
         # TODO(sage): Refactor the context_attention_fwd kernel so that this
         # overhead can be removed
-        context_lens = torch.empty_like(attn_metadata.seq_lens)
-        batch_size = len(attn_metadata.query_start_loc) - 1
-        assert len(context_lens) == batch_size
-        for i in range(batch_size):
-            query_start = attn_metadata.query_start_loc[i]
-            query_end = attn_metadata.query_start_loc[i + 1]
-            context_lens[i] = attn_metadata.seq_lens[i] - (query_end -
-                                                           query_start)
 
         # Compute attention and update output up to `num_actual_tokens`.
         context_attention_fwd(q=query[:num_actual_tokens],
@@ -172,11 +176,31 @@ class ROCmAttentionImpl(AttentionImpl):
                               b_loc=attn_metadata.block_table,
                               b_start_loc=attn_metadata.query_start_loc,
                               b_seq_len=attn_metadata.seq_lens,
-                              b_ctx_len=context_lens,
+                              b_ctx_len=None,
                               max_input_len=attn_metadata.max_query_len,
                               k_scale=layer._k_scale,
                               v_scale=layer._v_scale,
                               alibi_slopes=self.alibi_slopes,
                               sliding_window=self.sliding_window[0],
                               sm_scale=self.scale)
+        # a = torch.cat((torch.tensor([0],device=query.device, dtype=torch.int32),
+        #                            torch.cumsum(attn_metadata.seq_lens, dim=0).to(dtype=torch.int32)))
+        # print(f"BLOCK TABLE: {attn_metadata.block_table}")
+        # extend_attention_fwd(q_extend=query[:num_actual_tokens],
+        #                      k_extend=key[:num_actual_tokens],
+        #                      v_extend=value[:num_actual_tokens],
+        #                      o_extend=output[:num_actual_tokens],
+        #                      k_buffer=key_cache,
+        #                      v_buffer=value_cache,
+        #                      qo_indptr=attn_metadata.query_start_loc,
+        #                      kv_indptr=a,
+        #                      kv_indices=attn_metadata.block_table,
+        #                      custom_mask=None,
+        #                      mask_indptr = None,
+        #                      max_len_extend=attn_metadata.max_query_len,
+        #                     #   k_scale=layer._k_scale,
+        #                     #   v_scale=layer._v_scale,
+        #                     #   alibi_slopes=self.alibi_slopes,
+        #                     #   sliding_window=self.sliding_window[0],
+        #                       sm_scale=self.scale)
         return output
