@@ -136,22 +136,11 @@ class ROCmAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache, self.num_kv_heads, self.head_size)
+        # key_cache, value_cache = PagedAttention.split_kv_cache(
+        #     kv_cache, self.num_kv_heads, self.head_size)
 
         # Reshape the input keys and values and store them in the cache.
-        PagedAttention.write_to_paged_cache(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            attn_metadata.slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
-        # key_cache, value_cache = kv_cache.unbind(0)
-        # torch.ops._C_cache_ops.reshape_and_cache_flash(
+        # PagedAttention.write_to_paged_cache(
         #     key,
         #     value,
         #     key_cache,
@@ -161,46 +150,50 @@ class ROCmAttentionImpl(AttentionImpl):
         #     layer._k_scale,
         #     layer._v_scale,
         # )
+        key_cache, value_cache = kv_cache.unbind(0)
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            attn_metadata.slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
 
         # TODO(sage): Refactor the context_attention_fwd kernel so that this
         # overhead can be removed
 
         # Compute attention and update output up to `num_actual_tokens`.
-        context_attention_fwd(q=query[:num_actual_tokens],
-                              k=key[:num_actual_tokens],
-                              v=value[:num_actual_tokens],
-                              o=output[:num_actual_tokens],
-                              kv_cache_dtype=self.kv_cache_dtype,
-                              k_cache=key_cache,
-                              v_cache=value_cache,
-                              b_loc=attn_metadata.block_table,
-                              b_start_loc=attn_metadata.query_start_loc,
-                              b_seq_len=attn_metadata.seq_lens,
-                              b_ctx_len=None,
-                              max_input_len=attn_metadata.max_query_len,
-                              k_scale=layer._k_scale,
-                              v_scale=layer._v_scale,
-                              alibi_slopes=self.alibi_slopes,
-                              sliding_window=self.sliding_window[0],
-                              sm_scale=self.scale)
-        # a = torch.cat((torch.tensor([0],device=query.device, dtype=torch.int32),
-        #                            torch.cumsum(attn_metadata.seq_lens, dim=0).to(dtype=torch.int32)))
-        # print(f"BLOCK TABLE: {attn_metadata.block_table}")
-        # extend_attention_fwd(q_extend=query[:num_actual_tokens],
-        #                      k_extend=key[:num_actual_tokens],
-        #                      v_extend=value[:num_actual_tokens],
-        #                      o_extend=output[:num_actual_tokens],
-        #                      k_buffer=key_cache,
-        #                      v_buffer=value_cache,
-        #                      qo_indptr=attn_metadata.query_start_loc,
-        #                      kv_indptr=a,
-        #                      kv_indices=attn_metadata.block_table,
-        #                      custom_mask=None,
-        #                      mask_indptr = None,
-        #                      max_len_extend=attn_metadata.max_query_len,
-        #                     #   k_scale=layer._k_scale,
-        #                     #   v_scale=layer._v_scale,
-        #                     #   alibi_slopes=self.alibi_slopes,
-        #                     #   sliding_window=self.sliding_window[0],
+        # context_attention_fwd(q=query[:num_actual_tokens],
+        #                       k=key[:num_actual_tokens],
+        #                       v=value[:num_actual_tokens],
+        #                       o=output[:num_actual_tokens],
+        #                       kv_cache_dtype=self.kv_cache_dtype,
+        #                       k_cache=key_cache,
+        #                       v_cache=value_cache,
+        #                       b_loc=attn_metadata.block_table,
+        #                       b_start_loc=attn_metadata.query_start_loc,
+        #                       b_seq_len=attn_metadata.seq_lens,
+        #                       b_ctx_len=None,
+        #                       max_input_len=attn_metadata.max_query_len,
+        #                       k_scale=layer._k_scale,
+        #                       v_scale=layer._v_scale,
+        #                       alibi_slopes=self.alibi_slopes,
+        #                       sliding_window=self.sliding_window[0],
         #                       sm_scale=self.scale)
+        extend_attention_fwd(q_extend=query[:num_actual_tokens],
+                             k_extend=key[:num_actual_tokens],
+                             v_extend=value[:num_actual_tokens],
+                             o_extend=output[:num_actual_tokens],
+                             k_buffer=key_cache,
+                             v_buffer=value_cache,
+                             qo_indptr=attn_metadata.query_start_loc,
+                             kv_indptr=attn_metadata.kv_indptr,
+                             kv_indices=attn_metadata.block_table,
+                             custom_mask=None,
+                             mask_indptr=None,
+                             max_len_extend=attn_metadata.max_query_len,
+                             sm_scale=self.scale)
         return output

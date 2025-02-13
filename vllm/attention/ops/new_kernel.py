@@ -103,7 +103,7 @@ def _fwd_kernel(
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
-        kv_offset = (start_n + offs_n)
+        kv_offset = start_n + offs_n
 
         # Load the page index
         offs_kv_loc = tl.load(kv_indices + (cur_seq * stride_kv_indices) +

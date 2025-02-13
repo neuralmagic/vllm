@@ -498,6 +498,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefix_kv_lens = None
             suffix_kv_lens = None
 
+        B = query_start_loc.shape[0] - 1
+        kv_indptr = torch.zeros((B + 1, ), dtype=torch.int32, device="cuda")
+        kv_indptr[1:B + 1] = torch.cumsum(seq_lens[:B], dim=0)
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=total_num_scheduled_tokens,
             max_query_len=max_num_scheduled_tokens,
@@ -512,7 +515,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_prefix_query_lens=cu_prefix_query_lens,
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
-        )
+            kv_indptr=kv_indptr)
 
         # Hot-Swap lora model
         if self.lora_config:
