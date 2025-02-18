@@ -61,11 +61,18 @@ def _fwd_kernel(
     cur_kv_head = cur_head // kv_group_num
 
     cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
+
+    # Query length
     cur_seq_len_extend = tl.load(qo_indptr + cur_seq +
                                  1) - cur_seq_extend_start_idx
+
     cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+
+    # Context Length
     cur_seq_len_prefix = tl.load(kv_indptr + cur_seq +
                                  1) - cur_seq_kv_start_idx
+
+    # Sequence Length
     cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
 
     if USE_CUSTOM_MASK:
@@ -306,7 +313,8 @@ def extend_attention_fwd(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     USE_CUSTOM_MASK = custom_mask is not None
-
+    assert USE_CUSTOM_MASK is False
+    # breakpoint()
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
 

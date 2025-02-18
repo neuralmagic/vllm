@@ -500,7 +500,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         B = query_start_loc.shape[0] - 1
         kv_indptr = torch.zeros((B + 1, ), dtype=torch.int32, device="cuda")
-        kv_indptr[1:B + 1] = torch.cumsum(seq_lens[:B], dim=0)
+        kv_indptr[1:B + 1] = torch.cumsum(seq_lens, dim=0)
+        print(f"kv_indptr: {kv_indptr} seq_Lens: {seq_lens}")
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=total_num_scheduled_tokens,
             max_query_len=max_num_scheduled_tokens,

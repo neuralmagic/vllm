@@ -778,6 +778,7 @@ if triton.__version__ >= "2.1.0":
         if sliding_window is None or sliding_window <= 0:
             sliding_window = 0
 
+        assert sliding_window is 0
         if alibi_slopes is not None:
             _fwd_kernel_alibi[grid](
                 q,

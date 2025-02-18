@@ -10,6 +10,7 @@ from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import BlockDiagonalCausalFromBottomRightMask
 
 from vllm.attention.backends.xformers import _make_alibi_bias
+from vllm.attention.ops.new_kernel import extend_attention_fwd
 from vllm.attention.ops.prefix_prefill import context_attention_fwd
 from vllm.platforms import current_platform
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -23,6 +24,24 @@ CUDA_DEVICES = [
 ]
 SLIDING_WINDOW = [0, 16, 64, 128, 256, 512, 2048]
 KV_CACHE_DTYPES = ["auto", "fp8", "fp8_e5m2"]
+
+
+def call_extend_attention(query, key, value, output, key_cache, value_cache,
+                          query_start_loc, kv_indptr, block_table,
+                          max_query_len, sm_scale):
+    extend_attention_fwd(q_extend=query,
+                         k_extend=key,
+                         v_extend=value,
+                         o_extend=output,
+                         k_buffer=key_cache,
+                         v_buffer=value_cache,
+                         qo_indptr=query_start_loc,
+                         kv_indptr=kv_indptr,
+                         kv_indices=block_table,
+                         custom_mask=None,
+                         mask_indptr=None,
+                         max_len_extend=max_query_len,
+                         sm_scale=sm_scale)
 
 
 @pytest.mark.parametrize("num_heads", NUM_HEADS)

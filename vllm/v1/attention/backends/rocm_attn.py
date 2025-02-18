@@ -165,6 +165,7 @@ class ROCmAttentionImpl(AttentionImpl):
         # TODO(sage): Refactor the context_attention_fwd kernel so that this
         # overhead can be removed
 
+        # breakpoint()
         # Compute attention and update output up to `num_actual_tokens`.
         # context_attention_fwd(q=query[:num_actual_tokens],
         #                       k=key[:num_actual_tokens],
@@ -183,6 +184,9 @@ class ROCmAttentionImpl(AttentionImpl):
         #                       alibi_slopes=self.alibi_slopes,
         #                       sliding_window=self.sliding_window[0],
         #                       sm_scale=self.scale)
+        assert self.sliding_window[0] <= 0
+        assert self.alibi_slopes is None
+        breakpoint()
         extend_attention_fwd(q_extend=query[:num_actual_tokens],
                              k_extend=key[:num_actual_tokens],
                              v_extend=value[:num_actual_tokens],
