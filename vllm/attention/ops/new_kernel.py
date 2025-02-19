@@ -109,7 +109,10 @@ def _fwd_kernel(
 
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+        # If the number of tokens we are processing is greater 
+        # than the context length, then we mask?
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
+        # This is the token?? that we are going to process
         kv_offset = start_n + offs_n
 
         # Load the page index

@@ -186,7 +186,7 @@ class ROCmAttentionImpl(AttentionImpl):
         #                       sm_scale=self.scale)
         assert self.sliding_window[0] <= 0
         assert self.alibi_slopes is None
-        breakpoint()
+        # breakpoint()
         extend_attention_fwd(q_extend=query[:num_actual_tokens],
                              k_extend=key[:num_actual_tokens],
                              v_extend=value[:num_actual_tokens],
