@@ -11,7 +11,6 @@ import torch.nn as nn
 
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention
-from vllm.config import CompilationLevel, VllmConfig
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group, graph_capture
 from vllm.forward_context import set_forward_context
