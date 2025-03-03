@@ -305,6 +305,10 @@ def long_context_infos(long_context_lora_files_16k_1,
 
 @pytest.fixture
 def llama_2_7b_engine_extra_embeddings():
+
+    print("test_lora_manager : Before cleanup ... ")
+    print(torch.cuda.memory_summary(device="cuda", abbreviated=True))
+
     cleanup_dist_env_and_memory(shutdown_ray=True)
     get_model_old = get_model
 
@@ -312,6 +316,9 @@ def llama_2_7b_engine_extra_embeddings():
         kwargs["vllm_config"].lora_config = LoRAConfig(max_loras=4,
                                                        max_lora_rank=8)
         return get_model_old(**kwargs)
+
+    print("test_lora_manager : After cleanup / Creating vllm engine with ... ")
+    print(torch.cuda.memory_summary(device="cuda", abbreviated=True))
 
     with patch("vllm.worker.model_runner.get_model", get_model_patched):
         engine = vllm.LLM("meta-llama/Llama-2-7b-hf",

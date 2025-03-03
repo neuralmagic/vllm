@@ -71,11 +71,16 @@ def v1(run_with_both_engines_lora):
     # Simple autouse wrapper to run both engines for each test
     # This can be promoted up to conftest.py to run for every
     # test in a package
+    print("test_layers : Before cleanup ...")
+    print(torch.cuda.memory_summary(device="cuda", abbreviated=True))
     cleanup_dist_env_and_memory(shutdown_ray=True)
 
     # Reload punica_gpu as the kernels used are tied to engine type.
     from vllm.lora.punica_wrapper import punica_gpu
     importlib.reload(punica_gpu)
+
+    print("test_layers : After cleanup / Testing with ...")
+    print(torch.cuda.memory_summary(device="cuda", abbreviated=True))
 
     yield
 
