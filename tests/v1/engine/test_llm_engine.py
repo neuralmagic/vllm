@@ -6,7 +6,8 @@ from typing import Optional
 import pytest
 
 from tests.v1.engine.utils import PLP_APC_UNSUPPORTED_MSG
-from vllm import LLM, SamplingParams
+from vllm import LLM, BeamSearchParams, SamplingParams
+from vllm.inputs import TextPrompt
 
 MODEL = "facebook/opt-125m"
 DTYPE = "half"
@@ -112,3 +113,41 @@ def test_llm_engine_refuses_prompt_logprobs_with_apc(vllm_model_apc):
 
     # Validate exception string is correct
     assert str(excinfo.value) == PLP_APC_UNSUPPORTED_MSG
+
+
+def test_beam_search(vllm_model, example_prompts) -> None:
+    """Test passes if parallel sampling `n>1` yields `n` unique completions.
+    
+    Args:
+      vllm_model: VllmRunner instance under test.
+      example_prompt: test fixture providing prompts for testing.
+    """
+    fmt_prompts = [TextPrompt(prompt=p) for p in example_prompts]
+    n = 6
+    model: LLM = vllm_model.model
+    outputs = model.beam_search(
+        fmt_prompts,
+        BeamSearchParams(
+            beam_width=n,
+            max_tokens=32,
+            ignore_eos=True,
+        ))
+
+    for out in outputs:
+        completion_counts: dict[str, int] = {}
+        # Assert correct number of completions
+        assert len(out.sequences) == n, (
+            f"{len(out.sequences)} completions; {n} expected.")
+        for idx in range(n):
+            seq = out.sequences[idx]
+            text = seq.text
+            completion_counts[text] = completion_counts.get(text, 0) + 1
+        # Assert unique completions
+        if len(completion_counts) != n:
+            repeats = {
+                txt: num
+                for (txt, num) in completion_counts.items() if num > 1
+            }
+            raise AssertionError(
+                f"{len(completion_counts)} unique completions; expected"
+                f" {n}. Repeats: {repeats}")

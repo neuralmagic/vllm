@@ -21,7 +21,7 @@ from vllm.outputs import (ClassificationOutput, ClassificationRequestOutput,
                           PoolingRequestOutput, RequestOutput, ScoringOutput,
                           ScoringRequestOutput)
 from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import BeamSearchParams, SamplingParams
 
 # set some common config/environment variables that should be set
 # for all processes created by vllm and all processes
@@ -37,28 +37,11 @@ os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
 torch._inductor.config.compile_threads = 1
 
 __all__ = [
-    "__version__",
-    "__version_tuple__",
-    "LLM",
-    "ModelRegistry",
-    "PromptType",
-    "TextPrompt",
-    "TokensPrompt",
-    "SamplingParams",
-    "RequestOutput",
-    "CompletionOutput",
-    "PoolingOutput",
-    "PoolingRequestOutput",
-    "EmbeddingOutput",
-    "EmbeddingRequestOutput",
-    "ClassificationOutput",
-    "ClassificationRequestOutput",
-    "ScoringOutput",
-    "ScoringRequestOutput",
-    "LLMEngine",
-    "EngineArgs",
-    "AsyncLLMEngine",
-    "AsyncEngineArgs",
-    "initialize_ray_cluster",
-    "PoolingParams",
+    "__version__", "__version_tuple__", "LLM", "ModelRegistry", "PromptType",
+    "TextPrompt", "TokensPrompt", "SamplingParams", "RequestOutput",
+    "CompletionOutput", "PoolingOutput", "PoolingRequestOutput",
+    "EmbeddingOutput", "EmbeddingRequestOutput", "ClassificationOutput",
+    "ClassificationRequestOutput", "ScoringOutput", "ScoringRequestOutput",
+    "LLMEngine", "EngineArgs", "AsyncLLMEngine", "AsyncEngineArgs",
+    "initialize_ray_cluster", "PoolingParams", "BeamSearchParams"
 ]
