@@ -443,6 +443,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.allow_deep_gemm = use_deep_gemm
 
         # Check for DeepGemm support.
         self.allow_deep_gemm = False
