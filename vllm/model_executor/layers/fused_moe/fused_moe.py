@@ -1675,8 +1675,21 @@ def cutlass_moe_fp8(
                                  dtype=torch.int32,
                                  device=device)
 
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    # TODO(luka): torch.compile will try to reuse m*topk between subgraphs
+    #  if calculated directly. Instead, we carefully manipulate tensor sizes
+    #  so they all depend on nodes close to them.
+    # instead of size directly, try using reshape
+    # resulting in 1D shape (m*topk,)
+    topk_shape = topk_ids.shape
+
+    def topk_empty(other_dims=tuple(), **kwargs):
+        return torch.empty(*topk_shape, *other_dims,
+                           **kwargs).reshape([-1, *other_dims])
+
+    a_map = topk_empty(dtype=torch.int32, device=device)
+    c_map = topk_empty(dtype=torch.int32, device=device)
+    # a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    # c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
 
     ops.get_cutlass_moe_mm_data(topk_ids, expert_offsets, problem_sizes1,
                                 problem_sizes2, a_map, c_map, num_experts, n,
@@ -1685,14 +1698,17 @@ def cutlass_moe_fp8(
     rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
     rep_a_scales = a_scale[a_map] if per_act_token else a_scale
 
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
-    c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
+    c1 = topk_empty((n * 2, ), device=device, dtype=out_dtype)
+    c2 = topk_empty((k, ), device=device, dtype=out_dtype)
+    # c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
+    # c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
 
     ops.cutlass_moe_mm(c1, rep_a_q, w1_q, rep_a_scales, w1_scale,
                        expert_offsets[:-1], problem_sizes1, ab_strides1,
                        ab_strides1, c_strides1)
 
-    intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
+    intermediate = topk_empty((n, ), device=device, dtype=out_dtype)
+    # intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
     torch.ops._C.silu_and_mul(intermediate, c1)
 
     intemediate_q, intermediate_scales = ops.scaled_fp8_quant(
