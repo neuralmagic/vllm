@@ -19,7 +19,7 @@ def main(dp_size, dp_rank, dp_master_ip, dp_master_port, GPUs_per_dp_rank):
     os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
     # set devices for each dp_rank
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
-        str(6+i) for i in range(dp_rank * GPUs_per_dp_rank, (dp_rank + 1) *
+        str(2+i) for i in range(dp_rank * GPUs_per_dp_rank, (dp_rank + 1) *
                               GPUs_per_dp_rank))
 
     # Sample prompts.
