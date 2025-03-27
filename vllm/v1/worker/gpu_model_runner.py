@@ -6,10 +6,11 @@ import weakref
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
-import torch
 import torch.distributed
 import torch.nn as nn
+import tqdm
 
+import torch
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
 from vllm.config import CompilationLevel, VllmConfig
@@ -1530,11 +1531,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
+        print(
+            f"max cuda graph capture size >> {max(self.cudagraph_batch_sizes)}, max num seqs {self.max_num_reqs}, max num batched tokens {self.max_num_tokens}"
+        )
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         with graph_capture(device=self.device):
-            for num_tokens in reversed(self.cudagraph_batch_sizes):
+            for num_tokens in tqdm.tqdm(reversed(self.cudagraph_batch_sizes),
+                                        desc="CUDAGraph Capture",
+                                        total=len(self.cudagraph_batch_sizes)):
                 for _ in range(self.vllm_config.compilation_config.
                                cudagraph_num_of_warmups):
                     self._dummy_run(num_tokens)
