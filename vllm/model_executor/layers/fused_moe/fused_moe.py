@@ -1058,7 +1058,7 @@ def fused_topk(
                                         topk,
                                         dtype=torch.int32,
                                         device=hidden_states.device)
-
+    print(f"topk_weights: {topk_weights.shape}, topk_ids: {topk_ids.shape}, token_expert_indicies: {token_expert_indicies.shape}")
     ops.topk_softmax(
         topk_weights,
         topk_ids,
@@ -1520,8 +1520,8 @@ def fused_moe(
         Defaults to False.
     - global_num_experts (int): The total number of experts in the global
         expert space.
-    - expert_map (Optional[torch.Tensor]):  A tensor mapping expert indices 
-        from the global expert space to the local expert space of the expert 
+    - expert_map (Optional[torch.Tensor]):  A tensor mapping expert indices
+        from the global expert space to the local expert space of the expert
         parallel shard.
     - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
         w1.
