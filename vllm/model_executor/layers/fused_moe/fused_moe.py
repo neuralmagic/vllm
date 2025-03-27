@@ -1058,7 +1058,6 @@ def fused_topk(
                                         topk,
                                         dtype=torch.int32,
                                         device=hidden_states.device)
-    print(f"topk_weights: {topk_weights.shape}, topk_ids: {topk_ids.shape}, token_expert_indicies: {token_expert_indicies.shape}")
     ops.topk_softmax(
         topk_weights,
         topk_ids,
