@@ -3651,7 +3651,8 @@ class VllmConfig:
                 not self.model_config.enforce_eager:
                 batch_size_capture_list = [1, 2, 4] + [
                     i for i in range(
-                        8, self.scheduler_config.max_batch_size_to_capture, 8)
+                        8, self.scheduler_config.max_batch_size_to_capture +
+                        1, 8)
                 ]
                 max_num_tokens = self.scheduler_config.max_num_batched_tokens
                 batch_size_capture_list = [
