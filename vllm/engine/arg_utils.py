@@ -9,7 +9,6 @@ from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union, cast, get_args)
 
 import torch
-
 import vllm.envs as envs
 from vllm import version
 from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
@@ -141,6 +140,7 @@ class EngineArgs:
     quantization: Optional[str] = None
     enforce_eager: Optional[bool] = None
     max_seq_len_to_capture: int = 8192
+    max_batch_size_to_capture: Optional[int] = None
     disable_custom_all_reduce: bool = False
     tokenizer_pool_size: int = 0
     # Note: Specifying a tokenizer pool by passing a class
@@ -635,6 +635,9 @@ class EngineArgs:
                             'Additionally for encoder-decoder models, if the '
                             'sequence length of the encoder input is larger '
                             'than this, we fall back to the eager mode.')
+        parser.add_argument("--max-batch-size-to-capture",
+                            type=int,
+                            default=None)
         parser.add_argument('--disable-custom-all-reduce',
                             action='store_true',
                             default=EngineArgs.disable_custom_all_reduce,
@@ -1424,6 +1427,7 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            max_batch_size_to_capture=self.max_batch_size_to_capture,
         )
 
         lora_config = LoRAConfig(

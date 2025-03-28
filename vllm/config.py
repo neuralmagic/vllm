@@ -17,12 +17,12 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Final, Literal,
                     Optional, Protocol, Union)
 
-import torch
 from packaging.version import Version
 from pydantic import BaseModel, Field, PrivateAttr
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import PretrainedConfig
 
+import torch
 import vllm.envs as envs
 from vllm.compilation.inductor_pass import CallableInductorPass, InductorPass
 from vllm.logger import init_logger
@@ -1598,6 +1598,8 @@ class SchedulerConfig:
 
     # Maximum number of sequences to be processed in a single iteration.
     max_num_seqs: int = 128
+
+    max_batch_size_to_capture: Optional[int] = None
 
     # Maximum length of a sequence (including prompt and generated text).
     max_model_len: int = 8192
@@ -3647,8 +3649,10 @@ class VllmConfig:
             batch_size_capture_list = []
             if self.model_config is not None and \
                 not self.model_config.enforce_eager:
-                batch_size_capture_list = [1, 2, 4
-                                           ] + [i for i in range(8, 513, 8)]
+                batch_size_capture_list = [1, 2, 4] + [
+                    i for i in range(
+                        8, self.scheduler_config.max_batch_size_to_capture, 8)
+                ]
                 max_num_tokens = self.scheduler_config.max_num_batched_tokens
                 batch_size_capture_list = [
                     size for size in batch_size_capture_list
