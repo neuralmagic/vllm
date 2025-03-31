@@ -33,6 +33,7 @@ from time import sleep
 from vllm import LLM, SamplingParams
 from vllm.utils import get_open_port
 
+
 def main(model, dp_size, local_dp_rank, global_dp_rank, dp_master_ip,
          dp_master_port, GPUs_per_dp_rank):
     os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
