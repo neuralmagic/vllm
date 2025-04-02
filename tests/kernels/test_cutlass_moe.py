@@ -4,7 +4,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
-from vllm.model_executor.layers.fused_moe.cutlass_moe import cutlass_moe_fp8
+from vllm.model_executor.layers.fused_moe.cutlass_moe import cutlass_moe_fp8, modular_cutlass_moe_fp8
 from vllm.model_executor.layers.fused_moe.fused_moe import (fused_experts,
                                                             fused_topk)
 from vllm.platforms import current_platform
@@ -118,18 +118,48 @@ def test_cutlass_moe_no_graph(
 
         triton_output = fused_experts(a_d, w1_d, w2_d, topk_weights, topk_ids)
 
-        cutlass_output = cutlass_moe_fp8(a,
-                                         w1_q,
-                                         w2_q,
-                                         w1_scale,
-                                         w2_scale,
-                                         topk_weights,
-                                         topk_ids,
-                                         ab_strides1,
-                                         c_strides1,
-                                         ab_strides2,
-                                         c_strides2,
-                                         a1_scale=a_scale1)
+        if True:
+            cutlass_moe_fp8_fn = modular_cutlass_moe_fp8(
+                ab_strides1,
+                c_strides1,
+                ab_strides2,
+                c_strides2,
+            )
+        else:
+            def cutlass_moe_fp8_fn(
+                    a,
+                    w1_q,
+                    w2_q,
+                    w1_scale,
+                    w2_scale,
+                    topk_weights,
+                    topk_ids,
+                    a1_scale=a_scale1
+            ):
+                return cutlass_moe_fp8(
+                    a,
+                    w1_q,
+                    w2_q,
+                    w1_scale,
+                    w2_scale,
+                    topk_weights,
+                    topk_ids,
+                    ab_strides1,
+                    c_strides1,
+                    ab_strides2,
+                    c_strides2,
+                    a1_scale=a_scale1
+                )
+
+        cutlass_output = cutlass_moe_fp8_fn(
+            a,
+            w1_q,
+            w2_q,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            a1_scale=a_scale1)
 
         #print(triton_output)
         #print(cutlass_output)
