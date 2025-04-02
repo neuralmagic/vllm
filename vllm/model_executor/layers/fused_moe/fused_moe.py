@@ -1322,10 +1322,6 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             intermediate_cache3.mul_(
                 curr_topk_weights.view(tokens_in_chunk, -1, 1))
 
-        if True:
-            intermediate_cache3 = intermediate_cache3.view(-1, top_k_num, K)
-            intermediate_cache3.mul_(curr_topk_weights.view(tokens_in_chunk, -1, 1))
-
         ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx])
 
