@@ -235,7 +235,9 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         M = q_hidden_states.shape[0]
         E, N, _ = w2.shape   # because w1 + w2 are transposed
         K = w1.shape[1]  #?
+        topk = topk_ids.shape[1]
         assert K == w2.shape[-1]
+        assert E == w1.shape[0]
         device = q_hidden_states.device
 
         per_act_token = a1_scale.numel() != 1 if a1_scale is not None else (
@@ -271,9 +273,9 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         # fix names
         #print(f"E {E}, M {M}, N {N}, K {K}")
-        c1 = _resize_cache(workspace13, (M, N * 2))
-        c2 = _resize_cache(workspace2, (M, N))
-        c3 = _resize_cache(workspace13, (M, K))
+        c1 = _resize_cache(workspace13, (M * topk, N * 2))
+        c2 = _resize_cache(workspace2, (M * topk, N))
+        c3 = _resize_cache(workspace13, (M * topk, K))
 
         ops.cutlass_moe_mm(
             c1,
