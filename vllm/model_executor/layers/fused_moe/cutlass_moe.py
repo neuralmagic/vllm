@@ -7,6 +7,9 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.utils import _fp8_perm, _resize_cache
+from vllm.model_executor.layers.fused_moe.dispatch_combine import (
+    StandardDispatchCombine
+)
 
 
 #TODO make the grouped gemm kernel consistent with scaled gemm kernel
@@ -150,44 +153,6 @@ def cutlass_moe_fp8(
             topk_weights.view(m, topk, 1).to(out_dtype)).sum(dim=1)
 
 
-class CutlassDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
-
-    def __init__(self, out_dtype: torch.dtype):
-        super().__init__()
-        self.out_dtype = out_dtype
-
-    def dispatch(
-        self,
-        a1: torch.Tensor,
-        a1_scale: Optional[torch.Tensor],
-        a2_scale: Optional[torch.Tensor],
-        topk_ids: torch.Tensor,
-        num_experts: int,
-        expert_map: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        # why do we need to check a2_scale here?
-        per_act_token = a1_scale.numel() != 1 if a1_scale is not None else (
-            a2_scale.numel() != 1 if a2_scale is not None else False)
-
-        a1q, a1q_scale = ops.scaled_fp8_quant(
-            a1, a1_scale, use_per_token_if_dynamic=per_act_token)
-
-        return a1q, a1_scale, topk_ids
-
-    def combine(
-        self,
-        output: torch.Tensor,
-        fused_expert_output: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> None:
-        M, topk = topk_weights.shape
-        K = fused_expert_output.shape[-1]
-        fused_expert_output = (fused_expert_output.view(-1, topk, K) *
-                               topk_weights.view(M, -1, 1))
-        assert output.dtype == self.out_dtype
-        ops.moe_sum(fused_expert_output, output)
-
-
 class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
     def __init__(
@@ -301,7 +266,7 @@ def modular_cutlass_moe_fp8(
     out_dtype: torch.dtype = torch.half,
 ) -> mk.FusedMoEModularKernel:
     return mk.FusedMoEModularKernel(
-        CutlassDispatchCombine(out_dtype),
+        StandardDispatchCombine(),
         CutlassExperts(
             ab_strides1,
             c_strides1,
