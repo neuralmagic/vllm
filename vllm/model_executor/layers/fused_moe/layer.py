@@ -8,6 +8,8 @@ from typing import Callable, List, Optional, Tuple
 import pplx_kernels as pplx
 import torch
 import torch.nn.functional as F
+from pplx_kernels.nvshmem import (nvshmem_alloc_empty_unique_id,
+                                  nvshmem_get_unique_id, nvshmem_init)
 from torch.nn.parameter import UninitializedParameter
 
 import vllm.envs as envs
@@ -23,10 +25,13 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
-from vllm.utils import direct_register_custom_op
+from vllm.utils import direct_register_custom_op, run_once
 
 if current_platform.is_cuda_alike():
-    from .fused_moe import fused_experts
+    #from .pplx_dispatch_combine import PplxDispatchCombine
+    from .dispatch_combine import StandardDispatchCombine
+    from .fused_moe import TritonExperts, fused_experts
+    from .modular_kernel import FusedMoEModularKernel
 else:
     fused_experts = None  # type: ignore
 if current_platform.is_tpu():
@@ -238,33 +243,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias)
 
-        expert_num_tokens = torch.empty(
-            self.moe.num_local_experts,
-            dtype=torch.int32,
-            device=x.device,
-        )
-        expert_x = torch.empty(
-            (self.moe.num_local_experts, MOE_DP_CHUNK_SIZE,
-             self.moe.hidden_dim),
-            dtype=self.moe.in_dtype,
-            device=x.device,
-        )
+        print("GGDGGDGDG")
 
-        bound_m = torch.tensor([self.moe.num__local_tokens],
-                               dtype=torch.uint32,
-                               device=x.device)
+        if False and self.moe.dp_size > 1:
+            dispatch_combine = PplxDispatchCombine(
+                self.all_to_all,
+                MOE_DP_CHUNK_SIZE,
+                self.moe.world_size,
+                self.moe.dp_size,
+                self.moe.in_dtype,
+            )
+        else:
+            dispatch_combine = StandardDispatchCombine(self.moe.in_dtype, )
 
-        assert (topk_ids.dtype == torch.uint32)
-        self.all_to_all.dispatch(
-            out_expert_num_tokens=expert_num_tokens,
-            out_expert_x=expert_x,
-            dp_x=x,
-            indices=topk_ids,  # TODO: is this right?
-            bound_m=bound_m,
+        experts = TritonExperts()
+
+        fused_experts = FusedMoEModularKernel(
+            dispatch_combine,
+            experts,
         )
 
-        expert_y = fused_experts(
-            hidden_states=expert_x,
+        return fused_experts(
+            hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             topk_weights=topk_weights,
@@ -273,21 +273,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             activation=activation,
             global_num_experts=global_num_experts,
             expert_map=expert_map,  # FIXME.
-        )
-
-        max_num_tokens = MOE_DP_CHUNK_SIZE // self.moe.dp_size,
-        y = torch.empty(
-            (max_num_tokens, self.moe.hidden_dim),
-            dtype=self.moe.out_dtype,
-            device=x.device,
-        )
-
-        self.all_to_all.combine(
-            out_tokens=y,
-            indices=topk_ids,
-            weights=topk_weights,
-            expert_y=expert_y,
-            bound_m=bound_m,
         )
 
     def forward_cpu(
@@ -435,6 +420,14 @@ def determine_expert_map(
     return (local_num_experts, expert_map)
 
 
+@run_once
+def pplx_init(rank, world_size):
+    uid = nvshmem_get_unique_id(
+    ) if rank == 0 else nvshmem_alloc_empty_unique_id()
+    torch.distributed.broadcast(uid, src=0)
+    nvshmem_init(uid, rank, world_size)
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -555,8 +548,23 @@ class FusedMoE(torch.nn.Module):
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
         if quant_config is None:
+            pplx_init(self.dp_rank, self.dp_size)
+
+            moe = MoEConfig(
+                num_experts=self.global_num_experts,
+                experts_per_token=0,
+                hidden_dim=hidden_size,
+                num_local_experts=self.local_num_experts,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                #in_dtype = 0,
+                #out_dtype = 0,
+            )
+
             self.quant_method: Optional[QuantizeMethodBase] = (
-                UnquantizedFusedMoEMethod())
+                UnquantizedFusedMoEMethod(moe))
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
