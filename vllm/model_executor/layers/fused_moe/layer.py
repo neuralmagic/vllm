@@ -387,7 +387,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                                 expert_map=expert_map,
                                 renormalize=renormalize)
 
-    forward_native = forward_cuda
+    forward_native = forward_tpu if current_platform.is_tpu() else forward_cuda
 
 
 def determine_expert_map(
@@ -903,14 +903,16 @@ class FusedMoE(torch.nn.Module):
                              full_router_logits: torch.Tensor):
         max_tokens_across_dp = get_forward_context(
         ).dp_metadata.max_tokens_across_dp
-        cu_tokens_across_dp_cpu = get_forward_context(
-        ).dp_metadata.cu_tokens_across_dp_cpu
+        #cu_tokens_across_dp_cpu = get_forward_context(
+        #).dp_metadata.cu_tokens_across_dp_cpu
         num_tokens_across_dp = get_forward_context(
         ).dp_metadata.num_tokens_across_dp
 
         #In this function we define two ranges:
-        # 1. chunk_range - The current iteration of the loops's range over the DP world tokens
-        # 2. my_tokens_in_chunk - The tokens within chunk_range that this DP rank owns.
+        # 1. chunk_range - The current iteration of the loops's range over the
+        #    DP world tokens
+        # 2. my_tokens_in_chunk - The tokens within chunk_range that this DP
+        #    rank owns.
 
         moe_dp_chunk_size_per_rank = MOE_DP_CHUNK_SIZE // self.dp_size
 
@@ -953,8 +955,8 @@ class FusedMoE(torch.nn.Module):
             )
 
             if self.dp_size > 1:
-                start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_this_iter[
-                    self.dp_rank - 1]
+                start = 0 if self.dp_rank == 0 else (
+                    cu_tokens_across_dp_this_iter[self.dp_rank - 1])
                 end = cu_tokens_across_dp_this_iter[self.dp_rank]
 
                 all_hidden_states = get_dp_group().all_reduce(
