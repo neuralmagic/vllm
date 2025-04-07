@@ -175,7 +175,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
     def __init__(self, moe: MoEConfig):
-        self.all_to_all = get_all_to_all(
+        super().__init__()
+        self._moe = moe
+        self._all_to_all = get_all_to_all(
             max_num_tokens=MOE_DP_CHUNK_SIZE // moe.dp_size,
             num_experts=moe.num_experts,
             experts_per_token=moe.experts_per_token,
@@ -315,22 +317,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias)
 
-        print("HELLO")
+        block_shape = None  # TBD
 
-        if False and self.moe.dp_size > 1:
+        if False and self._moe.dp_size > 1:
             dispatch_combine = PplxDispatchCombine(
-                self.all_to_all,
+                self._all_to_all,
                 MOE_DP_CHUNK_SIZE,
-                self.moe.world_size,
-                self.moe.dp_size,
-                self.moe.in_dtype,
+                self._moe.world_size,
+                self._moe.dp_size,
+                self._moe.in_dtype,
             )
         else:
-            block_size = None  # TBD
-            dispatch_combine = StandardDispatchCombine(self.moe.in_dtype,
-                                                       block_size)
+            dispatch_combine = StandardDispatchCombine(self._moe.in_dtype,
+                                                       block_shape)
 
-        experts = TritonExperts()
+        experts = TritonExperts(
+            use_fp8_w8a8 = False,
+            use_int8_w8a16 = False,
+            use_int4_w4a16 = False,
+            block_shape = block_shape,
+        )
 
         fused_experts = FusedMoEModularKernel(
             dispatch_combine,
