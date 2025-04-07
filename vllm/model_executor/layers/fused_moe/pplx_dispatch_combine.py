@@ -86,6 +86,9 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         # This argument is optional
         bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
 
+        # TODO: optimize this?
+        rank_topk_ids = rank_topk_ids.to(dtype=torch.uint32)
+
         self.a2a.dispatch(
             out_expert_num_tokens=expert_num_tokens,
             out_expert_x=expert_x,

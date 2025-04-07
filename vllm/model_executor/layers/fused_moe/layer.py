@@ -319,12 +319,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         block_shape = None  # TBD
 
-        if False and self._moe.dp_size > 1:
+        if self._moe.dp_size > 1:
             dispatch_combine = PplxDispatchCombine(
                 self._all_to_all,
                 MOE_DP_CHUNK_SIZE,
-                self._moe.world_size,
-                self._moe.dp_size,
+                self._moe.ep_size,
+                self._moe.ep_size // self._moe.dp_size,
                 self._moe.in_dtype,
             )
         else:
