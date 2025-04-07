@@ -1167,7 +1167,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         assert hidden_states.shape[1] // 2 == w1.shape[
             2], "Hidden size mismatch"
     else:
-        assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+        assert hidden_states.shape[1] == w1.shape[2], f"Hidden size mismatch {hidden_states.shape[1]} != {w1.shape[2]}"
 
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -1482,7 +1482,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 2], "Hidden size mismatch"
         else:
             assert hidden_states.shape[1] == w1.shape[
-                2], "Hidden size mismatch"
+                2], f"Hidden size mismatch {hidden_states.shape[1]} != {w1.shape[2]}"
 
         assert hidden_states.is_contiguous(
         ), "Hidden_states must be contiguous"

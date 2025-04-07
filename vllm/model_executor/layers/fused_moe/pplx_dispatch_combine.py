@@ -95,7 +95,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
             out_expert_x_scale=expert_x_scale,
             dp_x=a1q,
             dp_x_scale=a1q_scale,
-            indices=rank_topk_ids,
+            indices=rank_topk_ids.to(torch.uint32),
             bound_m=bound_m,
         )
         return expert_x, expert_x_scale
@@ -114,7 +114,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         assert output.shape[1] == fused_expert_output.shape[-1]
 
         self.a2a.combine(out_tokens=output,
-                         indices=topk_ids,
+                         indices=topk_ids.to(torch.uint32),
                          weights=topk_weights,
                          expert_y=fused_expert_output,
                          bound_m=bound_m)

@@ -159,6 +159,11 @@ class AllToAllCache:
             self._cache[key] = instance
             return instance
 
+    def clear():
+        for k, v in self._cache.items():
+            v.destroy()
+        del self._cache
+
 
 # Global singleton
 _all_to_all_cache = AllToAllCache()
@@ -331,6 +336,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             dispatch_combine = StandardDispatchCombine(self._moe.in_dtype,
                                                        block_shape)
 
+        # TBD type flags + block_shape
         experts = TritonExperts(
             use_fp8_w8a8 = False,
             use_int8_w8a16 = False,
