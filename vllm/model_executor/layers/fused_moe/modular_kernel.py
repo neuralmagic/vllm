@@ -224,7 +224,8 @@ class FusedMoEModularKernel(torch.nn.Module):
 
     def forward(
         self,
-        a1: torch.Tensor,
+        a1: torch.
+        Tensor,  # rename to hidden_states for compatibility with function?
         w1: torch.Tensor,
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
