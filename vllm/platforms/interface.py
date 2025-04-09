@@ -120,6 +120,12 @@ class Platform:
     def is_rocm(self) -> bool:
         return self._enum == PlatformEnum.ROCM
 
+    def is_rocm_cdna(self) -> bool:
+        return self.is_rocm() and self.has_cdna_target()
+
+    def is_rocm_rdna(self) -> bool:
+        return self.is_rocm() and self.has_rdna_target()
+
     def is_tpu(self) -> bool:
         return self._enum == PlatformEnum.TPU
 
@@ -180,6 +186,14 @@ class Platform:
             return current_capability >= capability
 
         return current_capability.to_int() >= capability
+
+    @classmethod
+    def has_rdna_target(cls):
+        return False
+
+    @classmethod
+    def has_cdna_target(cls):
+        return False
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
