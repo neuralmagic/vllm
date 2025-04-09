@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import importlib.util
 from typing import Any, Callable, Dict, List, Optional
 
@@ -10,6 +11,7 @@ from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase,
@@ -430,6 +432,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config: Fp8Config):
+        from vllm.model_executor.layers.fused_moe import fused_experts
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
 
@@ -445,6 +448,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else:
                 logger.warning_once(
                     "DeepGemm not supported on the current platform.")
+
+        self.fused_experts = functools.partial(
+            fused_experts,
+            block_shape=self.quant_config.weight_block_size,
+            allow_deep_gemm=self.allow_deep_gemm)
 
     def create_weights(self, layer: Module, num_experts: int, hidden_size: int,
                        intermediate_size_per_partition: int,
@@ -758,6 +766,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                                         requires_grad=False)
             return
 
+    # Maybe extra args
+    def set_dispatch_combine(self, dispatch_combine: mk.FusedMoEQuantizeDispatchCombine) -> bool:
+        from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import TritonOrDeepGemmExperts
+
+        #block_m = MOE_DP_CHUNK_SIZE * (moe.ep_size // moe.dp_size)
+        #print(f"block_m = {block_m}")
+
+        experts = TritonOrDeepGemmExperts(
+            use_fp8_w8a8 = True,
+            use_int8_w8a16 = False,
+            use_int4_w4a16 = False,
+            block_shape = self.quant_config.weight_block_size,
+            block_m = None, # TODO
+            allow_deep_gemm=self.allow_deep_gemm,
+        )
+
+        self.fused_experts = mk.FusedMoEModularKernel(
+            dispatch_combine,
+            experts,
+        )
+
+        return True
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -775,8 +806,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.fused_moe import fused_experts
-
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -790,8 +819,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        return fused_experts(
-            x,
+        return self.fused_experts(
+            hidden_states=x,
             layer.w13_weight,
             layer.w2_weight,
             topk_weights=topk_weights,
@@ -807,8 +836,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                       if self.block_quant else layer.w2_weight_scale),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
-            allow_deep_gemm=self.allow_deep_gemm,
         )
 
 

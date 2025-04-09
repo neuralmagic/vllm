@@ -59,6 +59,9 @@ def _moe_problem_size(
 
     # Make sure we are using the correct a1 (pre-permute).
     assert topk_ids.shape[0] == a1.shape[0]
+    assert a1.dim() == 2
+    assert w1.dim() == 3 and w2.dim() == 3
+    assert topk_ids.dim() == 2
     M, _ = a1.shape
     E, N, _ = w1.shape
     K = w2.shape[1]
@@ -224,8 +227,7 @@ class FusedMoEModularKernel(torch.nn.Module):
 
     def forward(
         self,
-        a1: torch.
-        Tensor,  # rename to hidden_states for compatibility with function?
+        hidden_states: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -246,7 +248,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         of weights, w1 and w2, and top-k gating mechanism.
 
         Parameters:
-        - a1: (torch.Tensor): The input tensor to the MoE layer.
+        - hidden_states: (torch.Tensor): The input tensor to the MoE layer.
         - w1 (torch.Tensor): The first set of expert weights.
         - w2 (torch.Tensor): The second set of expert weights.
         - topk_weights (torch.Tensor): The topk weights applied at the end of
@@ -273,7 +275,10 @@ class FusedMoEModularKernel(torch.nn.Module):
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
+        a1 = hidden_states
         E, M, N, K, top_k = _moe_problem_size(a1, w1, w2, topk_ids)
+
+        #print(f"INIT shape: E={E}, M={M}, N={N}, K={K}, top_k={top_k}")
 
         if global_num_experts == -1:
             global_num_experts = E

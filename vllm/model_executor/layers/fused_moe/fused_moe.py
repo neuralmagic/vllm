@@ -1177,7 +1177,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         torch.float32, torch.float16, torch.bfloat16
     ]
 
-    num_tokens, _ = hidden_states.shape
+    num_tokens = hidden_states.shape[0]
     E, N, _ = w1.shape
     K = w2.shape[1]
     if global_num_experts == -1:
@@ -1443,13 +1443,15 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool,
-        block_shape: Optional[List[int]],
+        block_shape: Optional[List[int]] = None,
+        block_m: Optional[int] = None,
     ):
         super().__init__()
         self.use_fp8_w8a8 = use_fp8_w8a8
         self.use_int4_w4a16 = use_int4_w4a16
         self.use_int8_w8a16 = use_int8_w8a16
         self.block_shape = block_shape
+        self.block_m = block_m
 
     def workspace_shapes(self, a_dtype: torch.dtype, M: int, N: int, K: int,
                          topk: int,
@@ -1478,11 +1480,11 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
     ) -> torch.Tensor:
         # Check constraints.
         if self.use_int4_w4a16:
-            assert hidden_states.shape[1] // 2 == w1.shape[
+            assert hidden_states.shape[-1] // 2 == w1.shape[
                 2], "Hidden size mismatch"
         else:
-            assert hidden_states.shape[1] == w1.shape[
-                2], f"Hidden size mismatch {hidden_states.shape[1]} != {w1.shape[2]}"
+            assert hidden_states.shape[-1] == w1.shape[
+                2], f"Hidden size mismatch {hidden_states.shape[-1]} != {w1.shape[2]}"
 
         assert hidden_states.is_contiguous(
         ), "Hidden_states must be contiguous"
@@ -1525,6 +1527,9 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             raise ValueError(
                 f"Unsupported compute_type: {hidden_states.dtype}")
 
+        #print(f"shape: E={E}, M={num_tokens}, N={N}, K={K}, top_k={top_k_num}")
+        #print(f"BLOCK_M = {self.block_m}")
+
         # We can reuse the memory between these because by the time we need
         # cache3, we're done with cache1
         intermediate_cache1 = _resize_cache(workspace13,
@@ -1535,8 +1540,11 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                                             (num_tokens, top_k_num, K))
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'],
-                                 global_num_experts, expert_map))
+            moe_align_block_size(
+                topk_ids,
+                config['BLOCK_SIZE_M'] if self.block_m is None else self.block_m,
+                global_num_experts, expert_map
+            ))
 
         invoke_fused_moe_kernel(hidden_states,
                                 w1,
