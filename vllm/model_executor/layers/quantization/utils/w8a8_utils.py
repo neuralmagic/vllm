@@ -215,11 +215,11 @@ class Fp8LinearOp:
                     input_scale,
                     num_token_padding=self.output_padding,
                     use_per_token_if_dynamic=use_per_token_if_dynamic)
+
+                per_tensor_weights = (weight_scale.numel() == 1)
+                per_tensor_activations = (x_scale.numel() == 1)
             else:
                 qinput, x_scale = input_2d, input_scale
-
-            per_tensor_weights = (weight_scale.numel() == 1)
-            per_tensor_activations = (x_scale.numel() == 1)
 
             if per_tensor_weights and per_tensor_activations:
                 # Fused GEMM_DQ
