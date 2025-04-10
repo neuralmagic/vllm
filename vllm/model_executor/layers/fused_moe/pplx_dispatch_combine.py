@@ -31,15 +31,15 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         super().__init__()
         self.a2a = a2a
         self.block_shape = block_shape
-        self.max_num_tokens = max_num_tokens                             # not right?
-        self.dp_num_tokens = max_num_tokens #* (world_size // dp_size)   # this is not right
+        self.max_num_tokens = max_num_tokens
         self.world_size = world_size  # debug
+        self.dp_size = dp_size
         self.rank = rank              # debug
         self.quant_dtype = quant_dtype
-        print(f"max_num_tokens = {max_num_tokens}")
-        print(f"dp_num_tokens = {self.dp_num_tokens}")
-        print(f"world_size = {world_size}")
-        print(f"dp_size = {dp_size}")
+        if False:
+            print(f"max_num_tokens = {max_num_tokens}")
+            print(f"world_size = {world_size}")
+            print(f"dp_size = {dp_size}")
 
     def dispatch(
         self,
@@ -50,7 +50,12 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         num_experts: int,
         expert_map: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        #assert expert_map is None ????
+        #assert expert_map is None?
+
+        assert a1.shape[0] <= self.max_num_tokens
+
+        num_tokens = a1.shape[0]   # M
+        hidden_dim = a1.shape[-1]  # K
 
         # Is this always going to be a1.device?
         device = a1.device
@@ -70,19 +75,21 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
             a1q = a1
             a1q_scale = a1_scale
 
+        num_local_experts = num_experts // self.world_size
         expert_num_tokens = torch.zeros(
-            num_experts,
+            (num_local_experts, ),
             dtype=torch.int32,
             device=a1.device,
         )
-        expert_num_tokens.fill_(-1)
+        expert_num_tokens.fill_(-1)  # debugging remove
 
+        num_dp = self.world_size // self.dp_size
         expert_x = torch.empty(
-            (num_experts, self.dp_num_tokens, a1q.shape[-1]),
+            (num_local_experts, self.max_num_tokens * num_dp, hidden_dim),
             dtype=a1q.dtype,
             device=a1.device,
         )
-        expert_x.fill_(torch.nan)
+        expert_x.fill_(torch.nan)   # debugging remove
 
         expert_x_scale: Optional[torch.Tensor] = None
         if a1q.dtype.itemsize == 1:
@@ -100,35 +107,36 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
             )
 
         # This argument is optional, defaults to indices.shape[0]
-        bound_m = None #get_forward_context().dp_metadata.dp_rank_num_tokens
+        #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
+        bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
 
         # TODO: optimize this?
         indices = rank_topk_ids.to(dtype=torch.uint32)
 
         # rank_topk_ids is (num_tokens, experts_per_token)
-        torch.set_printoptions(profile="full")
-
-        print(f"num_experts = {num_experts}")
-        print(f"A1Q = {a1q.shape}")
-        print(f"num tokens = {expert_num_tokens.shape}")
-        print(f"expert_x = {expert_x.shape}")
-        if expert_x_scale is not None:
-            print(f"expert_x_scale = {expert_x_scale.shape}")
-        print(f"bound_m = {bound_m}")
-        #print(f"topk_ids = {rank_topk_ids.shape} {rank_topk_ids}")
-        print(f"indices = {indices.shape} {torch.unique(indices.flatten())}")
+        if False:
+            torch.set_printoptions(profile="full")
+            print(f"num_experts = {num_experts}")
+            print(f"A1Q = {a1q.shape}")
+            print(f"expert num tokens = {expert_num_tokens.shape}")
+            print(f"expert_x = {expert_x.shape}")
+            if expert_x_scale is not None:
+                print(f"expert_x_scale = {expert_x_scale.shape}")
+            print(f"bound_m = {bound_m}")
+            #print(f"topk_ids = {rank_topk_ids.shape} {rank_topk_ids}")
+            print(f"indices = {indices.shape} {torch.unique(indices.flatten())}")
+            print("DISPATCH")
 
         #######
         expert_token_from: list[list[tuple[int, int]]] = [
             [] for _ in range(num_experts)
         ]
-        i_rank = self.rank
-        for token_idx in range(a1q.shape[0]):
-            for expert_idx in indices[token_idx]:
-                expert_token_from[expert_idx].append((i_rank, token_idx))
+        for i_rank in range(num_dp):
+            for token_idx in range(num_tokens):
+                for expert_idx in indices[token_idx]:
+                    expert_token_from[expert_idx].append((i_rank, token_idx))
         #######
 
-        print("DISPATCH")
         self.a2a.dispatch(
             out_expert_num_tokens=expert_num_tokens,
             out_expert_x=expert_x,
@@ -140,45 +148,48 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         )
 
         # expert_num_tokens, use this to reformat expert_x/expert_x_scale
-        #print(f"expert_num_tokens = {expert_num_tokens} {(expert_num_tokens > 0).nonzero()}")
-        print(f"expert_num_tokens = {(expert_num_tokens > 0).nonzero()}")
+        if False:
+            print(f"expert_num_tokens = {(expert_num_tokens > 0).nonzero()}")
 
-        print(f"EXPERT_X = {expert_x.shape} total={expert_x.numel()} nan={torch.isnan(expert_x).sum()}")
-        for i in range(expert_x.shape[0]):
-            if torch.isnan(expert_x[i]).sum() < expert_x[i].numel():
-                print(i)
-        print("END_EXPERT_X")
+            print(f"EXPERT_X = {expert_x.shape} total={expert_x.numel()} nan={torch.isnan(expert_x).sum()}")
+            print(f"EXPERT_IDS = {torch.logical_not(torch.isnan(expert_x)).sum(dim=(1,2)).nonzero()}")
+            for i in range(expert_x.shape[0]):
+                if torch.isnan(expert_x[i]).sum() < expert_x[i].numel():
+                    print(i)
+            print("END_EXPERT_X")
 
-        num_local_experts = num_experts // self.world_size
-        for i_rank in range(self.world_size):
-            if i_rank != self.rank:
-                continue
-            for i_local_expert in range(num_local_experts):
-                expert_idx = i_rank * num_local_experts + i_local_expert
-                cnt_tokens = int(expert_num_tokens[i_local_expert].item())
-                logger.debug(
-                    "Expert #%d on Rank %d: %d tokens",
-                    expert_idx,
-                    self.rank,
-                    cnt_tokens,
-                )
-                #assert cnt_tokens == len(expert_token_from[expert_idx]), f"{cnt_tokens} != {len(expert_token_from[expert_idx])}"
-                #cnt_from_dp_rank = [0] * self.dp_num_tokens
-                for i_token in range(cnt_tokens):
-                    src_dp_rank, src_token_idx = expert_token_from[expert_idx][i_token]
-                    #cnt_from_dp_rank[src_dp_rank] += 1
-                    dst_x = expert_x[i_local_expert, i_token]
+            for i_rank in range(self.world_size):  # why world size here and num_dp above?
+                if i_rank != self.rank:
+                    continue
+                for i_local_expert in range(num_local_experts):
+                    expert_idx = i_rank * num_local_experts + i_local_expert
+                    cnt_tokens = int(expert_num_tokens[i_local_expert].item())
                     logger.debug(
-                        "  x[%d] (from DP Rank %d Token %d): %s",
-                        i_token,
-                        src_dp_rank,
-                        src_token_idx,
-                        dst_x.cpu(),
+                        "Expert #%d on Rank %d: %d tokens",
+                        expert_idx,
+                        self.rank,
+                        cnt_tokens,
                     )
+                    assert cnt_tokens == len(expert_token_from[expert_idx]), f"{cnt_tokens} != {len(expert_token_from[expert_idx])}"
+                    cnt_from_dp_rank = [0] * num_dp
+                    print(f"CNT_TOKENS {cnt_tokens}")
+                    for i_token in range(cnt_tokens):
+                        src_dp_rank, src_token_idx = expert_token_from[expert_idx][i_token]
+                        cnt_from_dp_rank[src_dp_rank] += 1
+                        dst_x = expert_x[i_local_expert, i_token]
+                        logger.debug(
+                            "  x[%d] (from DP Rank %d Token %d): %s",
+                            i_token,
+                            src_dp_rank,
+                            src_token_idx,
+                            dst_x.cpu(),
+                        )
 
-        #return expert_x, expert_x_scale
-        return (expert_x.view(-1, expert_x.shape[-1]),
-                expert_x_scale.view(-1, expert_x_scale[-1]) if expert_x_scale is not None else expert_x_scale)
+        if True:
+            return expert_x, expert_x_scale
+        else:
+            return (expert_x.view(-1, expert_x.shape[-1]),
+                    expert_x_scale.view(-1, expert_x_scale[-1]) if expert_x_scale is not None else expert_x_scale)
 
     def combine(
         self,
@@ -188,9 +199,11 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         topk_ids: torch.Tensor,
     ) -> None:
         # This argument is optional
-        bound_m = None #get_forward_context().dp_metadata.dp_rank_num_tokens
+        #bound_m = None #get_forward_context().dp_metadata.dp_rank_num_tokens
+        num_tokens = fused_expert_output.shape[0]   # M
+        bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=fused_expert_output.device)
 
-        assert output.shape[0] == self.max_num_tokens
+        assert output.shape[0] <= self.max_num_tokens
         assert output.shape[1] == fused_expert_output.shape[-1]
 
         self.a2a.combine(out_tokens=output,
@@ -198,3 +211,6 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                          weights=topk_weights,
                          expert_y=fused_expert_output,
                          bound_m=bound_m)
+
+        #print("END COMBINE")
+

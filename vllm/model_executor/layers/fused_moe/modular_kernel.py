@@ -56,16 +56,21 @@ def _moe_problem_size(
     of w1 or w2.  Similarly, some kernels transpose the weights, so this needs
     to be kept in mind.
     """
-
-    # Make sure we are using the correct a1 (pre-permute).
-    assert topk_ids.shape[0] == a1.shape[0]
-    assert a1.dim() == 2
     assert w1.dim() == 3 and w2.dim() == 3
-    assert topk_ids.dim() == 2
-    M, _ = a1.shape
     E, N, _ = w1.shape
     K = w2.shape[1]
+
+    if a1.dim() == 2:
+        # Make sure we are using the correct a1 (pre-permute).
+        assert topk_ids.shape[0] == a1.shape[0], f"{topk_ids.shape[0]}, {topk_ids.shape} != {a1.shape[0]} {a1.shape}"
+        M, _ = a1.shape
+    else:
+        M = a1.shape[1]
+        assert E == a1.shape[0]
+
+    assert topk_ids.dim() == 2
     topk = topk_ids.shape[1]
+
     return E, M, N, K, topk
 
 
@@ -147,6 +152,14 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         - Workspace type: The dtype to use for the workspace tensors.
         """
         raise NotImplementedError
+
+    def activation(self, activation: str, output: torch.Tensor, input: torch.Tensor) -> None:
+        if activation == "silu":
+            torch.ops._C.silu_and_mul(output, input)
+        elif activation == "gelu":
+            torch.ops._C.gelu_and_mul(output, input)
+        else:
+            raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
     @abstractmethod
     def apply(

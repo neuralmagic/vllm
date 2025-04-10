@@ -99,12 +99,7 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
                            expert_offsets[:-1], problem_sizes1,
                            self.ab_strides1, self.ab_strides1, self.c_strides1)
 
-        if activation == "silu":
-            torch.ops._C.silu_and_mul(c2, c1)
-        elif activation == "gelu":
-            torch.ops._C.gelu_and_mul(c2, c1)
-        else:
-            raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+        self.activation(activation, c2, c1)
 
         a2q, a2q_scale = ops.scaled_fp8_quant(
             c2, a2_scale, use_per_token_if_dynamic=per_act_token)

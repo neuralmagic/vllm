@@ -1456,8 +1456,8 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
     def workspace_shapes(self, a_dtype: torch.dtype, M: int, N: int, K: int,
                          topk: int,
                          num_experts: int) -> Tuple[int, int, torch.dtype]:
-        workspace1 = M * topk * max(N * 2, K)
-        workspace2 = M * topk * N
+        workspace1 = M * topk * max(N * 2, K) * num_experts  # XXXXX
+        workspace2 = M * topk * N * num_experts
         return (workspace1, workspace2, a_dtype)
 
     def apply(
@@ -1494,12 +1494,10 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn
         ]
 
-        num_tokens, _ = hidden_states.shape
-        E, N, _ = w1.shape
-        K = w2.shape[1]
+        E, num_tokens, N, K, top_k_num = mk._moe_problem_size(hidden_states, w1, w2, topk_ids)
+
         if global_num_experts == -1:
             global_num_experts = E
-        top_k_num = topk_ids.shape[1]
 
         config_dtype = get_config_dtype_str(use_fp8_w8a8=self.use_fp8_w8a8,
                                             use_int8_w8a16=self.use_int8_w8a16,
@@ -1539,12 +1537,20 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         intermediate_cache3 = _resize_cache(workspace13,
                                             (num_tokens, top_k_num, K))
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            moe_align_block_size(
-                topk_ids,
-                config['BLOCK_SIZE_M'] if self.block_m is None else self.block_m,
-                global_num_experts, expert_map
-            ))
+        if hidden_states.dim() == 2: #block_m is None:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size(
+                    topk_ids,
+                    config['BLOCK_SIZE_M'],
+                    global_num_experts, expert_map
+                ))
+        else:
+            stride = hidden_states.shape[1]
+            sorted_token_ids = torch.arange(0, hidden_states.shape[0], device=hidden_states.device, dtype=torch.int)
+            sorted_token_ids = sorted_token_ids * stride
+            expert_ids = torch.logical_not(torch.isnan(hidden_states)).sum(dim=(1,2)).nonzero()
+            num_tokens_post_padded = torch.zeros(1, device=hidden_states.device, dtype=torch.int)
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         invoke_fused_moe_kernel(hidden_states,
                                 w1,
@@ -1565,14 +1571,9 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                                 use_int4_w4a16=self.use_int4_w4a16,
                                 block_shape=self.block_shape)
 
-        if activation == "silu":
-            torch.ops._C.silu_and_mul(intermediate_cache2,
-                                      intermediate_cache1.view(-1, N))
-        elif activation == "gelu":
-            torch.ops._C.gelu_and_mul(intermediate_cache2,
-                                      intermediate_cache1.view(-1, N))
-        else:
-            raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+        self.activation(activation,
+                        intermediate_cache2,
+                        intermediate_cache1.view(-1, N))
 
         a2q_scale: Optional[torch.Tensor] = None
 
