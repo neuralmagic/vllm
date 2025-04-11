@@ -5,6 +5,7 @@ import pplx_kernels as pplx
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import get_dp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.utils import _fp8_quantize
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
@@ -52,6 +53,8 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         #assert expert_map is None?
 
+        print(f"DISPATCH START {self.rank}")
+
         assert a1.shape[0] <= self.max_num_tokens
 
         num_tokens = a1.shape[0]   # M
@@ -59,6 +62,8 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
 
         # Is this always going to be a1.device?
         device = a1.device
+        #device = get_dp_group().device
+        #assert a1.device == device
 
         if self.quant_dtype == torch.float8_e4m3fn:
             per_act_token = a1_scale.numel(
@@ -79,7 +84,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         expert_num_tokens = torch.zeros(
             (num_local_experts, ),
             dtype=torch.int32,
-            device=a1.device,
+            device=device,
         )
         expert_num_tokens.fill_(-1)  # debugging remove
 
@@ -87,7 +92,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         expert_x = torch.empty(
             (num_local_experts, self.max_num_tokens * num_dp, hidden_dim),
             dtype=a1q.dtype,
-            device=a1.device,
+            device=device,
         )
         expert_x.fill_(torch.nan)   # debugging remove
 
@@ -103,15 +108,18 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                     (expert_x.size(2) + block_size - 1) // block_size,
                 ),
                 dtype=torch.float32,
-                device=a1.device,
+                device=device,
             )
 
         # This argument is optional, defaults to indices.shape[0]
         #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
-        bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
+
+        # This causes a deadlock????
+        #bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
+        bound_m = None
 
         # TODO: optimize this?
-        indices = rank_topk_ids.to(dtype=torch.uint32)
+        indices = rank_topk_ids.to(dtype=torch.uint32).to(device)
 
         # rank_topk_ids is (num_tokens, experts_per_token)
         if False:
@@ -131,10 +139,11 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         expert_token_from: list[list[tuple[int, int]]] = [
             [] for _ in range(num_experts)
         ]
-        for i_rank in range(num_dp):
-            for token_idx in range(num_tokens):
-                for expert_idx in indices[token_idx]:
-                    expert_token_from[expert_idx].append((i_rank, token_idx))
+        if False:
+            for i_rank in range(num_dp):
+                for token_idx in range(num_tokens):
+                    for expert_idx in indices[token_idx]:
+                        expert_token_from[expert_idx].append((i_rank, token_idx))
         #######
 
         self.a2a.dispatch(
@@ -150,9 +159,10 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         # expert_num_tokens, use this to reformat expert_x/expert_x_scale
         if False:
             print(f"expert_num_tokens = {(expert_num_tokens > 0).nonzero()}")
-
+            nans = torch.isnan(expert_x).sum(dim=(1,2))
+            expert_ids = torch.where((nans > 0).flatten(), -1, torch.arange(0, nans.numel(), device=expert_x.device, dtype=torch.int))
+            print(f"EXPERT_IDS = {nans.shape}\n{nans > 0}\n{nans.nonzero()}\n{expert_ids}\nEND")
             print(f"EXPERT_X = {expert_x.shape} total={expert_x.numel()} nan={torch.isnan(expert_x).sum()}")
-            print(f"EXPERT_IDS = {torch.logical_not(torch.isnan(expert_x)).sum(dim=(1,2)).nonzero()}")
             for i in range(expert_x.shape[0]):
                 if torch.isnan(expert_x[i]).sum() < expert_x[i].numel():
                     print(i)
@@ -185,6 +195,8 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                             dst_x.cpu(),
                         )
 
+        print(f"DISPATCH DONE {self.rank}")
+
         if True:
             return expert_x, expert_x_scale
         else:
@@ -198,10 +210,18 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> None:
+        device = fused_expert_output.device
+        #device = torch.device("cuda", self.rank)
+        #device = get_dp_group().device
+        #assert fused_expert_output.device == device
+
+        print(f"COMBINE START {self.rank}")
+
         # This argument is optional
-        #bound_m = None #get_forward_context().dp_metadata.dp_rank_num_tokens
+        #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
         num_tokens = fused_expert_output.shape[0]   # M
-        bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=fused_expert_output.device)
+        #bound_m = torch.tensor([num_tokens], dtype=torch.uint32, device=device)
+        bound_m = None
 
         assert output.shape[0] <= self.max_num_tokens
         assert output.shape[1] == fused_expert_output.shape[-1]
@@ -212,5 +232,4 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                          expert_y=fused_expert_output,
                          bound_m=bound_m)
 
-        #print("END COMBINE")
-
+        print(f"COMBINE END {self.rank}")
