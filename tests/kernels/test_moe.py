@@ -16,7 +16,7 @@ from tests.kernels.utils import (compute_max_diff, opcheck, stack_and_dev,
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_moe
-from vllm.model_executor.layers.fused_moe.fused_batched_moe import fused_batched_experts
+#from vllm.model_executor.layers.fused_moe.fused_batched_moe import fused_batched_experts
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     fused_topk, moe_align_block_size)
 from vllm.model_executor.layers.fused_moe.moe_torch_iterative import (
