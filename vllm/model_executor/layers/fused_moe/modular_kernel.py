@@ -135,9 +135,16 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
     """
 
     @abstractmethod
-    def workspace_shapes(self, a_dtype: torch.dtype, M: int, N: int, K: int,
-                         topk: int,
-                         num_experts: int) -> Tuple[int, int, torch.dtype]:
+    def workspace_shapes(
+        self,
+        a_dtype: torch.dtype,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        num_experts: int,
+        a: torch.Tensor,  # maybe add another output/dim to moe_problem_size?
+    ) -> Tuple[int, int, torch.dtype]:
         """
         Compute the number of elements for the temporary outputs of the two
         gemms and activation in the fused expert function.  Since the
@@ -303,7 +310,8 @@ class FusedMoEModularKernel(torch.nn.Module):
 
         workspace13_shape, workspace2_shape, workspace_dtype = (
             self.fused_experts.workspace_shapes(a1.dtype, M, N, K, top_k,
-                                                global_num_experts))
+                                                global_num_experts,
+                                                a1))
 
         # We can reuse the memory between cache1 and cache3 because by the time
         # we need cache3, we're done with cache1
