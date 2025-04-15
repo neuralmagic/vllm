@@ -53,7 +53,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         #assert expert_map is None?
 
-        print(f"DISPATCH START {self.rank}")
+        #print(f"DISPATCH START {self.rank}")
 
         assert a1.shape[0] <= self.max_num_tokens
 
@@ -195,7 +195,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                             dst_x.cpu(),
                         )
 
-        print(f"DISPATCH DONE {self.rank}")
+        #print(f"DISPATCH DONE {self.rank}")
 
         if True:
             return expert_x, expert_x_scale
@@ -215,7 +215,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         #device = get_dp_group().device
         #assert fused_expert_output.device == device
 
-        print(f"COMBINE START {self.rank}")
+        #print(f"COMBINE START {self.rank}")
 
         # This argument is optional
         #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
@@ -232,4 +232,4 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                          expert_y=fused_expert_output,
                          bound_m=bound_m)
 
-        print(f"COMBINE END {self.rank}")
+        #print(f"COMBINE END {self.rank}")
