@@ -89,7 +89,7 @@ class FusedMoEQuantizeDispatchCombine(ABC):
         topk_ids: torch.Tensor,
         num_experts: int,
         expert_map: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Perform any quantization (and/or) dispatching needed
         for this kernel.
@@ -186,6 +186,7 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         a2_scale: Optional[torch.Tensor],
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
+        expert_num_tokens: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
         This function computes the intermediate result of a Mixture of Experts
@@ -216,6 +217,8 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
           must be large enough to hold output of either MoE gemm.
         - workspace2 (torch.Tensor): A scratch tensor used for the activation
           function.
+        - expert_num_tokens: An optional tensor containing the number of tokens
+          assigned to each expert when using batched experts format input.
 
         Returns:
         - torch.Tensor: The unweighted, unreduced output tensor
@@ -306,7 +309,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         if global_num_experts == -1:
             global_num_experts = E
 
-        output = a1 if inplace else torch.empty_like(a1)
+        output = a1 if inplace else torch.zeros_like(a1)
 
         workspace13_shape, workspace2_shape, workspace_dtype = (
             self.fused_experts.workspace_shapes(a1.dtype, M, N, K, top_k,
@@ -322,7 +325,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                                  device=a1.device,
                                  dtype=workspace_dtype)
 
-        a1q, a1q_scale = self.dispatch_combine.dispatch(
+        a1q, a1q_scale, expert_num_tokens = self.dispatch_combine.dispatch(
             a1,
             a1_scale,
             a2_scale,
@@ -347,6 +350,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             a2_scale,
             workspace13=workspace13,
             workspace2=workspace2,
+            expert_num_tokens=expert_num_tokens,
         )
 
         self.dispatch_combine.combine(output, fused_out, topk_weights,

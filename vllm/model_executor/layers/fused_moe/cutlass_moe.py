@@ -61,6 +61,7 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         a2_scale: Optional[torch.Tensor],
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
+        expert_num_tokens: Optional[torch.Tensor],
     ) -> torch.Tensor:
         M = a1q.shape[0]
         _, N, K = w2.shape  # because w1 + w2 are transposed
