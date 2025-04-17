@@ -313,7 +313,7 @@ class FusedMoEModularKernel(torch.nn.Module):
 
         workspace13_shape, workspace2_shape, workspace_dtype = (
             self.fused_experts.workspace_shapes(a1.dtype, M, N, K, top_k,
-                                                global_num_experts,
+                                                E, #global_num_experts,  # TODO fix!
                                                 a1))
 
         # We can reuse the memory between cache1 and cache3 because by the time
