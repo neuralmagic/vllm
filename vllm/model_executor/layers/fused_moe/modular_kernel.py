@@ -309,11 +309,11 @@ class FusedMoEModularKernel(torch.nn.Module):
         if global_num_experts == -1:
             global_num_experts = E
 
-        output = a1 if inplace else torch.zeros_like(a1)
+        output = a1 if inplace else torch.empty_like(a1)
 
         workspace13_shape, workspace2_shape, workspace_dtype = (
             self.fused_experts.workspace_shapes(a1.dtype, M, N, K, top_k,
-                                                E, #global_num_experts,  # TODO fix!
+                                                global_num_experts,
                                                 a1))
 
         # We can reuse the memory between cache1 and cache3 because by the time

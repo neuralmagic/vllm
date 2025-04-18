@@ -52,7 +52,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         #assert expert_map is None?
 
-        print(f"DISPATCH START {self.rank}")
+        logger.debug(f"DISPATCH START {self.rank}")
 
         assert a1.dim() == 2
         assert a1.shape[0] <= self.max_num_tokens
@@ -79,7 +79,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         assert num_experts % self.world_size == 0
         num_local_experts = num_experts // self.world_size
 
-        print(f"{self.rank}: {num_local_experts}, device={device}")
+        logger.debug(f"{self.rank}: {num_local_experts}, device={device}")
 
         expert_num_tokens = torch.empty(
             num_local_experts,
@@ -89,7 +89,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         #expert_num_tokens.fill_(-1)  # debugging, remove later
 
         num_dp = self.world_size // self.dp_size
-        print(f"GOT HERE A {self.rank}: {self.max_num_tokens} {num_dp} {hidden_dim}")
+        logger.debug(f"GOT HERE A {self.rank}: {self.max_num_tokens} {num_dp} {hidden_dim}")
         expert_x = torch.empty(
             (num_local_experts, self.max_num_tokens * num_dp, hidden_dim),
             dtype=a1q.dtype,
@@ -97,7 +97,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         )
         expert_x.fill_(torch.nan)   # debugging, remove later
 
-        print(f"GOT HERE B {self.rank}")
+        logger.debug(f"GOT HERE B {self.rank}")
 
         expert_x_scale: Optional[torch.Tensor] = None
         if a1q.dtype.itemsize == 1:
@@ -114,7 +114,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                 device=device,
             )
 
-        print(f"GOT HERE C {self.rank}")
+        logger.debug(f"GOT HERE C {self.rank}")
 
         # This argument is optional, defaults to indices.shape[0]
         #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
@@ -126,21 +126,21 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         # TODO: optimize this?
         indices = rank_topk_ids.to(dtype=torch.uint32)
 
-        print(f"GOT HERE D {self.rank}")
+        logger.debug(f"GOT HERE D {self.rank}")
 
         # rank_topk_ids is (num_tokens, experts_per_token)
         if False:
             torch.set_printoptions(profile="full")
-            print(f"num_experts = {num_experts}")
-            print(f"A1Q = {a1q.shape}")
-            print(f"expert num tokens = {expert_num_tokens.shape}")
-            print(f"expert_x = {expert_x.shape}")
+            logger.debug(f"num_experts = {num_experts}")
+            logger.debug(f"A1Q = {a1q.shape}")
+            logger.debug(f"expert num tokens = {expert_num_tokens.shape}")
+            logger.debug(f"expert_x = {expert_x.shape}")
             if expert_x_scale is not None:
-                print(f"expert_x_scale = {expert_x_scale.shape}")
-            print(f"bound_m = {bound_m}")
-            #print(f"topk_ids = {rank_topk_ids.shape} {rank_topk_ids}")
-            print(f"indices = {indices.shape} {torch.unique(indices.flatten())}")
-            print("DISPATCH")
+                logger.debug(f"expert_x_scale = {expert_x_scale.shape}")
+            logger.debug(f"bound_m = {bound_m}")
+            #logger.debug(f"topk_ids = {rank_topk_ids.shape} {rank_topk_ids}")
+            logger.debug(f"indices = {indices.shape} {torch.unique(indices.flatten())}")
+            logger.debug("DISPATCH")
 
         #######
         if False:
@@ -163,11 +163,11 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
             bound_m=bound_m,
         )
 
-        print(f"GOT HERE E {self.rank}")
+        logger.debug(f"GOT HERE E {self.rank}")
 
         # expert_num_tokens, use this to reformat expert_x/expert_x_scale
         if False:
-            print(f"expert_num_tokens = {(expert_num_tokens > 0).nonzero()}")
+            logger.debug(f"expert_num_tokens = {(expert_num_tokens > 0).nonzero()}")
 
             for i_rank in range(self.world_size):  # why world size here and num_dp above?
                 if i_rank != self.rank:
@@ -183,7 +183,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                     )
                     assert cnt_tokens == len(expert_token_from[expert_idx]), f"{cnt_tokens} != {len(expert_token_from[expert_idx])}"
                     cnt_from_dp_rank = [0] * num_dp
-                    #print(f"CNT_TOKENS {cnt_tokens}")
+                    #logger.debug(f"CNT_TOKENS {cnt_tokens}")
                     for i_token in range(cnt_tokens):
                         src_dp_rank, src_token_idx = expert_token_from[expert_idx][i_token]
                         cnt_from_dp_rank[src_dp_rank] += 1
@@ -196,7 +196,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                             dst_x.cpu(),
                         )
 
-        print(f"DISPATCH DONE {self.rank}")
+        logger.debug(f"DISPATCH DONE {self.rank}")
 
         return expert_x, expert_x_scale, expert_num_tokens
 
@@ -212,7 +212,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         #device = get_dp_group().device
         #assert fused_expert_output.device == device
 
-        print(f"COMBINE START {self.rank}")
+        logger.debug(f"COMBINE START {self.rank}")
 
         # This argument is optional
         #bound_m = get_forward_context().dp_metadata.dp_rank_num_tokens
@@ -229,4 +229,4 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                          expert_y=fused_expert_output,
                          bound_m=bound_m)
 
-        print(f"COMBINE END {self.rank}")
+        logger.debug(f"COMBINE END {self.rank}")
