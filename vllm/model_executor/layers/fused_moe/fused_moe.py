@@ -1464,7 +1464,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         num_experts: int,
         a: torch.Tensor,
     ) -> Tuple[int, int, torch.dtype]:
-        workspace1 = M * topk * max(N * 2, K) * num_experts  # XXXXX
+        workspace1 = M * topk * max(N * 2, K) * num_experts
         workspace2 = M * topk * N * num_experts
         return (workspace1, workspace2, a_dtype)
 
@@ -1725,8 +1725,8 @@ class BatchedExperts(mk.FusedMoEPermuteExpertsUnpermute):
         a: torch.Tensor,
     ) -> Tuple[int, int, torch.dtype]:
         max_num_tokens = a.shape[1]
-        workspace13 = num_experts * max_num_tokens * K * 2 # *2 = HACK!!!!!
-        workspace2 = max_num_tokens * (N // 2)
+        workspace13 = num_experts * max_num_tokens * K * topk * 2 # TODO: *2 is a hack
+        workspace2 = max_num_tokens * N
         return (workspace13, workspace2, a_dtype)
 
     def apply(
