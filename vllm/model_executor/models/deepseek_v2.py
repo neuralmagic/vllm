@@ -149,12 +149,20 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        #print (f"deepseekv2moe {hidden_states.shape}")
+        
+        #print ("deepseekv2moe start : ")
+        #print (f"    hidden states {hidden_states}")
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        #print (f"hidden states after view -- {hidden_states.shape}")
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
+        #print (f"after shared experts !")
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        #print ("after gating ..")
         if hidden_states.dtype != torch.float16:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
@@ -163,6 +171,9 @@ class DeepseekV2MoE(nn.Module):
             # This is a special case to avoid FP16 overflow
             final_hidden_states = self.experts(hidden_states=hidden_states,
                                                router_logits=router_logits)
+
+        #print (f"    expert hidden states {final_hidden_states.view(num_tokens, hidden_dim)}")
+
         if shared_output is not None:
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = final_hidden_states + shared_output
@@ -170,9 +181,11 @@ class DeepseekV2MoE(nn.Module):
                 # This is a special case to avoid FP16 overflow
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+        #if self.tp_size > 1:
+        #    final_hidden_states = tensor_model_parallel_all_reduce(
+        #        final_hidden_states)
+
+        #print (f"    final hidden states {final_hidden_states.view(num_tokens, hidden_dim)}")
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -686,6 +699,8 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        #print (f"input_ids {input_ids.shape}")
+
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states

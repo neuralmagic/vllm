@@ -890,12 +890,16 @@ def grouped_topk(
     assert hidden_states.shape[0] == gating_output.shape[0], (
         "Number of tokens mismatch")
 
+    #print (f"hidden_states {hidden_states.shape}")
+
     if scoring_func == "softmax":
         scores = torch.softmax(gating_output, dim=-1)
     elif scoring_func == "sigmoid":
         scores = gating_output.sigmoid()
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    #print (f"scores {scores.shape}")
 
     num_token = scores.shape[0]
     if e_score_correction_bias is not None:
@@ -1759,22 +1763,47 @@ class BatchedExperts(mk.FusedMoEPermuteExpertsUnpermute):
         num_tokens, topk = topk_ids.shape
         _, tmp_max_num_tokens, K = hidden_states.shape
         max_num_tokens = tmp_max_num_tokens if self.max_num_tokens is None else self.max_num_tokens
-        print(f"global_num_experts = {global_num_experts}")
+        #print(f"global_num_experts = {global_num_experts}")
         num_experts = global_num_experts
         out = _resize_cache(workspace13, (num_experts, max_num_tokens, w2.shape[1]))
         num_local_experts = expert_num_tokens.numel()
-        #assert num_local_experts >= topk_ids.view(-1).max()
+        #print(f"global_num_experts = {global_num_experts} | local_num_experts = {num_local_experts}")
+    #assert num_local_experts >= topk_ids.view(-1).max()
         #print(f"apply a={hidden_states}")
         #print(f"apply topk={topk_ids}")
         #print(f"apply num_tokens={expert_num_tokens}")
+
+        #print (f"invoking batched experts | hidden states : {hidden_states.shape} |  topk_ids : {topk_ids.shape} | expert num tokens {expert_num_tokens} | sum expert_num_tokens {torch.sum(expert_num_tokens)}")
+        #print (f"hidden states {hidden_states}")
+
+        #debug = (f"invoking batched experts : \n"
+        #        f"| hidden states : {hidden_states.shape} {hidden_states.dtype} \n"
+        #        f"| w1 : {w1.shape} {w1.dtype} \n"
+        #        f"| w2k : {w2.shape} {w2.dtype} \n"
+        #        f"| activation : {activation} \n")
+        #if a1q_scale:
+        #    debug += f"| a1q_scale : {a1q_scale.shape} {a1q_scale.dtype} \n"
+        #print (debug)
 
         for expert in range(num_local_experts):  # num_experts
             num = expert_num_tokens[expert]
             assert num <= max_num_tokens
             if num > 0:
+                #tmp = _resize_cache(workspace2, (num, w1.shape[1] // 2))
+                #self.activation(activation, tmp, hidden_states[expert,:num,:] @ w1[expert].transpose(0, 1))
+                #out[expert, :num, :] = tmp @ w2[expert].transpose(0, 1)
+
                 tmp = _resize_cache(workspace2, (num, w1.shape[1] // 2))
-                self.activation(activation, tmp, hidden_states[expert,:num,:] @ w1[expert].transpose(0, 1))
-                out[expert, :num, :] = tmp @ w2[expert].transpose(0, 1)
+                tmp = tmp.to(dtype=torch.float32)
+                mm1 = hidden_states[expert,:num,:].to(dtype=torch.float32) @ w1[expert].transpose(0, 1).to(dtype=torch.float32)
+
+                self.activation(activation, tmp, mm1)
+
+                mm2 = tmp @ w2[expert].transpose(0, 1).to(dtype=torch.float32)
+                out[expert, :num, :] = mm2.to(dtype = out.dtype)
+
+                #out[expert, :num, :] = hidden_states[expert, :num, :]
+
                 # fill remainder with 0???
                 #out[expert, num:, :].fill_(0)
             else:

@@ -153,6 +153,22 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                         expert_token_from[expert_idx].append((i_rank, token_idx))
         #######
 
+        #print (f"a2a : ws {self.a2a.world_size} | ds {self.a2a.dp_size} | max_num_tokens {self.a2a.max_num_tokens} | rank {self.a2a.rank} | num_experts {self.a2a.num_experts} | experts_per_token {self.a2a.experts_per_token}")
+        #print (f"topk indices {indices}")
+        #print (f"doing quant {self.quant_dtype} ")
+
+        #a1q_decoy = torch.empty_like(a1q, device = a1q.device, dtype=a1q.dtype)
+        #for i in range(num_tokens):
+        #    a1q_decoy[i, :].fill_(i)
+        #a1q_scale_decoy = None
+        #if a1q_scale:
+        #    a1q_scale_decoy = torch.ones_like(a1q_scale, device=a1_scale.device, dtype = a1_scale.dtype)
+
+        #a1q = a1q_decoy
+        #a1q_scale = a1q_scale_decoy
+
+        #print (f"a1q_decoy {a1q_decoy}")
+
         self.a2a.dispatch(
             out_expert_num_tokens=expert_num_tokens,
             out_expert_x=expert_x,
@@ -162,6 +178,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
             indices=indices,
             bound_m=bound_m,
         )
+
 
         logger.debug(f"GOT HERE E {self.rank}")
 
@@ -198,6 +215,8 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
 
         logger.debug(f"DISPATCH DONE {self.rank}")
 
+        #print (f"expert_x {expert_x.shape} | expert_x_scale {expert_x_scale.shape} | expert_num_tokens {expert_num_tokens.shape}")
+
         return expert_x, expert_x_scale, expert_num_tokens
 
     def combine(
@@ -223,10 +242,21 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         assert output.shape[0] <= self.max_num_tokens
         assert output.shape[1] == fused_expert_output.shape[-1]
 
+        #topk_weights_decoy = torch.ones_like(topk_weights, device=topk_weights.device, dtype=topk_weights.dtype)
+        #topk_weights = topk_weights_decoy
+        #output.fill_(0)
+
         self.a2a.combine(out_tokens=output,
                          indices=topk_ids.to(torch.uint32),
                          weights=topk_weights,
                          expert_y=fused_expert_output,
                          bound_m=bound_m)
+
+        #if fused_expert_output.shape[0] == 6:
+        #if self.rank == 0:
+        #    print (f"combine fused expert output : {fused_expert_output}")
+        #    print (f"combine output : {output}")
+
+        #print (output)
 
         logger.debug(f"COMBINE END {self.rank}")

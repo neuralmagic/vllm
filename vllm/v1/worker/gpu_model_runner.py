@@ -1378,6 +1378,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens: int,
     ) -> torch.Tensor:
 
+        print (f"Triggering dummybatch execute {num_tokens}")
+
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.

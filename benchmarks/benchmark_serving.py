@@ -28,6 +28,7 @@ import os
 import random
 import time
 import warnings
+import pickle
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -260,6 +261,7 @@ async def benchmark(
     goodput_config_dict: dict[str, float],
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
+    pickle_output_file: Optional[str],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -388,6 +390,11 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+
+    if pickle_output_file:
+        with open(pickle_output_file, "wb+") as f:
+            pickle.dump(outputs, f)
+
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -678,6 +685,7 @@ def main(args: argparse.Namespace):
             goodput_config_dict=goodput_config_dict,
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
+            pickle_output_file=args.pickle_output_file,
         ))
 
     # Save config and results to json
@@ -1024,6 +1032,11 @@ if __name__ == "__main__":
                         help="A subset of LoRA module names passed in when "
                         "launching the server. For each request, the "
                         "script chooses a LoRA module at random.")
+
+    parser.add_argument("--pickle-output-file",
+                        default=None,
+                        type=str,
+                        help="Path to the output file")
 
     args = parser.parse_args()
 
