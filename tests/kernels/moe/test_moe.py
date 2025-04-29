@@ -15,8 +15,7 @@ from tests.kernels.utils import (opcheck, stack_and_dev, torch_moe,
                                  torch_moe_single)
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_moe
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    fused_topk, moe_align_block_size)
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.moe_torch_iterative import (
     fused_moe as iterative_moe)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
@@ -26,7 +25,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.models.mixtral import MixtralMoE
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.model_executor.layers.activation import SiluAndMul
 
 NUM_EXPERTS = [8, 64]
 EP_SIZE = [1, 4]
