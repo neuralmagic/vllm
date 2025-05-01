@@ -303,7 +303,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_group_quant = weight_quant.strategy == QuantizationStrategy.GROUP.value
         is_group_size_16 = weight_quant.group_size == 16
         is_float_type = weight_quant.type == QuantizationType.FLOAT
-        is_4_bits = weight_quant.num_bits == 8
+        is_4_bits = weight_quant.num_bits == 4
         return is_group_quant and is_float_type and is_4_bits
 
     def _is_wNa16_group_channel(self, weight_quant: BaseModel,

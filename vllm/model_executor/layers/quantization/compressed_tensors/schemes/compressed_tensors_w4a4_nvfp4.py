@@ -37,8 +37,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         weight = ModelWeightParameter(
             data=torch.empty(
                 # 2 fp4 items are packed in the input dimension
-                layer.output_size_per_partition,
-                layer.input_size_per_partition // 2,
+                sum(output_partition_sizes),
+                input_size_per_partition // 2,
                 dtype=torch.uint8),
             input_dim=1,
             output_dim=0,
@@ -53,7 +53,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
         # Per Group Weight Scale
         weight_scale = GroupQuantScaleParameter(data=torch.empty(
-            output_size_per_partition,
+            sum(output_partition_sizes),
             input_size_per_partition // self.group_size,
             dtype=torch.float8_e4m3fn,
         ),
