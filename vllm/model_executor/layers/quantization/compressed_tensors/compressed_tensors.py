@@ -24,7 +24,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     W4A16SPARSE24_SUPPORTED_BITS, WNA16_SUPPORTED_BITS, CompressedTensors24,
     CompressedTensorsScheme, CompressedTensorsW4A16Sparse24,
     CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8,
-    CompressedTensorsW8A16Fp8, CompressedTensorsWNA16)
+    CompressedTensorsW8A16Fp8, CompressedTensorsWNA16, CompressedTensorsW4A4Fp4)
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target, is_activation_quantization_format,
     should_ignore_layer)
@@ -299,6 +299,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         # All conditions satisfied.
         return True
 
+    def _is_fp4_nvfp4(self, weight_quant: BaseModel, input_quant: BaseModel):
+        is_group_quant = weight_quant.strategy == QuantizationStrategy.GROUP.value
+        is_group_size_16 = weight_quant.group_size == 16
+        is_float_type = weight_quant.type == QuantizationType.FLOAT
+        is_4_bits = weight_quant.num_bits == 8
+        return is_group_quant and is_float_type and is_4_bits
+
     def _is_wNa16_group_channel(self, weight_quant: BaseModel,
                                 input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
@@ -313,6 +320,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             self, weight_quant: BaseModel,
             input_quant: BaseModel) -> "CompressedTensorsScheme":
 
+        if self._is_fp4_nvfp4(weight_quant, input_quant):
+            return CompressedTensorsW4A4Fp4()
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if (self.quant_format == CompressionFormat.marlin_24.value

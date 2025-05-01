@@ -16,5 +16,5 @@ __all__ = [
     "CompressedTensorsW8A16Fp8", "CompressedTensorsW4A16Sparse24",
     "CompressedTensorsW8A8Int8", "CompressedTensorsW8A8Fp8",
     "WNA16_SUPPORTED_BITS", "W4A16SPARSE24_SUPPORTED_BITS",
-    "CompressedTensors24"
+    "CompressedTensors24", "CompressedTensorsW4A4Fp4"
 ]

@@ -8,11 +8,12 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme)
 from torch.nn.parameter import Parameter
 from vllm.model_executor.parameter import (ModelWeightParameter,
-                                           PerTensorScaleParamete, GroupQuantScaleParameter)
+                                           PerTensorScaleParameter, GroupQuantScaleParameter)
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     dequantize_to_dtype
 )
+import torch.nn.functional as F 
 
 __all__ = ["CompressedTensorsW4A4Fp4"]
 
@@ -25,11 +26,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
     def get_min_capability(cls) -> int:
         # dont restrict as emulations
         return 80
-
-    def process_weights_after_loading(self, layer) -> None:
-        weight_global_scale = layer.weight_global_scale.max().to(torch.float32)
-        layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
-
+    
     def create_weights(self, layer: torch.nn.Module,
                        output_partition_sizes: List[int],
                        input_size_per_partition: int,
@@ -48,12 +45,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             weight_loader=weight_loader)
         layer.register_parameter("weight_packed", weight)
 
-        # Input Scale
-        input_scale = PerTensorScaleParameter(data=torch.empty(
-            len(output_partition_sizes), dtype=torch.float32),
-                                              weight_loader=weight_loader)
-        layer.register_parameter("input_scale", input_scale)
-
         # Global Weight Scale
         weight_global_scale = PerTensorScaleParameter(data=torch.empty(
             len(output_partition_sizes), dtype=torch.float32),
@@ -63,14 +54,18 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         # Per Group Weight Scale
         weight_scale = GroupQuantScaleParameter(data=torch.empty(
             output_size_per_partition,
-            input_size_per_partition // group_size,
-            dtype=weight_dtype,
+            input_size_per_partition // self.group_size,
+            dtype=torch.float8_e4m3fn,
         ),
                                             input_dim=1,
                                             output_dim=0,
                                             weight_loader=weight_loader)
 
         layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer) -> None:
+        weight_global_scale = layer.weight_global_scale.max().to(torch.float32)
+        layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
 
     def apply_weights(self,
                       layer: torch.nn.Module,
