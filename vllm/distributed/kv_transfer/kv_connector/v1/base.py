@@ -22,7 +22,6 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -52,7 +51,7 @@ class KVTransferParams:
     """
     Abstract KVTransferParams used to send KVTransfer
     parameters between instances of vLLM.
-    
+
     Specific instances of KVConnector customize this
     method for serializing / deserializing msgs sent
     via the HTTP protocol.
@@ -65,7 +64,6 @@ class KVTransferParams:
         return None
 
 
-@dataclass
 class KVConnectorMetadata:
     """
     Abstract Metadata used to communicate between the
@@ -236,7 +234,7 @@ class KVConnectorBase_V1(ABC):
                 computed tokens for this request
 
         Returns:
-            * the number of tokens that can be loaded from the 
+            * the number of tokens that can be loaded from the
               external KV cache beyond what is already computed.
             * true if external KV cache tokens will be loaded
               asynchronously (between scheduler steps).
