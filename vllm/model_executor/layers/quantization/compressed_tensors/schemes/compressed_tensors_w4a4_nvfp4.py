@@ -63,9 +63,38 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
         layer.register_parameter("weight_scale", weight_scale)
 
+    def swizzle_blockscale(self, scale: torch.tensor):
+        assert (scale.dtype == torch.float8_e4m3fn)
+        # Pad and blockwise interleave weight_scale
+        scale_ndim = scale.ndim
+        if scale.ndim == 2:
+            scale = scale.unsqueeze(0)
+        assert scale.ndim == 3
+        B, M, K = scale.shape
+        round_up_multiple = lambda x, m: (x + m - 1) // m * m
+        M_padded = round_up_multiple(M, 128)
+        K_padded = round_up_multiple(K, 4)
+        padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
+        padded_scale[:B, :M, :K] = scale
+        batches, rows, cols = padded_scale.shape
+        assert rows % 128 == 0
+        assert cols % 4 == 0
+        padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32,
+                                            cols // 4, 4)
+        swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
+        swizzled_scale = swizzled_scale.contiguous().cuda()
+        return (swizzled_scale.reshape(M, K)
+                if scale_ndim == 2 else swizzled_scale.reshape(B, M, K))
+
     def process_weights_after_loading(self, layer) -> None:
         weight_global_scale = layer.weight_global_scale.max().to(torch.float32)
         layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
+
+        # Note: a post weight loading step but not required for the emulation
+        swizzled_weight_scale = self.swizzle_blockscale(layer.weight_scale)
+
+        layer.weight_scale_swizzled = Parameter(swizzled_weight_scale,
+                                                requires_grad=False)
 
     def apply_weights(self,
                       layer: torch.nn.Module,
@@ -74,10 +103,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
 
         w_fp4 = layer.weight_packed.data
-        w_blockscale = layer.weight_scale
         w_global_scale = layer.weight_global_scale
+        w_blockscale = layer.weight_scale_swizzled.data
         w_dq = dequantize_to_dtype(w_fp4, w_blockscale, w_global_scale,
                                    x.dtype, x.device, self.group_size)
 
-        return F.linear(x, w_dq)
+        out = F.linear(x, w_dq)
+        del w_dq 
+        return out
 
