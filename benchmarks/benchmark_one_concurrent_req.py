@@ -10,7 +10,13 @@ from typing import Optional
 import aiohttp  # Import aiohttp
 import numpy as np
 from backend_request_func import RequestFuncInput, RequestFuncOutput
+from benchmark_dataset import RandomDataset, SampleRequest
 from tqdm import tqdm
+
+try:
+    from vllm.transformers_utils.tokenizer import get_tokenizer
+except ImportError:
+    from backend_request_func import get_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +38,6 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
-
-
-@dataclass
-class SampleRequest:
-    prompt: str
-    prompt_len: int
-    expected_output_len: Optional[int] = None
 
 
 async def reset_cache(reset_url: str):
@@ -74,30 +73,6 @@ async def sequential_benchmark(
     Benchmark that processes requests sequentially, waiting for each to complete
     before starting the next one. Resets prefix cache between requests.
     """
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len = (
-        input_requests[0].prompt,
-        input_requests[0].prompt_len,
-        input_requests[0].expected_output_len,
-    )
-
-    test_input = RequestFuncInput(
-        model=model_id,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-    )
-
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please check your configuration. "
-            "Error: {test_output.error}")
-    else:
-        print("Initial test run completed. Starting sequential benchmark...")
-
-    benchmark_start_time = time.perf_counter()
     outputs = []
 
     pbar = tqdm(total=len(input_requests))
@@ -112,10 +87,19 @@ async def sequential_benchmark(
         output_len=1,
     )
 
+    print("Starting initial single prompt test run...")
+    test_output = await request_func(request_func_input=dummy_req_input)
+    if not test_output.success:
+        raise ValueError(
+            "Initial test run failed - Please check your configuration. "
+            "Error: %s", test_output.error)
+    else:
+        print("Initial test run completed. Starting sequential benchmark...")
+
+    benchmark_start_time = time.perf_counter()
+
     # Process requests sequentially
-    for i, request in enumerate(
-            input_requests
-    ):  # Added enumerate to potentially skip reset for the last request
+    for request in input_requests:
         prompt, prompt_len, output_len = (request.prompt, request.prompt_len,
                                           request.expected_output_len)
 
@@ -297,15 +281,6 @@ async def main_async(args):
     # Import needed functions based on your setup
     from backend_request_func import ASYNC_REQUEST_FUNCS
 
-    try:
-        from vllm.transformers_utils.tokenizer import get_tokenizer
-    except ImportError:
-        # Fallback if vllm is not installed
-        from transformers import AutoTokenizer
-
-        def get_tokenizer(tokenizer_name: str, **kwargs):
-            return AutoTokenizer.from_pretrained(tokenizer_name, **kwargs)
-
     backend = args.backend
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
@@ -330,16 +305,14 @@ async def main_async(args):
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    input_requests: list[SampleRequest] = []
-    print(f"Generating {args.num_requests} random text prompts with input "
-          f"length {args.input_len}...")
-    for _ in range(args.num_requests):
-        prompt = ''.join(
-            random.choices('abcdefghijklmnopqrstuvwxyz ', k=args.input_len))
-        input_requests.append(
-            SampleRequest(prompt=prompt,
-                          prompt_len=args.input_len,
-                          expected_output_len=args.output_len))
+    input_requests = RandomDataset().sample(
+        tokenizer=tokenizer,
+        num_requests=args.num_requests,
+        prefix_len=0,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        range_ratio=0.0,
+    )
 
     # Run benchmark
     result = await sequential_benchmark(
