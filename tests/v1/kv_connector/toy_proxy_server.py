@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import asyncio
 import itertools
 import os
 import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.logger import init_logger
 
@@ -153,6 +154,7 @@ async def send_request_to_service(client_info: dict, endpoint: str,
     req_data = req_data.copy()
     req_data['do_remote_decode'] = True
     req_data["stream"] = False
+    del req_data["stream_options"]
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id
@@ -191,6 +193,70 @@ async def stream_service_response(client_info: dict, endpoint: str,
         response.raise_for_status()
         async for chunk in response.aiter_bytes():
             yield chunk
+
+
+async def _forward_reset_cache(client_session: httpx.AsyncClient, host: str,
+                               port: int) -> dict:
+    target_url = f"http://{host}:{port}/reset_prefix_cache"
+
+    try:
+        response: httpx.Response = await client_session.post(target_url,
+                                                             timeout=5.0)
+
+        return {
+            "status_code": response.status_code,
+            "error_type": None,
+            "error_message": None,
+        }
+    except Exception as e:
+        logger.error("Exception occurred sending POST to %s: %s - %s",
+                     target_url, e.__class__.__name__, str(e))
+        return {
+            "status_code": None,
+            "error_type": e.__class__.__name__,
+            "error_message": str(e),
+        }
+
+
+@app.post("/reset_prefix_cache")
+async def reset_prefix_cache_on_all_servers(request: Request):
+    """
+    Forwards a reset_prefix_cache request to all prefill and decode servers.
+    """
+    tasks = []
+
+    def add_reset_tasks_for_servers(server_list):
+        for server_info in server_list:
+            tasks.append(
+                _forward_reset_cache(server_info['client'],
+                                     server_info['host'], server_info['port']))
+
+    add_reset_tasks_for_servers(request.app.state.prefill_clients)
+    add_reset_tasks_for_servers(request.app.state.decode_clients)
+
+    if not tasks:
+        return JSONResponse(content={
+            "message":
+            "No prefill or decode servers configured to reset."
+        },
+                            status_code=200)
+
+    all_results = await asyncio.gather(*tasks)
+
+    num_prefill_servers = len(request.app.state.prefill_clients)
+    prefill_server_results = all_results[:num_prefill_servers]
+    decode_server_results = all_results[num_prefill_servers:]
+
+    response_data = {
+        "message":
+        "Simple POST /reset_prefix_cache command forwarded to P/D workers.",
+        "prefill_servers_status": prefill_server_results,
+        "decode_servers_status": decode_server_results
+    }
+    all_downstream_ok = all(
+        result.get("error_type") is None for result in all_results)
+    status_code = 200 if all_downstream_ok else 207  # 207 Multi-Status
+    return JSONResponse(content=response_data, status_code=status_code)
 
 
 @app.post("/v1/completions")
@@ -236,14 +302,7 @@ async def handle_completions(request: Request):
                                  media_type="application/json")
 
     except Exception as e:
-        import sys
-        import traceback
-        exc_info = sys.exc_info()
-        print("Error occurred in disagg prefill proxy server"
-              " - completions endpoint")
-        print(e)
-        print("".join(traceback.format_exception(*exc_info)))
-        raise
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/healthcheck")
