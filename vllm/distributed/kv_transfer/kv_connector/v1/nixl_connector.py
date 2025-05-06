@@ -195,7 +195,6 @@ class NixlConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        # TODO ignored scheduler for now, I think this ds could be moved at some point
         meta = NixlConnectorMetadata()
 
         # Loop through scheduled reqs and convert to ReqMeta.
@@ -239,7 +238,7 @@ class NixlConnectorWorker:
         self.kv_caches: dict[str, torch.Tensor] = {}
 
         # Map of engine_id -> kv_caches_base_addr
-        self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = {}
+        self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = defaultdict(dict)
 
         # Number of NIXL regions. Currently one region per cache
         # (so 1 per layer for MLA, otherwise 2 per layer)
@@ -367,7 +366,7 @@ class NixlConnectorWorker:
         
         # TODO should we skip this if remote world_size == world_size (homogeneous)? 
         # Iterate over all other remote ranks to handshake with.
-        for rank_j in range(1, self._tp_size[metadata.tp_size]):
+        for rank_j in range(1, metadata.tp_size):
             path = f"tcp://{host}:{port + rank_j}"
             logger.debug("Querying metadata on path: %s", path)
             with zmq_ctx(zmq.REQ, path) as sock:
@@ -437,7 +436,7 @@ class NixlConnectorWorker:
         metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
-            kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
+            kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.rank],
             num_blocks=self.num_blocks,
             tp_size=self.world_size
         )
@@ -483,7 +482,7 @@ class NixlConnectorWorker:
 
         # Create dst descs and xfer side handles.
         # TODO likely dont need 'remote_rank' indexing, as ALL tp workers have same num blocks right?
-        if engine_id in self.dst_num_blocks[engine_id]:
+        if engine_id in self.dst_num_blocks:
             assert self.dst_num_blocks[engine_id] == nixl_agent_meta.num_blocks
 
         self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
