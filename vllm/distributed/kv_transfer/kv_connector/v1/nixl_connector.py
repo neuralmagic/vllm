@@ -52,6 +52,7 @@ class NixlAgentMetadata(
     agent_metadata: bytes
     kv_caches_base_addr: list[int]
     num_blocks: int
+    tp_size: int
 
 
 @dataclass
@@ -232,6 +233,7 @@ class NixlConnectorWorker:
         self.world_size = get_tensor_model_parallel_world_size()
         self.tp_group = get_tp_group()
 
+        # Remote tracking ds only contain one entry for own tp group: engine_id-self.rank 
         # KV Caches and nixl tracking data.
         self.kv_caches: dict[str, torch.Tensor] = {}
 
@@ -248,7 +250,7 @@ class NixlConnectorWorker:
         self.dst_xfer_side_handles: dict[str, dict[int, int]] = defaultdict(dict)
 
         # Map of engine_id -> num_blocks.
-        self.dst_num_blocks: dict[str, int] = {}
+        self.dst_num_blocks: dict[str, dict[int, int]] = defaultdict(dict)
         self._registered_descs: list[Any] = []
 
         # In progress transfers.
@@ -283,11 +285,13 @@ class NixlConnectorWorker:
         
         # Used to skip extra NIXL handshakes
         self.is_homogenous_tp = kv_config.kv_producers_tensor_parallel_size == kv_config.kv_consumers_tensor_parallel_size
-        if self.world_size == kv_config.kv_producers_tensor_parallel_size:
-            # TODO better name
-            self._other_world_size = kv_config.kv_consumers_tensor_parallel_size
-        else:
-            self._other_world_size = kv_config.kv_producers_tensor_parallel_size
+        # if self.world_size == kv_config.kv_producers_tensor_parallel_size:
+        # TODO we cant know this because it is spawned in a separate process with some other --tp value so we have to discover.
+        # Every instance may have a different number of tp workers.
+        # we can relax this right now and assume all instances are passed world size info from cli
+        # TODO what we can do is have current rank respond with own world size. Then client rank will broadcast world_size of other  
+        self._tp_size = {self.engine_id: self.world_size}
+        # kv end to local ranks. Or we can have only rank0 of both producer/consumer synch up on said value. Auto-scaling needs a refresh.
 
     @staticmethod
     def _nixl_handshake_listener(metadata: NixlAgentMetadata,
@@ -333,32 +337,41 @@ class NixlConnectorWorker:
         # a hack to keep us moving. We will switch when moving to etcd
         # or where we have a single ZMQ socket in the scheduler.
         # TODO Can we have a fixed number of remote ranks we handshake with? 
-        # Eg with tp multiplier rank0<==>rrank0,1 | rank1<==>rrank2,3 ... 
-        # iterate over all ranks to handshake with M.
-        for rank_j in range(self._other_world_size):
-            rank_j = self.rank if self.is_homogenous_tp else rank_j
+        # Ow we could have rank0 send all metadata in a batch.
+
+        def handshake(sock, rank: int)->NixlAgentMetadata:
+            # Send query for the request.
+            sock.send(GET_META_MSG)
+            metadata_bytes = sock.recv()
+            decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
+            metadata = decoder.decode(metadata_bytes)
+            got_metadata_time = time.perf_counter()
+
+            # Register Remote agent.
+            self.add_remote_agent(metadata, rank)
+            setup_agent_time = time.perf_counter()
+
+            logger.debug("NIXL handshake: get metadata took: %s",
+                        got_metadata_time - start_time)
+            logger.debug("NIXL handshake: add agent took: %s",
+                        setup_agent_time - got_metadata_time)
+            return metadata
+
+        # Handshake with remote agent-rank0 first to get the tp_size of remote  
+        path = f"tcp://{host}:{port}"
+        logger.debug("Querying master rank metadata on path: %s", path)
+        with zmq_ctx(zmq.REQ, path) as sock:
+           metadata = handshake(sock, 0)
+        
+        # TODO should we skip this if remote world_size == world_size (homogeneous)? 
+        # Iterate over all other remote ranks to handshake with.
+        for rank_j in range(1, self._tp_size[metadata.tp_size]):
             path = f"tcp://{host}:{port + rank_j}"
             logger.debug("Querying metadata on path: %s", path)
             with zmq_ctx(zmq.REQ, path) as sock:
-                # Send query for the request.
-                sock.send(GET_META_MSG)
-                metadata_bytes = sock.recv()
-                decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-                metadata = decoder.decode(metadata_bytes)
-                got_metadata_time = time.perf_counter()
+               metadata = handshake(sock, rank_j)
+                
 
-                # Register Remote agent.
-                self.add_remote_agent(metadata, rank_j)
-                setup_agent_time = time.perf_counter()
-
-                logger.debug("NIXL handshake: get metadata took: %s",
-                            got_metadata_time - start_time)
-                logger.debug("NIXL handshake: add agent took: %s",
-                            setup_agent_time - got_metadata_time)
-
-            # Cut it short for homogenous tp and only record one remote rank
-            if self.is_homogenous_tp:
-                break
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
@@ -388,7 +401,7 @@ class NixlConnectorWorker:
         logger.debug("num_blocks: %s, block_shape: %s", self.num_blocks,
                      block_shape)
         logger.debug("Per layer kv cache size: %s", first_kv_cache.shape)
-        self.dst_num_blocks[self.engine_id] = self.num_blocks
+        self.dst_num_blocks[self.engine_id][self.rank] = self.num_blocks
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
         caches_data = []
@@ -424,6 +437,7 @@ class NixlConnectorWorker:
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
             num_blocks=self.num_blocks,
+            tp_size=self.world_size
         )
         ready_event = threading.Event()
         self._nixl_handshake_listener_t = threading.Thread(
@@ -439,6 +453,9 @@ class NixlConnectorWorker:
         if engine_id in self._remote_agents:
             return
 
+        if engine_id in self._tp_size:
+            assert self._tp_size[engine_id] == nixl_agent_meta.tp_size
+        self._tp_size[engine_id] = nixl_agent_meta.tp_size
         self._remote_agents[engine_id][remote_rank] = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata)
         self.kv_caches_base_addr[
@@ -462,7 +479,7 @@ class NixlConnectorWorker:
                 "NIXL_INIT_AGENT", descs)
 
         # Create dst descs and xfer side handles.
-        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+        self.dst_num_blocks[engine_id][remote_rank] = nixl_agent_meta.num_blocks
         blocks_data = []
         for base_addr in self.kv_caches_base_addr[engine_id][remote_rank]:
             for block_id in range(nixl_agent_meta.num_blocks):
