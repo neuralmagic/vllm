@@ -88,11 +88,30 @@ async def sequential_benchmark(
     )
 
     print("Starting initial single prompt test run...")
-    test_output = await request_func(request_func_input=dummy_req_input)
+
+    # NOTE(tms): With this initial test run we see logs like this:
+    # WARNING 05-06 23:36:44 [block_pool.py:283] Failed to reset prefix cache because some blocks (52) are not freed yet # noqa
+    # This doesn't happen if we use input_requests[1], I think because it's
+    # 0 then the same prompt runs twice
+    test_prompt, test_prompt_len, test_output_len = (
+        input_requests[0].prompt,
+        input_requests[0].prompt_len,
+        input_requests[0].expected_output_len,
+    )
+
+    test_input = RequestFuncInput(
+        model=model_id,
+        prompt=test_prompt,
+        api_url=api_url,
+        prompt_len=test_prompt_len,
+        output_len=test_output_len,
+    )
+
+    test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please check your configuration. "
-            "Error: %s", test_output.error)
+            "Error: {test_output.error}")
     else:
         print("Initial test run completed. Starting sequential benchmark...")
 
