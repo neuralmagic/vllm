@@ -52,6 +52,7 @@ class NixlAgentMetadata(
     agent_metadata: bytes
     kv_caches_base_addr: list[int]
     num_blocks: int
+    block_len: int # tp_size dependent 
     tp_size: int
 
 
@@ -438,6 +439,7 @@ class NixlConnectorWorker:
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
             kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.rank],
             num_blocks=self.num_blocks,
+            block_len=self.block_len,
             tp_size=self.world_size
         )
         ready_event = threading.Event()
@@ -489,10 +491,10 @@ class NixlConnectorWorker:
         blocks_data = []
         for base_addr in self.kv_caches_base_addr[engine_id][remote_rank]:
             for block_id in range(nixl_agent_meta.num_blocks):
-                block_offset = block_id * self.block_len
+                block_offset = block_id * nixl_agent_meta.block_len
                 # (addr, len, device id)
                 blocks_data.append(
-                    (base_addr + block_offset, self.block_len, self.rank))
+                    (base_addr + block_offset, nixl_agent_meta.block_len, self.rank)) # TODO remote rank?
         logger.debug("Created %s blocks for dst engine %s with remote rank %s and local rank %s",
                     len(blocks_data), engine_id, remote_rank, self.rank)
 
@@ -637,7 +639,8 @@ class NixlConnectorWorker:
         request_id: str,
     ):
         # TODO right now I am missing the remote rank input: where should I read these blocks from?
-        # should I map remote_block_ids=>remote_rank?
+        # should I map remote_block_ids=>remote_rank? dst_engine is actually unique per rank!
+        print("READ_BLOCKS", remote_block_ids, dst_engine_id)
 
         # NOTE(rob): this takes ~2s. We need to get this off the hotpath.
         if dst_engine_id not in self._remote_agents:
