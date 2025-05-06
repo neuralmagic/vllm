@@ -22,7 +22,6 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -47,7 +46,6 @@ class KVConnectorRole(enum.Enum):
     WORKER = 1
 
 
-@dataclass
 class KVConnectorMetadata:
     pass
 
@@ -61,6 +59,20 @@ class KVConnectorBase_V1(ABC):
         self._connector_metadata = KVConnectorMetadata()
         self._vllm_config = vllm_config
         self._role = role
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """
+        Initialize with the KV caches. Useful for pre-registering the
+        KV Caches in the KVConnector (e.g. for NIXL).
+
+        Args: kv_caches:
+            dictionary of layer names, kv cache
+        """
+        return
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        """Get the finished recving and sending requests."""
+        return set(), set()
 
     @property
     def role(self) -> KVConnectorRole:
@@ -188,6 +200,7 @@ class KVConnectorBase_V1(ABC):
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request",
+                                 block_ids: list[int],
                                  num_external_tokens: int):
         """
         Update KVConnector state after block allocation.
