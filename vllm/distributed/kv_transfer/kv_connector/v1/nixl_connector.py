@@ -195,6 +195,7 @@ class NixlConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
+        # TODO ignored scheduler for now, I think this ds could be moved at some point
         meta = NixlConnectorMetadata()
 
         # Loop through scheduled reqs and convert to ReqMeta.
@@ -462,6 +463,7 @@ class NixlConnectorWorker:
             engine_id][remote_rank] = nixl_agent_meta.kv_caches_base_addr
 
         # Create src descs and xfer side handles. Local block descr only contains own rank.
+        # TODO we could pull this out if it has nothing to do with remote
         if self.src_xfer_side_handle < 0:
             blocks_data = []
             for base_addr in self.kv_caches_base_addr[self.engine_id][self.rank]:
@@ -479,6 +481,7 @@ class NixlConnectorWorker:
                 "NIXL_INIT_AGENT", descs)
 
         # Create dst descs and xfer side handles.
+        # TODO likely dont need 'remote_rank' indexing, as ALL tp workers have same num blocks right?
         self.dst_num_blocks[engine_id][remote_rank] = nixl_agent_meta.num_blocks
         blocks_data = []
         for base_addr in self.kv_caches_base_addr[engine_id][remote_rank]:
@@ -630,6 +633,9 @@ class NixlConnectorWorker:
         dst_engine_id: str,
         request_id: str,
     ):
+        # TODO right now I am missing the remote rank input: where should I read these blocks from?
+        # should I map remote_block_ids=>remote_rank?
+
         # NOTE(rob): this takes ~2s. We need to get this off the hotpath.
         if dst_engine_id not in self._remote_agents:
             self._nixl_handshake(remote_host, remote_port)
