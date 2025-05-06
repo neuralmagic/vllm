@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.logger import init_logger
@@ -303,7 +303,14 @@ async def handle_completions(request: Request):
                                  media_type="application/json")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        import sys
+        import traceback
+        exc_info = sys.exc_info()
+        print("Error occurred in disagg prefill proxy server"
+              " - completions endpoint")
+        print(e)
+        print("".join(traceback.format_exception(*exc_info)))
+        raise
 
 
 @app.get("/healthcheck")
