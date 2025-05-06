@@ -3442,6 +3442,10 @@ class KVTransferConfig(BaseModel):
     # any extra config that the connector may need
     kv_connector_extra_config: dict[str, Any] = {}
 
+    kv_producers_tensor_parallel_size: Optional[int] = None
+    kv_consumers_tensor_parallel_size: Optional[int] = None
+
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
