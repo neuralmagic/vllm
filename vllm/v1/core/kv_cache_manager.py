@@ -178,7 +178,7 @@ class KVCacheManager:
                 prefix caching.
             num_lookahead_tokens: The number of speculative tokens to allocate.
                 This is used by spec decode proposers with kv-cache such
-                as eagle.
+                as eagle. 
             skip_cache_blocks: Whether to skip caching the blocks. This is
                 used by P/D when allocating blocks used in a KV transfer
                 which will complete in a future step.
@@ -271,13 +271,9 @@ class KVCacheManager:
         if not self.enable_caching:
             return new_blocks
 
+        # For disaggregated, avoid caching until KVs are recved.
         if skip_cache_blocks:
-            # NOTE(rob): this assert is valid because we only call
-            # skip_cache_blocks=True on the first time of WAITING
-            # during a P/D setup.
             assert request.request_id not in self.num_cached_block
-            # NOTE(rob): this is necessary so we don't double
-            # cache a block after is has finished recving.
             self.num_cached_block[request.request_id] = len(
                 new_computed_blocks)
             return new_blocks
@@ -306,8 +302,7 @@ class KVCacheManager:
         # for a running request.
         num_cached_blocks = self.num_cached_block.get(request.request_id,
                                                       len(new_computed_blocks))
-
-        # Speculated tokens might be rejected in the future, so we do
+        # Speculated tokens might be rejected in the future, so we does
         # not cache any speculated tokens. We only cache blocks with
         # generated (accepted) tokens.
         num_full_blocks_after_append = (num_computed_tokens + num_tokens - len(
