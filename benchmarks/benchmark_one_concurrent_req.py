@@ -102,6 +102,16 @@ async def sequential_benchmark(
 
     pbar = tqdm(total=len(input_requests))
 
+    # Small request to force a forward pass.
+    # Used for resetting the prefix cache.
+    dummy_req_input = RequestFuncInput(
+        model=model_id,
+        prompt="0",
+        api_url=api_url,
+        prompt_len=1,
+        output_len=1,
+    )
+
     # Process requests sequentially
     for i, request in enumerate(
             input_requests
@@ -134,6 +144,7 @@ async def sequential_benchmark(
 
         # Reset prefix cache if configured, except after the very last request
         if cache_reset_url:
+            await request_func(request_func_input=dummy_req_input)
             await reset_cache(cache_reset_url)
 
     pbar.close()
