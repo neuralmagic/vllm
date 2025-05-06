@@ -250,8 +250,9 @@ class NixlConnectorWorker:
         # Map of engine_id -> nixl_prepped_dlist_handle (int)].
         self.dst_xfer_side_handles: dict[str, dict[int, int]] = defaultdict(dict)
 
-        # Map of engine_id -> num_blocks.
-        self.dst_num_blocks: dict[str, dict[int, int]] = defaultdict(dict)
+        # Map of engine_id -> num_blocks. Remote TP ranks will have the same
+        # amount of blocks.
+        self.dst_num_blocks: dict[str, int] = dict()
         self._registered_descs: list[Any] = []
 
         # In progress transfers.
@@ -402,7 +403,7 @@ class NixlConnectorWorker:
         logger.debug("num_blocks: %s, block_shape: %s", self.num_blocks,
                      block_shape)
         logger.debug("Per layer kv cache size: %s", first_kv_cache.shape)
-        self.dst_num_blocks[self.engine_id][self.rank] = self.num_blocks
+        self.dst_num_blocks[self.engine_id] = self.num_blocks
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
         caches_data = []
@@ -482,7 +483,10 @@ class NixlConnectorWorker:
 
         # Create dst descs and xfer side handles.
         # TODO likely dont need 'remote_rank' indexing, as ALL tp workers have same num blocks right?
-        self.dst_num_blocks[engine_id][remote_rank] = nixl_agent_meta.num_blocks
+        if engine_id in self.dst_num_blocks[engine_id]:
+            assert self.dst_num_blocks[engine_id] == nixl_agent_meta.num_blocks
+
+        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
         blocks_data = []
         for base_addr in self.kv_caches_base_addr[engine_id][remote_rank]:
             for block_id in range(nixl_agent_meta.num_blocks):
@@ -491,7 +495,7 @@ class NixlConnectorWorker:
                 blocks_data.append(
                     (base_addr + block_offset, self.block_len, self.rank))
         logger.debug("Created %s blocks for dst engine %s with remote rank %s and local rank %s",
-                     len(blocks_data), engine_id, remote_rank, self.rank)
+                    len(blocks_data), engine_id, remote_rank, self.rank)
 
         # Register with NIXL.
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
