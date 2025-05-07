@@ -325,8 +325,9 @@ def pplx_dispatch_combine(pgi, dp_size, a, topk_weight, topk_ids, num_experts):
         ata,
         max_num_tokens,
         world_size,
-        dp_size,
         rank,
+        dp_size,
+        a.dtype,
     )
 
     a_chunk = chunk_by_rank(a, rank, world_size).to(device)
@@ -459,8 +460,8 @@ def pplx_moe(pgi, dp_size, a, w1, w2, topk_weight, topk_ids):
         ata,
         max_num_tokens,
         world_size,
-        dp_size,
         rank,
+        dp_size,
     )
 
     experts = BatchedExperts(a.shape[0])
