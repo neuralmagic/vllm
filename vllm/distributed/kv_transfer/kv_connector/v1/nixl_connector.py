@@ -237,9 +237,9 @@ class NixlConnectorWorker:
         # KV Caches and nixl tracking data.
         self.kv_caches: dict[str, torch.Tensor] = {}
 
-        # Map of engine_id -> kv_caches_base_addr. For TP case, the structure 
-        # is still flat. 
-        self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = defaultdict(dict)
+        # Map of engine_id -> kv_caches_base_addr. For TP case, each local 
+        # rank will still only pull from a single remote TP worker. 
+        self.kv_caches_base_addr: dict[str, list[int]] = dict()
 
         # Number of NIXL regions. Currently one region per cache
         # (so 1 per layer for MLA, otherwise 2 per layer)
@@ -248,10 +248,10 @@ class NixlConnectorWorker:
         # nixl_prepped_dlist_handle (int).
         self.src_xfer_side_handle: int = -1
         # Map of engine_id -> nixl_prepped_dlist_handle (int)].
-        self.dst_xfer_side_handles: dict[str, dict[int, int]] = defaultdict(dict)
+        self.dst_xfer_side_handles: dict[str, int] = dict()
 
         # Map of engine_id -> num_blocks. Remote TP ranks will have the same
-        # amount of blocks.
+        # number of blocks.
         self.dst_num_blocks: dict[str, int] = dict()
         self._registered_descs: list[Any] = []
 
@@ -270,30 +270,8 @@ class NixlConnectorWorker:
 
         # Background thread for establishing new connections.
         self._nixl_handshake_listener_t: Optional[threading.Thread] = None
-
-        # TODO tp multiplier only works when N/M is a multiple of the other. We can 
-        # refactor later if needs be.
-        if kv_config.kv_producers_tensor_parallel_size is None or kv_config.kv_consumers_tensor_parallel_size is None: 
-            # Ignore unless both are set 
-            kv_config.kv_producers_tensor_parallel_size = self.world_size
-            kv_config.kv_consumers_tensor_parallel_size = self.world_size
-        else:
-            assert kv_config.kv_producers_tensor_parallel_size >= 0 and \
-                kv_config.kv_consumers_tensor_parallel_size >= 0
-            assert (kv_config.kv_producers_tensor_parallel_size % 
-                kv_config.kv_consumers_tensor_parallel_size == 0) or \
-                (kv_config.kv_consumers_tensor_parallel_size % 
-                kv_config.kv_producers_tensor_parallel_size ==0)
         
-        # Used to skip extra NIXL handshakes
-        self.is_homogenous_tp = kv_config.kv_producers_tensor_parallel_size == kv_config.kv_consumers_tensor_parallel_size
-        # if self.world_size == kv_config.kv_producers_tensor_parallel_size:
-        # TODO we cant know this because it is spawned in a separate process with some other --tp value so we have to discover.
-        # Every instance may have a different number of tp workers.
-        # we can relax this right now and assume all instances are passed world size info from cli
-        # TODO what we can do is have current rank respond with own world size. Then client rank will broadcast world_size of other  
         self._tp_size = {self.engine_id: self.world_size}
-        # kv end to local ranks. Or we can have only rank0 of both producer/consumer synch up on said value. Auto-scaling needs a refresh.
 
     @staticmethod
     def _nixl_handshake_listener(metadata: NixlAgentMetadata,
@@ -366,12 +344,15 @@ class NixlConnectorWorker:
            metadata = handshake(sock, 0)
         
         # TODO should we skip this if remote world_size == world_size (homogeneous)? 
-        # Iterate over all other remote ranks to handshake with.
-        for rank_j in range(1, metadata.tp_size):
-            path = f"tcp://{host}:{port + rank_j}"
-            logger.debug("Querying metadata on path: %s", path)
+
+        # Handshake only with the other TP remote the current local rank will 
+        # pull from. With homogeneous TP it happens to be the same rank_i. 
+        p_remote_rank = self.rank % metadata.tp_size
+        if p_remote_rank > 0:
+            path = f"tcp://{host}:{port + p_remote_rank}"
+            logger.debug("Querying metadata on path: %s at remote rank %s", path, p_remote_rank)
             with zmq_ctx(zmq.REQ, path) as sock:
-               metadata = handshake(sock, rank_j)
+                metadata = handshake(sock, p_remote_rank)
                 
 
 
@@ -424,9 +405,11 @@ class NixlConnectorWorker:
                 region_len = self.num_blocks * self.block_len
                 caches_data.append((base_addr, region_len, self.rank, ""))
                 kv_caches_base_addr.append(base_addr)
-        # Own kv_caches will only be indexed by self.rank. Remote kv caches will contain info for all workers.
-        self.kv_caches_base_addr[self.engine_id][self.rank] = kv_caches_base_addr
+        self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
         self.num_regions = len(caches_data)
+        print("************************BLOCKS SETUP")
+        print(f"Number of blocks {len(kv_caches_base_addr)=}\n")
+        print(f"{self.num_blocks=}, {self.block_len=}, {self.num_regions=}\n")
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, "VRAM")
         logger.debug("Registering descs: %s", caches_data)
@@ -439,7 +422,7 @@ class NixlConnectorWorker:
         metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
-            kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id][self.rank],
+            kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
             num_blocks=self.num_blocks,
             tp_size=self.world_size
         )
@@ -454,7 +437,8 @@ class NixlConnectorWorker:
 
     def add_remote_agent(self, nixl_agent_meta: NixlAgentMetadata, remote_rank: int=0):
         engine_id = nixl_agent_meta.engine_id
-        if engine_id in self._remote_agents:
+        # TODO re-evaluate refreshing for scaling/recovery
+        if engine_id in self._remote_agents and remote_rank in self._remote_agents[engine_id]:
             return
 
         if engine_id in self._tp_size:
@@ -462,17 +446,12 @@ class NixlConnectorWorker:
         self._tp_size[engine_id] = nixl_agent_meta.tp_size
         self._remote_agents[engine_id][remote_rank] = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata)
-        self.kv_caches_base_addr[
-            engine_id][remote_rank] = nixl_agent_meta.kv_caches_base_addr
 
-        # Create src descs and xfer side handles. D workers adding remote P's.
-        tp_multiplier = self._tp_size[self.engine_id] // self._tp_size[engine_id]
-        assert tp_multiplier > 0, "Decode TP cannot be smaller than prefill TP"
-        # TODO may not be needed if block_len is already accounting for tp
-        # dst_block_len = self.block_len // tp_multiplier  
+        # Create src descs and xfer side handles.
+        # TODO we could pull this out of remote_agent, only depends on self
         if self.src_xfer_side_handle < 0:
             blocks_data = []
-            for base_addr in self.kv_caches_base_addr[self.engine_id][self.rank]:
+            for base_addr in self.kv_caches_base_addr[self.engine_id]:
                 for block_id in range(self.num_blocks):
                     block_offset = block_id * self.block_len
                     # (addr, len, device id)
@@ -492,18 +471,27 @@ class NixlConnectorWorker:
 
         self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
         blocks_data = []
-        # TODO map only the split belonging to current rank
         # With heterogenous TP, prepare the descriptors by splitting the P KV 
         # cache into chunks of D worker's size (D>P).
-        # Eg. 1P 2D => P KV:[KV_0 | KV_1].  
+        # Eg. 1P 2D => P0 KV:[KV_0 | KV_1] (contiguous view).  
         p_remote_rank = self.rank % nixl_agent_meta.tp_size
         # Only register the remote's descriptor if current rank pulls from it
         if p_remote_rank == remote_rank:
+            self.kv_caches_base_addr[engine_id] = nixl_agent_meta.kv_caches_base_addr
+            # TODO enforce tp sizes are exact multiples
+            d_workers_per_p_worker = self._tp_size[self.engine_id] // self._tp_size[engine_id]
+            assert d_workers_per_p_worker > 0, "Decode TP cannot be smaller than prefill TP"
+
             # TODO in case sizes aren't exactly divisible, we may want to swap
-            # self.block_len with meta.block_len // tp_multiplier 
+            # self.block_len with meta.block_len // d_workers_per_p_worker 
             # (eg when dividing by 3) and handle final block. src_xfer too.
+            # assert nixl_agent_meta.block_len % self.block_len == 0
+
+            # Split the kv memory inside a nixl region to guarantee each local
+            # rank is pulling the kv cache of all layers of a remote worker. 
             rank_offset = self.rank // nixl_agent_meta.tp_size * self.block_len
-            for base_addr in self.kv_caches_base_addr[engine_id][remote_rank]:
+            print(f"Local Rank {self.rank} remote {remote_rank}: {rank_offset=}, {len(self.kv_caches_base_addr[engine_id])}\n\n")
+            for base_addr in self.kv_caches_base_addr[engine_id]:
                 base_addr += rank_offset
                 for block_id in range(nixl_agent_meta.num_blocks):
                     block_offset = block_id * self.block_len
@@ -515,8 +503,7 @@ class NixlConnectorWorker:
 
             # Register with NIXL.
             descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
-            self.dst_xfer_side_handles[
-                engine_id][remote_rank] = self.nixl_wrapper.prep_xfer_dlist(
+            self.dst_xfer_side_handles[engine_id] = self.nixl_wrapper.prep_xfer_dlist(
                     self._remote_agents[engine_id][remote_rank], descs)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
@@ -669,15 +656,13 @@ class NixlConnectorWorker:
 
         assert len(local_block_ids) > 0
         assert len(local_block_ids) == len(remote_block_ids)
-        # TODO you have to make N xfers with heter tp 
-        # With homogeneous TP, each TP worker loads KV from corresponding rank.
-        # With heterogenous TP, assuming D>P, the D tp workers will have to 
-        # issue xfers to part of the P `p_remote_rank` kv caches.
-        p_remote_rank = self.rank % self._tp_size[dst_engine_id]
+        # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from 
+        # corresponding rank. With heterogenous TP, fixing D>P, the D tp 
+        # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get side handles.
         local_xfer_side_handle = self.src_xfer_side_handle
-        remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id][p_remote_rank]
+        remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id]
 
         # Get descs ids.
         remote_block_descs_ids = self._get_block_descs_ids(
