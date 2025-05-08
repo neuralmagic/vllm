@@ -4,7 +4,10 @@ from vllm.scalar_type import scalar_types
 __all__ = [
     "break_fp4_bytes",
     "dequantize_to_dtype",
-    "ref_nvfp4_quant"
+    "ref_nvfp4_quant",
+    "dequantize_unfused",
+    "requantize_with_max",
+    "expand_global_scale"
 ]
 
 FLOAT4_E2M1_MAX = scalar_types.float4_e2m1fn.max()
@@ -53,10 +56,32 @@ def dequantize_to_dtype(tensor_fp4,
     assert tensor_fp4.dtype == torch.uint8
     m, packed_k = tensor_fp4.shape
     k = packed_k * 2
+    #m, k = tensor_fp4.shape
+    tensor_f32 = break_fp4_bytes(tensor_fp4, torch.float32)
+    tensor_f32 = tensor_f32.reshape(m, k // block_size, block_size)
+    #tensor_f32 = tensor_fp4.reshape(m, k // block_size, block_size)
+    tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
+    tensor_sf = convert_swizzled_to_linear(tensor_sf, m, k, block_size)
+    tensor_sf_dtype = tensor_sf.to(torch.float32) / global_scale
+
+    # scale the tensor
+    out = (tensor_f32 * tensor_sf_dtype.unsqueeze(-1)).reshape(m, k)
+    return out.to(dtype)
+
+
+def dequantize_unfused(tensor_fp4,
+                        tensor_sf,
+                        global_scale,
+                        dtype,
+                        device,
+                        block_size=16):
+
+    assert tensor_fp4.dtype == torch.uint8
+    m, packed_k = tensor_fp4.shape
+    k = packed_k * 2
     tensor_f32 = break_fp4_bytes(tensor_fp4, torch.float32)
     tensor_f32 = tensor_f32.reshape(m, k // block_size, block_size)
     tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
-    tensor_sf = convert_swizzled_to_linear(tensor_sf, m, k, block_size)
     tensor_sf_dtype = tensor_sf.to(torch.float32) / global_scale
 
     # scale the tensor
@@ -87,6 +112,18 @@ def get_reciprocal(x):
         raise TypeError("Input must be a float, int, or a torch.Tensor.")
 
 
+def requantize_with_max(x, global_scale, scale):
+    assert global_scale.dtype == torch.float32
+    assert x.ndim == 2
+    m, n = x.shape
+    block_size = 16
+    x = torch.reshape(x, (m, n // block_size, block_size))
+    scale = scale.to(global_scale.dtype) / global_scale
+    scaled_x = x.to(torch.float32) / scale.unsqueeze(-1)
+    clipped_x = torch.clamp(scaled_x, -6.0, 6.0).reshape(m, n)
+    return cast_to_fp4(clipped_x)
+
+
 def ref_nvfp4_quant(x, global_scale, block_size):
     assert global_scale.dtype == torch.float32
     assert x.ndim == 2
@@ -102,3 +139,18 @@ def ref_nvfp4_quant(x, global_scale, block_size):
     clipped_x = torch.clamp(scaled_x, -6.0, 6.0).reshape(m, n)
     # both outputs are float32
     return cast_to_fp4(clipped_x), scale.squeeze(-1)
+
+
+def expand_global_scale(local_scale, sizes, global_scale):
+    output_scale = torch.zeros(local_scale.shape, dtype=global_scale.dtype).to(global_scale.device)
+    end = 0
+    for i in range(len(sizes)):
+        size = sizes[i]
+        current_global_scale = global_scale[i]
+        start = end 
+        end = start + size
+        output_scale[start:end, :] = current_global_scale
+
+    print(output_scale)
+    print(global_scale)
+    return output_scale

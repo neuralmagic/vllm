@@ -11,7 +11,7 @@ from vllm.model_executor.parameter import (ModelWeightParameter,
                                            PerTensorScaleParameter, GroupQuantScaleParameter)
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    dequantize_to_dtype
+    dequantize_to_dtype, dequantize_unfused, requantize_with_max, expand_global_scale
 )
 import torch.nn.functional as F 
 
@@ -34,6 +34,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                        **kwargs):
         
         # Weight
+        self.output_partition_sizes = output_partition_sizes
+        self.params_dtype = params_dtype
         weight = ModelWeightParameter(
             data=torch.empty(
                 # 2 fp4 items are packed in the input dimension
@@ -87,12 +89,34 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 if scale_ndim == 2 else swizzled_scale.reshape(B, M, K))
 
     def process_weights_after_loading(self, layer) -> None:
-        weight_global_scale = layer.weight_global_scale.max().to(torch.float32)
-        layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
+        """
+        end = 0 
+        all_dequant = []
+
+       
+        # dequant using global scale
+        for i in range(len(layer.weight_global_scale)):
+            global_scale = layer.weight_global_scale[i]
+            size = self.output_partition_sizes[i]
+            start = end 
+            end = start + size
+
+            dequant_weight = dequantize_unfused(layer.weight_packed[start:end, :], layer.weight_scale[start:end, :], global_scale,
+                                    self.params_dtype, layer.weight_packed.device, self.group_size)
+
+            all_dequant.append(dequant_weight)
+       
+        del layer.weight_packed
+        layer.weight_global_scale = Parameter(layer.weight_global_scale.max().to(torch.float32), requires_grad=False)
+        # requant with max
+        layer.weight = requantize_with_max(torch.cat(all_dequant, axis=0), layer.weight_global_scale, layer.weight_scale)
+        """
+        
+        # expand global_scale to have the same shape as the weight scales
+        layer.weight_global_scale = Parameter(expand_global_scale(layer.weight_scale, self.output_partition_sizes, layer.weight_global_scale), requires_grad=False)
 
         # Note: a post weight loading step but not required for the emulation
         swizzled_weight_scale = self.swizzle_blockscale(layer.weight_scale)
-
         layer.weight_scale_swizzled = Parameter(swizzled_weight_scale,
                                                 requires_grad=False)
 
@@ -101,13 +125,11 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-
         w_fp4 = layer.weight_packed.data
         w_global_scale = layer.weight_global_scale
         w_blockscale = layer.weight_scale_swizzled.data
         w_dq = dequantize_to_dtype(w_fp4, w_blockscale, w_global_scale,
-                                   x.dtype, x.device, self.group_size)
-
+                                x.dtype, x.device, self.group_size)
         out = F.linear(x, w_dq)
         del w_dq 
         return out
