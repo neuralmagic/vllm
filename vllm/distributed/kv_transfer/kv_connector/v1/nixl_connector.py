@@ -24,10 +24,12 @@ from vllm.logger import init_logger
 from vllm.sampling_params import KVTransferParams
 from vllm.utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
 GET_META_MSG = b"get_meta_msg"
@@ -103,18 +105,19 @@ class NixlConnector(KVConnectorBase_V1):
     ############################################################
     # Scheduler Side Methods
     ############################################################
-    def get_num_new_matched_tokens(self, request: "Request",
-                                   num_computed_tokens: int) -> int:
+    def get_num_new_matched_tokens(
+            self, request: "Request",
+            num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens)
 
     def update_state_after_alloc(self, request: "Request",
-                                 block_ids: list[int],
+                                 blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(
-            request, block_ids, num_external_tokens)
+            request, blocks, num_external_tokens)
 
     def build_connector_meta(
         self,
@@ -122,6 +125,14 @@ class NixlConnector(KVConnectorBase_V1):
     ) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
+
+    def request_finished(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+    ) -> tuple[bool, Optional[KVTransferParams]]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, blocks)
 
     ############################################################
     # Worker Side Methods
@@ -169,26 +180,29 @@ class NixlConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
 
-    def get_num_new_matched_tokens(self, request: "Request",
-                                   num_computed_tokens: int) -> int:
+    def get_num_new_matched_tokens(
+            self, request: "Request",
+            num_computed_tokens: int) -> tuple[int, bool]:
         """For remote prefill, allocate for all tokens."""
-
-        # NOTE: this function is called in the WAITING loop.
-        # So we should only have full blocks of computed tokens.
-        assert num_computed_tokens % self.block_size == 0
-
         if request.do_remote_prefill:
+            assert num_computed_tokens % self.block_size == 0
             rounded_num_prompt_tokens = round_down(
                 len(request.prompt_token_ids), self.block_size)
-            return max(rounded_num_prompt_tokens - num_computed_tokens, 0)
+            count = max(rounded_num_prompt_tokens - num_computed_tokens, 0)
+            return count, count > 0
 
-        return 0
+        return 0, False
 
     def update_state_after_alloc(self, request: "Request",
-                                 block_ids: list[int],
+                                 blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
-        if request.do_remote_prefill and num_external_tokens > 0:
-            self._reqs_need_recv[request.request_id] = (request, block_ids)
+        if request.do_remote_prefill:
+            # Get unhashed blocks to pull from remote.
+            self._reqs_need_recv[request.request_id] = (
+                request, blocks.get_unhashed_block_ids())
+
+            # Only trigger 1 KV transfer per request.
+            request.do_remote_prefill = False
 
     def build_connector_meta(
         self,
@@ -209,6 +223,38 @@ class NixlConnectorScheduler:
         self._reqs_need_recv.clear()
 
         return meta
+
+    def request_finished(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+    ) -> tuple[bool, Optional[KVTransferParams]]:
+        """
+        Once a request is finished, determine whether request blocks
+        should be freed now or will be sent asynchronously and freed later.
+        """
+
+        if (not request.do_remote_decode
+                or request.status != RequestStatus.FINISHED_LENGTH_CAPPED):
+            return False, None
+
+        # Get computed blocks.
+        all_block_ids = blocks.get_block_ids()
+        last_block_full = request.num_computed_tokens % self.block_size == 0
+        computed_block_ids = (all_block_ids
+                              if last_block_full else all_block_ids[:-1])
+
+        # If prompt < block_size, then there will be no KV xfer so free blocks
+        # immediately.
+        delay_free_blocks = len(computed_block_ids) > 0
+
+        return delay_free_blocks, KVTransferParams(
+            do_remote_prefill=True,
+            remote_block_ids=computed_block_ids,
+            remote_engine_id=self.vllm_config.kv_transfer_config.engine_id,
+            remote_host=envs.VLLM_NIXL_SIDE_CHANNEL_HOST,
+            remote_port=envs.VLLM_NIXL_SIDE_CHANNEL_PORT,
+        )
 
 
 class NixlConnectorWorker:
@@ -331,7 +377,7 @@ class NixlConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
-        first_layer_name, first_kv_cache = next(iter(kv_caches.items()))
+        _, first_kv_cache = next(iter(kv_caches.items()))
         kv_elem_size = first_kv_cache.element_size()
 
         # TODO(tms): Find a more robust way to detect and handle MLA
@@ -555,7 +601,6 @@ class NixlConnectorWorker:
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.requests.items():
-            # NOTE: this is non-blocking
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ", req_id,
@@ -593,8 +638,20 @@ class NixlConnectorWorker:
         # saturate IB with heterogeneous TP sizes. We should remove the staging
         # blocks until we are ready.
 
-        assert len(local_block_ids) > 0
-        assert len(local_block_ids) == len(remote_block_ids)
+        # Full prefix cache hit: do not need to read remote blocks,
+        # just notify P worker that we have the blocks we need.
+        num_local_blocks = len(local_block_ids)
+        if num_local_blocks == 0:
+            print("HERE!!!!!")
+            self.nixl_wrapper.send_notif(dst_engine_id,
+                                         notif_msg=request_id.encode("utf-8"))
+            return
+
+        # Partial prefix cache hit: just read uncomputed blocks blocks.
+        num_remote_blocks = len(remote_block_ids)
+        assert num_local_blocks <= num_remote_blocks
+        if num_local_blocks < num_remote_blocks:
+            remote_block_ids = remote_block_ids[-num_local_blocks:]
 
         # Get side handles.
         local_xfer_side_handle = self.src_xfer_side_handle

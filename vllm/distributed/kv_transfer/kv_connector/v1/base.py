@@ -22,17 +22,20 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from vllm.logger import init_logger
+from vllm.sampling_params import KVTransferParams
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -46,6 +49,7 @@ class KVConnectorRole(enum.Enum):
     WORKER = 1
 
 
+@dataclass
 class KVConnectorMetadata:
     pass
 
@@ -70,9 +74,9 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(self) -> tuple[Optional[set[str]], Optional[set[str]]]:
         """Get the finished recving and sending requests."""
-        return set(), set()
+        return None, None
 
     @property
     def role(self) -> KVConnectorRole:
@@ -182,7 +186,7 @@ class KVConnectorBase_V1(ABC):
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
@@ -195,12 +199,14 @@ class KVConnectorBase_V1(ABC):
         Returns:
             the number of tokens that can be loaded from the 
             external KV cache beyond what is already computed.
+            True if the external KV cache tokens will be loaded
+            asynchronously (between scheduler steps).
         """
         pass
 
     @abstractmethod
     def update_state_after_alloc(self, request: "Request",
-                                 block_ids: list[int],
+                                 blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
         """
         Update KVConnector state after block allocation.
@@ -220,3 +226,22 @@ class KVConnectorBase_V1(ABC):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         pass
+
+    # TODO: KVTransferParams is currently specific to NixlConnector,
+    #  make it generic
+    def request_finished(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+    ) -> tuple[bool, Optional[KVTransferParams]]:
+        """
+        Called when a request has finished, before its blocks are freed.
+
+        Returns:
+            True if the request is being saved/sent asynchronously and blocks
+            should not be freed until the request_id is returned from
+            get_finished().
+            Optional KVTransferParams to be included in the request outputs
+            returned by the engine.
+        """
+        return False, None

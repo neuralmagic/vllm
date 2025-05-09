@@ -36,6 +36,12 @@ class KVCacheBlocks:
         """Converts the KVCacheBlocks instance to a list of block IDs."""
         return [block.block_id for block in self.blocks]
 
+    def get_unhashed_block_ids(self) -> list[int]:
+        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        return [
+            block.block_id for block in self.blocks if block.block_hash is None
+        ]
+
 
 class KVCacheManager:
 
@@ -123,9 +129,14 @@ class KVCacheManager:
 
         Returns:
             A tuple containing:
-                - A list of blocks that are computed for the request.
+                - A list of new blocks that are computed for the request.
                 - The number of computed tokens.
         """
+        # Request has already has its blocks, do not look up in block table.
+        # This can happen in P/D if blocks are injected by the scheduler.
+        if self.req_to_blocks.get(request.request_id, None) is not None:
+            return KVCacheBlocks.create_empty(), request.num_computed_tokens
+
         if not self.enable_caching:
             # Prefix caching is disabled.
             return KVCacheBlocks.create_empty(), 0
@@ -184,7 +195,7 @@ class KVCacheManager:
         num_tokens: int,
         new_computed_blocks: Optional[KVCacheBlocks] = None,
         num_lookahead_tokens: int = 0,
-        skip_cache_blocks: bool = False,
+        delay_cache_blocks: bool = False,
     ) -> Optional[KVCacheBlocks]:
         """Add slots for a request with new tokens to append.
 
@@ -198,7 +209,7 @@ class KVCacheManager:
             num_lookahead_tokens: The number of speculative tokens to allocate.
                 This is used by spec decode proposers with kv-cache such
                 as eagle.
-            skip_cache_blocks: Whether to skip caching the blocks. This is
+            delay_cache_blocks: Whether to skip caching the blocks. This is
                 used by P/D when allocating blocks used in a KV transfer
                 which will complete in a future step.
 
@@ -296,23 +307,20 @@ class KVCacheManager:
         if not self.enable_caching:
             return KVCacheBlocks(new_blocks)
 
-        if skip_cache_blocks:
-            # NOTE(rob): this assert is valid because we only call
-            # skip_cache_blocks=True on the first time of WAITING
-            # during a P/D setup.
+        if delay_cache_blocks:
+            # P/D: delay caching blocks if we have to recv from
+            # remote. Update state for locally cached blocks.
             assert request.request_id not in self.num_cached_block
-            # NOTE(rob): this is necessary so we don't double
-            # cache a block after is has finished recving.
             self.num_cached_block[request.request_id] = len(
                 new_computed_block_list)
-            return KVCacheBlocks(new_blocks)
+        else:
+            self.cache_blocks(
+                request=request,
+                num_tokens=num_tokens,
+                num_computed_tokens=num_computed_tokens,
+                new_computed_block_list=new_computed_block_list,
+            )
 
-        self.cache_blocks(
-            request=request,
-            num_tokens=num_tokens,
-            num_computed_tokens=num_computed_tokens,
-            new_computed_block_list=new_computed_block_list,
-        )
         return KVCacheBlocks(new_blocks)
 
     def cache_blocks(
@@ -421,8 +429,7 @@ class KVCacheManager:
         Returns:
             int: The number of common prefix blocks.
         """
-        assert request.status in (RequestStatus.RUNNING,
-                                  RequestStatus.FINISHED_REMOTE_DECODE)
+        assert request.status == RequestStatus.RUNNING
         blocks = self.req_to_blocks[request.request_id]
         num_common_blocks = 0
         for block in blocks:

@@ -209,7 +209,7 @@ steps:
     - pytest -v -s v1/worker
     - pytest -v -s v1/structured_output
     - pytest -v -s v1/spec_decode
-    - pytest -v -s v1/kv_transfer
+    - pytest -v -s v1/kv_connector/unit
     - pytest -v -s v1/test_serial_utils.py
     - pytest -v -s v1/test_stats.py
     - pytest -v -s v1/test_utils.py
@@ -409,7 +409,7 @@ steps:
   - vllm/model_executor/layers/quantization
   commands:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  - bash ./run-tests.sh -c configs/models-small.txt -t 1
+  - pytest -s -v test_lm_eval_correctness.py --config-list-file=configs/models-small.txt --tp-size=1
 
 - label: OpenAI API correctness
   source_file_dependencies:
@@ -714,4 +714,4 @@ steps:
   - vllm/model_executor/layers/quantization
   commands:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  - bash ./run-tests.sh -c configs/models-large.txt -t 4
+  - pytest -s -v test_lm_eval_correctness.py --config-list-file=configs/models-large.txt --tp-size=4

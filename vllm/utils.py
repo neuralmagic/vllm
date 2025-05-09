@@ -41,7 +41,6 @@ from collections.abc import (AsyncGenerator, Awaitable, Generator, Hashable,
 from concurrent.futures.process import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from functools import cache, lru_cache, partial, wraps
-from gettext import gettext as _gettext
 from types import MappingProxyType
 from typing import (TYPE_CHECKING, Any, Callable, Generic, Literal, NamedTuple,
                     Optional, Sequence, Tuple, Type, TypeVar, Union, cast,
@@ -1366,39 +1365,36 @@ class FlexibleArgumentParser(ArgumentParser):
         super().__init__(*args, **kwargs)
 
     if sys.version_info < (3, 13):
+        # Enable the deprecated kwarg for Python 3.12 and below
 
-        def parse_known_args(  # type: ignore[override]
-            self,
-            args: Sequence[str] | None = None,
-            namespace: Namespace | None = None,
-        ) -> tuple[Namespace | None, list[str]]:
+        def parse_known_args(self, args=None, namespace=None):
             namespace, args = super().parse_known_args(args, namespace)
             for action in FlexibleArgumentParser._deprecated:
-                if action.dest not in FlexibleArgumentParser._seen and getattr(
-                        namespace, action.dest,
-                        None) != action.default:  # noqa: E501
-                    self._warning(
-                        _gettext("argument '%(argument_name)s' is deprecated")
-                        % {'argument_name': action.dest})
-                    FlexibleArgumentParser._seen.add(action.dest)
+                if (hasattr(namespace, dest := action.dest)
+                        and getattr(namespace, dest) != action.default):
+                    logger.warning_once("argument '%s' is deprecated", dest)
             return namespace, args
 
-        def add_argument(self, *args: Any, **kwargs: Any):
-            # add a deprecated=True compatibility
-            # for python < 3.13
-            deprecated = kwargs.pop('deprecated', False)
+        def add_argument(self, *args, **kwargs):
+            deprecated = kwargs.pop("deprecated", False)
             action = super().add_argument(*args, **kwargs)
-            object.__setattr__(action, 'deprecated', deprecated)
-            if deprecated and \
-                action not in FlexibleArgumentParser._deprecated:
-                self._deprecated.add(action)
-
+            if deprecated:
+                FlexibleArgumentParser._deprecated.add(action)
             return action
 
-        def _warning(self, message: str):
-            self._print_message(
-                _gettext('warning: %(message)s\n') % {'message': message},
-                sys.stderr)
+        class _FlexibleArgumentGroup(_ArgumentGroup):
+
+            def add_argument(self, *args, **kwargs):
+                deprecated = kwargs.pop("deprecated", False)
+                action = super().add_argument(*args, **kwargs)
+                if deprecated:
+                    FlexibleArgumentParser._deprecated.add(action)
+                return action
+
+        def add_argument_group(self, *args, **kwargs):
+            group = self._FlexibleArgumentGroup(self, *args, **kwargs)
+            self._action_groups.append(group)
+            return group
 
     def parse_args(  # type: ignore[override]
         self,
