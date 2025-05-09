@@ -4,7 +4,6 @@
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-import contextlib
 import dataclasses
 import datetime
 import pickle
@@ -361,29 +360,12 @@ def stateless_destroy_torch_distributed_process_group(
     Destroy ProcessGroup returned by
         stateless_init_torch_distributed_process_group().
     """
+    try:
+        # pytorch < 2.7
+        # Lazy import for non-CUDA backends.
+        from torch.distributed.distributed_c10d import _shutdown_backend
+        _shutdown_backend(pg)
+    except:
+        pg.shutdown()
 
-    def _shutdown_backend(pg):
-        # We have been using,
-        # torch.distributed.distributed_c10d._shutdown_backend
-        # for backend shutdowns. But the function has been retired
-        # since Torch 2.7.0. As a recourse, we copy-paste the
-        # `_shutdown_backend` function from <2.7.0 here.
-        from torch.distributed.distributed_c10d import ProcessGroupNCCL
-        backend = None
-        with contextlib.suppress(RuntimeError):
-            backend = pg._get_backend(torch.device("cuda"))
-
-        if is_nccl_available() and isinstance(backend, ProcessGroupNCCL):
-            # explicitly call shutdown to ensure that NCCL resources are
-            # released
-            backend._shutdown()
-
-    torch.distributed.barrier()
-    if pg.rank() == 0:
-        # Let the other ranks finish first
-        # Rank 0 has the TCPStore server. Let the other ranks finish so
-        # they don't complain about the non-existence of the TCPStore server.
-        time.sleep(1)
-
-    _shutdown_backend(pg)
     _unregister_process_group(pg.group_name)
