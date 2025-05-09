@@ -360,11 +360,12 @@ def stateless_destroy_torch_distributed_process_group(
     Destroy ProcessGroup returned by
         stateless_init_torch_distributed_process_group().
     """
-    # TODO: pytorch < 2.7?
-    if False:
+    try:
+        # pytorch < 2.7
         # Lazy import for non-CUDA backends.
         from torch.distributed.distributed_c10d import _shutdown_backend
         _shutdown_backend(pg)
-    else:
+    except:
         pg.shutdown()
+
     _unregister_process_group(pg.group_name)
