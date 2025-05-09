@@ -9,7 +9,7 @@ from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme)
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    dequantize_to_dtype, expand_global_scale)
+    dequantize_to_dtype)
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            ModelWeightParameter,
                                            PerTensorScaleParameter)
@@ -90,7 +90,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
     def process_weights_after_loading(self, layer) -> None:
         print(layer.weight_global_scale)
-        layer.weight_global_scale = Parameter(layer.weight_global_scale.max().to(torch.float32), requires_grad=False)
+        layer.weight_global_scale = Parameter(
+            layer.weight_global_scale.max().to(torch.float32),
+            requires_grad=False)
         # Note: a post weight loading step but not required for the emulation
         swizzled_weight_scale = self.swizzle_blockscale(layer.weight_scale)
         layer.weight_scale_swizzled = Parameter(swizzled_weight_scale,

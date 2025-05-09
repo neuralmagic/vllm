@@ -64,6 +64,7 @@ def dequantize_to_dtype(tensor_fp4,
     out = (tensor_f32 * tensor_sf_dtype.unsqueeze(-1)).reshape(m, k)
     return out.to(dtype)
 
+
 def dequantize_unfused(tensor_fp4,
                        tensor_sf,
                        global_scale,
