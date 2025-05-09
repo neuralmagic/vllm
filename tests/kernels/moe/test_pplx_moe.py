@@ -307,7 +307,7 @@ def pplx_dispatch_combine(pgi, dp_size, a, topk_weight, topk_ids, num_experts):
     world_size = pgi.world_size
     max_num_tokens = rank_chunk(num_tokens, 0, world_size)
 
-    ata = AllToAll.internode(
+    ata = AllToAll(
         max_num_tokens=max_num_tokens,
         num_experts=num_experts,
         experts_per_token=topk,
@@ -441,7 +441,7 @@ def pplx_moe(pgi, dp_size, a, w1, w2, topk_weight, topk_ids):
     topk = topk_ids.shape[1]
     max_num_tokens = rank_chunk(a.shape[0], 0, world_size)
 
-    ata = AllToAll.internode(
+    ata = AllToAll(
         max_num_tokens=max_num_tokens,
         num_experts=num_experts,
         experts_per_token=topk,

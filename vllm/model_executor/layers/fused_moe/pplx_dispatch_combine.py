@@ -66,15 +66,25 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
 
         per_act_token = a1_scale.numel() != 1 if a1_scale is not None else (
             a2_scale.numel() != 1 if a2_scale is not None else False)
+        
+        # print("A1 DTYPE", a1.dtype)
+        # print("A1 SHAPES:", a1.shape, a1_scale.shape)
+        # print("PER ACT TOKEN:", per_act_token)
 
         a1q, a1q_scale = moe_kernel_quantize_input(a1, a1_scale,
                                                    self.quant_dtype,
                                                    per_act_token,
                                                    self.block_shape)
 
+        # print("pplx_dispatch_combine a1:", a1)   
+        # print("full a1_scale:", a1_scale)
+        # print("pplx_dispatch_combine a1q:", a1q)
+        # print("full a1q_scale:", a1q_scale)
+
         rem_experts = num_experts % self.world_size
         num_local_experts = ((num_experts // self.world_size) +
                              (1 if self.rank < rem_experts else 0))
+        # print("num_local_experts in dispatch:", num_local_experts, self.rank)
 
         expert_num_tokens = torch.empty(
             num_local_experts,
@@ -96,7 +106,7 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                           else 1) * float32_size
             expert_x_scale = torch.empty(
                 (
-                    num_experts,
+                    num_local_experts,
                     expert_x.size(1),
                     (expert_x.size(2) + block_size - 1) // block_size,
                 ),
@@ -110,6 +120,12 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         # TODO: optimize this?
         indices = rank_topk_ids.to(dtype=torch.uint32)
 
+        # print("before dispatch:", expert_num_tokens)
+        # print("dispatch shapes:", expert_x.shape, expert_x_scale.shape,
+        #       a1q.shape, a1q_scale.shape, rank_topk_ids.shape)
+        # print("dispatch types:", expert_x.dtype, expert_x_scale.dtype,
+        #       a1q.dtype, a1q_scale.dtype, rank_topk_ids.dtype)
+        # print("dispatch indices:", indices)
         self.a2a.dispatch(
             out_expert_num_tokens=expert_num_tokens,
             out_expert_x=expert_x,
@@ -119,6 +135,15 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
             indices=indices,
             bound_m=bound_m,
         )
+        # print("dispatched:", expert_x.shape, expert_x_scale.shape,
+        #       expert_num_tokens.shape)
+        # print("dispatched types:", expert_x.dtype, expert_x_scale.dtype,
+        #       a1q.dtype, a1q_scale.dtype, rank_topk_ids.dtype)
+        # print("expert x:", expert_x)
+        # print("expert a1q:", a1q)
+        # # print("expert_x_scale x:", expert_x_scale)
+        # print("expert_num_tokens x:", expert_num_tokens)
+        # # print("after dispatch:", expert_num_tokens)
         return expert_x, expert_x_scale, expert_num_tokens
 
     def combine(
@@ -144,6 +169,12 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
+        # torch.set_printoptions(profile="full")
+        # print("output:", output)
+        print("fused_expert_output:", fused_expert_output)
+        # print("OUTPUT SHAPE:", output.shape)
+        # print("FUSED EXPERT OUTPUT SHAPE:", fused_expert_output.shape)
+        # torch.set_printoptions(profile="default")
         self.a2a.combine(out_tokens=output,
                          indices=topk_ids.to(torch.uint32),
                          weights=topk_weights,
