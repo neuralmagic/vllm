@@ -1571,15 +1571,6 @@ class FlexibleArgumentParser(ArgumentParser):
 
         return processed_args
 
-    def add_argument_group(
-        self,
-        *args: Any,
-        **kwargs: Any,
-    ) -> _FlexibleArgumentGroup:
-        group = _FlexibleArgumentGroup(self, self, *args, **kwargs)
-        self._action_groups.append(group)
-        return group
-
 
 async def _run_task_with_lock(task: Callable, lock: asyncio.Lock, *args,
                               **kwargs):
