@@ -33,10 +33,10 @@ from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 
+import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
-import torch
 import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase)

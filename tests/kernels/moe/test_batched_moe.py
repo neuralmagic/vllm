@@ -3,9 +3,9 @@
 from dataclasses import dataclass
 
 import pytest
+import torch
 import triton.language as tl
 
-import torch
 from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
     invoke_moe_batched_triton_kernel)
 

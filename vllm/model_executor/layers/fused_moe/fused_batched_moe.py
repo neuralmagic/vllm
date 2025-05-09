@@ -2,10 +2,10 @@
 """Fused batched MoE kernel."""
 from typing import List, Optional, Tuple
 
+import torch
 import triton
 import triton.language as tl
 
-import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     get_config_dtype_str, try_get_optimal_moe_config)

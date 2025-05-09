@@ -18,10 +18,10 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from transformers import Llama4TextConfig
-
 import torch
 from torch import nn
+from transformers import Llama4TextConfig
+
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig

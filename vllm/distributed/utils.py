@@ -13,6 +13,7 @@ import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
+import torch
 from torch.distributed import ProcessGroup, TCPStore
 from torch.distributed.distributed_c10d import (Backend, PrefixStore,
                                                 _get_default_timeout,
@@ -20,7 +21,6 @@ from torch.distributed.distributed_c10d import (Backend, PrefixStore,
                                                 is_nccl_available)
 from torch.distributed.rendezvous import rendezvous
 
-import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 

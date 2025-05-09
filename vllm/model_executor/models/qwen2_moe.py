@@ -25,11 +25,11 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
+import torch
 import torch.nn.functional as F
+from torch import nn
 from transformers import PretrainedConfig
 
-import torch
-from torch import nn
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig

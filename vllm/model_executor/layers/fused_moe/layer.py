@@ -8,10 +8,10 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 from weakref import WeakValueDictionary
 
+import torch
 import torch.nn.functional as F
 from torch.nn.parameter import UninitializedParameter
 
-import torch
 import vllm.envs as envs
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,

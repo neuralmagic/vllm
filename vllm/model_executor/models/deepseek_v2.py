@@ -24,10 +24,11 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
-from transformers import PretrainedConfig
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
+
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig

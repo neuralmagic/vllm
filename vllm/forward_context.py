@@ -6,9 +6,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+import torch
 import torch.distributed as dist
 
-import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
