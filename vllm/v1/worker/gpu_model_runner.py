@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
+from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.config import (CompilationLevel, VllmConfig,
                          get_layers_from_vllm_config)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
@@ -141,6 +142,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise NotImplementedError(
                 "Non-Attention backend is not supported by V1 GPUModelRunner.")
 
+        if self.vllm_config.compilation_config.full_cuda_graph:
+            attn_backend_name = self.attn_backend.__name__
+            flash_attn_version = get_flash_attn_version()
+            if attn_backend_name != "FlashAttentionBackend" or \
+                flash_attn_version != 3:
+                raise ValueError(
+                    f"full_cuda_graph is only supported with "
+                    f"FA3. Current attention backend is {attn_backend_name}, "
+                    f"FlashAttention version is {flash_attn_version}.")
+
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             weakref.proxy(self))
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
@@ -221,6 +232,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.positions = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int64,
                                      device=self.device)
+        self.query_start_loc = torch.zeros(self.max_num_reqs + 1,
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.seq_lens = torch.zeros(self.max_num_reqs,
+                                    dtype=torch.int32,
+                                    device=self.device)
+        self.slot_mapping = torch.zeros(self.max_num_tokens,
+                                        dtype=torch.int64,
+                                        device=self.device)
+
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: Optional[IntermediateTensors] = None
 
@@ -273,7 +294,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          pin_memory=self.pin_memory)
         self.positions_np = self.positions_cpu.numpy()
         self.slot_mapping_cpu = torch.zeros(self.max_num_tokens,
-                                            dtype=torch.int32,
+                                            dtype=torch.int64,
                                             device="cpu",
                                             pin_memory=self.pin_memory)
         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
@@ -591,10 +612,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.positions_cpu[:total_num_scheduled_tokens],
                 non_blocking=True)
 
-        query_start_loc = self.query_start_loc_cpu[:num_reqs + 1].to(
-            self.device, non_blocking=True)
-        seq_lens = self.seq_lens_cpu[:num_reqs].to(self.device,
-                                                   non_blocking=True)
+        self.query_start_loc[:num_reqs + 1].copy_(
+            self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+        self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+                                       non_blocking=True)
+        self.slot_mapping[:total_num_scheduled_tokens].copy_(
+            self.slot_mapping_cpu[:total_num_scheduled_tokens],
+            non_blocking=True)
+
+        # Fill unused with -1. Needed for reshape_and_cache
+        self.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
+        self.seq_lens[num_reqs:].fill_(0)
+        self.query_start_loc[num_reqs + 1:].fill_(-1)
+
+        query_start_loc = self.query_start_loc[:num_reqs + 1]
+        seq_lens = self.seq_lens[:num_reqs]
+
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc, seq_lens=seq_lens)
 
@@ -1043,54 +1076,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
 
-        def maybe_setup_kv_connector():
-            # Update KVConnector with the KVConnector metadata forward().
-            if has_kv_transfer_group():
-                kv_connector = get_kv_transfer_group()
-                assert isinstance(kv_connector, KVConnectorBase_V1)
-                assert scheduler_output.kv_connector_metadata is not None
-                kv_connector.bind_connector_metadata(
-                    scheduler_output.kv_connector_metadata)
-
-                # Background KV cache transfers happen here.
-                # These transfers are designed to be async and the requests
-                # involved may be disjoint from the running requests.
-                # Do this here to save a collective_rpc.
-                kv_connector.start_load_kv(get_forward_context())
-
-        def maybe_wait_for_save():
-            if has_kv_transfer_group():
-                kv_connector = get_kv_transfer_group()
-                kv_connector.wait_for_save()
-
-        def maybe_get_finished() -> tuple[set[str], set[str]]:
-            if has_kv_transfer_group():
-                kv_connector = get_kv_transfer_group()
-                return kv_connector.get_finished()
-            return set(), set()
-
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
-            # KV send/recv even if no work to do.
-            with set_forward_context(None, self.vllm_config):
-                maybe_setup_kv_connector()
-                maybe_wait_for_save()
-                finished_sending, finished_recving = maybe_get_finished()
+            if not has_kv_transfer_group():
+                # Return empty ModelRunnerOutput if there's no work to do.
+                return EMPTY_MODEL_RUNNER_OUTPUT
 
-            # Return empty ModelRunnerOutput if there's no work to do.
-            output = EMPTY_MODEL_RUNNER_OUTPUT
-
-            if len(finished_sending) > 0 or len(finished_recving) > 0:
-                output = copy.deepcopy(EMPTY_MODEL_RUNNER_OUTPUT)
-                output.finished_sending = finished_sending
-                output.finished_recving = finished_recving
-            return output
+            return self.kv_connector_no_forward(scheduler_output)
 
         # Prepare the decoder inputs.
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-
         attn_metadata, logits_indices, spec_decode_metadata = (
             self._prepare_inputs(scheduler_output))
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if (self.use_cuda_graph
                 and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
             # Use piecewise CUDA graphs.
@@ -1162,7 +1159,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens):
-            maybe_setup_kv_connector()
+            self.maybe_setup_kv_connector(scheduler_output)
 
             model_output = self.model(
                 input_ids=input_ids,
@@ -1171,8 +1168,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
             )
 
-            maybe_wait_for_save()
-            finished_sending, finished_recving = maybe_get_finished()
+            self.maybe_wait_for_kv_save()
+            finished_sending, finished_recving = (
+                self.get_finished_kv_transfers())
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -1362,6 +1360,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_recving=finished_recving,
         )
 
+    def kv_connector_no_forward(
+            self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
+        # KV send/recv even if no work to do.
+        with set_forward_context(None, self.vllm_config):
+            self.maybe_setup_kv_connector(scheduler_output)
+            finished_sending, finished_recving = (
+                self.get_finished_kv_transfers())
+
+        if not finished_sending and not finished_recving:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.finished_sending = finished_sending
+        output.finished_recving = finished_recving
+        return output
+
+    @staticmethod
+    def maybe_setup_kv_connector(scheduler_output: "SchedulerOutput"):
+        # Update KVConnector with the KVConnector metadata forward().
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            assert isinstance(kv_connector, KVConnectorBase_V1)
+            assert scheduler_output.kv_connector_metadata is not None
+            kv_connector.bind_connector_metadata(
+                scheduler_output.kv_connector_metadata)
+
+            # Background KV cache transfers happen here.
+            # These transfers are designed to be async and the requests
+            # involved may be disjoint from the running requests.
+            # Do this here to save a collective_rpc.
+            kv_connector.start_load_kv(get_forward_context())
+
+    @staticmethod
+    def maybe_wait_for_kv_save() -> None:
+        if has_kv_transfer_group():
+            get_kv_transfer_group().wait_for_save()
+
+    @staticmethod
+    def get_finished_kv_transfers(
+    ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        if has_kv_transfer_group():
+            return get_kv_transfer_group().get_finished()
+        return None, None
+
     def generate_draft_token_ids(
         self,
         sampled_token_ids: list[list[int]],
@@ -1522,6 +1564,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _dummy_run(
         self,
         num_tokens: int,
+        skip_attn: bool = True,
     ) -> torch.Tensor:
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
@@ -1537,6 +1580,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list,
                                         dtype=np.int32)
+
+        if skip_attn:
+            attn_metadata = None
+        else:
+            query_start_loc = self.query_start_loc[:num_reqs + 1]
+            seq_lens = self.seq_lens[:num_reqs]
+
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc, seq_lens=seq_lens)
+
+            attn_metadata = self.attn_metadata_builder.build(
+                num_reqs=num_tokens,
+                num_actual_tokens=num_tokens,
+                max_query_len=num_tokens,
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+            )
 
         with self.maybe_dummy_run_with_lora(self.lora_config,
                                             num_scheduled_tokens):
@@ -1566,7 +1626,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for k, v in self.intermediate_tensors.items()
                 })
 
-            with set_forward_context(None,
+            with set_forward_context(attn_metadata,
                                      self.vllm_config,
                                      num_tokens=num_tokens):
                 outputs = model(
@@ -1752,11 +1812,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         with graph_capture(device=self.device):
+            skip_attn = not self.vllm_config.compilation_config.full_cuda_graph
             for num_tokens in reversed(self.cudagraph_batch_sizes):
                 for _ in range(self.vllm_config.compilation_config.
                                cudagraph_num_of_warmups):
-                    self._dummy_run(num_tokens)
-                self._dummy_run(num_tokens)
+                    self._dummy_run(num_tokens, skip_attn=skip_attn)
+                self._dummy_run(num_tokens, skip_attn=skip_attn)
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
