@@ -456,7 +456,6 @@ class NixlConnectorWorker:
         dst_num_blocks_per_local_rank = nixl_agent_meta.num_blocks // d_workers_per_p_worker
 
         # Create src descs and xfer side handles.
-        # TODO we could pull this out of remote_agent, only depends on self
         if d_workers_per_p_worker not in self.src_xfer_side_handle:
             blocks_data = []
             for base_addr in self.kv_caches_base_addr[self.engine_id]:
@@ -501,7 +500,6 @@ class NixlConnectorWorker:
             # Split the kv memory inside a nixl region to guarantee each local
             # rank is pulling the kv cache of all layers of a remote worker. 
             # TODO what if the region_len of P and D don't match in size due to some TP overhead??Also this would assume the mem utilized is the same.. 
-            assert d_workers_per_p_worker == 2
             rank_offset = self.rank // nixl_agent_meta.tp_size * nixl_agent_meta.block_len * dst_num_blocks_per_local_rank
             print(f"Local Rank {self.rank} remote {remote_rank}: {rank_offset=}/ Remote region_len {nixl_agent_meta.num_blocks*nixl_agent_meta.block_len}\n\n")
             print(f"{nixl_agent_meta.num_blocks=}, {dst_num_blocks_per_local_rank=}")
