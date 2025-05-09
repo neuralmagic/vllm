@@ -24,10 +24,10 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
-import torch
-from torch import nn
 from transformers import PretrainedConfig
 
+import torch
+from torch import nn
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -141,14 +141,8 @@ class DeepseekV2MoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                # When just tensor-parallel is used, it isn't required
-                # to reduce the shared_output result. Instead we reduce
-                # at the end of the forward pass.
-                # With EP and the pplx kernels - this is no longer viable
-                # as all GPU ranks in DP, produce the complete set of
-                # hidden_states.
-                # Therefore reduce the shared experts early.
-                reduce_results=self.experts.must_reduce_shared_outputs(),
+                reduce_results=self.experts.must_reduce_shared_expert_outputs(
+                ),
                 prefix=f"{prefix}.shared_experts",
             )
 

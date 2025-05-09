@@ -192,7 +192,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 import torch
-
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionLayer,
                                               AttentionMetadata,
@@ -882,6 +881,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         if attn_metadata is None:
             # Profiling run.
+            # The zero fill is required when used with DP + EP
+            # to ensure all ranks within a DP group compute the
+            # same expert outputs.
             return output.fill_(0)
 
         num_actual_toks = attn_metadata.num_actual_tokens

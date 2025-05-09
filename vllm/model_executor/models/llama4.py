@@ -18,10 +18,10 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-import torch
-from torch import nn
 from transformers import Llama4TextConfig
 
+import torch
+from torch import nn
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -88,7 +88,7 @@ class Llama4MoE(nn.Module):
             quant_config=quant_config,
             bias=False,
             prefix=f"{prefix}.shared_expert",
-            reduce_results=False,  # We need to do scatter before reduce
+            reduce_results=self.experts.must_reduce_shared_expert_outputs(),
         )
 
     def forward(self, hidden_states):
