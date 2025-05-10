@@ -459,9 +459,12 @@ class NixlConnectorWorker:
         if d_workers_per_p_worker not in self.src_xfer_side_handle:
             blocks_data = []
             for base_addr in self.kv_caches_base_addr[self.engine_id]:
-                # self.num_blocks > nixl_agent_meta.num_blocks
-                for block_id in range(nixl_agent_meta.num_blocks):
-                    # block_offset = block_id * nixl_agent_meta.block_len 
+                # NOTE Here more blocks that what are transfered are used 
+                # as self.num_blocks >= nixl_agent_meta.num_blocks. We could
+                # create fewer, but then _get_block_descs_ids needs to select
+                # nixl_agent_meta.num_blocks instead of self.num_blocks for 
+                # local descr, and that makes handling regular flow less clean. 
+                for block_id in range(self.num_blocks):
                     block_offset = block_id * self.block_len 
                     for b in range(self.block_size):
                         head_offset = b * self.kv_dim
