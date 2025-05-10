@@ -14,7 +14,7 @@ import zmq
 from typing_extensions import Optional
 
 from vllm import envs
-from vllm.config import VllmConfig, KVTransferConfig
+from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.parallel_state import (
@@ -100,7 +100,7 @@ class NixlConnector(KVConnectorBase_V1):
             self.connector_worker: Optional[NixlConnectorWorker] = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = NixlConnectorWorker(str(self.engine_id), vllm_config.kv_transfer_config)
+            self.connector_worker = NixlConnectorWorker(str(self.engine_id))
 
     ############################################################
     # Scheduler Side Methods
@@ -216,7 +216,7 @@ class NixlConnectorScheduler:
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, engine_id: str, kv_config: KVTransferConfig):
+    def __init__(self, engine_id: str):
         if NixlWrapper is None:
             logger.error("NIXL is not available")
             raise RuntimeError("NIXL is not available")
@@ -343,8 +343,6 @@ class NixlConnectorWorker:
         with zmq_ctx(zmq.REQ, path) as sock:
            metadata = handshake(sock, 0)
         
-        # TODO should we skip this if remote world_size == world_size (homogeneous)? 
-
         # Handshake only with the other TP remote the current local rank will 
         # pull from. With homogeneous TP it happens to be the same rank_i. 
         p_remote_rank = self.rank % metadata.tp_size
@@ -369,15 +367,16 @@ class NixlConnectorWorker:
             self.num_blocks = first_kv_cache.shape[0]
             block_rank = 2  # [block_size, latent_dim]
             block_shape = first_kv_cache.shape[-block_rank:]
-            # TODO handle heterogenous TP for MLA
+            self.block_size, kv_latent_dim = block_shape
+            self.kv_dim = kv_elem_size * kv_latent_dim
         else:
             # [2 (k and v), num_blocks, block_size, kv_heads, head_dim]
             self.num_blocks = first_kv_cache.shape[1]
             block_rank = 3  # [block_size, kv_heads, head_dim]
             block_shape = first_kv_cache.shape[-block_rank:]
-            self.block_size, self.n_kv_heads, self.head_dim = block_shape
+            self.block_size, n_kv_heads, head_dim = block_shape
             # head size in btyes.
-            self.kv_dim = kv_elem_size * self.n_kv_heads * self.head_dim
+            self.kv_dim = kv_elem_size * n_kv_heads * head_dim
 
         # TODO(tms): self.block_len needs to be per-layer for sliding window,
         # hybrid attn, etc
@@ -403,7 +402,6 @@ class NixlConnectorWorker:
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
             cache_list = [cache_or_caches] if use_mla else cache_or_caches
-            # TODO I think current mem layout is fine but double check
             for cache in cache_list:
                 base_addr = cache.data_ptr()
                 region_len = self.num_blocks * self.block_len
@@ -411,9 +409,6 @@ class NixlConnectorWorker:
                 kv_caches_base_addr.append(base_addr)
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
         self.num_regions = len(caches_data)
-        print("************************BLOCKS SETUP")
-        print(f"Number of blocks {len(kv_caches_base_addr)=}\n")
-        print(f"{self.num_blocks=}, {self.block_len=}, {self.num_regions=}\n")
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, "VRAM")
         logger.debug("Registering descs: %s", caches_data)
@@ -451,18 +446,22 @@ class NixlConnectorWorker:
         self._remote_agents[engine_id][remote_rank] = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata)
         
-        # TODO enforce tp sizes are exact multiples
         d_workers_per_p_worker = self._tp_size[self.engine_id] // self._tp_size[engine_id]
         assert d_workers_per_p_worker > 0, "Decode TP cannot be smaller than prefill TP"
+
+        # TODO we should also check hidden_dim and kv precision, they must match
+        remote_block_size = nixl_agent_meta.block_len / (self.kv_dim*d_workers_per_p_worker)
+        assert self.block_size == remote_block_size, "Remote P worker with "
+        "different block size is not supported"
 
         # Create src descs and xfer side handles.
         if d_workers_per_p_worker not in self.src_xfer_side_handle:
             blocks_data = []
             for base_addr in self.kv_caches_base_addr[self.engine_id]:
-                # NOTE Here more blocks that what are transfered are used 
-                # as self.num_blocks >= nixl_agent_meta.num_blocks. We could
-                # create fewer, but then _get_block_descs_ids needs to select
-                # nixl_agent_meta.num_blocks instead of self.num_blocks for 
+                # NOTE With heter-TP, more blocks are prepared than what are 
+                # needed as self.num_blocks >= nixl_agent_meta.num_blocks. We 
+                # could create fewer, but then _get_block_descs_ids needs to 
+                # select agent_meta.num_blocks instead of self.num_blocks for 
                 # local descr, and that makes handling regular flow less clean. 
                 for block_id in range(self.num_blocks):
                     block_offset = block_id * self.block_len 
@@ -470,7 +469,6 @@ class NixlConnectorWorker:
                         head_offset = b * self.kv_dim
                         addr = base_addr + block_offset + head_offset
                         # (addr, len, device id)
-                        # use the block size of the dst/P node to make sure regions match
                         blocks_data.append((addr, self.kv_dim, self.rank))
             logger.debug("Created %s blocks for src engine %s and rank %s",
                         len(blocks_data), self.engine_id, self.rank)
@@ -488,8 +486,9 @@ class NixlConnectorWorker:
         self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
 
         blocks_data = []
-        # With heterogenous TP, prepare the descriptors by splitting the P KV 
-        # cache along kv_head dim, of D worker's kv_head size (D>P).
+        # With homogeneous TP, D pulls the whole kv cache from corresponding 
+        # rank. With heterogenous TP, prepare the descriptors by splitting the
+        # P KV cache along kv_head dim, of D worker's kv_head size (D>P).
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].  
         p_remote_rank = self.rank % nixl_agent_meta.tp_size
         # Only register the remote's descriptors if current rank pulls from it.
@@ -677,8 +676,6 @@ class NixlConnectorWorker:
         local_xfer_side_handle = self.src_xfer_side_handle[d_workers_per_p_worker]
         remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id]
 
-        print(f"BLOCK IDS {local_block_ids=}, {remote_block_ids=}")
-
         # Get descs ids.
         remote_block_descs_ids = self._get_block_descs_ids(
             dst_engine_id, remote_block_ids)
@@ -686,9 +683,6 @@ class NixlConnectorWorker:
             self.engine_id, local_block_ids)
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
     
-        print(f"LOCAL {len(local_block_descs_ids)=}, {local_xfer_side_handle=}")
-        print(f"REMOTE {len(remote_block_descs_ids)=}, {remote_xfer_side_handle=}")
-
         # Prepare transfer with Nixl.
         handle = self.nixl_wrapper.make_prepped_xfer(
             "READ",
@@ -715,12 +709,11 @@ class NixlConnectorWorker:
 
         # Compute the desc ids for each block.
         descs_ids: list[int] = []
-        # TODO branch out here here to save on number of descr for homogen tp 
         for reg_id in region_ids:
             for block_id in block_ids:
-                # descs_ids.append(reg_id * num_blocks + block_id)
                 for kv_block in range(self.block_size):
-                    descs_ids.append(reg_id * num_blocks * self.block_size + block_id * self.block_size + kv_block)
+                    descs_ids.append(reg_id * num_blocks * self.block_size + 
+                                     block_id * self.block_size + kv_block)
         return descs_ids
 
 
