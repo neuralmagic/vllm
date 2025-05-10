@@ -247,7 +247,7 @@ class NixlConnectorWorker:
 
         # nixl_prepped_dlist_handle. Different dst TP sizes require preparing
         # xfer layout differently.
-        self.src_xfer_side_handle: int = dict()
+        self.src_xfer_side_handle: dict[int, int] = dict()
         # Map of engine_id -> nixl_prepped_dlist_handle (int)].
         self.dst_xfer_side_handles: dict[str, int] = dict()
 
