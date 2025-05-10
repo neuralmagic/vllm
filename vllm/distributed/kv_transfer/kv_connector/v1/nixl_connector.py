@@ -286,7 +286,6 @@ class NixlConnectorWorker:
         # move this into the scheduler rather than worker, since
         # each rank needs the metadata of all other ranks (whereas
         # in this setup, each rank only gets one other rank's meta.
-        # TODO iterate over all ranks to handshake with M. Can we get M from config?
 
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(metadata)
@@ -369,18 +368,21 @@ class NixlConnectorWorker:
             # MLA case.
             self.num_blocks = first_kv_cache.shape[0]
             block_rank = 2  # [block_size, latent_dim]
-            # TODO does this include tp dependent size?
             block_shape = first_kv_cache.shape[-block_rank:]
+            # TODO handle heterogenous TP for MLA
         else:
-            # [2 (k and v), num_blocks, ...]
+            # [2 (k and v), num_blocks, block_size, kv_heads, head_dim]
             self.num_blocks = first_kv_cache.shape[1]
             block_rank = 3  # [block_size, kv_heads, head_dim]
             block_shape = first_kv_cache.shape[-block_rank:]
+            self.block_size, self.n_kv_heads, self.head_dim = block_shape
+            # head size in btyes.
+            self.kv_dim = kv_elem_size * self.n_kv_heads * self.head_dim
 
         # TODO(tms): self.block_len needs to be per-layer for sliding window,
         # hybrid attn, etc
+        # block size in bytes
         self.block_len = kv_elem_size * math.prod(block_shape)
-        print(f"\n\n{self.block_len=}\n\n")
 
         logger.debug("Registering KV_Caches. use_mla: %s, shape %s", use_mla,
                      first_kv_cache.shape)
@@ -401,6 +403,7 @@ class NixlConnectorWorker:
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
             cache_list = [cache_or_caches] if use_mla else cache_or_caches
+            # TODO I think current mem layout is fine but double check
             for cache in cache_list:
                 base_addr = cache.data_ptr()
                 region_len = self.num_blocks * self.block_len
@@ -416,7 +419,6 @@ class NixlConnectorWorker:
         logger.debug("Registering descs: %s", caches_data)
         self.nixl_wrapper.register_memory(descs)
         logger.debug("Done registering descs")
-
         self._registered_descs.append(descs)
 
         # After KV Caches registered, listen for new connections.
@@ -438,7 +440,6 @@ class NixlConnectorWorker:
         ready_event.wait()
 
     def add_remote_agent(self, nixl_agent_meta: NixlAgentMetadata, remote_rank: int=0):
-        # FIXME one other approach I tried is loading half of every remote block instead of half the blocks. Doesnt seem to make much difference 
         engine_id = nixl_agent_meta.engine_id
         # TODO re-evaluate refreshing for scaling/recovery
         if engine_id in self._remote_agents and remote_rank in self._remote_agents[engine_id]:
@@ -453,18 +454,21 @@ class NixlConnectorWorker:
         # TODO enforce tp sizes are exact multiples
         d_workers_per_p_worker = self._tp_size[self.engine_id] // self._tp_size[engine_id]
         assert d_workers_per_p_worker > 0, "Decode TP cannot be smaller than prefill TP"
-        dst_num_blocks_per_local_rank = nixl_agent_meta.num_blocks // d_workers_per_p_worker
 
         # Create src descs and xfer side handles.
         if d_workers_per_p_worker not in self.src_xfer_side_handle:
             blocks_data = []
             for base_addr in self.kv_caches_base_addr[self.engine_id]:
-                for block_id in range(dst_num_blocks_per_local_rank):
-                    block_offset = block_id * nixl_agent_meta.block_len
-                    # (addr, len, device id)
-                    # use the block size of the dst/P node to make sure regions match
-                    blocks_data.append(
-                        (base_addr + block_offset, nixl_agent_meta.block_len, self.rank))
+                # self.num_blocks > nixl_agent_meta.num_blocks
+                for block_id in range(nixl_agent_meta.num_blocks):
+                    # block_offset = block_id * nixl_agent_meta.block_len 
+                    block_offset = block_id * self.block_len 
+                    for b in range(self.block_size):
+                        head_offset = b * self.kv_dim
+                        addr = base_addr + block_offset + head_offset
+                        # (addr, len, device id)
+                        # use the block size of the dst/P node to make sure regions match
+                        blocks_data.append((addr, self.kv_dim, self.rank))
             logger.debug("Created %s blocks for src engine %s and rank %s",
                         len(blocks_data), self.engine_id, self.rank)
 
@@ -474,49 +478,34 @@ class NixlConnectorWorker:
             self.src_xfer_side_handle[d_workers_per_p_worker] = self.nixl_wrapper.prep_xfer_dlist(
                 "NIXL_INIT_AGENT", descs)
 
-        # Create dst descs and xfer side handles. TP workers have same #blocks
-        # if engine_id in self.dst_num_blocks:
-        #     assert self.dst_num_blocks[engine_id] == nixl_agent_meta.num_blocks
+        # Create dst descs and xfer side handles. TP workers have same #blocks.
+        if engine_id in self.dst_num_blocks:
+            assert self.dst_num_blocks[engine_id] == nixl_agent_meta.num_blocks
 
-        # self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
-        # When D_TP>P_TP, P blocks are split between D workers. Hence we may 
-        # record a fraction of the total num_blocks in P.   
-        self.dst_num_blocks[engine_id] = dst_num_blocks_per_local_rank
+        self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
 
         blocks_data = []
         # With heterogenous TP, prepare the descriptors by splitting the P KV 
-        # cache into chunks of D worker's size (D>P).
-        # Eg. PTP1 DTP2 => P0 KV:[KV_0 | KV_1] (contiguous view).  
+        # cache along kv_head dim, of D worker's kv_head size (D>P).
+        # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].  
         p_remote_rank = self.rank % nixl_agent_meta.tp_size
-        # Only register the remote's descriptor if current rank pulls from it
+        # Only register the remote's descriptors if current rank pulls from it.
         if p_remote_rank == remote_rank:
             self.kv_caches_base_addr[engine_id] = nixl_agent_meta.kv_caches_base_addr
-
-            # TODO in case sizes aren't exactly divisible, we may want to swap
-            # self.block_len with meta.block_len // d_workers_per_p_worker 
-            # (eg when dividing by 3) and handle final block. src_xfer too.
-            # assert nixl_agent_meta.block_len % self.block_len == 0
-
-            # Split the kv memory inside a nixl region to guarantee each local
-            # rank is pulling the kv cache of all layers of a remote worker. 
-            # TODO what if the region_len of P and D don't match in size due to some TP overhead??Also this would assume the mem utilized is the same.. 
-            rank_offset = self.rank // nixl_agent_meta.tp_size * nixl_agent_meta.block_len * dst_num_blocks_per_local_rank
-            print(f"Local Rank {self.rank} remote {remote_rank}: {rank_offset=}/ Remote region_len {nixl_agent_meta.num_blocks*nixl_agent_meta.block_len}\n\n")
-            print(f"{nixl_agent_meta.num_blocks=}, {dst_num_blocks_per_local_rank=}")
-            # DECODE TP2  || self.num_blocks=33769, self.block_len=16384, self.num_regions=56
-            # PREFILL TP1 || self.num_blocks=17371, self.block_len=32768, self.num_regions=56
-            # FIXME assume num_blocks and block_len are actually divisible and all is nice. This needs to be enforced (eg diff mem usage might break)
+            rank_offset = self.rank // nixl_agent_meta.tp_size * self.kv_dim
+            # Register all remote blocks, but only the corresponding kv heads.
             for base_addr in nixl_agent_meta.kv_caches_base_addr:
-                base_addr += rank_offset
-                # for block_id in range(self.num_blocks):
-                for block_id in range(dst_num_blocks_per_local_rank):
-                    # block_offset = block_id * self.block_len
+                for block_id in range(nixl_agent_meta.num_blocks):
                     block_offset = block_id * nixl_agent_meta.block_len
-                    # (addr, len, device id)
-                    blocks_data.append(
-                        (base_addr + block_offset, nixl_agent_meta.block_len, self.rank))
-                    # blocks_data.append(
-                    #     (base_addr + block_offset, self.block_len, self.rank))
+                    # TODO assume same block_size. Should enforce it on handshake.
+                    for b in range(self.block_size):
+                        # block_offset = block_id * self.block_len
+                        # Remote kv_dim=local kv_dim * d_workers_per_p_worker
+                        head_offset = b * self.kv_dim * d_workers_per_p_worker
+                        addr = base_addr + block_offset + head_offset
+                        # (addr, len, device id)
+                        blocks_data.append(
+                                (addr + rank_offset, self.kv_dim, remote_rank))
             logger.debug("Created %s blocks for dst engine %s with remote rank %s and local rank %s",
                         len(blocks_data), engine_id, remote_rank, self.rank)
 
@@ -685,12 +674,17 @@ class NixlConnectorWorker:
         local_xfer_side_handle = self.src_xfer_side_handle[d_workers_per_p_worker]
         remote_xfer_side_handle = self.dst_xfer_side_handles[dst_engine_id]
 
+        print(f"BLOCK IDS {local_block_ids=}, {remote_block_ids=}")
+
         # Get descs ids.
         remote_block_descs_ids = self._get_block_descs_ids(
             dst_engine_id, remote_block_ids)
         local_block_descs_ids = self._get_block_descs_ids(
             self.engine_id, local_block_ids)
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+    
+        print(f"LOCAL {len(local_block_descs_ids)=}, {local_xfer_side_handle=}")
+        print(f"REMOTE {len(remote_block_descs_ids)=}, {remote_xfer_side_handle=}")
 
         # Prepare transfer with Nixl.
         handle = self.nixl_wrapper.make_prepped_xfer(
@@ -718,9 +712,12 @@ class NixlConnectorWorker:
 
         # Compute the desc ids for each block.
         descs_ids: list[int] = []
+        # TODO branch out here here to save on number of descr for homogen tp 
         for reg_id in region_ids:
             for block_id in block_ids:
-                descs_ids.append(reg_id * num_blocks + block_id)
+                # descs_ids.append(reg_id * num_blocks + block_id)
+                for kv_block in range(self.block_size):
+                    descs_ids.append(reg_id * num_blocks * self.block_size + block_id * self.block_size + kv_block)
         return descs_ids
 
 
