@@ -345,7 +345,9 @@ class NixlConnectorWorker:
 
         # Handshake only with the other TP remote the current local rank will
         # pull from. With homogeneous TP it happens to be the same rank_i.
-        p_remote_rank = self.rank % metadata.tp_size
+        d_workers_per_p_worker = self._tp_size[
+            self.engine_id] // metadata.tp_size
+        p_remote_rank = self.rank // d_workers_per_p_worker
         if p_remote_rank > 0:
             path = f"tcp://{host}:{port + p_remote_rank}"
             logger.debug("Querying metadata on path: %s at remote rank %s",
@@ -496,18 +498,18 @@ class NixlConnectorWorker:
         # rank. With heterogeneous TP, prepare the descriptors by splitting the
         # P KV cache along kv_head dim, of D worker's kv_head size (D>P).
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
-        p_remote_rank = self.rank % nixl_agent_meta.tp_size
+        p_remote_rank = self.rank // d_workers_per_p_worker
         # Only register the remote's descriptors if current rank pulls from it.
         if p_remote_rank == remote_rank:
             self.kv_caches_base_addr[
                 engine_id] = nixl_agent_meta.kv_caches_base_addr
-            rank_offset = self.rank // nixl_agent_meta.tp_size * self.kv_dim
+            rank_offset = self.rank % d_workers_per_p_worker * self.kv_dim
             # Register all remote blocks, but only the corresponding kv heads.
             for base_addr in nixl_agent_meta.kv_caches_base_addr:
                 for block_id in range(nixl_agent_meta.num_blocks):
                     block_offset = block_id * nixl_agent_meta.block_len
                     for b in range(self.block_size):
-                        # Remote kv_dim=local kv_dim * d_workers_per_p_worker
+                        # Remote kv_dim = local kv_dim * d_workers_per_p_worker
                         head_offset = b * self.kv_dim * d_workers_per_p_worker
                         addr = base_addr + block_offset + head_offset
                         # (addr, len, device id)
