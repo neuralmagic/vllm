@@ -20,6 +20,8 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         ab_strides2: torch.Tensor,
         c_strides2: torch.Tensor,
         out_dtype: torch.dtype,
+        per_act_token: bool,
+        per_out_ch: bool,
     ):
         super().__init__()
         self.ab_strides1 = ab_strides1
@@ -27,6 +29,8 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         self.ab_strides2 = ab_strides2
         self.c_strides2 = c_strides2
         self.out_dtype = out_dtype
+        self.per_act_token = per_act_token
+        self.per_out_ch = per_out_ch
 
     def workspace_shapes(
         self,
@@ -75,8 +79,12 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # print("c_strides1:", self.c_strides1)
         # print("ab_strides2:", self.ab_strides2)
         # print("c_strides2:", self.c_strides1)
-        print("a1q val:", a1q)
+        # print("a1q val:", a1q)
         # print("expert_map:", expert_map)
+
+        # print("w1_scale:", w1_scale.shape, "w1:", w1.shape)
+        # print("a1_scale:", a1q_scale.shape, "a1:", a1q.shape)
+        # print(a1q_scale)
 
         assert w1_scale is not None
         assert w2_scale is not None
@@ -89,9 +97,9 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # ) == 0 or a1q_scale.shape[0] == 1 or a1q_scale.shape[0] == a1q.shape[
         #     0], "Input scale shape mismatch" #TODO adjust
         assert w1_scale.dim() == 1 or w1_scale.shape[1] == 1 or w1_scale.shape[
-            1] == w1.shape[2], "W1 scale shape mismatch"
+            1] == w1.shape[1], "W1 scale shape mismatch"
         assert w2_scale.dim() == 1 or w2_scale.shape[1] == 1 or w2_scale.shape[
-            1] == w2.shape[2], "W2 scale shape mismatch"
+            1] == w2.shape[1], "W2 scale shape mismatch"
         assert w1.shape[0] == w2.shape[0], "Weights expert number mismatch"
         assert w1.shape[0] == w1_scale.shape[
             0], "w1 scales expert number mismatch"
@@ -110,7 +118,6 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         assert self.out_dtype in [torch.half,
                                   torch.bfloat16], "Invalid output dtype"
 
-        a1q_scale = a1q_scale[:,:,0:1].reshape(-1, 1).contiguous()
         w1_scale = w1_scale.reshape(-1, w1_scale.shape[-1]).contiguous()
         w2_scale = w2_scale.reshape(-1, w2_scale.shape[-1]).contiguous()
         # a1q_scale = a1q_scale[0][0][0]
@@ -118,8 +125,8 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # print("a shapes in moe func:", a1q.shape, a1q_scale.shape, a1q.device)
         # print("w shapes in moe func:", w1.shape, w2.shape, a1q.device)
         # print("a starts in moe func:", a1q)
-        print("w1 scale val reshaped:", w1_scale)
-        print("w2 scale val reshaped:", w2_scale)
+        # print("w1 scale val reshaped:", w1_scale)
+        # print("w2 scale val reshaped:", w2_scale)
 
         # TODO
         # a shape: #experts * padded_size * hidden_size
@@ -130,8 +137,7 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # we need a new get_cutlass_moe_mm_data for this
         # for now: try to compute them with pytorch code
 
-        M = a1q.shape[0]
-        MM = a1q.shape[1]
+        padded_M = a1q.shape[1]
         _, K, N = w2.shape  # because w1 + w2 are transposed
         device = a1q.device
 
@@ -157,9 +163,12 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
             local_topk_ids = topk_ids
 
         topk = local_topk_ids.shape[1]
+        local_E = w1.shape[0]
 
-        per_act_token = a1q_scale.numel() != 1 if a1q_scale is not None else (
-            a2_scale.numel() != 1 if a2_scale is not None else False)
+        # print("w1_scale:", w1_scale.shape)
+
+        # print("cutlass_moe: per_act_token:", self.per_act_token)
+        # print("cutlass_moe: per_out_ch:", self.per_out_ch)
 
         # expert_offsets = torch.empty((global_num_experts + 1),
         #                              dtype=torch.int32,
@@ -192,17 +201,16 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # print("a1q:", a1q)
         # print("w1:", w1)
 
-        local_num_experts = w1.shape[0]
-        expert_offsets = torch.empty((local_num_experts + 1),
+        expert_offsets = torch.empty((local_E + 1),
                                      dtype=torch.int32,
                                      device=device)
-        problem_sizes1 = torch.empty((local_num_experts, 3),
+        problem_sizes1 = torch.empty((local_E, 3),
                                      dtype=torch.int32,
                                      device=device)
-        problem_sizes2 = torch.empty((local_num_experts, 3),
+        problem_sizes2 = torch.empty((local_E, 3),
                                      dtype=torch.int32,
                                      device=device)
-        for idx in range(local_num_experts):
+        for idx in range(local_E):
             expert_offsets[idx] = idx * a1q.shape[1]
             problem_sizes1[idx][0] = expert_num_tokens[idx]
             problem_sizes1[idx][1] = 2 * N
@@ -224,44 +232,59 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         # a1q = _fp8_perm(a1q, a_map)
         # a1q_scale = a1q_scale[a_map] if per_act_token else a1q_scale
 
-        # c1 = _resize_cache(workspace13, (M * topk, N * 2))
-        # c2 = _resize_cache(workspace2, (M * topk, N))
-        # c3 = _resize_cache(workspace13, (M * topk, K))
+        # c1 = _resize_cache(workspace13, (local_E * topk, N * 2))
+        # c2 = _resize_cache(workspace2, (local_E * topk, N))
+        # c3 = _resize_cache(workspace13, (local_E * topk, K))
 
-        c1 = torch.zeros((M * topk * MM, N * 2), device=a1q.device, dtype=workspace13.dtype)
-        c2 = torch.zeros((M * topk * MM, N), device=a1q.device, dtype=workspace13.dtype)
-        c3 = torch.zeros((M * topk * MM, K), device=a1q.device, dtype=workspace13.dtype)
+        c1 = torch.zeros((local_E * padded_M, N * 2), device=a1q.device, dtype=workspace13.dtype)
+        c2 = torch.zeros((local_E * padded_M, N), device=a1q.device, dtype=workspace13.dtype)
+        c3 = torch.zeros((local_E * padded_M, K), device=a1q.device, dtype=workspace13.dtype)
 
         fp8_type = a1q.dtype
         a1q = a1q.view(dtype=torch.uint8).reshape(
             -1, a1q.shape[2]).contiguous().view(dtype=fp8_type)
         w1_scale = w1_scale.reshape(w1_scale.shape[0], -1).contiguous()
 
-        ops.cutlass_moe_mm(c1, a1q, w1, a1q_scale, w1_scale,
+        # print("a1q local", a1q_scale[:,0:5])
+
+        # print("first run")
+        ops.cutlass_moe_mm(c1, a1q.contiguous(), w1.contiguous(), a1q_scale.contiguous(), w1_scale.contiguous(),
                            expert_offsets[:-1], problem_sizes1,
-                           self.ab_strides1, self.ab_strides1, self.c_strides1)
+                           self.ab_strides1, self.ab_strides1, self.c_strides1,
+                           self.per_act_token, self.per_out_ch)
         
-        print("C1:", c1.view(M * topk, MM, N * 2))
+        # print("C1:", c1.view(local_E, padded_M, N * 2))
         # print("C1:", c1.t()[0])
 
+        # torch.set_printoptions(profile="full")
+        # print("c1:", c1[:,0:5])
+        # torch.set_printoptions(profile="default")
         self.activation(activation, c2, c1)
 
+        # print("c2:", c2[:,0:5])
+
         a2q, a2q_scale = ops.scaled_fp8_quant(
-            c2, a2_scale, use_per_token_if_dynamic=per_act_token)
+            c2.contiguous(), a2_scale, use_per_token_if_dynamic=self.per_act_token)
+        # a2q_scale[a2q_scale < 0.0001] = 0.0
 
         if expert_map is not None:
             c3.fill_(0)
 
-        ops.cutlass_moe_mm(c3, a2q, w2, a2q_scale, w2_scale,
-                           expert_offsets[:-1], problem_sizes2,
-                           self.ab_strides2, self.ab_strides2, self.c_strides2)
+        # print(a2q_scale.shape)
+        # print("a2q local:", a2q_scale.reshape((local_E, -1, 1))[:, 0:5, :])
 
-        print("UNMAPPED C3:", c3.view(M * topk, MM, K))
-        print("TOPK IDS:", topk_ids)
+        # print("second run")
+        ops.cutlass_moe_mm(c3, a2q.contiguous(), w2.contiguous(), a2q_scale.contiguous(), w2_scale.contiguous(),
+                           expert_offsets[:-1], problem_sizes2,
+                           self.ab_strides2, self.ab_strides2, self.c_strides2,
+                           self.per_act_token, self.per_out_ch)
+
+        # print("UNMAPPED C3:", c3.view(local_E, padded_M, K))
+        # print("TOPK IDS:", topk_ids)
 
         # c3 = c3[c_map, ...]
 
-        return c3.reshape(M * topk, MM, K)
+        return c3.reshape(local_E, padded_M, K)
 
 
 def modular_cutlass_moe_fp8(

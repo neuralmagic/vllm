@@ -10,6 +10,8 @@
 #include "cutlass_extensions/common.hpp"
 #include "get_group_starts.cuh"
 
+#include <sstream>
+
 using namespace cute;
 
 namespace {
@@ -76,7 +78,8 @@ void cutlass_group_gemm_caller(
     torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
     torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
     torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
-    torch::Tensor const& b_strides, torch::Tensor const& c_strides) {
+    torch::Tensor const& b_strides, torch::Tensor const& c_strides,
+    bool per_act_token, bool per_out_ch) {
   using ElementAB = typename Gemm::ElementAB;
   using ElementD = typename Gemm::ElementD;
 
@@ -84,8 +87,8 @@ void cutlass_group_gemm_caller(
   int k_size = a_tensors.size(1);
   int n_size = out_tensors.size(1);
 
-  bool per_act_token = a_scales.numel() != 1;
-  bool per_out_ch = b_scales.numel() != num_experts;
+//   bool per_act_token = a_scales.numel() != 1;
+//   bool per_out_ch = b_scales.numel() != num_experts;
 
   auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
 
@@ -102,6 +105,28 @@ void cutlass_group_gemm_caller(
                             a_scales_ptrs, b_scales_ptrs, a_tensors, b_tensors,
                             out_tensors, a_scales, b_scales);
 
+//   std::stringstream ss;
+//   ss << "a_scales: " << a_scales << "\n";
+//   ss << "a_scales_ptrs: " << a_scales_ptrs.to(torch::kInt64) << "\n";
+//   std::cout << ss.str();
+
+
+
+//   if (a_tensors.device().index() == 0) {
+//     printf("SCALE ELEMS:\n");
+//     const ElementAccumulator* a_scales_as_ptr =
+//         static_cast<const ElementAccumulator*>(a_scales.data_ptr());
+//     std::cout << a_scales_as_ptr[0] << "\n";
+//     // for (int e = 0; e < num_experts; e++) {
+//     //     const ElementAccumulator* e_scales = a_scales_as_ptr[e];
+//     //     // for (int j = 0; j < problem_sizes[e][0].item<int>(); ++j) {
+//     //     //     printf("%d %d: %ld\n", e, j, e_scales[j]);
+//     //     // }
+//     //     std::cout << e_scales[0] << "\n";
+//     // }
+//   }
+
+  using GemmKernel = typename Gemm::GemmKernel;
   using GemmKernel = typename Gemm::GemmKernel;
   using StrideA = Stride<int64_t, Int<1>, Int<0>>;
   using StrideB = Stride<int64_t, Int<1>, Int<0>>;
@@ -117,6 +142,8 @@ void cutlass_group_gemm_caller(
       static_cast<StrideA*>(a_strides.data_ptr()),
       static_cast<const ElementAB**>(b_ptrs.data_ptr()),
       static_cast<StrideB*>(b_strides.data_ptr())};
+
+//   printf("PREPARE ARGS: %d %d\n", per_act_token, per_out_ch);
 
   // Currently, we are only able to do broadcast on either all or none a_scales
   // and on either all or none b_scales

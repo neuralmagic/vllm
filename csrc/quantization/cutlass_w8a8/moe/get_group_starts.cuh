@@ -7,6 +7,8 @@
 #include "core/scalar_type.hpp"
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
+#include <sstream>
+#include <iostream>
 
 template <typename ElementAB, typename ElementC, typename ElementAccumulator>
 __global__ void get_group_gemm_starts(
@@ -28,6 +30,11 @@ __global__ void get_group_gemm_starts(
       a_scales_base_as_int + (per_act_token ? expert_offset : 0);
   b_scales_offsets[expert_id] =
       b_scales_base_as_int + (per_out_ch ? n * expert_id : expert_id);
+
+  // printf("scale at expert %d and offset %ld (n: %ld, k: %ld): %f %f %f\n",
+  //   expert_id, expert_offset, n, k,
+  //   a_scales_offsets[expert_id][0], a_scales_offsets[expert_id][1],
+  //   a_scales_offsets[expert_id][2]);
 }
 
 #define __CALL_GET_STARTS_KERNEL(TENSOR_C_TYPE, C_TYPE)                    \
@@ -65,6 +72,10 @@ void run_get_group_gemm_starts(
   int num_experts = static_cast<int>(expert_offsets.size(0));
   bool per_act_token = a_scales.numel() != 1;
   bool per_out_ch = b_scales.numel() != num_experts;
+
+  // printf("per_act_token: %d, per_out_ch: %d\n", per_act_token, per_out_ch);
+  // printf("a_scales: %ld, b_scales: %ld\n", a_scales.numel(), b_scales.numel());
+  // printf("num_experts: %d\n", num_experts);
 
   auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
 
