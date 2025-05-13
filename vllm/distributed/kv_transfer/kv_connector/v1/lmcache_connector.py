@@ -163,4 +163,4 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         if not self.async_save_supported:
             return False, None
 
-        return self._lmcache_engine.request_finished(request, block_ids), None
+        return self._lmcache_engine.request_finished(request, block_ids)
