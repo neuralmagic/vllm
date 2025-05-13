@@ -160,4 +160,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             * Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
-        return self.async_save_supported, None
+        if not self.async_save_supported:
+            return False, None
+
+        return self._lmcache_engine.request_finished(request, block_ids), None
