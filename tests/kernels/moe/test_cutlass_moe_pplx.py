@@ -87,14 +87,12 @@ def _worker_parallel_launch(
     finally:
         torch.distributed.destroy_process_group()
 
-
 def parallel_launch(
     world_size: int,
     worker: Callable[Concatenate[ProcessGroupInfo, P], None],
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> None:
-    assert not kwargs
     spawn(
         _worker_parallel_launch,
         args=(
@@ -105,9 +103,8 @@ def parallel_launch(
             worker,
         ) + args,
         nprocs=world_size,
-        join=True,
+        join=False,
     )
-
 
 def rank_chunk(num, r, w):
     rem = num % w
@@ -309,7 +306,7 @@ def pplx_cutlass_moe(
 
     # print("out:", out, out.shape, rank_num_tokens)
 
-    return out[:rank_num_tokens]
+    return out#[:rank_num_tokens]
 
 
 vllm_config = VllmConfig()
@@ -393,14 +390,43 @@ def _pplx_moe(
                                  pgi.world_size).to(pplx_output.device)
         
     # if (pgi.device.index == 0):
-    print("PPLX OUT:", pplx_output)
-    print("TORCH OUT:", torch_output)
+    # print("PPLX OUT:", pplx_output)
+    # print("TORCH OUT:", torch_output)
+
+    # ground_experts = CutlassExperts(
+    #     ab_strides1,
+    #     c_strides1,
+    #     ab_strides2,
+    #     c_strides2,
+    #     out_dtype,
+    #     per_act_token,
+    #     per_out_ch
+    # )
+
+    # ground_output = ground_experts(a,
+    #                                w1,
+    #                                w2,
+    #                                topk_ids,
+    #                                "silu",
+    #                                w1.shape[0],
+    #                                None,
+    #                                w1_scale,
+    #                                w2_scale,
+    #                                None,
+    #                                None,
+    #                                a1_scale,
+    #                                None,
+    #                                torch.empty((0), device=a.device, dtype=out_dtype),
+    #                                torch.empty((0), device=a.device, dtype=out_dtype))
+                                   
 
     # TODO figure out if there is an issue or the results are just inaccurate
     # due to dequantization
-    # torch.testing.assert_close(pplx_output, torch_output, atol=0.01, rtol=0)
+    torch.testing.assert_close(pplx_output, torch_output, atol=0.01, rtol=0)
 
     nvshmem_finalize()
+
+    return pplx_output
 
 
 @pytest.mark.parametrize("m", [2, 64, 224])
@@ -412,8 +438,8 @@ def _pplx_moe(
 @pytest.mark.parametrize("per_out_ch", [True, False])
 @pytest.mark.parametrize("world_dp_size", [[2, 1]])  #, [4, 2]])
 # @pytest.mark.parametrize("m", [5])
-# @pytest.mark.parametrize("n", [1024])
-# @pytest.mark.parametrize("k", [1024])
+# @pytest.mark.parametrize("n", [16])
+# @pytest.mark.parametrize("k", [16])
 # @pytest.mark.parametrize("e", [4])
 # @pytest.mark.parametrize("topk", [1])
 # @pytest.mark.parametrize("per_act_token", [True])
@@ -439,9 +465,9 @@ def test_cutlass_moe_pptx(
 
         dtype = torch.half
 
-        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10.0
-        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10.0
-        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10.0
+        a = torch.ones((m, k), device="cuda", dtype=dtype) / 10.0
+        w1 = torch.ones((e, 2 * n, k), device="cuda", dtype=dtype) / 10.0
+        w2 = torch.ones((e, k, n), device="cuda", dtype=dtype) / 10.0
 
         # for idx in range (m):
         #     a[idx] = torch.full((k,), idx + 1, device="cuda", dtype=dtype)
@@ -455,25 +481,27 @@ def test_cutlass_moe_pptx(
 
         # a[1:] = torch.zeros((m - 1, k), device="cuda", dtype=dtype)
 
-        # Get the right scale for tests.
-        a_q, a_scale1 = ops.scaled_fp8_quant(
-            a, use_per_token_if_dynamic=per_act_token)
-
         # print("a:", a.shape)
         # print("a_scale1:", a_scale1)
 
         # TODO this snippet makes the scales identical for all tokens - remove
         # after testing
-        if per_act_token:
-            for idx in range(m):
-                if idx != 0:
-                    a_scale1[idx] = a_scale1[0]
+        # if per_act_token:
+        #     a_scale1 = torch.empty((m, 1), device="cuda", dtype=torch.float32)
+        #     for idx in range(m):
+        #         # if idx != 0:
+        #             # a_scale1[idx] = a_scale1[0]
+        #         a_scale1[idx] = torch.full((1,), idx + 1, device="cuda", dtype=torch.float32)
+        #     a_q, a_scale1 = ops.scaled_fp8_quant(
+        #         a, a_scale1, use_per_token_if_dynamic=per_act_token)
+        # else:
+        #     # Get the right scale for tests.
+        #     a_q, a_scale1 = ops.scaled_fp8_quant(
+        #         a, use_per_token_if_dynamic=per_act_token)
 
         # a_q, _ = ops.scaled_fp8_quant(a,
         #                               a_scale1,
         #                               use_per_token_if_dynamic=per_act_token)
-
-        # a_d = a_q.float().mul(a_scale1).to(dtype)
 
         # print("a_d:", a_d)
         # print("a:", a)
@@ -483,7 +511,9 @@ def test_cutlass_moe_pptx(
         # for i in range(m):
         #     a_d_float[i] = a_d_float[i] * a_scale1[i]
         # a_d = a_d_float.to(dtype)
-        a_d = a_q.float().mul(a_scale1).to(dtype)
+
+        # a_d = a_q.float().mul(a_scale1).to(dtype)
+        # print("a_q:", a_q)
         # print("a_d:", a_d)
         # torch.testing.assert_close(a, a_d, atol=1e-1, rtol=0)
 
@@ -545,13 +575,14 @@ def test_cutlass_moe_pptx(
         # torch.testing.assert_close((w2_q.half() * w2_scale).half(), w2_d, atol=2e-2, rtol=0)
 
         world_size, dp_size = world_dp_size
+        a_scale1 = torch.empty((m if per_act_token else 1, 1),
+                               device="cuda", dtype=torch.float32)
         # print("original a:", a)
-        parallel_launch(world_size, _pplx_moe, dp_size, a,
-                        w1_q, w2_q,
+        parallel_launch(world_size, _pplx_moe, dp_size, a, w1_q, w2_q,
                         w1_scale, w2_scale, topk_weights, topk_ids,
                         ab_strides1, c_strides1, ab_strides2, c_strides2,
                         a_scale1, score, dtype,
-                        a_d, w1_d, w2_d, per_act_token, per_out_ch)
+                        a, w1_d, w2_d, per_act_token, per_out_ch)
 
         # cutlass_output = cutlass_moe_fp8(a,
         #                                  w1_q,

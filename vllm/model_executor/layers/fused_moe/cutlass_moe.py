@@ -243,9 +243,12 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
         fp8_type = a1q.dtype
         a1q = a1q.view(dtype=torch.uint8).reshape(
             -1, a1q.shape[2]).contiguous().view(dtype=fp8_type)
-        w1_scale = w1_scale.reshape(w1_scale.shape[0], -1).contiguous()
+        # w1_scale = w1_scale.reshape(w1_scale.shape[0], -1).contiguous()
 
-        # print("a1q local", a1q_scale[:,0:5])
+        # print("a1q local", a1q[:,0:5], a1q.shape)
+        # print("a1q_scale local", a1q_scale[:,0:5], a1q_scale.shape)
+        # print("w1_scale shape", w1_scale.shape)
+        # print("w2_scale shape", w2_scale.shape)
 
         # print("first run")
         ops.cutlass_moe_mm(c1, a1q.contiguous(), w1.contiguous(), a1q_scale.contiguous(), w1_scale.contiguous(),
@@ -284,7 +287,7 @@ class CutlassExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         # c3 = c3[c_map, ...]
 
-        return c3.reshape(local_E, padded_M, K)
+        return c3.reshape(local_E, padded_M, K).contiguous()
 
 
 def modular_cutlass_moe_fp8(

@@ -70,15 +70,25 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         
         # print("A1 DTYPE", a1.dtype)
         # print("A1 SHAPES:", a1.shape, a1_scale.shape)
+        repeat_cols = 4
+        if self.per_act_token:
+            repeat_rows = 1
+            a1q, a1q_scale = moe_kernel_quantize_input(a1, None,
+                                                    self.quant_dtype,
+                                                    self.per_act_token,
+                                                    self.block_shape)
+        else:
+            repeat_rows = a1q.shape[0]
+            a1q, a1q_scale = moe_kernel_quantize_input(a1, a1_scale,
+                                                    self.quant_dtype,
+                                                    self.per_act_token,
+                                                    self.block_shape)
 
-        a1q, a1q_scale = moe_kernel_quantize_input(a1, a1_scale,
-                                                   self.quant_dtype,
-                                                   self.per_act_token,
-                                                   self.block_shape)
+        a1q_scale = a1q_scale.repeat(repeat_rows, repeat_cols).contiguous()
 
-        # # print("pplx_dispatch_combine a1:", a1)   
+        # # # print("pplx_dispatch_combine a1:", a1)   
         # print("full a1_scale:", a1_scale)
-        # # print("pplx_dispatch_combine a1q:", a1q)
+        # # # print("pplx_dispatch_combine a1q:", a1q)
         # print("full a1q_scale:", a1q_scale)
 
         rem_experts = num_experts % self.world_size
