@@ -128,6 +128,7 @@ def ref_nvfp4_quant(x, global_scale, block_size):
     vec_max = torch.max(torch.abs(x), dim=-1,
                         keepdim=True)[0].to(torch.float32)
     scale = global_scale * (vec_max * get_reciprocal(FLOAT4_E2M1_MAX))
+    scale = torch.clamp(scale, max=448, min=-448)
     scale = scale.to(torch.float8_e4m3fn).to(torch.float32)
     output_scale = get_reciprocal(scale * get_reciprocal(global_scale))
 
