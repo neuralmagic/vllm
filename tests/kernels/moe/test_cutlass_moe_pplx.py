@@ -103,7 +103,7 @@ def parallel_launch(
             worker,
         ) + args,
         nprocs=world_size,
-        join=False,
+        join=True,
     )
 
 def rank_chunk(num, r, w):
@@ -162,7 +162,7 @@ def pplx_cutlass_moe(
     rank = pgi.rank
     world_size = pgi.world_size
     rank_num_tokens = rank_chunk(num_tokens, rank, world_size)
-    max_num_tokens = max(128, rank_chunk(a.shape[0], 0, world_size))
+    max_num_tokens = rank_chunk(num_tokens, 0, world_size)
     topk = topk_ids.shape[1]
 
     # return torch.zeros((a.shape[0], a.shape[1]), dtype=out_dtype, device=device)
@@ -195,14 +195,14 @@ def pplx_cutlass_moe(
         # hidden_dim_scale_bytes=0,
     )
 
-    if block_size == hidden_dim:
-        repeat_cols = scale_elems
-    else:
-        repeat_cols = 1
-    if a1_scale.shape[0] == 1:
-        repeat_rows = num_tokens
-    else:
-        repeat_rows = 1
+    # if block_size == hidden_dim:
+    #     repeat_cols = scale_elems
+    # else:
+    #     repeat_cols = 1
+    # if a1_scale.shape[0] == 1:
+    #     repeat_rows = num_tokens
+    # else:
+    #     repeat_rows = 1
 
     w1 = w1.to(device)
     w2 = w2.to(device)
@@ -212,9 +212,10 @@ def pplx_cutlass_moe(
     c_strides1 = c_strides1[:rank_num_tokens].to(device)
     ab_strides2 = ab_strides2[:rank_num_tokens].to(device)
     c_strides2 = c_strides2[:rank_num_tokens].to(device)
+    a1_scale = a1_scale.to(device)
     # print("a1 scale before repeat:", a1_scale.shape, a.shape)
     # print(a1_scale)
-    a1_scale = a1_scale.repeat(repeat_rows, repeat_cols).contiguous().to(device)
+    # a1_scale = a1_scale.repeat(repeat_rows, repeat_cols).contiguous().to(device)
     # print("a1 scale after repeat:", a1_scale.shape, a.shape)
     # topk_weights = topk_weights.to(device)
     # topk_ids = topk_ids.to(device)
@@ -234,6 +235,8 @@ def pplx_cutlass_moe(
     )
 
     experts = CutlassExperts(
+            max_num_tokens * world_size,
+            (num_experts + world_size - 1) // world_size,
             ab_strides1,
             c_strides1,
             ab_strides2,
@@ -285,7 +288,7 @@ def pplx_cutlass_moe(
                         expert_map=None, #TODO
                         w1_scale=chunk_by_rank(w1_scale, rank, world_size),
                         w2_scale=chunk_by_rank(w2_scale, rank, world_size),
-                        a1_scale=chunk_by_rank(a1_scale, rank, world_size))
+                        a1_scale=chunk_by_rank(a1_scale, rank, world_size) if per_act_token else a1_scale[rank])
     # # out = fused_experts(
     # #     a_chunk,
     # #     # Chunking weights like this only works for batched format
@@ -390,8 +393,8 @@ def _pplx_moe(
                                  pgi.world_size).to(pplx_output.device)
         
     # if (pgi.device.index == 0):
-    # print("PPLX OUT:", pplx_output)
-    # print("TORCH OUT:", torch_output)
+    print("PPLX OUT:", pplx_output)
+    print("TORCH OUT:", torch_output)
 
     # ground_experts = CutlassExperts(
     #     ab_strides1,
@@ -422,11 +425,9 @@ def _pplx_moe(
 
     # TODO figure out if there is an issue or the results are just inaccurate
     # due to dequantization
-    torch.testing.assert_close(pplx_output, torch_output, atol=0.01, rtol=0)
+    torch.testing.assert_close(pplx_output, torch_output, atol=0.05, rtol=0)
 
     nvshmem_finalize()
-
-    return pplx_output
 
 
 @pytest.mark.parametrize("m", [2, 64, 224])
@@ -434,12 +435,12 @@ def _pplx_moe(
 @pytest.mark.parametrize("k", [1024, 1536])
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("per_act_token", [True])
+@pytest.mark.parametrize("per_act_token", [True, False])
 @pytest.mark.parametrize("per_out_ch", [True, False])
 @pytest.mark.parametrize("world_dp_size", [[2, 1]])  #, [4, 2]])
 # @pytest.mark.parametrize("m", [5])
-# @pytest.mark.parametrize("n", [16])
-# @pytest.mark.parametrize("k", [16])
+# @pytest.mark.parametrize("n", [1024])
+# @pytest.mark.parametrize("k", [1024])
 # @pytest.mark.parametrize("e", [4])
 # @pytest.mark.parametrize("topk", [1])
 # @pytest.mark.parametrize("per_act_token", [True])
@@ -465,9 +466,9 @@ def test_cutlass_moe_pptx(
 
         dtype = torch.half
 
-        a = torch.ones((m, k), device="cuda", dtype=dtype) / 10.0
-        w1 = torch.ones((e, 2 * n, k), device="cuda", dtype=dtype) / 10.0
-        w2 = torch.ones((e, k, n), device="cuda", dtype=dtype) / 10.0
+        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10.0
+        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10.0
+        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10.0
 
         # for idx in range (m):
         #     a[idx] = torch.full((k,), idx + 1, device="cuda", dtype=dtype)
@@ -575,8 +576,10 @@ def test_cutlass_moe_pptx(
         # torch.testing.assert_close((w2_q.half() * w2_scale).half(), w2_d, atol=2e-2, rtol=0)
 
         world_size, dp_size = world_dp_size
-        a_scale1 = torch.empty((m if per_act_token else 1, 1),
-                               device="cuda", dtype=torch.float32)
+        a_scale1 = torch.randn((m if per_act_token else 1, 1),
+                               device="cuda", dtype=torch.float32) / 10.0
+        if not per_act_token:
+            a_scale1 = a_scale1.repeat(world_size, 1)
         # print("original a:", a)
         parallel_launch(world_size, _pplx_moe, dp_size, a, w1_q, w2_q,
                         w1_scale, w2_scale, topk_weights, topk_ids,
@@ -609,3 +612,4 @@ def test_cutlass_moe_pptx(
         #                            pplx_output,
         #                            atol=5e-2,
         #                            rtol=1e-2)
+

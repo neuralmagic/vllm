@@ -78,17 +78,17 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
                                                     self.per_act_token,
                                                     self.block_shape)
         else:
-            repeat_rows = a1q.shape[0]
+            repeat_rows = a1.shape[0]
             a1q, a1q_scale = moe_kernel_quantize_input(a1, a1_scale,
                                                     self.quant_dtype,
                                                     self.per_act_token,
                                                     self.block_shape)
 
-        a1q_scale = a1q_scale.repeat(repeat_rows, repeat_cols).contiguous()
+        a1q_scale = a1q_scale.repeat(repeat_rows, repeat_cols)
 
-        # # # print("pplx_dispatch_combine a1:", a1)   
+        # # # # print("pplx_dispatch_combine a1:", a1)   
         # print("full a1_scale:", a1_scale)
-        # # # print("pplx_dispatch_combine a1q:", a1q)
+        # # # # print("pplx_dispatch_combine a1q:", a1q)
         # print("full a1q_scale:", a1q_scale)
 
         rem_experts = num_experts % self.world_size
@@ -154,13 +154,13 @@ class PplxDispatchCombine(mk.FusedMoEQuantizeDispatchCombine):
         #       a1q.dtype, a1q_scale.dtype, rank_topk_ids.dtype)
         # print("expert x:", expert_x)
         # print("expert a1q:", a1q)
-        # # print("expert_x_scale x:", expert_x_scale)
+        # print("expert_x_scale x:", expert_x_scale)
         # print("expert_num_tokens x:", expert_num_tokens)
         # # print("after dispatch:", expert_num_tokens)
         if self.per_act_token:
-            expert_x_scale = expert_x_scale[:, :, 0:1].contiguous()
+            expert_x_scale = expert_x_scale[:, :, 0:1]
         else:
-            expert_x_scale = expert_x_scale[0:1, 0:1, 0:1].contiguous()
+            expert_x_scale = expert_x_scale[0:1, 0:1, 0:1]
         # print("returned:", expert_x.shape, expert_x_scale.shape,
         #       expert_num_tokens.shape)
         return expert_x, expert_x_scale, expert_num_tokens
