@@ -3,10 +3,7 @@ import torch
 
 from vllm.scalar_type import scalar_types
 
-__all__ = [
-    "break_fp4_bytes", "dequantize_to_dtype", "ref_nvfp4_quant",
-    "dequantize_unfused", "requantize_with_max", "expand_global_scale"
-]
+__all__ = ["break_fp4_bytes", "dequantize_to_dtype", "ref_nvfp4_quant"]
 
 FLOAT4_E2M1_MAX = scalar_types.float4_e2m1fn.max()
 
@@ -136,17 +133,3 @@ def ref_nvfp4_quant(x, global_scale, block_size):
     clipped_x = torch.clamp(scaled_x, -6.0, 6.0).reshape(m, n)
     # both outputs are float32
     return cast_to_fp4(clipped_x), scale.squeeze(-1)
-
-
-def expand_global_scale(local_scale, sizes, global_scale):
-    output_scale = torch.zeros(local_scale.shape, dtype=global_scale.dtype).to(
-        global_scale.device)
-    end = 0
-    for i in range(len(sizes)):
-        size = sizes[i]
-        current_global_scale = global_scale[i]
-        start = end
-        end = start + size
-        output_scale[start:end, :] = current_global_scale
-
-    return output_scale

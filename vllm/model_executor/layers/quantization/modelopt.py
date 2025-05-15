@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Optional, Union
 
 import torch
+import torch._dynamo
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -13,6 +14,8 @@ from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+    dequantize_to_dtype, ref_nvfp4_quant)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -20,10 +23,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.parameter import (ModelWeightParameter,
                                            PerTensorScaleParameter)
 from vllm.platforms import current_platform
-from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    ref_nvfp4_quant, dequantize_to_dtype)
-from math import ceil
-import torch._dynamo
+
 torch._dynamo.config.suppress_errors = True
 
 logger = init_logger(__name__)
@@ -392,7 +392,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         # for input only the contracting dimension has a constraint.
         x_m, x_k = x.shape
         block_size = group_size = 16
-       
+
         # quantize input to (FP4 and interleaved block scale)
         x_global_scale = 1 / layer.input_scale
         x_fp4, x_blockscale = ref_nvfp4_quant(x, x_global_scale, block_size)
@@ -402,7 +402,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         x_blockscale = x_blockscale.unsqueeze(-1) / x_global_scale
         x_dq = (x_fp4 * x_blockscale).reshape(x_m, x_k).to(output_dtype)
         del x_fp4, x_blockscale
-    
+
         # dequantize weight
         w_fp4 = layer.weight.data.view(torch.uint8)
         w_blockscale = layer.weight_scale_swizzled.data
@@ -414,4 +414,3 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         out = torch.matmul(x_dq, w_dq.t())
         del w_dq, x_dq
         return out
-       
