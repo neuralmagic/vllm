@@ -13,7 +13,7 @@ def is_activation_quantization_format(format: str) -> bool:
     _ACTIVATION_QUANTIZATION_FORMATS = [
         CompressionFormat.naive_quantized.value,
         CompressionFormat.int_quantized.value,
-        CompressionFormat.float_quantized.value,
+        CompressionFormat.float_quantized.value, "nvfp4-pack-quantized"
     ]
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
