@@ -6,8 +6,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from vllm._custom_ops import (cutlass_scaled_fp4_mm,
-                              cutlass_scaled_mm_supports_fp4, scaled_fp4_quant)
+from vllm._custom_ops import cutlass_scaled_mm_supports_fp4
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, FusedMoEMethodBase, FusedMoeWeightScaleSupported)
@@ -18,8 +17,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-    apply_fp4_marlin_linear, is_fp4_marlin_supported,
-    prepare_fp4_layer_for_marlin, prepare_moe_fp4_layer_for_marlin)
+    is_fp4_marlin_supported, prepare_moe_fp4_layer_for_marlin)
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (  # noqa: E501
+    dequantize_to_dtype, ref_nvfp4_quant)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -387,27 +387,10 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
         layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
 
-        layer.alpha = Parameter(layer.input_scale * layer.weight_scale_2,
-                                requires_grad=False)
-
-        # Swizzle the weight blockscale.
-        # contracting dimension is input dimension
-        # block_size = 16;
-        assert (layer.weight_scale.shape[1] % 16 == 0), (
-            "Expected weight_scale.dim(1) to be divisible by 16")
-        assert (layer.weight_scale.dtype == torch.float8_e4m3fn), (
-            "Weight Block scale must be represented as FP8-E4M3")
         swizzled_weight_scale = self.swizzle_blockscale(layer.weight_scale)
 
         layer.weight_scale_swizzled = Parameter(swizzled_weight_scale,
                                                 requires_grad=False)
-        layer.weight = Parameter(layer.weight.data, requires_grad=False)
-
-        if self.use_marlin:
-            prepare_fp4_layer_for_marlin(layer)
-            del layer.alpha
-            del layer.input_scale
-            del layer.weight_scale_swizzled
 
     def apply(
         self,
@@ -415,38 +398,33 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.use_marlin:
-            return apply_fp4_marlin_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                weight_scale_2=layer.weight_scale_2,
-                workspace=layer.workspace,
-                size_n=layer.output_size_per_partition,
-                size_k=layer.input_size_per_partition,
-                bias=bias)
 
+        # for input only the contracting dimension has a constraint.
+        x_m, x_k = x.shape
+        block_size = 16
         output_dtype = x.dtype
-        output_shape = [x.shape[0], layer.weight.shape[0]]
 
-        # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        s_quant = 1 / layer.input_scale
-        x_fp4, x_blockscale = scaled_fp4_quant(x, s_quant)
+        # quantize input to (FP4 and interleaved block scale)
+        x_global_scale = 1 / layer.input_scale
+        x_fp4, x_blockscale = ref_nvfp4_quant(x, x_global_scale, block_size)
 
-        # validate dtypes of quantized input, input block scale,
-        # weight and weight_blockscale
-        assert (x_fp4.dtype == torch.uint8)
-        assert (layer.weight.dtype == torch.uint8)
-        assert (x_blockscale.dtype == torch.float8_e4m3fn)
-        assert (layer.weight_scale_swizzled.dtype == torch.float8_e4m3fn)
-        assert (layer.alpha.dtype == torch.float32)
+        # dequantize input
+        x_fp4 = x_fp4.reshape(x_m, x_k // block_size, block_size)
+        x_blockscale = x_blockscale.unsqueeze(-1) / x_global_scale
+        x_dq = (x_fp4 * x_blockscale).reshape(x_m, x_k).to(output_dtype)
+        del x_fp4, x_blockscale
 
-        out = cutlass_scaled_fp4_mm(x_fp4, layer.weight, x_blockscale,
-                                    layer.weight_scale_swizzled, layer.alpha,
-                                    output_dtype)
-        if bias is not None:
-            out = out + bias
-        return out.view(*output_shape)
+        # dequantize weight
+        w_fp4 = layer.weight.data.view(torch.uint8)
+        w_blockscale = layer.weight_scale_swizzled.data
+        w_global_scale = 1 / layer.weight_scale_2
+        w_dq = dequantize_to_dtype(w_fp4, w_blockscale, w_global_scale,
+                                   output_dtype, x.device, block_size)
+
+        # matmul
+        out = torch.matmul(x_dq, w_dq.t())
+        del w_dq, x_dq
+        return out
 
 
 class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
