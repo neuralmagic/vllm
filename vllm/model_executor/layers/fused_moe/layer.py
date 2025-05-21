@@ -58,7 +58,7 @@ logger = init_logger(__name__)
 
 # Note: this limit is somewhat arbitrary and might be changed later.
 # The size of the activations will be E x MOE_DP_CHUNK_SIZE x hidden_dim.
-MOE_DP_CHUNK_SIZE = 256
+MOE_DP_CHUNK_SIZE = 128
 
 
 @dataclass
@@ -74,6 +74,7 @@ class FusedMoEParallelConfig:
 
     @property
     def use_pplx_kernels(self):
+        #print(f"USE_PPLX_KERNELS {self.dp_size} {self.use_ep} {has_pplx}")
         return self.dp_size > 1 and self.use_ep and has_pplx
 
     @staticmethod
@@ -185,6 +186,7 @@ class FusedMoEParallelConfig:
 # Adapted from pplx-kernels tests/all_to_all_utils.py
 @dataclass
 class MoEConfig:
+    max_num_tokens: int
     num_experts: int
     experts_per_token: int
     hidden_dim: int
@@ -447,7 +449,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 max_num_tokens=MOE_DP_CHUNK_SIZE,
                 world_size=world_size,
                 dp_size=dp_size,
-                use_fp8_w8a8=False,
+                use_fp8_w8a8=False,  #moe.in_dtype == torch.float8_e4m3fn,
                 use_int8_w8a8=False,
                 use_int8_w8a16=False,
                 use_int4_w4a16=False,
@@ -824,14 +826,19 @@ class FusedMoE(torch.nn.Module):
             from vllm_hpu_extension.ops import DynamicFusedMOE
             self.hpu_fused_moe = DynamicFusedMOE(self.global_num_experts)
 
+        logger.debug(f"PARAM DTYPE = {params_dtype}")
+        #assert params_dtype.itemsize == 1
+
         moe = MoEConfig(
+            max_num_tokens=MOE_DP_CHUNK_SIZE,
             num_experts=self.global_num_experts,
             experts_per_token=top_k,
             hidden_dim=hidden_size,
             num_local_experts=self.local_num_experts,
             moe_parallel_config=self.moe_parallel_config,
             # TODO (bnell): this needs to be fixed for quantized types.
-            in_dtype=params_dtype,
+            #in_dtype=params_dtype,
+            in_dtype=torch.float8_e4m3fn,
         )
 
         # Note: get_quant_method will look at the layer's local_num_experts
@@ -839,12 +846,15 @@ class FusedMoE(torch.nn.Module):
         quant_method: Optional[QuantizeMethodBase] = None
 
         if quant_config is None:
+            logger.info("NONQUANT TYPE!")
             quant_method = UnquantizedFusedMoEMethod(moe)
             prepare_finalize = _construct_prepare_finalize(moe, quant_config)
         else:
             quant_method = quant_config.get_quant_method(self, prefix)
             # No pplx for quantized types yet.
-            prepare_finalize = None
+            logger.info("QUANT TYPE!")
+            #prepare_finalize = None
+            prepare_finalize = _construct_prepare_finalize(moe, quant_config)
 
         assert quant_method is not None
         assert isinstance(quant_method, FusedMoEMethodBase)
@@ -1227,6 +1237,8 @@ class FusedMoE(torch.nn.Module):
                 renormalize=renormalize)
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
+
+        assert topk_ids.dtype == indices_type
 
         return topk_weights, topk_ids
 

@@ -14,7 +14,8 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase,
+from vllm.model_executor.layers.fused_moe import (MOE_DP_CHUNK_SIZE, FusedMoE,
+                                                  FusedMoEMethodBase,
                                                   FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
@@ -463,8 +464,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         self.fused_experts = functools.partial(
             fused_experts,
+            use_fp8_w8a8=True,
             block_shape=self.quant_config.weight_block_size,
             allow_deep_gemm=self.allow_deep_gemm)
+
+        self.use_pplx_kernels = False
+        self.rocm_aiter_moe_enabled = False
 
     def create_weights(self, layer: Module, num_experts: int, hidden_size: int,
                        intermediate_size_per_partition: int,
@@ -797,22 +802,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         world_size: int,
         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
     ) -> bool:
+        from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
+            BatchedPrepareAndFinalize, BatchedTritonExperts)
+        from vllm.model_executor.layers.fused_moe.pplx_prepare_finalize import (
+            PplxPrepareAndFinalize)
         from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
             TritonOrDeepGemmExperts)
 
         if self.use_marlin or self.rocm_aiter_moe_enabled:
             return False
 
-        experts = TritonOrDeepGemmExperts(
-            use_fp8_w8a8=True,
-            block_shape=self.quant_config.weight_block_size,
-            allow_deep_gemm=self.allow_deep_gemm,
-        )
+        if isinstance(prepare_finalize,
+                      (BatchedPrepareAndFinalize, PplxPrepareAndFinalize)):
+            logger.debug("BatchedTritonExperts")
+            experts = BatchedTritonExperts(
+                max_num_tokens=MOE_DP_CHUNK_SIZE,
+                world_size=world_size,
+                dp_size=dp_size,
+                use_fp8_w8a8=True,
+                use_int8_w8a8=False,
+                use_int8_w8a16=False,
+                use_int4_w4a16=False,
+                block_shape=self.quant_config.weight_block_size,
+            )
+        else:
+            experts = TritonOrDeepGemmExperts(
+                use_fp8_w8a8=True,
+                block_shape=self.quant_config.weight_block_size,
+                allow_deep_gemm=self.allow_deep_gemm,
+            )
 
         self.fused_experts = mk.FusedMoEModularKernel(
             prepare_finalize,
             experts,
         )
+
+        self.use_pplx_kernels = True
 
         return True
 
@@ -845,7 +870,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-        )
+            indices_type=torch.uint32 if self.use_pplx_kernels else None)
 
         if self.rocm_aiter_moe_enabled:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa: E501
@@ -892,7 +917,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_ids=topk_ids,
                 inplace=True,
                 activation=activation,
-                use_fp8_w8a8=True,
                 global_num_experts=global_num_experts,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 expert_map=expert_map,
