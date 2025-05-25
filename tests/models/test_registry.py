@@ -11,23 +11,25 @@ from vllm.model_executor.models import (is_pooling_model,
 from vllm.model_executor.models.adapters import (as_classification_model,
                                                  as_embedding_model,
                                                  as_reward_model)
+from vllm.model_executor.models.colqwen2_vl import ColQwen2VL
 from vllm.model_executor.models.registry import (_MULTIMODAL_MODELS,
                                                  _SPECULATIVE_DECODING_MODELS,
                                                  _TEXT_GENERATION_MODELS,
                                                  ModelRegistry)
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 
-from ..utils import fork_new_process_for_each_test
+from ..utils import create_new_process_for_each_test
 from .registry import HF_EXAMPLE_MODELS
 
-from vllm.model_executor.models.colqwen2_vl import ColQwen2VL
-from vllm.multimodal import MULTIMODAL_REGISTRY
 
 def test_colqwen2vl_registration():
-    assert 'ColQwen2VL' in MULTIMODAL_REGISTRY, "ColQwen2VL should be registered."
+    assert 'ColQwen2VL' in MULTIMODAL_REGISTRY, (
+        "ColQwen2VL should be registered.")
     model = MULTIMODAL_REGISTRY['ColQwen2VL']()
     assert isinstance(model, ColQwen2VL), "Failed to instantiate ColQwen2VL."
-    
+
+
 @pytest.mark.parametrize("model_arch", ModelRegistry.get_supported_archs())
 def test_registry_imports(model_arch):
     model_info = HF_EXAMPLE_MODELS.get_hf_info(model_arch)
@@ -52,7 +54,7 @@ def test_registry_imports(model_arch):
         assert supports_multimodal(model_cls)
 
 
-@fork_new_process_for_each_test
+@create_new_process_for_each_test()
 @pytest.mark.parametrize("model_arch,is_mm,init_cuda,is_ce", [
     ("LlamaForCausalLM", False, False, False),
     ("MllamaForConditionalGeneration", True, False, False),
@@ -77,7 +79,7 @@ def test_registry_model_property(model_arch, is_mm, init_cuda, is_ce):
                 stacklevel=2)
 
 
-@fork_new_process_for_each_test
+@create_new_process_for_each_test()
 @pytest.mark.parametrize("model_arch,is_pp,init_cuda", [
     ("MLPSpeculatorPreTrainedModel", False, False),
     ("DeepseekV2ForCausalLM", True, False),
