@@ -8,11 +8,10 @@ from typing import Any, Optional, Union
 # Third-party imports
 import torch
 from transformers import BatchFeature
-from transformers.models.colqwen2_vl import (ColQwen2VLImageProcessor,
-                                             ColQwen2VLProcessor)
-from transformers.models.colqwen2_vl.configuration_colqwen2 import (
-    ColQwen2VLConfig)
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+from transformers.models.colqwen2 import ColQwen2Processor
+from transformers.models.colqwen2.configuration_colqwen2 import ColQwen2Config
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
+    Qwen2VLImageProcessor, smart_resize)
 
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
@@ -116,9 +115,9 @@ class ColQwen2VLProcessingInfo(Qwen2VLProcessingInfo):
         max_pixels: Optional[int] = None,
         size: Optional[dict[str, int]] = None,
         **kwargs: object,
-    ) -> ColQwen2VLProcessor:
+    ) -> ColQwen2Processor:
         return self.ctx.get_hf_processor(
-            ColQwen2VLProcessor,
+            ColQwen2Processor,
             image_processor=self.get_image_processor(min_pixels=min_pixels,
                                                      max_pixels=max_pixels,
                                                      size=size),
@@ -131,7 +130,7 @@ class ColQwen2VLProcessingInfo(Qwen2VLProcessingInfo):
         image_height: int,
         num_frames: int = 1,
         do_resize: bool = True,
-        image_processor: Optional[ColQwen2VLImageProcessor],
+        image_processor: Optional[Qwen2VLImageProcessor],
     ) -> tuple[ImageSize, int]:
         if image_processor is None:
             image_processor = self.get_image_processor()
@@ -174,7 +173,7 @@ class ColQwen2VLProcessingInfo(Qwen2VLProcessingInfo):
         *,
         image_width: int,
         image_height: int,
-        image_processor: Optional[ColQwen2VLImageProcessor],
+        image_processor: Optional[Qwen2VLImageProcessor],
     ) -> int:
         _, num_image_tokens = self._get_vision_info(
             image_width=image_width,
@@ -189,7 +188,7 @@ class ColQwen2VLProcessingInfo(Qwen2VLProcessingInfo):
         image_width: int,
         image_height: int,
         num_frames: int,
-        image_processor: Optional[ColQwen2VLImageProcessor],
+        image_processor: Optional[Qwen2VLImageProcessor],
     ) -> int:
         _, num_video_tokens = self._get_vision_info(
             image_width=image_width,
@@ -304,7 +303,7 @@ class ColQwen2(Qwen2VLForConditionalGeneration):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        config: ColQwen2VLConfig = vllm_config.model_config.hf_config
+        config: ColQwen2Config = vllm_config.model_config.hf_config
         self.config = config
         self.dim = 128
         # Add custom text projection layer to project from

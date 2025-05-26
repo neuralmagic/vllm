@@ -74,30 +74,27 @@ def run_e5_v(query: Query) -> ModelRequestData:
 
 
 def run_colqwen2vlm(query: Query) -> ModelRequestData:
+    # ColQwen2 only supports text OR image input
     if query["modality"] == "text":
         text = query["text"]
         prompt = f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
         image = None
     elif query["modality"] == "image":
-        text = "Describe the image."
-        prompt = (
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-            f"{text}<|im_end|>\n"
-            "<|im_start|>assistant\n")
+        prompt = None
         image = query["image"]
     else:
         modality = query['modality']
         raise ValueError(f"Unsupported query modality: '{modality}'")
 
-    llm = LLM(
+    engine_args = EngineArgs(
         model="vidore/colqwen2-v1.0-merged",
         task="embed",
         trust_remote_code=True,
+        limit_mm_per_prompt={"image": 1},
     )
 
     return ModelRequestData(
-        llm=llm,
+        engine_args=engine_args,
         prompt=prompt,
         image=image,
     )
