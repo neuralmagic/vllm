@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard library imports
 import math
+from collections.abc import Iterable, Mapping
 from functools import partial
-from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Optional, Union
 
 # Third-party imports
 import torch
@@ -42,8 +43,8 @@ def round_by_factor(number: float, factor: int) -> int:
 
 
 def ceil_by_factor(number: float, factor: int) -> int:
-  """Returns the smallest integer greater than or equal to 
-  'number' that is divisible by 'factor'."""
+    """Returns the smallest integer greater than or equal to 
+    'number' that is divisible by 'factor'."""
     return math.ceil(number / factor) * factor
 
 
@@ -301,16 +302,12 @@ class ColQwen2(Qwen2VLForConditionalGeneration):
     transformers ColQwen2 class.
     """
 
-    def __init__(self, *, 
-                 vllm_config: VllmConfig, 
-                 prefix: str = ""):
-        super().__init__(vllm_config=vllm_config, 
-                         prefix=prefix)
-        config: ColQwen2VLConfig = 
-            vllm_config.model_config.hf_config
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        config: ColQwen2VLConfig = vllm_config.model_config.hf_config
         self.config = config
         self.dim = 128
-        # Add custom text projection layer to project from 
+        # Add custom text projection layer to project from
         # model hidden size to embedding dimension
         self.custom_text_proj = ColumnParallelLinear(
             self.config.hidden_size,
@@ -324,10 +321,9 @@ class ColQwen2(Qwen2VLForConditionalGeneration):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
+        kv_caches: list[torch.Tensor],
         attn_metadata: AttentionMetadata,
-        intermediate_tensors: 
-            Optional[IntermediateTensors] = None,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> torch.Tensor:
@@ -371,8 +367,8 @@ class ColQwen2(Qwen2VLForConditionalGeneration):
         # For embedding models, we don't need to sample
         return None
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-        torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         # First load the standard weights
         loaded = super().load_weights(weights)
 

@@ -637,7 +637,7 @@ See [this page](./pooling_models.md) for more information on how to use pooling 
     Since some model architectures support both generative and pooling tasks,
     you should explicitly specify the task type to ensure that the model is used in pooling mode instead of generative mode.
 
-#### Text Embedding
+#### Embedding
 
 Specified using `--task embed`.
 
@@ -652,6 +652,7 @@ The following table lists those that are tested in vLLM.
 |-------------------------------------|--------------------|----------|--------------------------|------------------------|-----------------------------|
 | `LlavaNextForConditionalGeneration` | LLaVA-NeXT-based   | T / I    | `royokong/e5-v`          | ✅︎                     |                             |
 | `Phi3VForCausalLM`                  | Phi-3-Vision-based | T + I    | `TIGER-Lab/VLM2Vec-Full` | 🚧                      | ✅︎                          |
+| `ColQwen2VL`           | Visual Retriever based on Qwen2-VL-2B-Instruct with ColBERT | T + I    | `vidore/colqwen2-v1.pyth0-merged` |                       |                           |
 
 #### Transcription
 

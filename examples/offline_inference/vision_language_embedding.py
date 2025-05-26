@@ -92,10 +92,8 @@ def run_colqwen2vlm(query: Query) -> ModelRequestData:
 
     llm = LLM(
         model="vidore/colqwen2-v1.0-merged",
-        # model="vidore/colqwen2-1.0-hf-internal",
         task="embed",
         trust_remote_code=True,
-        # dtype=torch.bfloat16,
     )
 
     return ModelRequestData(
