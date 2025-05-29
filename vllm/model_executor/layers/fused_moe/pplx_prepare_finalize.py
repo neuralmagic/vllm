@@ -149,6 +149,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             float32_size = torch.float32.itemsize
             block_size = (quant_config.block_shape[1] if quant_config.
                           block_shape is not None else 1) * float32_size
+            # zeros?
             expert_x_scale = torch.empty(
                 (
                     num_local_experts,
