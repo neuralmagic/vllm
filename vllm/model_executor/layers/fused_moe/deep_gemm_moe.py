@@ -138,10 +138,24 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         workspace2 = _resize_cache(workspace2, (M_sum, N // 2))
         workspace3 = _resize_cache(workspace13, (M_sum, K))
 
+        s = "mm1 :\n"
+        s += f" a1q : {a1q.shape} \n"
+        s += f" a1q_scale : {a1q_scale.shape}\n"
+        torch.set_printoptions(profile="full")
+        s += f" expert_map {expert_map} \n"
+        s += f" expert_ids {expert_ids} \n"
+        torch.set_printoptions(profile="default")
+
+        print(s, flush=True)
+
         dg.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             (a1q, a1q_scale), (w1, w1_scale), workspace1, expert_ids)
 
         self.activation(activation, workspace2, workspace1.view(-1, N))
+
+        s = "quant input :\n"
+        s += f" workspace2 : {workspace2.shape} \n"
+        print(s, flush=True)
 
         a2q_scale: Optional[torch.Tensor] = None
         a2q, a2q_scale = per_token_group_quant_fp8(workspace2,

@@ -321,6 +321,9 @@ class FusedMoEModularKernel(torch.nn.Module):
                                  device=a1.device,
                                  dtype=workspace_dtype)
 
+        print(f"workspace13 {workspace13.shape}", flush=True)
+        print(f"workspace2 {workspace2.shape}", flush=True)
+
         fused_out = self.fused_experts.apply(
             a1q,
             w1,
@@ -403,6 +406,14 @@ class FusedMoEModularKernel(torch.nn.Module):
         if global_num_experts == -1:
             global_num_experts = w1.size(0)
 
+        s = "modular kernel : \n"
+        s += f"a1 : {a1.shape} \n"
+        torch.set_printoptions(profile="full")
+        s += f"topk : {topk_ids.shape} {topk_ids} \n"
+        torch.set_printoptions(profile="default")
+
+        print(s, flush=True)
+
         (a1q, a1q_scale, expert_num_tokens, _expert_topk_ids,
          _expert_topk_weights) = self.prepare_finalize.prepare(
              a1, a1_scale, a2_scale, topk_weights, topk_ids,
@@ -411,6 +422,16 @@ class FusedMoEModularKernel(torch.nn.Module):
         topk_ids = topk_ids if _expert_topk_ids is None else _expert_topk_ids
         topk_weights = (topk_weights if _expert_topk_weights is None else
                         _expert_topk_weights)
+
+        s = "after dispatch : \n"
+        s += f"a1q : {a1q.shape} \n"
+        s += f"a1q_scale : {a1q_scale.shape} \n"
+        torch.set_printoptions(profile="full")
+        s += f"topk : {topk_ids.shape} {topk_ids} \n"
+        s += f"expert_num_tokens : {expert_num_tokens.shape} {expert_num_tokens} \n"
+        torch.set_printoptions(profile="default")
+
+        print(s, flush=True)
 
         fused_out = None
         if a1q.numel() == 0:
