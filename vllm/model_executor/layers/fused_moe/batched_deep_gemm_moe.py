@@ -123,7 +123,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         a2q_scale: Optional[torch.Tensor] = None
         a2q, a2q_scale = per_token_group_quant_fp8(act_out,
                                                    self.block_shape[1],
-                                                   column_major_scales=False,
+                                                   column_major_scales=True,
                                                    out_q=quant_out)
         a2q = a2q.view(E, max_num_tokens, -1)
         a2q_scale = a2q_scale.view(E, max_num_tokens, -1)
