@@ -59,8 +59,8 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         max_num_tokens = a.size(
             0) if self.max_num_tokens is None else self.max_num_tokens
         workspace13 = (num_experts, max_num_tokens * num_dispatchers,
-                       max(K, N))
-        workspace2 = (num_experts, max_num_tokens * num_dispatchers, (N // 2))
+                       max(K, N // 2))
+        workspace2 = (num_experts, max_num_tokens * num_dispatchers, max(K, N))
         output = (num_experts, max_num_tokens * num_dispatchers, K)
         return (workspace13, workspace2, output, a.dtype)
 
@@ -95,8 +95,11 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         E, max_num_tokens, N, K, top_k_num = mk._moe_problem_size(
             hidden_states, w1, w2, topk_ids)
 
-        workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N))
-        workspace2 = _resize_cache(workspace2, (E, max_num_tokens, N // 2))
+        # fused out is taken from 13
+        mm1_out = _resize_cache(workspace2, (E, max_num_tokens, N))
+        act_out = _resize_cache(workspace13, (E, max_num_tokens, N // 2))
+        quant_out = _resize_cache(workspace2.view(dtype=torch.float8_e4m3fn),
+                                  (E, max_num_tokens, N // 2))
 
         # (from deepgemm docs) : A value hint (which is a value on CPU)
         # for the M expectation of each batch, correctly setting this value
@@ -105,21 +108,23 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         dg.m_grouped_gemm_fp8_fp8_bf16_nt_masked((a1q, a1q_scale),
                                                  (w1, w1_scale),
-                                                 out=workspace1,
+                                                 out=mm1_out,
                                                  masked_m=expert_num_tokens,
                                                  expected_m=expected_m)
 
         # TODO (varun) [Optimization]: Use a batched version of activation.
         # Similarly for the quant below.
-        self.activation(activation, workspace2, workspace1.view(-1, N))
+        self.activation(activation, act_out, mm1_out.view(-1, N))
 
-        w2_hidden_size = workspace2.size(-1)
-        workspace2 = workspace2.view(-1, w2_hidden_size)
+        act_out_hidden = act_out.size(-1)
+        act_out = act_out.view(-1, act_out_hidden)
+        quant_out = quant_out.view(act_out.shape)
 
         a2q_scale: Optional[torch.Tensor] = None
-        a2q, a2q_scale = per_token_group_quant_fp8(workspace2,
+        a2q, a2q_scale = per_token_group_quant_fp8(act_out,
                                                    self.block_shape[1],
-                                                   column_major_scales=False)
+                                                   column_major_scales=False,
+                                                   out_q=quant_out)
         a2q = a2q.view(E, max_num_tokens, -1)
         a2q_scale = a2q_scale.view(E, max_num_tokens, -1)
 
