@@ -94,8 +94,9 @@ allreduce_prototype_twoshot(T const* A, T* B, uint32_t N, int num_blocks,
 
 enum QuickReduceQuantLevel {
   FP16 = 0,
-  INT8,
-  INT4,
+  INT8 = 1,
+  INT6 = 2,
+  INT4 = 3,
 };
 
 struct DeviceComms {
@@ -103,7 +104,7 @@ struct DeviceComms {
   static long constexpr kTileSize = 256 * 16 * 8;
 
   // Max problem size is 2GB (in bytes) or half of uint32_t max value.
-  static int64_t constexpr kMaxProblemSize = 2147483647;
+  static int64_t constexpr kMaxProblemSize = 2147483648;
   static int64_t constexpr kMaxTiles = kMaxProblemSize / kTileSize;
 
   // Max TP-8
@@ -219,6 +220,9 @@ struct DeviceComms {
       switch (quant_level_) {
         case QuickReduceQuantLevel::INT8:
           TWOSHOT_DISPATCH(CodecQ8)
+          break;
+        case QuickReduceQuantLevel::INT6:
+          TWOSHOT_DISPATCH(CodecQ6)
           break;
         case QuickReduceQuantLevel::INT4:
           TWOSHOT_DISPATCH(CodecQ4)
