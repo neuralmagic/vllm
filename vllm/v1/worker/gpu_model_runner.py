@@ -77,6 +77,11 @@ else:
 
 logger = init_logger(__name__)
 
+import dataclasses
+@dataclasses.dataclass
+class CUDAGraphMetaData:
+    cudagraph: torch.cuda.CUDAGraph
+    outputs: Optional[Any] = None
 
 class GPUModelRunner(LoRAModelRunnerMixin):
 
@@ -118,6 +123,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_model_len = model_config.max_model_len
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
+        self.cudagraphs = {}
 
         # Model-related.
         self.num_query_heads = model_config.get_num_attention_heads(
@@ -200,6 +206,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.use_cuda_graph = (self.compilation_config.level
                                == CompilationLevel.PIECEWISE
                                and not self.model_config.enforce_eager)
+        self.use_cuda_graph = True
         # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
         # The convention is different.
         # self.cudagraph_batch_sizes sorts in ascending order.
@@ -208,6 +215,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             reversed(self.compilation_config.cudagraph_capture_sizes))
 
         self.full_cuda_graph = self.compilation_config.full_cuda_graph
+        self.full_cuda_graph = True
 
         # Cache the device properties.
         self._init_device_properties()
@@ -1289,12 +1297,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            model_output = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-            )
+            if num_input_tokens in self.cudagraphs:
+                graph = self.cudagraphs[num_input_tokens].cudagraph
+                print("REPLAYING GRAPH")
+                graph.replay()
+                model_output = self.cudagraphs[num_input_tokens].outputs
+            else:
+                model_output = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                )
+
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
@@ -1896,6 +1911,109 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return hidden_states[logit_indices]
 
     @torch.inference_mode()
+    def _dummy_run_capture(
+        self,
+        num_tokens: int,
+        capture_attn_cudagraph: bool = False):
+
+        # Padding for DP
+        num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
+        num_tokens += num_pad
+
+        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+        # for dummy run with LoRA so that the num_reqs collectively
+        # has num_tokens in total.
+        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        assert sum(num_scheduled_tokens_list) == num_tokens
+        assert len(num_scheduled_tokens_list) == num_reqs
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list,
+                                        dtype=np.int32)
+
+        attn_metadata: Optional[dict[str, Any]] = None
+        if capture_attn_cudagraph:
+            attn_metadata = {}
+
+            query_start_loc = self.query_start_loc[:num_reqs + 1]
+            # Make sure max_model_len is used at the graph capture time.
+            self.seq_lens_np[:num_reqs] = self.max_model_len
+            self.seq_lens_np[num_reqs:] = 0
+            self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+                                           non_blocking=True)
+            seq_lens = self.seq_lens[:num_reqs]
+
+            common_attn_metadata = CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                max_query_len=num_tokens,
+            )
+
+            for kv_cache_group_id, kv_cache_group_spec in enumerate(
+                    self.kv_cache_config.kv_cache_groups):
+
+                attn_metadata_i = self.attn_metadata_builders[
+                    kv_cache_group_id].build_for_cudagraph_capture(
+                        common_attn_metadata)
+                for layer_name in kv_cache_group_spec.layer_names:
+                    attn_metadata[layer_name] = attn_metadata_i
+
+        with self.maybe_dummy_run_with_lora(self.lora_config,
+                                            num_scheduled_tokens):
+            model = self.model
+            if self.is_multimodal_model:
+                input_ids = None
+                inputs_embeds = self.inputs_embeds[:num_tokens]
+            else:
+                input_ids = self.input_ids[:num_tokens]
+                inputs_embeds = None
+            if self.uses_mrope:
+                positions = self.mrope_positions[:, :num_tokens]
+            else:
+                positions = self.positions[:num_tokens]
+
+            if get_pp_group().is_first_rank:
+                intermediate_tensors = None
+            else:
+                if self.intermediate_tensors is None:
+                    self.intermediate_tensors = (
+                        self.model.make_empty_intermediate_tensors(
+                            batch_size=self.max_num_tokens,
+                            dtype=self.model_config.dtype,
+                            device=self.device))
+
+                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                    num_tokens, None, False)
+
+
+            with self.maybe_randomize_inputs(input_ids), set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp):
+                # If the graph does not exist, capture it
+                if num_tokens not in self.cudagraphs:
+                    self.cudagraphs[num_tokens] = CUDAGraphMetaData(cudagraph=torch.cuda.CUDAGraph())
+                    print(f"MAKING NEW CUDAGRAPH FOR NUM TOKENS: {num_tokens}")
+                    cudagraph = self.cudagraphs[num_tokens].cudagraph
+                    with torch.cuda.graph(cudagraph):
+                        outputs = model(
+                            input_ids=input_ids,
+                            positions=positions,
+                            intermediate_tensors=intermediate_tensors,
+                            inputs_embeds=inputs_embeds,
+                        )
+                    self.cudagraphs[num_tokens].outputs = outputs
+                # otherwise just do the warmup
+                else:
+                    graph = self.cudagraphs[num_tokens].cudagraph
+                    graph.replay()
+    @torch.inference_mode()
     def _dummy_sampler_run(
         self,
         hidden_states: torch.Tensor,
@@ -2072,8 +2190,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                    total=len(self.cudagraph_batch_sizes)):
                 for _ in range(
                         self.compilation_config.cudagraph_num_of_warmups):
-                    self._dummy_run(num_tokens, capture_attn_cudagraph=full_cg)
-                self._dummy_run(num_tokens, capture_attn_cudagraph=full_cg)
+                    self._dummy_run_capture(num_tokens, capture_attn_cudagraph=full_cg)
+                self._dummy_run_capture(num_tokens, capture_attn_cudagraph=full_cg)
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
