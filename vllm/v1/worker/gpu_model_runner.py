@@ -1298,7 +1298,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            if num_input_tokens in self.cudagraphs:
+            if num_input_tokens in self.cudagraphs and not skip_cuda_graphs:
                 graph = self.cudagraphs[num_input_tokens].cudagraph
                 new_input_addresses = [
                     x.data_ptr() for x in [input_ids, positions, 
