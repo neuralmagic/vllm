@@ -82,6 +82,7 @@ import dataclasses
 class CUDAGraphMetaData:
     cudagraph: torch.cuda.CUDAGraph
     outputs: Optional[Any] = None
+    input_addresses: Optional[list[int]] = None
 
 class GPUModelRunner(LoRAModelRunnerMixin):
 
@@ -1299,6 +1300,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             if num_input_tokens in self.cudagraphs:
                 graph = self.cudagraphs[num_input_tokens].cudagraph
+                new_input_addresses = [
+                    x.data_ptr() for x in [input_ids, positions, 
+                                            intermediate_tensors, inputs_embeds] if isinstance(x, torch.Tensor)
+                ]
+                assert new_input_addresses == self.cudagraphs[num_input_tokens].input_addresses
                 print("REPLAYING GRAPH")
                 graph.replay()
                 model_output = self.cudagraphs[num_input_tokens].outputs
@@ -2009,6 +2015,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             inputs_embeds=inputs_embeds,
                         )
                     self.cudagraphs[num_tokens].outputs = outputs
+                    self.cudagraphs[num_tokens].input_addresses = [
+                        x.data_ptr() for x in [input_ids, positions, 
+                                               intermediate_tensors, inputs_embeds] if isinstance(x, torch.Tensor)
+                        ]
                 # otherwise just do the warmup
                 else:
                     graph = self.cudagraphs[num_tokens].cudagraph
