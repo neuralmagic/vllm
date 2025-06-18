@@ -211,7 +211,8 @@ class MoEConfig:
     in_dtype: torch.dtype  # The activation type.
     quant_dtype: torch.dtype = None
 
-    # TODO: add more quantization params, blocked, per-token, etc.
+    # TODO: add more quantization params.
+    per_act_token: bool = False
     block_size: int = 128
 
     max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
@@ -291,22 +292,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                        params_dtype: torch.dtype, **extra_weight_attrs):
         raise NotImplementedError
 
-    def init_prepare_finalize(self, moe: MoEConfig,
-                              quant_config: Optional[QuantizationConfig]):
+    @staticmethod
+    def make_prepare_finalize(moe: MoEConfig):
+
         all2all_manager = get_ep_group().device_communicator.all2all_manager
         assert all2all_manager is not None
-
-        self.moe = moe
-        quant_dtype = None
-        act_quant_block_size = None
-        from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-        if isinstance(quant_config, Fp8Config):
-            act_quant_block_size = quant_config.weight_block_size
-            quant_dtype = torch.float8_e4m3fn
 
         prepare_finalize: Optional[Union[PplxPrepareAndFinalize,
                                          DeepEPHTPrepareAndFinalize,
                                          DeepEPLLPrepareAndFinalize]] = None
+
         if moe.use_pplx_kernels:
             all_to_all_args = dict(
                 max_num_tokens=moe.max_num_tokens,
@@ -334,9 +329,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
             handle = all2all_manager.get_handle(all_to_all_args)
 
-            input_activations = get_quant_config_input_activations(
-                quant_config)
-
             prepare_finalize = PplxPrepareAndFinalize(
                 handle,
                 max_num_tokens=moe.max_num_tokens,
@@ -345,9 +337,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # dp_size actually means tp_size, bug in pplx kernels
                 dp_size=all2all_manager.tp_group.world_size,
                 quant_dtype=moe.quant_dtype,
-                per_act_token=(input_activations.strategy
-                               == QuantizationStrategy.TOKEN
-                               if input_activations is not None else False),
+                per_act_token=moe.per_act_token,
             )
         elif moe.use_deepep_ht_kernels:
             assert moe.dp_size == all2all_manager.dp_world_size
@@ -361,8 +351,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 dp_size=all2all_manager.dp_world_size,
                 rank_expert_offset=all2all_manager.rank *
                 moe.num_local_experts,
-                quant_dtype=quant_dtype,
-                block_shape=act_quant_block_size,
+                quant_dtype=moe.quant_dtype,
+                block_shape=moe.block_size,
             )
 
         elif moe.use_deepep_ll_kernels:
@@ -384,10 +374,18 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 world_size=all2all_manager.world_size,
                 dp_size=all2all_manager.dp_world_size,
                 max_tokens_per_rank=moe.max_num_tokens,
-                quant_dtype=quant_dtype,
-                block_shape=act_quant_block_size,
+                quant_dtype=moe.quant_dtype,
+                block_shape=moe.block_size,
                 use_fp8_dispatch=False,
             )
+
+        return prepare_finalize
+
+    def init_prepare_finalize(self, moe: MoEConfig,
+                              quant_config: Optional[QuantizationConfig]):
+
+        self.moe = moe
+        prepare_finalize = self.make_prepare_finalize(moe)
 
         self.topk_indices_dtype = None
         if prepare_finalize is not None:
@@ -896,15 +894,27 @@ class FusedMoE(torch.nn.Module):
             from vllm_hpu_extension.ops import DynamicFusedMOE
             self.hpu_fused_moe = DynamicFusedMOE(self.global_num_experts)
 
+        input_activations = get_quant_config_input_activations(quant_config)
+        per_act_token = (input_activations.strategy
+                         == QuantizationStrategy.TOKEN
+                         if input_activations is not None else False),
         # Only support float8 for now.
         quant_dtype = params_dtype
+        per_act_token = False
+        quant_block_size = None
         if quant_config is not None:
             input_activations = get_quant_config_input_activations(
                 quant_config)
-            if (input_activations is not None
-                    and input_activations.num_bits == 8
-                    and input_activations.type == QuantizationType.FLOAT):
-                quant_dtype = torch.float8_e4m3fn
+            if input_activations is not None:
+                quant_dtype = current_platform.fp8_dtype() if (
+                    input_activations.num_bits == 0 and input_activations.type
+                    == QuantizationType.FLOAT) else quant_dtype
+                per_act_token = (
+                    input_activations.strategy == QuantizationStrategy.TOKEN)
+        from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+        if isinstance(quant_config, Fp8Config):
+            assert quant_dtype == torch.float8_e4m3fn
+            quant_block_size = quant_config.weight_block_size[1]
 
         moe = MoEConfig(
             num_experts=self.global_num_experts,
@@ -913,7 +923,10 @@ class FusedMoE(torch.nn.Module):
             num_local_experts=self.local_num_experts,
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=params_dtype,
+            # quantization params
             quant_dtype=quant_dtype,
+            per_act_token=per_act_token,
+            block_size=quant_block_size,
             max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
         )
         self.moe_config = moe
