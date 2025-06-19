@@ -1305,7 +1305,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                             intermediate_tensors, inputs_embeds] if isinstance(x, torch.Tensor)
                 ]
                 assert new_input_addresses == self.cudagraphs[num_input_tokens].input_addresses
-                print("REPLAYING GRAPH")
                 graph.replay()
                 model_output = self.cudagraphs[num_input_tokens].outputs
             else:
