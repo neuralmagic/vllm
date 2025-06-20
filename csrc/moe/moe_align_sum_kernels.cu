@@ -13,14 +13,45 @@
 namespace vllm {
 namespace moe {
 
+/*
+ * Utility function that consults expert map to see if
+ * the expert_id from topk_ids is really valid.
+ * Returns the expert_id from topk_ids if valid. Returns -1
+ * otherwise.
+ * Note: scalar_t could be an unsigned type. The function
+ * return type is int32_t instead of scalar_t to accommodate
+ * a return of -1.
+ */
+template <typename scalar_t>
+__device__ __forceinline__ int32_t expert_id_from_topk(
+  const size_t idx,
+  const scalar_t* __restrict__ topk_ids,
+  const int32_t* __restrict__ expert_map) {
+  
+  int32_t expert_id = static_cast<int32_t>(topk_ids[idx]);
+  if (!expert_map) {
+    // No expert_map to consult. Value from topk_ids is considered valid.
+    return expert_id; 
+  }
+  return expert_map[expert_id];
+}
+
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(
     const scalar_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
-    int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
-    size_t numel, int32_t* __restrict__ cumsum) {
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t num_experts, // total num experts
+    int32_t padded_num_experts, // num experts padded up to warpsize
+    int32_t experts_per_warp, // 32
+    int32_t block_size,
+    size_t numel, // topk numel
+    int32_t* __restrict__ cumsum, // ? 
+    const int32_t* __restrict__ expert_map) {
   extern __shared__ int32_t shared_counts[];
+
+  // block size of 1024
 
   const int warp_id = threadIdx.x / WARP_SIZE;
   const int my_expert_start = warp_id * experts_per_warp;
@@ -37,7 +68,11 @@ __global__ void moe_align_block_size_kernel(
   const size_t stride = blockDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
-    int expert_id = topk_ids[i];
+    int32_t expert_id = expert_id_from_topk(i, topk_ids, expert_map);
+    if (expert_id == -1) {
+      continue;
+    }
+
     int warp_idx = expert_id / experts_per_warp;
     int expert_offset = expert_id % experts_per_warp;
     atomicAdd(&shared_counts[warp_idx * experts_per_warp + expert_offset], 1);
@@ -73,12 +108,16 @@ template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
-    size_t numel) {
+    size_t numel,
+    const int32_t* __restrict__ expert_map) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i];
+    int32_t expert_id = expert_id_from_topk(i, topk_ids, expert_map);
+    if (expert_id == -1) {
+      continue;
+    }
     int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
     sorted_token_ids[rank_post_pad] = i;
   }
@@ -105,7 +144,8 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
-    int32_t block_size, size_t numel) {
+    int32_t block_size, size_t numel,
+    const int32_t* __restrict__ expert_map) {
   const size_t tid = threadIdx.x;
   const size_t stride = blockDim.x;
 
@@ -118,7 +158,11 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
+    const int32_t expert_id = expert_id_from_topk(i, topk_ids, expert_map);
+    if (expert_id == -1) {
+      continue;
+    }
+    ++tokens_cnts[(threadIdx.x + 1) * num_experts + expert_id];
   }
 
   __syncthreads();
@@ -154,7 +198,10 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i];
+    int32_t expert_id = expert_id_from_topk(i, topk_ids, expert_map);
+    if (expert_id == -1) {
+      continue;
+    }
     int32_t rank_post_pad =
         tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
@@ -167,11 +214,18 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
 // taken from
 // https://github.com/sgl-project/sglang/blob/8b5f83ed3b7d2a49ad5c5cd5aa61c5d502f47dbc
+// and updated to support expert map
+// In the case where an expert_map is passed, num_experts should equal
+// local num experts.
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           int64_t block_size, torch::Tensor sorted_token_ids,
                           torch::Tensor experts_ids,
-                          torch::Tensor num_tokens_post_pad) {
+                          torch::Tensor num_tokens_post_pad,
+                          std::optional<torch::Tensor> const& expert_map) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (expert_map) {
+    TORCH_CHECK(expert_map->dtype() == torch::kInt32);
+  }
 
   int64_t padded_num_experts =
       ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -203,7 +257,8 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
               sorted_token_ids.data_ptr<int32_t>(),
               experts_ids.data_ptr<int32_t>(),
               num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
-              topk_ids.numel());
+              topk_ids.numel(),
+              expert_map ? expert_map->data_ptr<int32_t>() : nullptr);
         } else {
           auto align_kernel = vllm::moe::moe_align_block_size_kernel<scalar_t>;
 
@@ -211,13 +266,29 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
           size_t shared_mem_size =
               num_warps * experts_per_warp * sizeof(int32_t);
 
+          auto const debug = false; //(topk_ids.device().index() == 0);
+          if (debug) {
+            std::cerr<<"moe_align_blocksize_kernel : ";
+            std::cerr<<"  # blocks : 1\n";
+            std::cerr<<"  # block size : "<<threads<<"\n";
+            std::cerr<<"  # shared mem size : "<<shared_mem_size<<"\n";
+            std::cerr<<"  # topk ids numel : "<<topk_ids.numel()<<"\n";
+          }
+
           align_kernel<<<1, threads, shared_mem_size, stream>>>(
               topk_ids.data_ptr<scalar_t>(),
               sorted_token_ids.data_ptr<int32_t>(),
               experts_ids.data_ptr<int32_t>(),
               num_tokens_post_pad.data_ptr<int32_t>(), num_experts,
               padded_num_experts, experts_per_warp, block_size,
-              topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>());
+              topk_ids.numel(), cumsum_buffer.data_ptr<int32_t>(),
+              expert_map ? expert_map->data_ptr<int32_t>() : nullptr);
+
+          if (debug) {
+            cudaDeviceSynchronize();
+            std::cerr<<"expert ids "<<experts_ids<<"\n";
+            std::cerr<<"cumsum buffer "<<cumsum_buffer<<"\n";
+          }
 
           const int block_threads = std::min(256, (int)threads);
           const int num_blocks =
@@ -230,7 +301,8 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
           sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
               topk_ids.data_ptr<scalar_t>(),
               sorted_token_ids.data_ptr<int32_t>(),
-              cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel());
+              cumsum_buffer.data_ptr<int32_t>(), topk_ids.numel(),
+              expert_map ? expert_map->data_ptr<int32_t>() : nullptr);
         }
       });
 }

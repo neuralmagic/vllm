@@ -387,6 +387,8 @@ class FusedMoEModularKernel(torch.nn.Module):
         topk_weights = (topk_weights if _expert_topk_weights is None else
                         _expert_topk_weights)
 
+        print (f"expert_map {expert_map} | topk_ids {topk_ids} ", flush=True)
+
         fused_out = None
 
         if a1q.numel() == 0:

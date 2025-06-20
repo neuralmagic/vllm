@@ -34,6 +34,8 @@ def _moe_permute(
                              expert_map,
                              pad_sorted_ids=True))
 
+    print (f"sorted_token_ids :: {sorted_token_ids.shape}", flush=True)
+
     inv_perm: Optional[torch.Tensor] = None
 
     num_tokens = top_k_num * tokens_in_chunk

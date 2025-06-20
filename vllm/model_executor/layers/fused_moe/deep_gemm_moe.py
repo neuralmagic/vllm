@@ -31,7 +31,8 @@ def deep_gemm_block_shape() -> list[int]:
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int):
     align = deep_gemm_block_shape()[0]
-    return align <= M and N % align == 0 and K % align == 0
+    #return align <= M and N % align == 0 and K % align == 0
+    return N % align == 0 and K % align == 0
 
 
 def _valid_deep_gemm(hidden_states: torch.Tensor, w1: torch.Tensor,
@@ -118,6 +119,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         assert w2.size(1) == K
 
+        print (f"a1q {a1q.shape} | a1q_scale {a1q_scale.shape}", flush=True)
         a1q, a1q_scale, _, expert_ids, inv_perm = _moe_permute(
             a1q,
             a1q_scale,
