@@ -128,7 +128,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     if (expert_id == -1) {
       continue;
     }
-    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
+    ++tokens_cnts[(threadIdx.x + 1) * num_experts + expert_id];
   }
 
   __syncthreads();

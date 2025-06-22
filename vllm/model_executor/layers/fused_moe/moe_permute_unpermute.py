@@ -10,6 +10,53 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.fused_moe.utils import _fp8_perm
 
 
+def compute_inv_perm(sorted_token_ids: torch.Tensor,
+                     topk_ids: torch.Tensor) -> torch.Tensor:
+
+    valid_topk_mask = topk_ids != -1
+    valid_topk_numel = torch.count_nonzero(valid_topk_mask)
+    valid_indices = torch.argsort(sorted_token_ids)[:valid_topk_numel]
+
+    if valid_topk_numel == topk_ids.numel():
+        return valid_indices
+
+    # Running example:
+    # for num_tokens 15 and topk 2,
+    # let topk_ids be [-1, 14, 15, -1, 10, -1,
+    #                  13, -1,  3, 12, -1, 13,
+    #                   8, -1, 11, -1,  3,  7,
+    #                  -1, 13, -1,  4,  1, -1,
+    #                  10, 11,  4, -1, 13,  4]
+    # let valid_indices be [1152, 1280,  640, 1024,  128,  896,
+    #                       1025,  512,  768,  129,  384, 1026,
+    #                       256, 0,  641,  769,  257, 1027,  258]
+    # Note that sorted_token_ids dont account for the -1s in topk_ids.
+    valid_topk_mask = valid_topk_mask.view(-1)
+
+    # selection is [-1,  0,  1,  1,  2,  2,
+    #                3,  3,  4,  5,  5,  6,
+    #                7,  7,  8,  8,  9, 10,
+    #               10, 11, 11, 12, 13, 13,
+    #               14, 15, 16, 16, 17, 18]
+    selection = torch.cumsum(valid_topk_mask, 0) - 1
+
+    # selction becomes [ 0,  0,  1,  0,  2,  0,
+    #                    3,  0,  4,  5,  0,  6,
+    #                    7,  0,  8,  0,  9, 10,
+    #                    0, 11,  0, 12, 13,  0,
+    #                   14, 15, 16,  0, 17, 18]
+    selection = torch.where(~valid_topk_mask, 0, selection)
+
+    # selection becomes [1152, 1152, 1280, 1152,  640, 1152,
+    #                    1024, 1152,  128,  896, 1152, 1025,
+    #                     512, 1152,  768, 1152,  129,  384,
+    #                    1152, 1026, 1152,  256,    0, 1152,
+    #                     641,  769,  257, 1152, 1027,  258]
+    selection = valid_indices[selection]
+
+    return selection
+
+
 def _moe_permute(
     curr_hidden_states: torch.Tensor,
     a1q_scale: Optional[torch.Tensor],
@@ -38,7 +85,7 @@ def _moe_permute(
 
     num_tokens = top_k_num * tokens_in_chunk
     expert_ids = torch.repeat_interleave(expert_ids, block_m, dim=0)
-    inv_perm = torch.argsort(sorted_token_ids)[:num_tokens]
+    inv_perm = compute_inv_perm(sorted_token_ids, curr_topk_ids)
 
     # Permute according to sorted token ids.
     sorted_token_ids = sorted_token_ids.clamp(max=num_tokens - 1)
