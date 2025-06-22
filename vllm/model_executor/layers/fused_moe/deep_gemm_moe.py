@@ -113,18 +113,26 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         a1q = hidden_states
         _, N, K = w1.size()
 
+        local_num_experts = w1.size(0)
         if global_num_experts == -1:
-            global_num_experts = w1.size(0)
+            global_num_experts = local_num_experts
 
         assert w2.size(1) == K
 
+        # DeepGemmExperts are generally used with the DeepEP High Throughput
+        # kernels. The DeepEP High Throughput kernels accounts for the
+        # expert map and assigns a top_k id of -1 for experts not in this
+        # rank. This allows use to use "local_num_experts" in _moe_permute
+        # and we can ignore the expert_map completely.
+        # If using with other prepare_finalize, make sure to prepare
+        # the topk_ids as above.
         a1q, a1q_scale, _, expert_ids, inv_perm = _moe_permute(
             a1q,
             a1q_scale,
             topk_ids,
-            global_num_experts,
-            expert_map,
-            self.block_shape[0],
+            global_num_experts=local_num_experts,
+            expert_map=None,
+            block_m=self.block_shape[0],
         )
 
         if expert_map is not None:

@@ -106,22 +106,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         else:
             expert_x, expert_x_scale = token_data, None
 
-        # The existing MOE kernels assume that all entries of topk_ids are
-        # valid. To that effect, set the -1s in expert_topk_ids to some expert
-        # outside this rank so the expert_map can remap it to -1 when safe.
-        # With Expert Parallel, the experts are divided amongst the rank
-        # sequentially. For rank 0, set it to num_experts - 1 and for all other
-        # ranks set it to 0 as we know that expert_map will have a -1 in those
-        # regions for those ranks.
-        #
-        # DeepEP's topk_ids output refers to the local experts directly. Offset
-        # the topk_ids to move it back to the global experts space so it aligns
-        # with existing vLLM interfaces.
-        expert_topk_ids = torch.where(
-            expert_topk_ids == -1,
-            num_experts - 1 if self.rank_expert_offset == 0 else 0,
-            expert_topk_ids + self.rank_expert_offset)
-
         return (expert_x, expert_x_scale, expert_num_tokens, expert_topk_ids,
                 expert_topk_weights)
 
