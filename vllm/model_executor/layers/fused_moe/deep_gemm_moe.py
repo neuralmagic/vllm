@@ -31,7 +31,8 @@ def deep_gemm_block_shape() -> list[int]:
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int):
     align = deep_gemm_block_shape()[0]
-    return align <= M and N % align == 0 and K % align == 0
+    #return align <= M and N % align == 0 and K % align == 0
+    return N % align == 0 and K % align == 0
 
 
 def _valid_deep_gemm(hidden_states: torch.Tensor, w1: torch.Tensor,
