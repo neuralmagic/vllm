@@ -7,7 +7,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size)
-from vllm.model_executor.layers.fused_moe.utils import _fp8_perm
+from vllm.model_executor.layers.fused_moe.utils import _fp8_perm, _resize_cache
 
 
 def compute_inv_perm(sorted_token_ids: torch.Tensor,
@@ -64,6 +64,7 @@ def _moe_permute(
     global_num_experts: int,
     expert_map: Optional[torch.Tensor],
     block_m: int,
+    output: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor,
            torch.Tensor]:
     """
@@ -90,8 +91,13 @@ def _moe_permute(
     # Permute according to sorted token ids.
     sorted_token_ids = sorted_token_ids.clamp(max=num_tokens - 1)
 
+    if output is not None:
+        k = curr_hidden_states.size(1)
+        output = _resize_cache(output, (sorted_token_ids.size(0), k))
+
     curr_hidden_states = _fp8_perm(curr_hidden_states,
-                                   sorted_token_ids // top_k_num)
+                                   sorted_token_ids // top_k_num,
+                                   output=output)
 
     if a1q_scale is not None:
         a1q_scale = a1q_scale[sorted_token_ids // top_k_num]

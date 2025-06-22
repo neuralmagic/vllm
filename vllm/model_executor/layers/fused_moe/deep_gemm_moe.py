@@ -133,6 +133,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             global_num_experts=local_num_experts,
             expert_map=None,
             block_m=self.block_shape[0],
+            output=workspace2.view(dtype=torch.float8_e4m3fn),
         )
 
         if expert_map is not None:

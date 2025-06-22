@@ -88,11 +88,16 @@ def moe_kernel_quantize_input(
         return A, A_scale
 
 
-def _fp8_perm(m: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+def _fp8_perm(m: torch.Tensor, idx: torch.Tensor,
+              output: Optional[torch.Tensor]) -> torch.Tensor:
     """
     A permutation routine that works on fp8 types.
     """
     if torch.is_floating_point(m) and m.dtype.itemsize == 1:
-        return m.view(dtype=torch.uint8)[idx, ...].view(dtype=m.dtype)
+        return torch.index_select(
+            m.view(dtype=torch.uint8),
+            0,
+            idx,
+            out=output.view(dtype=torch.uint8)).view(dtype=m.dtype)
     else:
-        return m[idx, ...]
+        return torch.index_select(m, 0, idx, out=output)
