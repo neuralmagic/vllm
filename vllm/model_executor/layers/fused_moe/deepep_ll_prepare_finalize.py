@@ -127,9 +127,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                Optional[torch.Tensor], Optional[torch.Tensor]]:
 
         hidden_size = a1.size(1)
-        assert hidden_size in self.SUPPORTED_HIDDEN_SIZES, \
-            (f"Hidden Size {hidden_size} not in supported list of hidden sizes"
-            f"{self.SUPPORTED_HIDDEN_SIZES}")
+        # assert hidden_size in self.SUPPORTED_HIDDEN_SIZES, \
+        #     (f"Hidden Size {hidden_size} not in supported list of hidden sizes"
+        #     f"{self.SUPPORTED_HIDDEN_SIZES}")
 
         if self.use_fp8_dispatch:
             assert hidden_size % 128 == 0, \

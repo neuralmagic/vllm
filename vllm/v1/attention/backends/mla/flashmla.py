@@ -75,7 +75,9 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             1, # MQA for the decode path
         )
 
-        if self.runner.full_cuda_graph:
+        n = num_splits.size(0)
+        # logger.info(f"N: {n-1} sizes: {self.runner.cudagraph_batch_sizes}")
+        if self.runner.full_cuda_graph and (n-1) in self.runner.cudagraph_batch_sizes:
             # First time around (CUDAGraph capture), allocate the static buffer
             if self.cg_buf_tile_scheduler_metadata is None:
                 self.cg_buf_tile_scheduler_metadata = tile_scheduler_metadata
@@ -91,8 +93,9 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 tile_scheduler_metadata = self.cg_buf_tile_scheduler_metadata
 
                 # Num splits is per-batch, varying size (batch_size,)
-                n = num_splits.size(0)
+                # n = num_splits.size(0)
                 # make sure static buffer is large enough
+                # logger.info(f"N: {n} sizes: {self.runner.cudagraph_batch_sizes} max: {self.cg_buf_num_splits.size(0)}")
                 assert n <= self.cg_buf_num_splits.size(0)
                 num_splits_view = self.cg_buf_num_splits[:n]
                 num_splits_view.copy_(num_splits)
