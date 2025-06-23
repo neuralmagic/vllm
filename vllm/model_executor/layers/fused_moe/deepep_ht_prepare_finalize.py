@@ -204,7 +204,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # fused_expert_output can have 0 tokens - This happens when none of the
         # tokens from the all2all reach this EP rank.
-        if fused_expert_output.numel() != 0:
+        if fused_expert_output.numel() != 0 and False:
             fused_expert_output = self._apply_weights_and_reduce(
                 num_tokens=topk_ids.size(0),
                 fused_expert_output=fused_expert_output,
