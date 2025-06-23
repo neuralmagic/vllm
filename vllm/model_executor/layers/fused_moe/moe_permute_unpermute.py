@@ -8,10 +8,73 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size)
 from vllm.model_executor.layers.fused_moe.utils import _fp8_perm, _resize_cache
+from vllm.triton_utils import tl, triton
 
 
-def compute_inv_perm(sorted_token_ids: torch.Tensor,
-                     topk_ids: torch.Tensor) -> torch.Tensor:
+@triton.jit
+def moe_apply_weights_and_sum(
+    a,  # [M_sum, K]
+    am_stride,
+    o,  # [M, K]
+    om_stride,
+    inv_perm,  # [M]
+    topk_ids,  # [M, topk]
+    topk_weights,  # [M, topk]
+    APPLY_WEIGHT: tl.constexpr,
+    K: tl.constexpr,
+    NUM_TOPK: tl.constexpr,  # topk
+    BLOCK_K: tl.constexpr,
+):
+    """
+    grid = [BLOCK_M]
+    thread_block = [BLOCK_M, BLOCK_K]
+
+    M_sum is already pretty big
+    We dont want a 2D block for the fear that a reduce will introduce a block
+    synchronize.
+    """
+    m_idx = tl.program_id(axis=0)
+
+    # offset into ptrs
+    o_dtype = o.dtype.element_ty
+    o = o + m_idx.to(tl.int64) * om_stride.to(tl.int64)
+    topk_ids = topk_ids + m_idx.to(tl.int64) * NUM_TOPK
+    topk_weights = topk_weights + m_idx.to(tl.int64) * NUM_TOPK
+    inv_perm = inv_perm + m_idx.to(tl.int64) * NUM_TOPK
+
+    k_offsets = tl.arange(0, BLOCK_K).to(tl.int64)
+    o_ptrs = o + k_offsets
+    for k in range(tl.cdiv(K, BLOCK_K)):
+        k_mask = k_offsets < K - (k * BLOCK_K)
+
+        acc = tl.zeros((BLOCK_K, ), dtype=tl.float32)
+        for i in range(NUM_TOPK):
+            topk = tl.load(topk_ids + i)
+
+            # all false of topk_k is -1, all true otherwise
+            topk_mask = k_offsets < 0 if topk == -1 else k_offsets >= 0
+
+            topk_w = tl.load(topk_weights + i)
+            a_row_id = tl.load(inv_perm + i).to(tl.int64)
+
+            # load a_tile
+            a_ptrs = a + a_row_id * am_stride.to(tl.int64) + k_offsets + (
+                BLOCK_K * k)
+            a_tile = tl.load(a_ptrs, mask=k_mask & topk_mask,
+                             other=0.0).to(tl.float32)
+
+            if APPLY_WEIGHT:
+                # apply weight
+                a_tile *= topk_w
+
+            # accumulate
+            acc += a_tile
+        tl.store(o_ptrs, acc.to(o_dtype), mask=k_mask)
+        o_ptrs += BLOCK_K
+
+
+def _compute_inv_perm(sorted_token_ids: torch.Tensor,
+                      topk_ids: torch.Tensor) -> torch.Tensor:
 
     valid_topk_mask = topk_ids != -1
     valid_topk_numel = torch.count_nonzero(valid_topk_mask)
@@ -86,7 +149,7 @@ def _moe_permute(
 
     num_tokens = top_k_num * tokens_in_chunk
     expert_ids = torch.repeat_interleave(expert_ids, block_m, dim=0)
-    inv_perm = compute_inv_perm(sorted_token_ids, curr_topk_ids)
+    inv_perm = _compute_inv_perm(sorted_token_ids, curr_topk_ids)
 
     # Permute according to sorted token ids.
     sorted_token_ids = sorted_token_ids.clamp(max=num_tokens - 1)
@@ -125,6 +188,25 @@ def _moe_unpermute_and_reduce(
     if not apply_router_weight_on_input:
         curr_hidden.mul_(topk_weight.view(M, -1, 1))
     ops.moe_sum(curr_hidden, out)
+
+
+def moe_unpermute_and_reduce_triton(
+        out: torch.Tensor,  # [M, K]
+        curr_hidden: torch.Tensor,  # [M_sum, K]
+        inv_perm: torch.Tensor,  # [M]
+        topk_ids: torch.Tensor,  # [M, num_topk]
+        topk_weights: torch.Tensor,  # [M, num_topk]
+        apply_weight: bool):
+
+    M, K = out.size()
+    NUM_TOPK = topk_ids.size(1)
+
+    grid = (M, )
+    BLOCK_K = min(K, 1024)
+    moe_apply_weights_and_sum[grid](curr_hidden, curr_hidden.stride(0), out,
+                                    out.stride(0), inv_perm, topk_ids,
+                                    topk_weights, apply_weight, K, NUM_TOPK,
+                                    BLOCK_K)
 
 
 def moe_permute(

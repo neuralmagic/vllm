@@ -193,7 +193,7 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         M: int,
         N: int,
         K: int,
-        topk: int,
+        topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
@@ -233,6 +233,7 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         w1: torch.Tensor,
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
         activation: str,
         global_num_experts: int,
         expert_map: Optional[torch.Tensor],
@@ -410,19 +411,19 @@ class FusedMoEModularKernel(torch.nn.Module):
             if num_chunks == 1:
                 (workspace13_shape, workspace2_shape, fused_out_shape,
                  workspace_dtype) = self.fused_experts.workspace_shapes(
-                     a1, a1q, M, N, K, top_k, global_num_experts,
+                     a1, a1q, M, N, K, topk_ids, global_num_experts,
                      local_num_experts)
             else:
                 # Use the full M to get the final output shape.
                 _, _, fused_out_shape, _ = (
                     self.fused_experts.workspace_shapes(
-                        a1, a1q, M, N, K, top_k, global_num_experts,
+                        a1, a1q, M, N, K, topk_ids, global_num_experts,
                         local_num_experts))
                 # Use the CHUNK_SIZE to get the workspace shapes.
                 workspace13_shape, workspace2_shape, _, workspace_dtype = (
                     self.fused_experts.workspace_shapes(
-                        a1, a1q, CHUNK_SIZE, N, K, top_k, global_num_experts,
-                        local_num_experts))
+                        a1, a1q, CHUNK_SIZE, N, K, topk_ids,
+                        global_num_experts, local_num_experts))
 
             # We can reuse the memory between cache1 and cache3 because by the
             # time we need cache3, we're done with cache1.
@@ -442,6 +443,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                     w1,
                     w2,
                     topk_ids,
+                    topk_weights,
                     activation=activation,
                     global_num_experts=global_num_experts,
                     expert_map=expert_map,
@@ -482,13 +484,17 @@ class FusedMoEModularKernel(torch.nn.Module):
                     curr_a2_scale = _chunk_scales(a2_scale, begin_chunk_idx,
                                                   end_chunk_idx)
                     curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+                    curr_topk_weights = topk_weights[
+                        begin_chunk_idx:end_chunk_idx]
 
+                    # TODO (varun): add apply weights arg
                     self.fused_experts.apply(
                         fused_out[begin_out_idx:end_out_idx],
                         curr_a1q,
                         w1,
                         w2,
                         curr_topk_ids,
+                        curr_topk_weights,
                         activation=activation,
                         global_num_experts=global_num_experts,
                         expert_map=expert_map,
@@ -503,7 +509,11 @@ class FusedMoEModularKernel(torch.nn.Module):
                         expert_num_tokens=expert_num_tokens,
                     )
 
-        self.prepare_finalize.finalize(output, fused_out, topk_weights,
-                                       topk_ids, apply_router_weight_on_input)
+        # TODO (varun) : fix apply weights
+        self.prepare_finalize.finalize(output,
+                                       fused_out,
+                                       topk_weights,
+                                       topk_ids,
+                                       apply_router_weight_on_input=True)
 
         return output

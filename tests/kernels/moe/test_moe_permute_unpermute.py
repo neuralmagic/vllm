@@ -14,11 +14,12 @@ import torch
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
-    moe_permute, moe_permute_unpermute_supported, moe_unpermute)
+    _moe_unpermute_and_reduce, moe_permute, moe_permute_unpermute_supported,
+    moe_unpermute, moe_unpermute_and_reduce_triton)
 from vllm.platforms import current_platform
 
 NUM_EXPERTS = [16, 64]
-TOP_KS = [2, 4, 6, 8]
+TOP_KS = [1, 2, 4, 6, 8]
 EP_SIZE = [1, 4, 16]
 current_platform.seed_everything(0)
 
@@ -224,3 +225,62 @@ def test_moe_permute_unpermute(n_token: int, n_hidden: int, topk: int,
 
     # check unpermuted hidden
     torch.testing.assert_close(result4, gold4, atol=2e-2, rtol=0)
+
+
+@pytest.mark.parametrize("n_token",
+                         [1, 8, 33, 64, 222, 1024, 2048, 3000, 5000])
+@pytest.mark.parametrize("n_hidden", [64, 2048, 4100, 7168])
+@pytest.mark.parametrize("n_expert", NUM_EXPERTS)
+@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_moe_unpermute_and_reduce_triton(n_token: int, n_hidden: int,
+                                         n_expert: int, topk: int,
+                                         dtype: torch.dtype):
+
+    M_sum = n_token * 64
+    a = torch.randn((M_sum, n_hidden), device="cuda", dtype=dtype) / 10
+    inv_perm = torch.randint(low=0,
+                             high=M_sum,
+                             size=(n_token * topk, ),
+                             device="cuda")
+    out = torch.randn((n_token, n_hidden), device="cuda", dtype=dtype)
+
+    topk_ids = torch.zeros((n_token, topk), dtype=torch.int64, device="cpu")
+    for i in range(n_token):
+        topk_ids[i] = torch.randperm(n_expert)[:topk]
+    topk_weights = torch.rand((n_token, topk),
+                              dtype=torch.float32,
+                              device="cpu")
+
+    # mark half the topk_id as invalid (-1)
+    if topk != 1:
+        num_invalid_indices = topk // 2
+        for i in range(n_token):
+            invalid_indices = torch.randint(low=0,
+                                            high=topk,
+                                            size=(num_invalid_indices, ))
+            for x in invalid_indices:
+                topk_ids[i][x] = -1
+    # reflect invalid indices in topk_weights
+    topk_weights = torch.where(topk_ids == -1, 0, topk_weights)
+
+    topk_ids = topk_ids.to("cuda")
+    topk_weights = topk_weights.to("cuda")
+
+    # reference
+    ref_out = out.clone()
+    _moe_unpermute_and_reduce(out=ref_out,
+                              curr_hidden=a,
+                              inv_perm=inv_perm,
+                              topk_weight=topk_weights,
+                              apply_router_weight_on_input=False)
+
+    # impl
+    moe_unpermute_and_reduce_triton(out=out,
+                                    curr_hidden=a,
+                                    inv_perm=inv_perm,
+                                    topk_ids=topk_ids,
+                                    topk_weights=topk_weights,
+                                    apply_weight=True)
+
+    torch.testing.assert_close(ref_out, out, atol=6e-2, rtol=6e-2)

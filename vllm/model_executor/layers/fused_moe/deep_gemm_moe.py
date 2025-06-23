@@ -9,7 +9,7 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
-    _moe_permute)
+    _moe_permute, moe_unpermute_and_reduce_triton)
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP)
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -75,16 +75,25 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         return True
 
     def workspace_shapes(
-        self, a: torch.Tensor, aq: torch.Tensor, M: int, N: int, K: int,
-        topk: int, global_num_experts: int, local_num_experts: int
+        self,
+        a: torch.Tensor,
+        aq: torch.Tensor,
+        M: int,
+        N: int,
+        K: int,
+        topk_ids: torch.Tensor,
+        global_num_experts: int,
+        local_num_experts: int,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         num_experts = local_num_experts
         block_m = self.block_shape[0]
-        M_sum = (M * topk) + num_experts * (block_m - 1)
+
+        valid_topk_numel = torch.count_nonzero(topk_ids != -1)
+        M_sum = valid_topk_numel + num_experts * (block_m - 1)
         M_sum = round_up(M_sum, block_m)
         workspace1 = (M_sum, max(N * 2, K))
         workspace2 = (M_sum, max(N, K))
-        output = (M * topk, K)
+        output = (M, K)
         return (workspace1, workspace2, output, a.dtype)
 
     def apply(
@@ -94,6 +103,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         w1: torch.Tensor,
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
         activation: str,
         global_num_experts: int,
         expert_map: Optional[torch.Tensor],
@@ -166,7 +176,12 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         dg.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             (a2q, a2q_scale), (w2, w2_scale), mm2_out, expert_ids)
 
-        torch.index_select(mm2_out, 0, inv_perm, out=output)
+        moe_unpermute_and_reduce_triton(output,
+                                        mm2_out,
+                                        inv_perm,
+                                        topk_ids,
+                                        topk_weights,
+                                        apply_weight=True)
 
 
 def deep_gemm_moe_fp8(

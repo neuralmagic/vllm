@@ -47,7 +47,7 @@ class TritonOrDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         M: int,
         N: int,
         K: int,
-        topk: int,
+        topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
@@ -57,9 +57,11 @@ class TritonOrDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         if self.allow_deep_gemm and _valid_deep_gemm_shape(M, N, K):
             assert self.deep_gemm_expert is not None
             return self.deep_gemm_expert.workspace_shapes(
-                a, aq, M, N, K, topk, global_num_experts, local_num_experts)
+                a, aq, M, N, K, topk_ids, global_num_experts,
+                local_num_experts)
         else:
-            return self.triton_expert.workspace_shapes(a, aq, M, N, K, topk,
+            return self.triton_expert.workspace_shapes(a, aq, M, N, K,
+                                                       topk_ids,
                                                        global_num_experts,
                                                        local_num_experts)
 
@@ -70,6 +72,7 @@ class TritonOrDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         w1: torch.Tensor,
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
         activation: str,
         global_num_experts: int,
         expert_map: Optional[torch.Tensor],
@@ -97,6 +100,7 @@ class TritonOrDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             w1,
             w2,
             topk_ids,
+            topk_weights,
             activation,
             global_num_experts,
             expert_map,
