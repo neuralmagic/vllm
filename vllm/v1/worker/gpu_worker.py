@@ -5,6 +5,7 @@ import gc
 import os
 from typing import TYPE_CHECKING, Optional
 
+import asyncio
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -290,17 +291,17 @@ class Worker(WorkerBase):
         return self.model_runner.get_model()
 
     @torch.inference_mode()
-    def execute_model(
+    async def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> Optional[ModelRunnerOutput]:
+    ) -> Optional[asyncio.Future[ModelRunnerOutput]]:
         intermediate_tensors = None
         if not get_pp_group().is_first_rank:
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
 
-        output = self.model_runner.execute_model(scheduler_output,
+        output = await self.model_runner.execute_model_async(scheduler_output,
                                                  intermediate_tensors)
         parallel_config = self.vllm_config.parallel_config
         if parallel_config.distributed_executor_backend != "external_launcher" \
@@ -309,7 +310,7 @@ class Worker(WorkerBase):
             get_pp_group().send_tensor_dict(output.tensors,
                                             all_gather_group=get_tp_group())
             return None
-        assert isinstance(output, ModelRunnerOutput)
+        #assert isinstance(output, ModelRunnerOutput)
         return output if self.is_driver_worker else None
 
     def profile(self, is_start: bool = True):

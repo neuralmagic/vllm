@@ -91,6 +91,7 @@ class CachedRequestData:
     new_token_ids: list[int]
     new_block_ids: tuple[list[int], ...]
     num_computed_tokens: int
+    num_tokens: int
 
     @classmethod
     def from_request(
@@ -106,6 +107,7 @@ class CachedRequestData:
             new_token_ids=new_token_ids,
             new_block_ids=new_block_ids,
             num_computed_tokens=request.num_computed_tokens,
+            num_tokens=request.num_tokens,
         )
 
 

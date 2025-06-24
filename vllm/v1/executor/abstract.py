@@ -4,6 +4,7 @@
 from concurrent.futures import Future
 from typing import Callable, Union
 
+import asyncio
 import torch
 import torch.distributed as dist
 
@@ -87,6 +88,23 @@ class Executor(ExecutorBase):
         output = self.collective_rpc("execute_model",
                                      args=(scheduler_output, ))
         return output[0]
+
+    async def execute_model_async(
+        self,
+        scheduler_output,
+    ) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
+        loop = asyncio.get_running_loop()
+        
+        if not hasattr(self, "running_lock"):
+            self.running_lock = asyncio.Lock()
+
+        async def _execute_model_async():
+            # Protect the persistent batch with a lock
+            async with self.running_lock:
+                output = await self.driver_worker.execute_model(scheduler_output)
+            return output
+
+        return loop.create_task(_execute_model_async())
 
     @property
     def max_concurrent_batches(self) -> int:

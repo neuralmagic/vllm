@@ -8,6 +8,9 @@ from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
+import asyncio
+from concurrent.futures import Future
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.factory import (
@@ -24,7 +27,7 @@ from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
 from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
                                               create_request_queue)
-from vllm.v1.core.sched.utils import check_stop
+from vllm.v1.core.sched.utils import check_stop, check_length
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -623,16 +626,20 @@ class Scheduler(SchedulerInterface):
         # them at each scheduling step.
         num_computed_tokens = request.num_computed_tokens
         num_regular_tokens = num_scheduled_tokens - num_scheduled_spec_tokens
-        new_token_ids = request.all_token_ids[
-            num_computed_tokens:num_computed_tokens + num_regular_tokens]
+        if request.num_placeholders > 0:
+            new_token_ids = []
+        else:
+            new_token_ids = request.all_token_ids[
+                num_computed_tokens:num_computed_tokens + num_regular_tokens]
 
-        req_data_queue = self._cached_reqs_data.get(request.request_id)
+        req_data_queue = None #self._cached_reqs_data.get(request.request_id)
         if req_data_queue:
             req_data = req_data_queue.popleft()
             req_data.resumed_from_preemption = resumed_from_preemption
             req_data.new_token_ids = new_token_ids
             req_data.new_block_ids = new_block_ids
             req_data.num_computed_tokens = num_computed_tokens
+            req_data.num_tokens = request.num_tokens
         else:
             # No cached request data, or all cached request data has been
             # used by the scheduled requests.
@@ -725,21 +732,14 @@ class Scheduler(SchedulerInterface):
             encoder_inputs_to_schedule.append(i)
         return encoder_inputs_to_schedule, num_new_tokens, encoder_budget
 
-    def update_from_output(
+    # Asynchronous split of update_from_output into state update and post-processing
+    async def _update_from_output(
         self,
         scheduler_output: SchedulerOutput,
-        model_runner_output: ModelRunnerOutput,
-    ) -> dict[int, EngineCoreOutputs]:
-        sampled_token_ids = model_runner_output.sampled_token_ids
-        spec_token_ids = model_runner_output.spec_token_ids
-        logprobs = model_runner_output.logprobs
-        prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        model_runner_output_future: Future[ModelRunnerOutput],
+    ) -> Optional[SpecDecodingStats]:
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-        pooler_outputs = model_runner_output.pooler_output
-        num_nans_in_logits = model_runner_output.num_nans_in_logits
-
         new_running: list[Request] = []
-        outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
 
         # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
@@ -752,14 +752,15 @@ class Scheduler(SchedulerInterface):
                 # The request was not scheduled in this step.
                 new_running.append(request)
                 continue
-
-            req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = sampled_token_ids[
-                req_index] if sampled_token_ids else []
-
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
+
+            # Handle speculative decoding rejections if any
             if scheduled_spec_token_ids:
+                model_output = await model_runner_output_future
+                idx = model_output.req_id_to_index[req_id]
+                generated_token_ids = model_output.sampled_token_ids[idx] or []
+
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -772,10 +773,112 @@ class Scheduler(SchedulerInterface):
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=len(scheduled_spec_token_ids),
-                    num_accepted_tokens=len(generated_token_ids) - 1)
+                    num_accepted_tokens=len(generated_token_ids) - 1,
+                )
+
+            if request.use_structured_output:
+                model_output = await model_runner_output_future
+                idx = model_output.req_id_to_index[req_id]
+                generated_token_ids = model_output.sampled_token_ids[idx] or []
+                spec_token_ids = model_output.spec_token_ids[idx] or []
+
+                if generated_token_ids and self.structured_output_manager.should_advance(
+                        request):
+                    # NOTE: structured_output_request
+                    # should not be None if use_structured_output, we have
+                    # check above, so safe to ignore type warning
+                    request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
+                        req_id, generated_token_ids)
+
+                # Add newly generated spec token ids to the request.
+                if spec_token_ids is not None:
+                    if self.structured_output_manager.should_advance(request):
+                        metadata = request.structured_output_request
+                        # Needs to happen after new_token_ids are accepted.
+                        request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
+                            spec_token_ids[idx])
+                    else:
+                        request.spec_token_ids = spec_token_ids[idx]
+
+            stopped = False
+            if model_runner_output_future.done():
+                model_output = await model_runner_output_future
+                idx = model_output.req_id_to_index[req_id]
+                generated_token_ids = model_output.sampled_token_ids[idx] or []
+        
+                for generated_token_id in generated_token_ids:
+                    request.append_output_token_ids(generated_token_id)
+                    stopped = check_stop(request, self.max_model_len)
+                    if stopped:
+                        break
+            else:
+                # Prefill done but we dont have the model data yet
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    # assert scheduler_output.num_scheduled_tokens[req_id] == 1
+                    request.append_placeholder_token()
+                    stopped = not check_length(request, self.max_model_len, include_placeholders=True)
+
+            if not stopped:
+                new_running.append(request)
+
+        self.running = new_running
+        
+        # Return the cached request data to the queue so they can be reused.
+        for req_data in scheduler_output.scheduled_cached_reqs:
+            # NOTE(rob): since we free stopped reqs above, adding stopped reqs
+            # to _cached_reqs_data will cause a memory leak.
+            if req_data.req_id not in self.finished_req_ids:
+                self._cached_reqs_data[req_data.req_id].append(req_data)
+        
+        return spec_decoding_stats
+
+    async def _process_model_output(
+        self,
+        model_runner_output_future: Future[ModelRunnerOutput],
+        spec_decoding_stats: Optional[SpecDecodingStats],
+    ) -> dict[int, EngineCoreOutputs]:
+        """
+        Await actual model outputs, replace placeholder -1 tokens with real tokens,
+        and build EngineCoreOutputs.
+        """ 
+        # Ensure this is an asyncio.Future or Task
+        model_runner_output_future = asyncio.ensure_future(model_runner_output_future)  # type: ignore
+        # Convert concurrent.futures.Future to asyncio.Future if needed
+        if isinstance(model_runner_output_future, Future) and not isinstance(model_runner_output_future, asyncio.Future):
+            loop = asyncio.get_running_loop()
+            wrapped = asyncio.wrap_future(model_runner_output_future, loop=loop)
+            model_runner_output_future = wrapped  # type: ignore
+        
+        model_output = await model_runner_output_future
+
+        # Capture speculative token proposals from model output for scheduling
+        if model_output.spec_token_ids is not None:
+            for req_id in model_output.req_ids:
+                if req_id in self.requests:
+                    request = self.requests[req_id]
+                    idx = model_output.req_id_to_index.get(req_id)
+                    if idx is not None:
+                        spec_ids = model_output.spec_token_ids[idx] or []
+                        request.spec_token_ids = list(spec_ids)
+        sampled = model_output.sampled_token_ids or []
+        logprobs = model_output.logprobs
+        prompt_logprobs_dict = model_output.prompt_logprobs_dict
+        pooler_outputs = model_output.pooler_output
+        num_nans_in_logits = model_output.num_nans_in_logits
+
+        outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+
+        for req_id in model_output.req_ids:
+            if req_id not in self.requests:
+                continue
+            
+            request = self.requests[req_id]
+            req_index = model_output.req_id_to_index[req_id]
+            new_token_ids = sampled[req_index] if len(sampled) > req_index else []
 
             cached_encoder_input_ids = (
                 self.encoder_cache_manager.get_cached_input_ids(request))
+
             # OPTIMIZATION: Avoid list(set) if the set is empty.
             if cached_encoder_input_ids:
                 for input_id in list(cached_encoder_input_ids):
@@ -789,60 +892,31 @@ class Scheduler(SchedulerInterface):
                             request, input_id)
 
             stopped = False
-            new_logprobs = None
-            new_token_ids = generated_token_ids
-            kv_transfer_params = None
-
-            # Append generated tokens and check for stop. Note that if
-            # a request is still being prefilled, we expect the model runner
-            # to return empty token ids for the request.
-            for num_new, output_token_id in enumerate(new_token_ids, 1):
-                request.append_output_token_ids(output_token_id)
-
-                # Check for stop and update request state.
-                # This must be called before we make the EngineCoreOutput.
-                stopped = check_stop(request, self.max_model_len)
-                if stopped:
-                    kv_transfer_params = self._free_request(request)
-                    del new_token_ids[num_new:]  # Trim new tokens if needed.
-                    break
+            # Replace placeholders with actual ids
+            if request.num_placeholders > 0 and len(new_token_ids) > 0:
+                assert len(new_token_ids) == 1
+                request.update_first_placeholder(new_token_ids[0])
 
             pooler_output = None
             if pooler_outputs:
                 pooler_output = pooler_outputs[req_index]
-                stopped = check_stop(request, self.max_model_len,
-                                     pooler_output)
-                if stopped:
-                    kv_transfer_params = self._free_request(request)
+
+            stopped = check_stop(request, self.max_model_len, pooler_output)
+
+            kv_transfer_params = None
+            if stopped:
+                kv_transfer_params = self._free_request(request)
 
             # Extract sample logprobs if needed.
+            new_logprobs = None
             if request.sampling_params is not None \
                 and request.sampling_params.logprobs is not None and logprobs:
                 # NOTE: once we support N tokens per step (spec decode),
                 # the outer lists can be of length > 1.
                 new_logprobs = logprobs.slice(req_index, req_index + 1)
 
-            if new_token_ids and self.structured_output_manager.should_advance(
-                    request):
-                # NOTE: structured_output_request
-                # should not be None if use_structured_output, we have
-                # check above, so safe to ignore type warning
-                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids)
-
-            # spec_token_ids comes from the model runner output
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
-
-            # Add newly generated spec token ids to the request.
-            if spec_token_ids is not None:
-                if self.structured_output_manager.should_advance(request):
-                    metadata = request.structured_output_request
-                    # Needs to happen after new_token_ids are accepted.
-                    request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
-                        spec_token_ids[req_index])
-                else:
-                    request.spec_token_ids = spec_token_ids[req_index]
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
@@ -868,20 +942,17 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            if not stopped:
-                new_running.append(request)
+            if stopped:
+                try:
+                    self.running.remove(request)
+                except ValueError:
+                    pass
+
+
+
 
         # KV Connector: update state for finished KV Transfers.
-        self._update_from_kv_xfer_finished(model_runner_output)
-
-        # Return the cached request data to the queue so they can be reused.
-        for req_data in scheduler_output.scheduled_cached_reqs:
-            # NOTE(rob): since we free stopped reqs above, adding stopped reqs
-            # to _cached_reqs_data will cause a memory leak.
-            if req_data.req_id not in self.finished_req_ids:
-                self._cached_reqs_data[req_data.req_id].append(req_data)
-
-        self.running = new_running
+        self._update_from_kv_xfer_finished(model_output)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -910,6 +981,22 @@ class Scheduler(SchedulerInterface):
 
         return engine_core_outputs
 
+    async def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_output_future: Future[ModelRunnerOutput],
+    ) -> Future[dict[int, EngineCoreOutputs]]:
+        """
+        Combined async API: first update scheduler state, then queue post-processing of model outputs.
+        Returns a Future that will resolve to the EngineCoreOutputs.
+        """
+        spec_stats = await self._update_from_output(scheduler_output, model_output_future)
+        # Schedule post-processing as a deferred task
+        task = asyncio.create_task(
+            self._process_model_output(model_output_future, spec_stats)
+        )
+        return task
+
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
@@ -935,7 +1022,7 @@ class Scheduler(SchedulerInterface):
             request_ids = (request_ids, )
         else:
             request_ids = set(request_ids)
-
+        
         running_requests_to_remove = []
         waiting_requests_to_remove = []
         valid_requests = []

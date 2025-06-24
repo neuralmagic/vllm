@@ -5,11 +5,13 @@ import copy
 import gc
 import time
 import weakref
+import asyncio
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
+import copy
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
@@ -85,7 +87,26 @@ else:
 logger = init_logger(__name__)
 
 
+async def async_cuda_synchronize(device=None):
+    # If you have multiple GPUs, set the device first
+    if device is not None:
+        torch.cuda.set_device(device)
+
+    # Grab the current stream for that device
+    stream = torch.cuda.current_stream(device)
+    # Create an event and record it on that stream
+    event = torch.cuda.Event()
+    stream.record_event(event)
+
+    # Poll the event until it's "completed"
+    # (i.e., all work submitted to the stream before record_event has finished)
+    while not event.query():
+        # yield control back to the asyncio loop
+        await asyncio.sleep(0)
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
+    is_async = False
 
     def __init__(
         self,
@@ -467,17 +488,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Update the cached states.
             num_computed_tokens = req_data.num_computed_tokens
             req_state.num_computed_tokens = num_computed_tokens
-            # Add the sampled token(s) from the previous step (if any).
-            # This doesn't include "unverified" tokens like spec decode tokens.
-            num_new_tokens = (num_computed_tokens +
-                              len(req_data.new_token_ids) -
-                              req_state.num_tokens)
-            if num_new_tokens == 1:
+
+            # Add the sampled token(s) from the previous step (if need).
+            # This doesn't include "unverified" tokens like spec tokens.
+            num_new_tokens_needed = (req_data.num_tokens -
+                                req_state.num_tokens)
+
+            if num_new_tokens_needed > len(req_data.new_token_ids):
+                raise ValueError(f"Missing tokens, num_new_tokens_needed: {num_new_tokens_needed}, len(req_data.new_token_ids): {len(req_data.new_token_ids)}, req_data.req_id: {req_data.req_id} req_data.num_tokens: {req_data.num_tokens} req_state.num_tokens: {req_state.num_tokens}")
+
+            if num_new_tokens_needed == 1:
                 # Avoid slicing list in most common case.
-                req_state.output_token_ids.append(req_data.new_token_ids[-1])
-            elif num_new_tokens > 0:
+                req_state.output_token_ids.append(
+                    req_data.new_token_ids[-1])
+            elif num_new_tokens_needed > 0:
                 req_state.output_token_ids.extend(
-                    req_data.new_token_ids[-num_new_tokens:])
+                    req_data.new_token_ids[-num_new_tokens_needed:])
+
             # Update the block IDs.
             if not req_data.resumed_from_preemption:
                 # Append the new blocks to the existing block IDs.
@@ -503,11 +530,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.block_table.append_row(req_data.new_block_ids,
                                                     req_index)
             # Add new_token_ids to token_ids_cpu.
-            start_token_index = num_computed_tokens
-            end_token_index = num_computed_tokens + len(req_data.new_token_ids)
-            self.input_batch.token_ids_cpu[
-                req_index,
-                start_token_index:end_token_index] = req_data.new_token_ids
+            start_token_index = self.input_batch.num_tokens[req_index]
+            end_token_index = req_state.num_tokens
+            num_tokens_to_add = end_token_index - start_token_index
+            if num_tokens_to_add > 0:
+                self.input_batch.token_ids_cpu[
+                    req_index,
+                    start_token_index:end_token_index] = req_data.new_token_ids[-num_tokens_to_add:]
             self.input_batch.num_tokens_no_spec[req_index] = end_token_index
             # Add spec_token_ids to token_ids_cpu.
             spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
@@ -1238,8 +1267,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pooler_output.append(None)
 
         return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_ids=copy.deepcopy(self.input_batch.req_ids),
+            req_id_to_index=copy.deepcopy(self.input_batch.req_id_to_index),
             sampled_token_ids=[],
             spec_token_ids=None,
             logprobs=None,
@@ -1250,7 +1279,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
-    def execute_model(
+    async def execute_model_async(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
@@ -1406,6 +1435,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            await async_cuda_synchronize(self.device)
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -1417,6 +1447,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logits=bonus_logits,
                 sampling_metadata=sampling_metadata,
             )
+            await async_cuda_synchronize(self.device)
+            
             bonus_token_ids = sampler_output.sampled_token_ids
 
             # Just like `bonus_logits`, `target_logits` is a new tensor with
@@ -1481,6 +1513,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
+
+        if get_pp_group().is_last_rank:
+            for req_idx, sampled_ids in enumerate(valid_sampled_token_ids):
+                if not sampled_ids:
+                    continue
+
+                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_idx = start_idx + len(sampled_ids)
+                if end_idx >= self.max_model_len:
+                    continue
+
+                self.input_batch.token_ids_cpu[req_idx,
+                                               start_idx:end_idx] = sampled_ids
+                self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+                self.input_batch.num_tokens[req_idx] = end_idx
+                req_id = self.input_batch.req_ids[req_idx]
+                req_state = self.requests[req_id]
+                req_state.output_token_ids.extend(sampled_ids)
+
+        else:
+            pass
 
         if not self.speculative_config:
             # Speculative decoding is not enabled.
@@ -1597,8 +1650,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             get_kv_transfer_group().clear_connector_metadata()
 
         return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_ids=copy.deepcopy(self.input_batch.req_ids),
+            req_id_to_index=copy.deepcopy(self.input_batch.req_id_to_index),
             sampled_token_ids=valid_sampled_token_ids,
             spec_token_ids=spec_token_ids,
             logprobs=logprobs_lists,
@@ -1608,6 +1661,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_recving=finished_recving,
             num_nans_in_logits=num_nans_in_logits,
         )
+        
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        return asyncio.run(self.execute_model_async(scheduler_output, intermediate_tensors))
 
     def kv_connector_no_forward(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
@@ -2532,3 +2592,5 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dtype=self.kv_cache_dtype,
                     block_size=max_model_len)
         return kv_cache_spec
+        
+        

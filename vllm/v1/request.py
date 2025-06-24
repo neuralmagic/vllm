@@ -106,6 +106,8 @@ class Request:
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
+        
+        self._num_placeholders = 0
 
     @classmethod
     def from_engine_core_request(cls, request: EngineCoreRequest) -> "Request":
@@ -144,6 +146,20 @@ class Request:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
 
+    def append_placeholder_token(self) -> None:
+        self._output_token_ids.append(-1)
+        self._all_token_ids.append(-1)
+        self._num_placeholders += 1
+
+    def update_first_placeholder(self, token_id: int) -> None:
+        self._output_token_ids[-self._num_placeholders] = token_id
+        self._all_token_ids[-self._num_placeholders] = token_id
+        self._num_placeholders -= 1
+
+    @property
+    def num_placeholders(self) -> int:
+        return self._num_placeholders
+
     @property
     def is_output_corrupted(self) -> bool:
         return self.num_nans_in_logits > 0
@@ -153,12 +169,23 @@ class Request:
         return len(self._all_token_ids)
 
     @property
+    def num_tokens_without_placeholders(self) -> int:
+        return len(self._all_token_ids) - self.num_placeholders
+
+    @property
     def num_tokens_with_spec(self) -> int:
         return len(self._all_token_ids) + len(self.spec_token_ids)
 
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def num_output_tokens_without_placeholders(self) -> int:
+        return len(self._output_token_ids) - self.num_placeholders
+    
+    def last_token_id(self) -> int:
+        return self._output_token_ids[-1-self.num_placeholders]
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

@@ -7,11 +7,21 @@ import torch
 from vllm.v1.request import Request, RequestStatus
 
 
+def check_length(request: Request, max_model_len: int, include_placeholders: bool = False) -> bool:
+    num_tokens = request.num_tokens_without_placeholders if not include_placeholders else request.num_tokens
+    num_output_tokens = request.num_output_tokens_without_placeholders if not include_placeholders else request.num_output_tokens
+    
+    return (num_tokens < max_model_len and num_output_tokens < request.max_tokens)
+
 def check_stop(request: Request,
                max_model_len: int,
-               pooler_output: Optional[torch.Tensor] = None) -> bool:
-    if (request.num_tokens >= max_model_len
-            or request.num_output_tokens >= request.max_tokens):
+               pooler_output: Optional[torch.Tensor] = None,
+               include_placeholders: bool = False) -> bool:
+    
+    if request.status >= RequestStatus.FINISHED_STOPPED:
+        return True
+
+    if not check_length(request, max_model_len, include_placeholders):
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         return True
 
@@ -23,14 +33,15 @@ def check_stop(request: Request,
 
     sampling_params = request.sampling_params
     assert sampling_params is not None
-    last_token_id = request.output_token_ids[-1]
-    if (not sampling_params.ignore_eos
-            and last_token_id == request.eos_token_id):
-        request.status = RequestStatus.FINISHED_STOPPED
-        return True
+    if len(request.output_token_ids) > request.num_placeholders:
+        last_token_id = request.last_token_id()
+        if (not sampling_params.ignore_eos
+                and last_token_id == request.eos_token_id):
+            request.status = RequestStatus.FINISHED_STOPPED
+            return True
 
-    if last_token_id in (sampling_params.stop_token_ids or ()):
-        request.status = RequestStatus.FINISHED_STOPPED
-        request.stop_reason = last_token_id
-        return True
+        if last_token_id in (sampling_params.stop_token_ids or ()):
+            request.status = RequestStatus.FINISHED_STOPPED
+            request.stop_reason = last_token_id
+            return True
     return False

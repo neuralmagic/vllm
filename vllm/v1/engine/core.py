@@ -12,10 +12,11 @@ from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
 from logging import DEBUG
-from typing import Any, Callable, Optional, TypeVar, Union
+from typing import Any, Callable, Optional, TypeVar, Union, Type, Awaitable
 
 import msgspec
 import zmq
+import asyncio
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
@@ -43,6 +44,51 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import EngineHandshakeMetadata, EngineZmqAddresses
 from vllm.version import __version__ as VLLM_VERSION
+from typing import Any, Callable, Coroutine, Dict, Optional, Type
+
+def create_eager_task_factory(
+    task_cls: Type[asyncio.Task] = asyncio.Task
+) -> Callable[..., asyncio.Future]:
+    """
+    Return a Task-factory that runs coroutines up to their first await immediately.
+    If the coroutine completes without suspending, returns a Future already done;
+    otherwise wraps it in task_cls for normal scheduling.
+    """
+    def factory(
+        loop: asyncio.AbstractEventLoop,
+        coro: Coroutine[Any, Any, Any],
+        *,
+        name: Optional[str] = None,
+        context: Optional[Dict[Any, Any]] = None
+    ) -> asyncio.Future:
+        try:
+            # drive coro to its first suspension point
+            coro.send(None)
+        except StopIteration as exc:
+            # completed synchronously: give back a Future done with the return value
+            fut = loop.create_future()
+            fut.set_result(exc.value)
+            return fut
+        else:
+            # it yielded, so schedule as a normal Task
+            try:
+                # Python 3.9+ signature
+                return task_cls(coro, loop=loop, name=name)
+            except TypeError:
+                # older Task signature without `context`
+                try:
+                    return task_cls(coro, loop=loop, name=name)
+                except TypeError:
+                    # really old signature: just coro
+                    return task_cls(coro)
+    return factory
+
+def on_task_exception(loop, context):
+    # Just use the default exception handler
+    loop.default_exception_handler(context)
+
+# the default "eager" factory, like asyncio.eager_task_factory in 3.12+
+eager_task_factory = create_eager_task_factory(asyncio.Task)
 
 logger = init_logger(__name__)
 
@@ -129,6 +175,8 @@ class EngineCore:
             logger.info("Batch queue is enabled with size %d",
                         self.batch_queue_size)
             self.batch_queue = queue.Queue(self.batch_queue_size)
+            
+        self.running_batchs = 0
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -207,7 +255,7 @@ class EngineCore:
         self.scheduler.finish_requests(request_ids,
                                        RequestStatus.FINISHED_ABORTED)
 
-    def execute_model(self, scheduler_output: SchedulerOutput):
+    def execute_model(self, scheduler_output: SchedulerOutput) -> Union[ModelRunnerOutput, Future[ModelRunnerOutput]]:
         try:
             return self.model_executor.execute_model(scheduler_output)
         except Exception as err:
@@ -220,72 +268,42 @@ class EngineCore:
                                   self.scheduler.make_stats())
             raise err
 
-    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+    async def execute_model_async(self, scheduler_output: SchedulerOutput) -> asyncio.Future[ModelRunnerOutput]:
+        """Kick off the executor's async model call and return its Future."""
+        # Await executor's coroutine to schedule the driver worker task and get its Future.
+        result = await self.model_executor.execute_model_async(scheduler_output)
+        # If we got a raw ModelRunnerOutput, wrap into an asyncio.Future.
+        if isinstance(result, ModelRunnerOutput):
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future[ModelRunnerOutput] = loop.create_future()
+            fut.set_result(result)
+            return fut
+        # Otherwise it's already an asyncio.Future (Task) for ModelRunnerOutput.
+        return result  # type: ignore
+
+    async def step(self) -> tuple[asyncio.Future[dict[int, EngineCoreOutputs]], bool]:
         """Schedule, execute, and make output.
 
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
-            return {}, False
+            # No pending requests: return a completed Future with empty outputs
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            fut.set_result({})
+            return fut, False
+        # Schedule work
         scheduler_output = self.scheduler.schedule()
-        model_output = self.execute_model(scheduler_output)
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output)  # type: ignore
-
-        return (engine_core_outputs,
+        # Kick off model execution
+        model_output_future = await self.execute_model_async(scheduler_output)
+        # Update scheduler with model future
+        engine_outputs_future = await self.scheduler.update_from_output(
+            scheduler_output, model_output_future  # type: ignore
+        )
+        return (engine_outputs_future,
                 scheduler_output.total_num_scheduled_tokens > 0)
 
-    def step_with_batch_queue(
-            self) -> tuple[Optional[dict[int, EngineCoreOutputs]], bool]:
-        """Schedule and execute batches with the batch queue.
-        Note that if nothing to output in this step, None is returned.
-
-        The execution flow is as follows:
-        1. Try to schedule a new batch if the batch queue is not full.
-        If a new batch is scheduled, directly return an empty engine core
-        output. In other words, fulfilling the batch queue has a higher priority
-        than getting model outputs.
-        2. If there is no new scheduled batch, meaning that the batch queue
-        is full or no other requests can be scheduled, we block until the first
-        batch in the job queue is finished.
-        3. Update the scheduler from the output.
-        """
-        assert self.batch_queue is not None
-
-        engine_core_outputs = None
-        scheduler_output = None
-        # Try to schedule a new batch if the batch queue is not full, but
-        # the scheduler may return an empty batch if all requests are scheduled.
-        # Note that this is not blocking.
-        if not self.batch_queue.full():
-            scheduler_output = self.scheduler.schedule()
-            if scheduler_output.total_num_scheduled_tokens > 0:
-                future = self.model_executor.execute_model(scheduler_output)
-                self.batch_queue.put_nowait(
-                    (future, scheduler_output))  # type: ignore
-
-        scheduled_batch = (scheduler_output is not None
-                           and scheduler_output.total_num_scheduled_tokens > 0)
-
-        # If no more requests can be scheduled and the job queue is not empty,
-        # block until the first batch in the job queue is finished.
-        # TODO(comaniac): Ideally we should peek the first batch in the
-        # job queue to check if it's finished before scheduling a new batch,
-        # but peeking the first element in a queue is not thread-safe,
-        # so we need more work.
-        if not scheduled_batch and not self.batch_queue.empty():
-            future, scheduler_output = self.batch_queue.get_nowait()
-            # Blocking until the first result is available.
-            model_output = future.result()
-            self.batch_queue.task_done()
-            engine_core_outputs = (self.scheduler.update_from_output(
-                scheduler_output, model_output))
-
-        return engine_core_outputs, scheduled_batch
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
@@ -394,8 +412,7 @@ class EngineCoreProc(EngineCore):
             super().__init__(vllm_config, executor_class, log_stats,
                              executor_fail_callback)
 
-        self.step_fn = (self.step if self.batch_queue is None else
-                        self.step_with_batch_queue)
+        self.step_fn = self.step
 
         # Background Threads and Queues for IO. These enable us to
         # overlap ZMQ socket IO with GPU since they release the GIL,
@@ -456,7 +473,6 @@ class EngineCoreProc(EngineCore):
             }))
 
         # Receive initialization message.
-        logger.info("Waiting for init message from front-end.")
         if not handshake_socket.poll(timeout=HANDSHAKE_TIMEOUT_MINS * 60_000):
             raise RuntimeError("Did not receive response from front-end "
                                f"process within {HANDSHAKE_TIMEOUT_MINS} "
@@ -464,7 +480,6 @@ class EngineCoreProc(EngineCore):
         init_bytes = handshake_socket.recv()
         init_message: EngineHandshakeMetadata = msgspec.msgpack.decode(
             init_bytes, type=EngineHandshakeMetadata)
-        logger.debug("Received init message: %s", init_message)
 
         received_parallel_config = init_message.parallel_config
         for key, value in received_parallel_config.items():
@@ -509,7 +524,17 @@ class EngineCoreProc(EngineCore):
             else:
                 engine_core = EngineCoreProc(*args, **kwargs)
 
-            engine_core.run_busy_loop()
+            async def _run_busy_loop():
+                # Use eager task factory so we can "priortize" newly created
+                # tasks.
+                loop = asyncio.get_running_loop()
+                # TODO: Re-enable when we upgrade to Python 3.12+ which has
+                # official asyncio.eager_task_factory support
+                #loop.set_task_factory(eager_task_factory)
+                loop.set_exception_handler(on_task_exception)
+                await engine_core.run_busy_loop()
+            
+            asyncio.run(_run_busy_loop())
 
         except SystemExit:
             logger.debug("EngineCore exiting.")
@@ -528,7 +553,7 @@ class EngineCoreProc(EngineCore):
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
 
-    def run_busy_loop(self):
+    async def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
 
         # Loop until process is sent a SIGINT or SIGTERM
@@ -536,13 +561,16 @@ class EngineCoreProc(EngineCore):
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # 2) Step the engine core and return the outputs.
-            self._process_engine_step()
+            await self._process_engine_step()
+
+            # Yield to allow batches to continue executing
+            await asyncio.sleep(0)
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
-
+        
         waited = False
-        while not self.engines_running and not self.scheduler.has_requests():
+        while not self.engines_running and not self.scheduler.has_requests() and not self.running_batchs > 0:
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
@@ -557,15 +585,25 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
-    def _process_engine_step(self) -> bool:
+    async def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
+        if self.running_batchs >= max(2,self.model_executor.max_concurrent_batches):
+            return False
 
         # Step the engine core.
-        outputs, model_executed = self.step_fn()
-        # Put EngineCoreOutputs into the output queue.
-        for output in (outputs.items() if outputs else ()):
-            self.output_queue.put_nowait(output)
+        outputs_future, model_executed = await self.step()
 
+        if model_executed:
+            self.running_batchs += 1
+
+            async def send_output_to_clients(outputs_future: Awaitable[dict[int, EngineCoreOutputs]]):
+                outputs = await outputs_future
+                # Put EngineCoreOutputs into the output queue.
+                for output in (outputs.items() if outputs else ()):
+                    self.output_queue.put_nowait(output)
+                self.running_batchs -= 1
+
+            asyncio.create_task(send_output_to_clients(outputs_future))
         return model_executed
 
     def _handle_client_request(self, request_type: EngineCoreRequestType,
