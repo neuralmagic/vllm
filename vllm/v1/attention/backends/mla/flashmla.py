@@ -76,8 +76,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         )
 
         n = num_splits.size(0)
-        # logger.info(f"N: {n-1} sizes: {self.runner.cudagraph_batch_sizes}")
-        if self.runner.full_cuda_graph and (n-1) in self.runner.cudagraph_batch_sizes:
+        if self.runner.full_cuda_graph and (n-1) <= self.runner.cudagraph_batch_sizes[-1]:
             # First time around (CUDAGraph capture), allocate the static buffer
             if self.cg_buf_tile_scheduler_metadata is None:
                 self.cg_buf_tile_scheduler_metadata = tile_scheduler_metadata
