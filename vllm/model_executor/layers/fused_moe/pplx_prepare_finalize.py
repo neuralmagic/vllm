@@ -74,8 +74,13 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             a1, (None if self.per_act_token else a1_scale), self.quant_dtype,
             self.per_act_token, self.block_shape)
 
-        if a1q_scale is not None:
+        if a1q_scale is not None and self.block_shape is None:
             a1q_scale = a1q_scale.repeat(repeat_rows, repeat_cols)
+
+        # device_id = a1.device.index
+        # for i in range(a1q_scale.shape[0]):
+        #     for j in range(a1q_scale.shape[1]):
+        #         a1q_scale[i, j] = device_id * 10 + i + 1 + 0.01 * (j + 1)
 
         # rem_experts need to be 0 for pplx to work properly.
         rem_experts = num_experts % self.world_size
@@ -90,7 +95,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
         num_dp = self.world_size // self.dp_size
-        expert_x = torch.empty(
+        expert_x = torch.zeros(
             (num_local_experts, self.max_num_tokens * num_dp, hidden_dim),
             dtype=a1q.dtype,
             device=device,
@@ -100,8 +105,10 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if a1q.dtype.itemsize == 1:
             float32_size = torch.float32.itemsize
             block_size = (self.block_shape[0] if self.block_shape is not None
-                          else 1) * float32_size
-            expert_x_scale = torch.empty(
+                          else float32_size)
+            # print("COMPUTE SCALE SIZE: ceil(", expert_x.size(2), "/", block_size,
+            #       ") =", (expert_x.size(2) + block_size - 1) // block_size)
+            expert_x_scale = torch.zeros(
                 (
                     num_local_experts,
                     expert_x.size(1),
@@ -115,6 +122,9 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # There's not much point setting this unless it is != indices.size(0)
         bound_m: Optional[torch.Tensor] = None
 
+        print("pre dispatch a1q:", a1q, a1q.shape)
+        print("pre dispatch a1q_scale:", a1q_scale, a1q_scale.shape)
+
         self.a2a.dispatch(
             out_expert_num_tokens=expert_num_tokens,
             out_expert_x=expert_x,
@@ -124,8 +134,11 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             indices=rank_topk_ids,
             bound_m=bound_m,
         )
-        if expert_x_scale is not None:
+        if expert_x_scale is not None and self.block_shape is None:
             expert_x_scale = expert_x_scale[:, :, 0:1]
+
+        print("post dispatch a1q:", expert_x, expert_x.shape)
+        print("post dispatch a1q_scale:", expert_x_scale, expert_x_scale.shape)
 
         return expert_x, expert_x_scale, expert_num_tokens, None, None
 
