@@ -442,12 +442,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   // CUTLASS w8a8 blockwise-scaled grouped GEMM
   ops.def(
-      "cutlass_moe_blockwise_mm(Tensor! out_tensors, Tensor a_tensors, Tensor "
-      "b_tensors, "
-      "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
-      "               Tensor problem_sizes, Tensor a_strides, "
-      "               Tensor b_strides, Tensor c_strides, bool per_act_block "
-      "               ) -> ()",
+      "cutlass_moe_blockwise_mm(Tensor! out_tensors, Tensor a_tensors, "
+      "               Tensor b_tensors, Tensor a_scales, Tensor b_scales, "
+      "               Tensor expert_offsets, Tensor problem_sizes, "
+      "               Tensor a_strides, Tensor b_strides, Tensor c_strides, "
+      "               bool per_act_block) -> ()",
       {stride_tag});
   ops.impl("cutlass_moe_blockwise_mm", torch::kCUDA, &cutlass_moe_blockwise_mm);
 
