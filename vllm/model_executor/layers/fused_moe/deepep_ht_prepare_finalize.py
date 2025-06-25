@@ -107,7 +107,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_x, expert_x_scale = token_data, None
 
         return (expert_x, expert_x_scale, expert_num_tokens, expert_topk_ids,
-                expert_topk_weights)
+                expert_topk_weights, sum(expert_num_tokens_per_expert_list))
 
     def prepare(
         self,
@@ -120,7 +120,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: Optional[torch.Tensor],
         apply_router_weight_on_input: bool,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
-               Optional[torch.Tensor], Optional[torch.Tensor]]:
+               Optional[torch.Tensor], Optional[torch.Tensor], Optional[int]]:
 
         if apply_router_weight_on_input:
             topk = rank_topk_ids.size(1)
@@ -146,7 +146,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if per_token_quant:
             a1q, a1q_scale = self._do_quant(a1, a1_scale, per_act_token=True)
             (expert_x, expert_x_scale, expert_num_tokens, expert_topk_ids,
-             expert_topk_weights) = self._do_dispatch(
+             expert_topk_weights, tokens_per_expert_sum) = self._do_dispatch(
                  tokens=a1q,
                  token_scales=a1q_scale,
                  rank_topk_ids=rank_topk_ids,
@@ -156,7 +156,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # DeepEP kernels only support dispatching per-token-quant
             # quantization. dispatch in bfloat16.
             (expert_x, _, expert_num_tokens, expert_topk_ids,
-             expert_topk_weights) = self._do_dispatch(
+             expert_topk_weights, tokens_per_expert_sum) = self._do_dispatch(
                  tokens=a1,
                  token_scales=None,
                  rank_topk_ids=rank_topk_ids,
@@ -170,7 +170,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                                                           per_act_token=False)
 
         return (expert_x, expert_x_scale, expert_num_tokens, expert_topk_ids,
-                expert_topk_weights)
+                expert_topk_weights, tokens_per_expert_sum)
 
     def _apply_weights_and_reduce(self, num_tokens: int,
                                   fused_expert_output: torch.Tensor,

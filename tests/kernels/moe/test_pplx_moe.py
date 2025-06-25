@@ -290,7 +290,7 @@ def pplx_prepare_finalize(
     chunk_topk_weight = chunk_by_rank(topk_weight, rank, world_size).to(device)
     chunk_topk_ids = chunk_by_rank(topk_ids, rank, world_size).to(device)
 
-    b_a, b_a_scale, expert_num_tokens, _, _ = prepare_finalize.prepare(
+    b_a, b_a_scale, expert_num_tokens, _, _, _ = prepare_finalize.prepare(
         a_chunk,
         None,
         None,

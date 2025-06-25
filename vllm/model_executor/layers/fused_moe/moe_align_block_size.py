@@ -154,6 +154,7 @@ def moe_align_block_size(
     num_experts: int,
     expert_map: Optional[torch.Tensor] = None,
     pad_sorted_ids: bool = False,
+    sum_tokens_per_expert: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -205,6 +206,8 @@ def moe_align_block_size(
         by block_size for proper block matrix operations.
     """
     valid_topk_numel = torch.count_nonzero(topk_ids != -1)
+    if sum_tokens_per_expert is None:
+        valid_topk_numel = topk_ids.numel()
 
     max_num_tokens_padded = valid_topk_numel + num_experts * (block_size - 1)
     if pad_sorted_ids:

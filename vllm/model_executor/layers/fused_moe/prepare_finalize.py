@@ -41,7 +41,7 @@ class MoEPrepareAndFinalizeNoEP(mk.FusedMoEPrepareAndFinalize):
         expert_map: Optional[torch.Tensor],
         apply_router_weight_on_input: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
-               Optional[torch.Tensor], Optional[torch.Tensor]]:
+               Optional[torch.Tensor], Optional[torch.Tensor], Optional[int]]:
 
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
@@ -55,7 +55,7 @@ class MoEPrepareAndFinalizeNoEP(mk.FusedMoEPrepareAndFinalize):
                                                    self.per_channel_quant,
                                                    self.block_shape)
 
-        return a1q, a1q_scale, None, None, None
+        return a1q, a1q_scale, None, None, None, None
 
     def finalize(
         self,

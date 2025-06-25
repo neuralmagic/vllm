@@ -128,6 +128,7 @@ def _moe_permute(
     expert_map: Optional[torch.Tensor],
     block_m: int,
     output: Optional[torch.Tensor],
+    sum_tokens_per_expert: Optional[int],
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor,
            torch.Tensor]:
     """
@@ -143,7 +144,8 @@ def _moe_permute(
                              block_m,
                              global_num_experts,
                              expert_map,
-                             pad_sorted_ids=True))
+                             pad_sorted_ids=True,
+                             sum_tokens_per_expert=sum_tokens_per_expert))
 
     inv_perm: Optional[torch.Tensor] = None
 

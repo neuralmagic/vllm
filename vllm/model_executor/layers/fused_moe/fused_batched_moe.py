@@ -412,7 +412,7 @@ class BatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: Optional[torch.Tensor],
         apply_router_weight_on_input: bool,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
-               Optional[torch.Tensor], Optional[torch.Tensor]]:
+               Optional[torch.Tensor], Optional[torch.Tensor], Optional[int]]:
         assert a1.dim() == 2
         assert topk_ids.dim() == 2
         assert topk_ids.size(0) == a1.size(0)
@@ -450,7 +450,7 @@ class BatchedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                  first_expert, :rows, :] = a1[:topks.numel()][topks]
             tokens_per_expert[expert_id - first_expert] = rows
 
-        return b_a1, a1_scale, tokens_per_expert, None, None
+        return b_a1, a1_scale, tokens_per_expert, None, None, None
 
     def finalize(
         self,
@@ -523,6 +523,7 @@ class BatchedExperts(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
+        sum_tokens_per_expert: Optional[int] = None
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         assert a.dim() == 2
         num_dp = self.dp_size
@@ -629,6 +630,7 @@ class BatchedTritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
+        sum_tokens_per_expert: Optional[int] = None
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         assert a.dim() == 2
         num_dp = self.world_size // self.dp_size

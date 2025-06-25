@@ -51,7 +51,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: Optional[torch.Tensor],
         apply_router_weight_on_input: bool,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
-               Optional[torch.Tensor], Optional[torch.Tensor]]:
+               Optional[torch.Tensor], Optional[torch.Tensor], Optional[int]]:
         num_tokens = a1.size(0)  # M
         hidden_dim = a1.size(-1)  # K
 
@@ -127,7 +127,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if expert_x_scale is not None:
             expert_x_scale = expert_x_scale[:, :, 0:1]
 
-        return expert_x, expert_x_scale, expert_num_tokens, None, None
+        return expert_x, expert_x_scale, expert_num_tokens, None, None, None
 
     def finalize(
         self,

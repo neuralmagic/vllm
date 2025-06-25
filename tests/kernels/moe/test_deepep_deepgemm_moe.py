@@ -420,6 +420,10 @@ MNKs = [
 TOPKS = [2, 6]
 NUM_EXPERTS = [32]
 
+MNKs = [(8, 128, 128)]
+TOPKS = [6]
+NUM_EXPERTS = [32]
+
 
 @pytest.mark.parametrize("mnk", MNKs)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
