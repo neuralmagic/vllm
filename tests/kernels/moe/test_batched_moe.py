@@ -181,19 +181,13 @@ def test_batched_mm(num_experts: int, max_tokens_per_expert: int, K: int,
         torch.float32: (1e-2, 1e-2),
     }[test_output.dtype]
 
-    if False:
-        torch.set_printoptions(profile="full")
-        print(f"REF_OUTPUT {q_ref_output.shape}\n{q_ref_output}")
-        print(f"TRITON {test_output.shape}\n{test_output}")
-
     torch.testing.assert_close(ref_output, q_ref_output, atol=atol, rtol=rtol)
-    #torch.testing.assert_close(ref_output, test_output, atol=atol, rtol=rtol)
     torch.testing.assert_close(test_output, q_ref_output, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("m", [1, 32, 45, 64, 222])
-@pytest.mark.parametrize("n", [128, 512, 1024])#, 2048])
-@pytest.mark.parametrize("k", [128, 512, 1024])#, 2048])
+@pytest.mark.parametrize("n", [128, 512, 1024, 2048])
+@pytest.mark.parametrize("k", [128, 512, 1024, 2048])
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
@@ -256,6 +250,7 @@ def test_fused_moe_batched_experts(
             per_act_token_quant=per_act_token_quant,
             block_shape=block_shape,
         )
+
         baseline_output = torch_experts(
             a,
             w1,
@@ -281,19 +276,10 @@ def test_fused_moe_batched_experts(
             block_shape=block_shape,
         )
 
-    #print(f"TORCH {baseline_output.shape}\n{baseline_output}")
-    #print(f"TRITON {triton_output.shape}\n{triton_output}")
-    #print(f"BATCHED {batched_output.shape}\n{batched_output}")
-
     torch.testing.assert_close(batched_output,
                                baseline_output,
                                atol=3e-2,
                                rtol=2e-2)
-
-    # torch.testing.assert_close(triton_output,
-    #                            baseline_output,
-    #                            atol=2e-2,
-    #                            rtol=2e-2)
 
     torch.testing.assert_close(triton_output,
                                batched_output,
