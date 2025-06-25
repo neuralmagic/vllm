@@ -73,13 +73,16 @@ def moe_apply_weights_and_sum(
         o_ptrs += BLOCK_K
 
 
-def _compute_inv_perm(sorted_token_ids: torch.Tensor,
-                      topk_ids: torch.Tensor) -> torch.Tensor:
+def _compute_inv_perm(sorted_token_ids: torch.Tensor, topk_ids: torch.Tensor,
+                      expert_num_tokens_sum: Optional[int]) -> torch.Tensor:
 
-    valid_topk_mask = topk_ids != -1
-    valid_topk_numel = torch.count_nonzero(valid_topk_mask)
+    valid_topk_numel = None
+    if expert_num_tokens_sum is not None:
+        valid_topk_numel = expert_num_tokens_sum
+    else:
+        valid_topk_numel = topk_ids.numel()
+
     valid_indices = torch.argsort(sorted_token_ids)[:valid_topk_numel]
-
     if valid_topk_numel == topk_ids.numel():
         return valid_indices
 
@@ -94,6 +97,7 @@ def _compute_inv_perm(sorted_token_ids: torch.Tensor,
     #                       1025,  512,  768,  129,  384, 1026,
     #                       256, 0,  641,  769,  257, 1027,  258]
     # Note that sorted_token_ids dont account for the -1s in topk_ids.
+    valid_topk_mask = topk_ids != -1
     valid_topk_mask = valid_topk_mask.view(-1)
 
     # selection is [-1,  0,  1,  1,  2,  2,
@@ -128,7 +132,7 @@ def _moe_permute(
     expert_map: Optional[torch.Tensor],
     block_m: int,
     output: Optional[torch.Tensor],
-    sum_tokens_per_expert: Optional[int],
+    expert_num_tokens_sum: Optional[int] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor,
            torch.Tensor]:
     """
@@ -145,13 +149,14 @@ def _moe_permute(
                              global_num_experts,
                              expert_map,
                              pad_sorted_ids=True,
-                             sum_tokens_per_expert=sum_tokens_per_expert))
+                             expert_num_tokens_sum=expert_num_tokens_sum))
 
     inv_perm: Optional[torch.Tensor] = None
 
     num_tokens = top_k_num * tokens_in_chunk
     expert_ids = torch.repeat_interleave(expert_ids, block_m, dim=0)
-    inv_perm = _compute_inv_perm(sorted_token_ids, curr_topk_ids)
+    inv_perm = _compute_inv_perm(sorted_token_ids, curr_topk_ids,
+                                 expert_num_tokens_sum)
 
     # Permute according to sorted token ids.
     sorted_token_ids = sorted_token_ids.clamp(max=num_tokens - 1)

@@ -232,7 +232,7 @@ class CutlassExpertsFp8(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
-        sum_tokens_per_expert: Optional[int],
+        expert_num_tokens_sum: Optional[int] = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         workspace1: tuple[int, ...] = ()
         workspace2: tuple[int, ...] = ()
@@ -269,6 +269,7 @@ class CutlassExpertsFp8(mk.FusedMoEPermuteExpertsUnpermute):
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
         expert_num_tokens: Optional[torch.Tensor],
+        expert_num_tokens_sum: Optional[int],
     ):
         assert w1_zp is None, "w1_zp is not supported in CUTLASS MoE"
         assert w2_zp is None, "w2_zp is not supported in CUTLASS MoE"

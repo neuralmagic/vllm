@@ -49,7 +49,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
-        sum_tokens_per_expert: Optional[int] = None,
+        expert_num_tokens_sum: Optional[int] = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         assert a.dim() == 2
         # FIXME (varun): We should be able to dispatch only from the leader
@@ -85,6 +85,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
         expert_num_tokens: Optional[torch.Tensor],
+        expert_num_tokens_sum: Optional[int],
     ):
         import deep_gemm as dg
         assert hidden_states.ndim == 3

@@ -1555,7 +1555,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
-        sum_tokens_per_expert: Optional[int] = None,
+        expert_num_tokens_sum: Optional[int] = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         topk = topk_ids.size(1)
         workspace1 = (M, topk, max(N * 2, K))
@@ -1583,6 +1583,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
         expert_num_tokens: Optional[torch.Tensor],
+        expert_num_tokens_sum: Optional[int],
     ):
         # Check constraints.
         if self.use_int4_w4a16:

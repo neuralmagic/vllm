@@ -84,31 +84,45 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
-        sum_tokens_per_expert: Optional[int] = None,
+        expert_num_tokens_sum: Optional[int] = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         num_experts = local_num_experts
-        if sum_tokens_per_expert is None:
-            sum_tokens_per_expert = topk_ids.numel()
+        if expert_num_tokens_sum is None:
+            expert_num_tokens_sum = topk_ids.numel()
 
         block_m = self.block_shape[0]
-        M_sum = sum_tokens_per_expert + num_experts * (block_m - 1)
+        M_sum = expert_num_tokens_sum + num_experts * (block_m - 1)
         M_sum = round_up(M_sum, block_m)
         workspace1 = (M_sum, max(N * 2, K))
         workspace2 = (M_sum, max(N, K))
         output = (M, K)
         return (workspace1, workspace2, output, a.dtype)
 
-    def apply(self, output: torch.Tensor, hidden_states: torch.Tensor,
-              w1: torch.Tensor, w2: torch.Tensor, topk_ids: torch.Tensor,
-              topk_weights: torch.Tensor, activation: str,
-              global_num_experts: int, expert_map: Optional[torch.Tensor],
-              w1_scale: Optional[torch.Tensor],
-              w2_scale: Optional[torch.Tensor], w1_zp: Optional[torch.Tensor],
-              w2_zp: Optional[torch.Tensor], a1q_scale: Optional[torch.Tensor],
-              a2_scale: Optional[torch.Tensor], workspace13: torch.Tensor,
-              workspace2: torch.Tensor,
-              expert_num_tokens: Optional[torch.Tensor]):
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        activation: str,
+        global_num_experts: int,
+        expert_map: Optional[torch.Tensor],
+        w1_scale: Optional[torch.Tensor],
+        w2_scale: Optional[torch.Tensor],
+        w1_zp: Optional[torch.Tensor],
+        w2_zp: Optional[torch.Tensor],
+        a1q_scale: Optional[torch.Tensor],
+        a2_scale: Optional[torch.Tensor],
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_num_tokens: Optional[torch.Tensor],
+        expert_num_tokens_sum: Optional[int],
+    ):
         import deep_gemm as dg
+
+        assert expert_num_tokens_sum is not None
 
         a1q = hidden_states
         _, N, K = w1.size()
@@ -134,6 +148,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             expert_map=None,
             block_m=self.block_shape[0],
             output=workspace2.view(dtype=torch.float8_e4m3fn),
+            expert_num_tokens_sum=expert_num_tokens_sum,
         )
 
         if expert_map is not None:

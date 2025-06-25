@@ -523,7 +523,7 @@ class BatchedExperts(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
-        sum_tokens_per_expert: Optional[int] = None
+        expert_num_tokens_sum: Optional[int] = None
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         assert a.dim() == 2
         num_dp = self.dp_size
@@ -552,6 +552,7 @@ class BatchedExperts(mk.FusedMoEPermuteExpertsUnpermute):
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
         expert_num_tokens: Optional[torch.Tensor],
+        expert_num_tokens_sum: Optional[int],
     ):
         assert hidden_states.dim() == 3
         assert expert_num_tokens is not None
@@ -630,7 +631,7 @@ class BatchedTritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         topk_ids: torch.Tensor,
         global_num_experts: int,
         local_num_experts: int,
-        sum_tokens_per_expert: Optional[int] = None
+        expert_num_tokens_sum: Optional[int] = None
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
         assert a.dim() == 2
         num_dp = self.world_size // self.dp_size
@@ -662,6 +663,7 @@ class BatchedTritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
         expert_num_tokens: Optional[torch.Tensor],
+        expert_num_tokens_sum: Optional[int],
     ):
         # Check constraints.
         if self.use_int4_w4a16:
