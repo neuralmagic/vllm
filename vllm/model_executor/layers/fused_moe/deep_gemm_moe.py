@@ -9,7 +9,7 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
-    _moe_permute, moe_unpermute_and_reduce_triton)
+    deepgemm_moe_permute, deepgemm_unpermute_and_reduce)
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP)
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -86,12 +86,10 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         local_num_experts: int,
         expert_num_tokens_sum: Optional[int] = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
-        num_experts = local_num_experts
-        if expert_num_tokens_sum is None:
-            expert_num_tokens_sum = topk_ids.numel()
 
+        assert expert_num_tokens_sum is not None
         block_m = self.block_shape[0]
-        M_sum = expert_num_tokens_sum + num_experts * (block_m - 1)
+        M_sum = expert_num_tokens_sum
         M_sum = round_up(M_sum, block_m)
         workspace1 = (M_sum, max(N * 2, K))
         workspace2 = (M_sum, max(N, K))
@@ -122,6 +120,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
     ):
         import deep_gemm as dg
 
+        assert expert_num_tokens is not None
         assert expert_num_tokens_sum is not None
 
         a1q = hidden_states
@@ -133,34 +132,18 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         assert w2.size(1) == K
 
-        # DeepGemmExperts are generally used with the DeepEP High Throughput
-        # kernels. The DeepEP High Throughput kernels accounts for the
-        # expert map and assigns a top_k id of -1 for experts not in this
-        # rank. This allows use to use "local_num_experts" in _moe_permute
-        # and we can ignore the expert_map completely.
-        # If using with other prepare_finalize, make sure to prepare
-        # the topk_ids as above.
-        a1q, a1q_scale, _, expert_ids, inv_perm = _moe_permute(
-            a1q,
-            a1q_scale,
-            topk_ids,
-            global_num_experts=local_num_experts,
-            expert_map=None,
-            block_m=self.block_shape[0],
-            output=workspace2.view(dtype=torch.float8_e4m3fn),
-            expert_num_tokens_sum=expert_num_tokens_sum,
-        )
-
-        if expert_map is not None:
-            # DeepGemm (Grouped Contiguous) kernel needs a valid B index
-            # for all rows of A. To that effect, simply compute with
-            # the 0th weight matrix.
-            # Note that this relies on the fact that corresponding topk
-            # weights would be 0 during weight multiplication.
-            expert_ids = torch.where(expert_ids == -1, 0, expert_ids)
+        a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
+            aq=a1q,
+            aq_scale=a1q_scale,
+            topk_ids=topk_ids,
+            expert_num_tokens=expert_num_tokens,
+            sum_expert_num_tokens=expert_num_tokens_sum,
+            aq_out=_resize_cache(workspace2.view(dtype=torch.float8_e4m3fn),
+                                 (expert_num_tokens_sum, K)))
 
         # Note: M_sum is different than the pre-permuted shape of a1q.
         M_sum = a1q.size(0)
+        assert M_sum == expert_num_tokens_sum
 
         mm1_out = _resize_cache(workspace13, (M_sum, N))
         act_out = _resize_cache(workspace2, (M_sum, N // 2))
@@ -182,12 +165,11 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         dg.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             (a2q, a2q_scale), (w2, w2_scale), mm2_out, expert_ids)
 
-        moe_unpermute_and_reduce_triton(output,
-                                        mm2_out,
-                                        inv_perm,
-                                        topk_ids,
-                                        topk_weights,
-                                        apply_weight=True)
+        deepgemm_unpermute_and_reduce(a=mm2_out,
+                                      topk_ids=topk_ids,
+                                      topk_weights=topk_weights,
+                                      inv_perm=inv_perm,
+                                      output=output)
 
 
 def deep_gemm_moe_fp8(

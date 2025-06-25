@@ -95,7 +95,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             topk_weights=rank_topk_weights,
             # expert_alignment rounds the number of tokens per expert
             # to this value.
-            expert_alignment=1,
+            expert_alignment=128,
             config=self._get_dispatch_config(),
             previous_event=None,
             async_finish=False,
@@ -106,8 +106,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         else:
             expert_x, expert_x_scale = token_data, None
 
-        return (expert_x, expert_x_scale, expert_num_tokens, expert_topk_ids,
-                expert_topk_weights, sum(expert_num_tokens_per_expert_list))
+        sum_expert_num_tokens = sum(expert_num_tokens_per_expert_list)
+        expert_num_tokens_gpu = torch.tensor(expert_num_tokens_per_expert_list,
+                                             dtype=torch.int32,
+                                             device=tokens.device)
+
+        return (expert_x, expert_x_scale, expert_num_tokens_gpu,
+                expert_topk_ids, expert_topk_weights, sum_expert_num_tokens)
 
     def prepare(
         self,
