@@ -1524,6 +1524,16 @@ def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
                                           num_tokens_post_pad)
 
 
+def compute_expert_num_tokens(topk_ids: torch.Tensor,
+                              expert_num_tokens: torch.Tensor,
+                              sum_expert_num_tokens: torch.Tensor,
+                              local_num_experts: int,
+                              expert_map: Optional[torch.Tensor]):
+    torch.ops._moe_C.compute_expert_num_tokens(topk_ids, expert_num_tokens,
+                                               sum_expert_num_tokens,
+                                               local_num_experts, expert_map)
+
+
 def moe_wna16_gemm(input: torch.Tensor, output: torch.Tensor,
                    b_qweight: torch.Tensor, b_scales: torch.Tensor,
                    b_qzeros: Optional[torch.Tensor],

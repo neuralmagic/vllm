@@ -22,6 +22,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "                     Tensor! num_tokens_post_pad) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
+  m.def(
+      "compute_expert_num_tokens(Tensor topk_ids, Tensor! expert_num_tokens,"
+      "                     Tensor! sum_expert_num_tokens, "
+      "                     int local_num_experts, "
+      "                     Tensor? expert_map) -> ()");
+  m.impl("compute_expert_num_tokens", torch::kCUDA, &compute_expert_num_tokens);
+
 #ifndef USE_ROCM
   m.def(
       "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "

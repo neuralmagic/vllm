@@ -29,3 +29,9 @@ bool moe_permute_unpermute_supported();
 void shuffle_rows(const torch::Tensor& input_tensor,
                   const torch::Tensor& dst2src_map,
                   torch::Tensor& output_tensor);
+
+void compute_expert_num_tokens(torch::Tensor& topk_ids,
+                               torch::Tensor& expert_num_tokens,
+                               torch::Tensor& sum_expert_num_tokens,
+                               const int64_t local_num_experts,
+                               std::optional<torch::Tensor> const& expert_map);

@@ -179,7 +179,7 @@ template <typename scalar_t>
 __global__ void compute_expert_num_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     const int32_t* __restrict__ expert_map, int32_t* expert_num_tokens,
-    int32_t* sum_expert_num_tokens, const int32_t num_experts,
+    int32_t* sum_expert_num_tokens, const int64_t num_experts,
     const size_t numel) {
   extern __shared__ int32_t shared_mem[];
 
@@ -331,7 +331,7 @@ void compute_expert_num_tokens(
     torch::Tensor& topk_ids,               // [M, num_topk]
     torch::Tensor& expert_num_tokens,      // [local_num_experts]
     torch::Tensor& sum_expert_num_tokens,  // [1]
-    const int32_t local_num_experts,
+    const int64_t local_num_experts,
     std::optional<torch::Tensor> const& expert_map  // [global_num_experts]
 ) {
   TORCH_CHECK(expert_num_tokens.dtype() == torch::kInt32);
@@ -355,7 +355,7 @@ void compute_expert_num_tokens(
   const int topk_numel = topk_ids.numel();
   dim3 block(std::min(topk_numel, 1024));
 
-  const int num_blocks = ((topk_numel - 1 / block.x) + 1) * block.x;
+  const int num_blocks = ((topk_numel - 1 / block.x) + 1);
   dim3 grid(std::min(num_sms, num_blocks));
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(topk_ids));
@@ -363,7 +363,7 @@ void compute_expert_num_tokens(
 
   size_t shared_mem_size = local_num_experts * sizeof(int32_t);
 
-  VLLM_DISPATCH_FLOATING_TYPES(
+  VLLM_DISPATCH_INTEGRAL_AND_UNSIGNED_TYPES(
       topk_ids.scalar_type(), "compute_expert_num_tokens_kernel", [&] {
         vllm::moe::compute_expert_num_tokens_kernel<scalar_t>
             <<<grid, block, shared_mem_size, stream>>>(
