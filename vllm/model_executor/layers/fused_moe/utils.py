@@ -39,6 +39,7 @@ def _fp8_quantize(
         A, A_scale = ops.scaled_fp8_quant(
             A, A_scale, use_per_token_if_dynamic=per_act_token)
     else:
+        assert not per_act_token
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
         A, A_scale = per_token_group_quant_fp8(A, block_k)
@@ -66,6 +67,7 @@ def _int8_quantize(
             "int8 quantization only supports block or channel-wise"
         A, A_scale = per_token_quant_int8(A)
     else:
+        assert not per_act_token
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
         A, A_scale = per_token_group_quant_int8(A, block_k)
@@ -86,7 +88,6 @@ def moe_kernel_quantize_input(
     elif quant_dtype == torch.int8:
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
     else:
-        assert A_scale is None
         return A, A_scale
 
 
@@ -105,3 +106,19 @@ def find_free_port():
         s.bind(('', 0))
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return s.getsockname()[1]
+
+
+# TODO(bnell): better name
+def maybe_fix_scales(scales: Optional[torch.Tensor], num_experts: int) -> Optional[torch.Tensor]:
+    if scales is not None and scales.ndim < 3:
+        if scales.numel() == 1:
+            scales = scales.view(1)
+            scales = torch.repeat_interleave(
+                scales,
+                num_experts,
+                dim=0
+            ).view(num_experts, 1, 1)
+        else:
+            scales = scales.view(num_experts, -1, scales.size(-1))
+
+    return scales
