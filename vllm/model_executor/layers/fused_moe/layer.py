@@ -213,7 +213,7 @@ class MoEConfig:
 
     # TODO: add more quantization params.
     per_act_token: bool = False
-    block_size: int = 128
+    block_shape: Optional[tuple[int]] = (128, 128)
 
     max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
 
@@ -221,6 +221,11 @@ class MoEConfig:
         if self.dp_size > 1:
             logger.debug("Using MOEConfig::max_num_tokens=%d",
                          self.max_num_tokens)
+
+    @property
+    def block_size(self):
+        if self.block_shape is not None:
+            return self.block_shape[1]
 
     @property
     def tp_size(self):
@@ -352,7 +357,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 rank_expert_offset=all2all_manager.rank *
                 moe.num_local_experts,
                 quant_dtype=moe.quant_dtype,
-                block_shape=moe.block_size,
+                block_shape=moe.block_shape,
             )
 
         elif moe.use_deepep_ll_kernels:
@@ -375,7 +380,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 dp_size=all2all_manager.dp_world_size,
                 max_tokens_per_rank=moe.max_num_tokens,
                 quant_dtype=moe.quant_dtype,
-                block_shape=moe.block_size,
+                block_shape=moe.block_shape,
                 use_fp8_dispatch=False,
             )
 
@@ -901,8 +906,9 @@ class FusedMoE(torch.nn.Module):
         # Only support float8 for now.
         quant_dtype = params_dtype
         per_act_token = False
-        quant_block_size = None
+        quant_block_shape = None
         if quant_config is not None:
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
             input_activations = get_quant_config_input_activations(
                 quant_config)
             if input_activations is not None:
@@ -911,10 +917,9 @@ class FusedMoE(torch.nn.Module):
                     == QuantizationType.FLOAT) else quant_dtype
                 per_act_token = (
                     input_activations.strategy == QuantizationStrategy.TOKEN)
-        from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-        if isinstance(quant_config, Fp8Config):
-            assert quant_dtype == torch.float8_e4m3fn
-            quant_block_size = quant_config.weight_block_size[1]
+            elif isinstance(quant_config, Fp8Config):
+                quant_dtype = torch.float8_e4m3fn
+                quant_block_shape = quant_config.weight_block_size
 
         moe = MoEConfig(
             num_experts=self.global_num_experts,
@@ -926,7 +931,7 @@ class FusedMoE(torch.nn.Module):
             # quantization params
             quant_dtype=quant_dtype,
             per_act_token=per_act_token,
-            block_size=quant_block_size,
+            block_shape=quant_block_shape,
             max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
         )
         self.moe_config = moe
