@@ -192,14 +192,16 @@ __global__ void compute_expert_num_tokens_kernel(
   int stride = gridDim.x * blockDim.x;
   int expert_count = 0;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += stride) {
-    int const expert_id = topk_ids[i];
-    bool valid_expert = expert_id >= 0 && expert_id < num_experts;
-    if (expert_map) {
-      valid_expert = valid_expert && expert_map[expert_id] != -1;
+    int expert_id = topk_ids[i];
+    if (expert_map && expert_id != -1) {
+      expert_id = expert_map[expert_id];
     }
+
+    bool const valid_expert = expert_id >= 0 && expert_id < num_experts;
     if (!valid_expert) {
       continue;
     }
+
     atomicAdd(&shared_mem[expert_id], 1);
     expert_count++;
   }

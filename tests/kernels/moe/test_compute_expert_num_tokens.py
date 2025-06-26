@@ -49,9 +49,7 @@ class TestTensors:
         expert_map[s:e] = torch.tensor(list(range(num_local_experts)),
                                        device=device)
 
-        # mark topk ids -1
-        topk_ids = expert_map[self.topk_ids.clone()]
-        return TestTensors(topk_ids=topk_ids, expert_map=expert_map)
+        return TestTensors(topk_ids=self.topk_ids.clone(), expert_map=expert_map)
 
 
 def ref_impl(tt: TestTensors, expert_num_tokens: torch.Tensor,
@@ -61,10 +59,12 @@ def ref_impl(tt: TestTensors, expert_num_tokens: torch.Tensor,
     expert_ids, counts = tt.topk_ids.unique(return_counts=True)
 
     for eid, count in zip(expert_ids, counts):
+        if eid != -1 and tt.expert_map is not None:
+            eid = tt.expert_map[eid]
+
         if eid == -1:
             continue
-        if tt.expert_map is not None and tt.expert_map[eid] == -1:
-            continue
+
         expert_num_tokens[eid] += count
         total_num_tokens[0] += count
 
@@ -91,12 +91,19 @@ def do_test_compute_expert_num_tokens(num_tokens: int,
         ref_total_num_tokens = torch.zeros((1),
                                            device="cpu",
                                            dtype=torch.int32)
-        impl_expert_num_tokens = ref_expert_num_tokens.clone().to("cuda")
-        impl_total_num_tokens = ref_total_num_tokens.clone().to("cuda")
-
         ref_impl(tt_rank, ref_expert_num_tokens, ref_total_num_tokens)
+        ref_expert_num_tokens = ref_expert_num_tokens.to("cuda")
+        ref_total_num_tokens = ref_total_num_tokens.to("cuda")
 
         tt_rank.to_device("cuda")
+        # Test with expert map
+        impl_expert_num_tokens = torch.zeros((num_local_experts),
+                                            device="cuda",
+                                            dtype=torch.int32)
+        impl_total_num_tokens = torch.zeros((1),
+                                           device="cuda",
+                                           dtype=torch.int32)
+
         ops.compute_expert_num_tokens(tt_rank.topk_ids,
                                       impl_expert_num_tokens,
                                       impl_total_num_tokens,
@@ -104,13 +111,32 @@ def do_test_compute_expert_num_tokens(num_tokens: int,
                                       expert_map=tt_rank.expert_map)
 
         torch.testing.assert_close(ref_expert_num_tokens,
-                                   impl_expert_num_tokens.to("cpu"),
+                                   impl_expert_num_tokens,
                                    atol=0,
                                    rtol=0)
         torch.testing.assert_close(ref_total_num_tokens,
-                                   impl_total_num_tokens.to("cpu"),
+                                   impl_total_num_tokens,
                                    atol=0,
                                    rtol=0)
+
+        # Test without expert map
+        impl_expert_num_tokens.fill_(0)
+        impl_total_num_tokens.fill_(0)
+        topk_ids = tt_rank.expert_map[tt_rank.topk_ids]
+        ops.compute_expert_num_tokens(topk_ids,
+                                      impl_expert_num_tokens,
+                                      impl_total_num_tokens,
+                                      local_num_experts=num_local_experts,
+                                      expert_map=None)
+        torch.testing.assert_close(ref_expert_num_tokens,
+                                   impl_expert_num_tokens,
+                                   atol=0,
+                                   rtol=0)
+        torch.testing.assert_close(ref_total_num_tokens,
+                                   impl_total_num_tokens,
+                                   atol=0,
+                                   rtol=0)
+
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 11, 19, 128, 127, 405, 1024, 3333, 6666, 7317])
 @pytest.mark.parametrize("num_topk", [2, 6, 8])
