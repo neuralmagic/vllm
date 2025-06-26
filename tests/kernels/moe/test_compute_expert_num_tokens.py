@@ -69,23 +69,10 @@ def ref_impl(tt: TestTensors, expert_num_tokens: torch.Tensor,
         total_num_tokens[0] += count
 
 
-#@pytest.mark.parametrize("num_tokens", [1,3,5])
-#@pytest.mark.parametrize("num_topk", [list(range(1, 8192))])
-#@pytest.mark.parametrize("num_experts", [32])
-#@pytest.mark.parametrize("ep_size", [1, 2, 4])
-
-#@pytest.mark.parametrize("num_tokens", [1, 128, 512])
-#@pytest.mark.parametrize("num_topk", [2, 6, 12])
-#@pytest.mark.parametrize("num_experts", [32])
-#@pytest.mark.parametrize("ep_size", [1, 2, 4])
-
-
-@pytest.mark.parametrize("num_tokens", [4])
-@pytest.mark.parametrize("num_topk", [6])
-@pytest.mark.parametrize("num_experts", [32])
-@pytest.mark.parametrize("ep_size", [1])
-def test_compute_expert_num_tokens(num_tokens: int, num_topk: int,
-                                   num_experts: int, ep_size: int):
+def do_test_compute_expert_num_tokens(num_tokens: int,
+                                num_topk: int,
+                                num_experts: int,
+                                ep_size: int):
 
     assert num_topk <= num_experts
 
@@ -104,23 +91,17 @@ def test_compute_expert_num_tokens(num_tokens: int, num_topk: int,
         ref_total_num_tokens = torch.zeros((1),
                                            device="cpu",
                                            dtype=torch.int32)
+        impl_expert_num_tokens = ref_expert_num_tokens.clone().to("cuda")
+        impl_total_num_tokens = ref_total_num_tokens.clone().to("cuda")
 
         ref_impl(tt_rank, ref_expert_num_tokens, ref_total_num_tokens)
 
         tt_rank.to_device("cuda")
-        impl_expert_num_tokens = ref_expert_num_tokens.clone().to("cuda")
-        impl_total_num_tokens = ref_total_num_tokens.clone().to("cuda")
-
         ops.compute_expert_num_tokens(tt_rank.topk_ids,
                                       impl_expert_num_tokens,
                                       impl_total_num_tokens,
                                       local_num_experts=num_local_experts,
                                       expert_map=tt_rank.expert_map)
-
-        torch.cuda.synchronize()
-        print(f"tt_rank {tt_rank.topk_ids} {tt_rank.expert_map}")
-        print(f"ref_expert_num_tokens {ref_expert_num_tokens}")
-        print(f"impl_expert_num_tokens {impl_expert_num_tokens}")
 
         torch.testing.assert_close(ref_expert_num_tokens,
                                    impl_expert_num_tokens.to("cpu"),
@@ -130,3 +111,21 @@ def test_compute_expert_num_tokens(num_tokens: int, num_topk: int,
                                    impl_total_num_tokens.to("cpu"),
                                    atol=0,
                                    rtol=0)
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 11, 19, 128, 127, 405, 1024, 3333, 6666, 7317])
+@pytest.mark.parametrize("num_topk", [2, 6, 8])
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("ep_size", [1, 2, 4])
+def test_compute_expert_num_tokens(num_tokens: int, num_topk: int,
+                                   num_experts: int, ep_size: int):
+    do_test_compute_expert_num_tokens(num_tokens, num_topk,
+                                      num_experts, ep_size)
+
+
+@pytest.mark.parametrize("numel", list(range(1, 8192, 11)))
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("ep_size", [2])
+def test_compute_expert_num_tokens_from_numel(numel: int, 
+                                   num_experts: int, ep_size: int):
+    do_test_compute_expert_num_tokens(num_tokens = numel, num_topk = 1,
+                                      num_experts = num_experts, ep_size = ep_size)

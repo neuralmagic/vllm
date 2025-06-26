@@ -204,6 +204,8 @@ __global__ void compute_expert_num_tokens_kernel(
     expert_count++;
   }
 
+  __syncthreads();
+
   for (int x = threadIdx.x; x < num_experts; x += blockDim.x) {
     atomicAdd(&expert_num_tokens[x], shared_mem[x]);
   }
@@ -336,6 +338,7 @@ void compute_expert_num_tokens(
 ) {
   TORCH_CHECK(expert_num_tokens.dtype() == torch::kInt32);
   TORCH_CHECK(sum_expert_num_tokens.dtype() == torch::kInt32);
+  TORCH_CHECK(expert_num_tokens.size(0) == local_num_experts);
 
   if (expert_map) {
     TORCH_CHECK(expert_map->dtype() == torch::kInt32);
