@@ -610,8 +610,10 @@ def _pplx_moe_loop(
         w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
         w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
         score = torch.randn((m, e), device="cuda", dtype=dtype)
+        world_size = pgi.world_size
+        rank = pgi.rank
         try:
-            _pplx_moe(pgi, dp_size, a, w1, w2, score, topk, use_internode)
+            _pplx_moe(world_size, dp_size, rank, a, w1, w2, score, topk, use_internode)
             format_result(f"test_pplx_moe[mnk={mnk}, e={e}, topk={topk}, dtype={dtype}]")
         except Exception as ex:
             format_result(f"test_pplx_moe[mnk={mnk}, e={e}, topk={topk}, dtype={dtype}]", ex)
@@ -641,27 +643,66 @@ def pytest_collection_modifyitems(config, items):
         if "child" in item.keywords:
             item.add_marker(skip_slow)
 
+from .utils import get_process_group
 
-@pytest.mark.parametrize("mnk", PPLX_MOE_COMBOS)
-@pytest.mark.parametrize("e", NUM_EXPERTS)
-@pytest.mark.parametrize("topk", TOP_KS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.child
-def test_pplx_moe_child(
-    mnk: tuple[int,int,int],
-    e: int,
-    topk: int,
-    dtype: torch.dtype,
-):
-    current_platform.seed_everything(7)
+# crazy_dec = pytest.mark.parametrize(
+#     pytest.mark.parametrize(
+#         pytest.mark.parametrize(
+#             pytest.mark.parametrize(
+#                 pytest.mark.skipif(_test_pplx_moe_child, _PROCESS_GROUP is None, reason="skip"),
+#                 "dtype", [torch.bfloat16]),
+#             "topk", TOP_KS),
+#         "e", NUM_EXPERTS),
+#     "mnk", PPLX_MOE_COMBOS)
 
-    m, n, k = mnk
-    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
-    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
-    score = torch.randn((m, e), device="cuda", dtype=dtype)
+# print(crazy_dec)
 
-    _pplx_moe(world_size, dp_size, rank, a, w1, w2, score, topk, use_internode)
+def pytest_generate_tests(metafunc):
+    if "data_param" in metafunc.fixturenames:
+        # Generate test cases for the 'data_param' fixture
+        metafunc.parametrize("mnk", PPLX_MOE_COMBOS)
+        metafunc.parametrize("e", NUM_EXPERTS)
+        metafunc.parametrize("topk", TOP_KS)
+        metafunc.parametrize("dtype", [torch.bfloat16])
+        metafunc.skipif(get_process_group() is None, reason="skip")
+
+#@pytest.mark.parametrize("mnk", PPLX_MOE_COMBOS)
+#@pytest.mark.parametrize("e", NUM_EXPERTS)
+#@pytest.mark.parametrize("topk", TOP_KS)
+#@pytest.mark.parametrize("dtype", [torch.bfloat16])
+#@pytest.mark.skipif(get_process_group() is None, reason="skip")
+def _test_pplx_moe_child(data_param):
+
+    def inner(
+            mnk: tuple[int,int,int],
+            e: int,
+            topk: int,
+            dtype: torch.dtype,
+    ):
+        current_platform.seed_everything(7)
+
+        m, n, k = mnk
+        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        use_internode = False
+
+        pgi = get_process_group()
+        dp_size = pgi.dp_size
+        rank = pgi.rank
+        world_size = pgi.world_size
+
+        _pplx_moe(world_size, dp_size, rank, a, w1, w2, score, topk, use_internode)
+
+    inner(*data_param)
+
+#import functools
+#
+##def _test_pplx_moe_child(a, b, c):
+#    print(f"PG {get_process_group()} {(a, b, c)}")
+#    (_test_pplx_moe_child)
+#    fn()
 
 
 @pytest.mark.parametrize("world_dp_size", [[2, 1]])
@@ -673,4 +714,4 @@ def test_pplx_moe(
 ):
     current_platform.seed_everything(7)
     world_size, dp_size = world_dp_size
-    parallel_launch(world_size, _pplx_moe_loop2, dp_size, use_internode)
+    parallel_launch(world_size, _pplx_moe_loop, dp_size, use_internode)

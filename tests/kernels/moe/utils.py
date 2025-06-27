@@ -38,6 +38,13 @@ class ProcessGroupInfo:
     device: torch.device
 
 
+_PROCESS_GROUP: Optional[ProcessGroupInfo] = None
+
+def get_process_group() -> Optional[ProcessGroupInfo]:
+    global _PROCESS_GROUP
+    return _PROCESS_GROUP
+
+
 def _worker_parallel_launch(
     local_rank: int,
     world_size: int,
@@ -61,16 +68,19 @@ def _worker_parallel_launch(
     barrier = torch.tensor([rank], device=device)
     torch.distributed.all_reduce(barrier)
 
+    global _PROCESS_GROUP
+    _PROCESS_GROUP = ProcessGroupInfo(
+        world_size=world_size,
+        world_local_size=world_local_size,
+        rank=rank,
+        node_rank=node_rank,
+        local_rank=local_rank,
+        device=device,
+    )
+
     try:
         worker(
-            ProcessGroupInfo(
-                world_size=world_size,
-                world_local_size=world_local_size,
-                rank=rank,
-                node_rank=node_rank,
-                local_rank=local_rank,
-                device=device,
-            ),
+            _PROCESS_GROUP,
             *args,
             **kwargs,
         )
