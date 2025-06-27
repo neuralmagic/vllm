@@ -59,12 +59,13 @@ class TritonOrDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             assert self.deep_gemm_expert is not None
             return self.deep_gemm_expert.workspace_shapes(
                 a, aq, M, N, K, topk_ids, global_num_experts,
-                local_num_experts)
+                local_num_experts, expert_num_tokens_sum)
         else:
             return self.triton_expert.workspace_shapes(a, aq, M, N, K,
                                                        topk_ids,
                                                        global_num_experts,
-                                                       local_num_experts)
+                                                       local_num_experts,
+                                                       expert_num_tokens_sum)
 
     def apply(
         self,
@@ -115,4 +116,5 @@ class TritonOrDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             workspace13,
             workspace2,
             expert_num_tokens,
+            expert_num_tokens_sum,
         )
