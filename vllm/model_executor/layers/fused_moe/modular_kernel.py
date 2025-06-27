@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.utils import cdiv
+from vllm import _custom_ops as ops
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -465,9 +466,21 @@ class FusedMoEModularKernel(torch.nn.Module):
             e = min(s + out_chunk_size, fused_out.size(0))
             return fused_out[s:e]
 
+        def slice_expert_num_tokens(slice_topk_ids: torch.Tensor) -> tuple[torch.Tensor, int]:
+            expert_num_tokens = torch.zeros((local_num_experts), device = slice_topk_ids.device, dtype=torch.int32)
+            sum_expert_num_tokens_gpu = torch.zeros((1), device = slice_topk_ids.device, dtype=torch.int32)
+            ops.compute_expert_num_tokens(slice_topk_ids,
+                                          expert_num_tokens,
+                                          sum_expert_num_tokens_gpu,
+                                          local_num_experts = local_num_experts,
+                                          expert_map = expert_map)
+            return (expert_num_tokens, sum_expert_num_tokens_gpu.item())
+
         for chunk_idx in range(num_chunks):
             c_a1q, c_a1q_scale, c_a2_scale, c_topk_ids, c_topk_weights = (
                 slice_input_tensors(chunk_idx))
+            c_expert_num_tokens, c_expert_num_tokens_sum = slice_expert_num_tokens(c_topk_ids) 
+
             self._do_fused_experts(fused_out=slice_output_tensor(chunk_idx),
                                    a1=a1,
                                    a1q=c_a1q,
@@ -485,8 +498,8 @@ class FusedMoEModularKernel(torch.nn.Module):
                                    w2_zp=w2_zp,
                                    a1q_scale=c_a1q_scale,
                                    a2_scale=c_a2_scale,
-                                   expert_num_tokens=expert_num_tokens,
-                                   expert_num_tokens_sum=expert_num_tokens_sum)
+                                   expert_num_tokens= c_expert_num_tokens,
+                                   expert_num_tokens_sum= c_expert_num_tokens_sum)
 
         return fused_out
 

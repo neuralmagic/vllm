@@ -336,7 +336,7 @@ def deepgemm_moe_permute(aq: torch.Tensor,
                          aq_scale: torch.Tensor,
                          topk_ids: torch.Tensor,
                          expert_num_tokens: torch.Tensor,
-                         sum_expert_num_tokens: torch.Tensor,
+                         sum_expert_num_tokens: Optional[int],
                          aq_out: Optional[torch.Tensor] = None):
 
     assert aq.ndim == 2

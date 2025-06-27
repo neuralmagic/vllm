@@ -122,7 +122,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
         assert expert_num_tokens is not None
         assert expert_num_tokens_sum is not None
-
+ 
         a1q = hidden_states
         _, N, K = w1.size()
 
