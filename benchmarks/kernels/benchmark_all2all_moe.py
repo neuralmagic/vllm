@@ -436,6 +436,7 @@ def bench_modular_kernel(
 
     from vllm import envs
 
+    assert len(bc.quant_args.block_size) == 2
     moe = MoEConfig(
         num_experts=bc.global_num_experts,
         experts_per_token=bc.topk,
@@ -446,7 +447,7 @@ def bench_modular_kernel(
         # quantization params
         quant_dtype=bc.quant_args.quant_dtype,
         per_act_token=bc.quant_args.per_act_token,
-        block_size=bc.quant_args.block_size,
+        block_shape=bc.quant_args.block_size,
         max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
     )
     print(f"MoE Config: {moe}")
