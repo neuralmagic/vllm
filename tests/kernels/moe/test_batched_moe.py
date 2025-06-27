@@ -9,9 +9,8 @@ import torch
 import triton.language as tl
 
 from tests.kernels.moe.utils import (batched_moe,
-                                     naive_batched_moe,
                                      make_quantized_test_activations,
-                                     make_test_weights, triton_moe)
+                                     make_test_weights, naive_batched_moe)
 from tests.kernels.quant_utils import native_batched_masked_quant_matmul
 from tests.kernels.utils import torch_experts
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -184,6 +183,7 @@ def test_batched_mm(num_experts: int, max_tokens_per_expert: int, K: int,
     torch.testing.assert_close(ref_output, q_ref_output, atol=atol, rtol=rtol)
     torch.testing.assert_close(test_output, q_ref_output, atol=atol, rtol=rtol)
 
+
 # @pytest.mark.parametrize("m", [6, 16, 199, 200, 256])
 # @pytest.mark.parametrize("n", [2816//2])
 # @pytest.mark.parametrize("k", [2048])
@@ -192,6 +192,7 @@ def test_batched_mm(num_experts: int, max_tokens_per_expert: int, K: int,
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 # @pytest.mark.parametrize("per_act_token_quant", [False])
 # @pytest.mark.parametrize("block_shape", [None])
+
 
 @pytest.mark.parametrize("m", [1, 32, 45, 64, 222])
 @pytest.mark.parametrize("n", [128, 512, 1024, 2048])

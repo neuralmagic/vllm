@@ -279,8 +279,8 @@ def dequant(
 
 
 def batched_dequant(
-    t: torch.Tensor, scale:
-    Optional[torch.Tensor],
+    t: torch.Tensor,
+    scale: Optional[torch.Tensor],
     block_shape: Optional[list[int]],
     per_act_token_quant: bool,
     out_dtype: Optional[torch.dtype] = torch.float32,
@@ -289,7 +289,8 @@ def batched_dequant(
         assert t.shape[0] == scale.shape[0]
         out = torch.empty_like(t, dtype=out_dtype)
         for e in range(t.shape[0]):
-            out[e] = dequant(t[e], scale[e], block_shape, per_act_token_quant, out_dtype)
+            out[e] = dequant(t[e], scale[e], block_shape, per_act_token_quant,
+                             out_dtype)
         return out
 
     return t.to(out_dtype)
