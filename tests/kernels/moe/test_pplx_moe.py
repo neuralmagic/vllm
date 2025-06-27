@@ -7,7 +7,10 @@ Run `pytest tests/kernels/test_pplx_moe.py`.
 from typing import Optional
 
 import pytest
+import itertools
 import torch
+import textwrap
+import traceback
 
 try:
     from pplx_kernels import AllToAll
@@ -532,8 +535,9 @@ def _batched_moe(pgi, dp_size, a, w1, w2, topk_weight, topk_ids):
 
 
 def _pplx_moe(
-    pgi: ProcessGroupInfo,
+    world_size: int,
     dp_size: int,
+    rank: int,
     a: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -543,12 +547,12 @@ def _pplx_moe(
 ):
     if use_internode:
         uid = nvshmem_get_unique_id(
-        ) if pgi.rank == 0 else nvshmem_alloc_empty_unique_id()
+        ) if rank == 0 else nvshmem_alloc_empty_unique_id()
         torch.distributed.broadcast(uid, src=0)
-        nvshmem_init(uid, pgi.rank, pgi.world_size)
+        nvshmem_init(uid, rank, world_size)
         group_name = None
     else:
-        group_ranks = list(range(pgi.world_size))
+        group_ranks = list(range(world_size))
         cpu_group = torch.distributed.new_group(group_ranks, backend="gloo")
         group_name = cpu_group.group_name
 
@@ -560,14 +564,14 @@ def _pplx_moe(
     with set_current_vllm_config(vllm_config), override_config(moe_config):
         topk_weight, topk_ids, _ = fused_topk(a, score, topk, False)
         torch_output = torch_experts(a, w1, w2, topk_weight, topk_ids)
-        pplx_output = pplx_moe(group_name, pgi.rank, pgi.world_size, dp_size,
+        pplx_output = pplx_moe(group_name, rank, world_size, dp_size,
                                a, w1, w2, topk_weight, topk_ids)
         # TODO (bnell): fix + re-enable
         #batched_output = _batched_moe(pgi, dp_size, a, w1, w2, topk_weight,
         #                              topk_ids)
 
-    torch_output = chunk_by_rank(torch_output, pgi.rank,
-                                 pgi.world_size).to(pplx_output.device)
+    torch_output = chunk_by_rank(torch_output, rank,
+                                 world_size).to(pplx_output.device)
 
     torch.testing.assert_close(pplx_output, torch_output, atol=2e-2, rtol=0)
     #torch.testing.assert_close(batched_output, torch_output, atol=2e-2, rtol=0)
@@ -576,28 +580,97 @@ def _pplx_moe(
         nvshmem_finalize()
 
 
+def format_result(msg, ex = None):
+    if ex is not None:
+        x = str(ex)
+        newx = x.strip(" \n\t")[:16]
+        if len(newx) < len(x):
+            newx = newx + " ..."
+
+        prefix = "E\t"
+        print(f"{textwrap.indent(traceback.format_exc(), prefix)}")
+        print(f"FAILED {msg} - {newx}\n")
+    else:
+        print(f"PASSED {msg}")
+
+
+def _pplx_moe_loop(
+    pgi: ProcessGroupInfo,
+    dp_size: int,
+    use_internode: bool
+):
+    current_platform.seed_everything(7)
+    combos = itertools.product(PPLX_MOE_COMBOS, NUM_EXPERTS, TOP_KS, [torch.bfloat16])
+    exceptions = []
+    count = 0
+    for mnk, e, topk, dtype in combos:
+        count = count + 1
+        m, n, k = mnk
+        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        try:
+            _pplx_moe(pgi, dp_size, a, w1, w2, score, topk, use_internode)
+            format_result(f"test_pplx_moe[mnk={mnk}, e={e}, topk={topk}, dtype={dtype}]")
+        except Exception as ex:
+            format_result(f"test_pplx_moe[mnk={mnk}, e={e}, topk={topk}, dtype={dtype}]", ex)
+            exceptions.append(ex)
+
+    if len(exceptions) > 0:
+        raise RuntimeError(f"{len(exceptions)} of {count} tests failed in child process.")
+
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run_child", action="store_true", default=False, help="run slow tests"
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: mark test as slow to run")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run_child"):
+        # --runslow given in cli: do not skip slow tests
+        return
+    skip_slow = pytest.mark.skip(reason="need --runslow option to run")
+    for item in items:
+        if "child" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 @pytest.mark.parametrize("mnk", PPLX_MOE_COMBOS)
 @pytest.mark.parametrize("e", NUM_EXPERTS)
 @pytest.mark.parametrize("topk", TOP_KS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("world_dp_size", [[2, 1]])
-@pytest.mark.parametrize("use_internode", [False])
-@requires_pplx
-def test_pplx_moe(
-    mnk: tuple[int, int, int],
+@pytest.mark.child
+def test_pplx_moe_child(
+    mnk: tuple[int,int,int],
     e: int,
     topk: int,
     dtype: torch.dtype,
-    world_dp_size: tuple[int, int],
-    use_internode: bool,
 ):
     current_platform.seed_everything(7)
+
     m, n, k = mnk
-    world_size, dp_size = world_dp_size
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
     w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
     score = torch.randn((m, e), device="cuda", dtype=dtype)
 
-    parallel_launch(world_size, _pplx_moe, dp_size, a, w1, w2, score, topk,
-                    use_internode)
+    _pplx_moe(world_size, dp_size, rank, a, w1, w2, score, topk, use_internode)
+
+
+@pytest.mark.parametrize("world_dp_size", [[2, 1]])
+@pytest.mark.parametrize("use_internode", [False])
+@requires_pplx
+def test_pplx_moe(
+    world_dp_size: tuple[int, int],
+    use_internode: bool,
+):
+    current_platform.seed_everything(7)
+    world_size, dp_size = world_dp_size
+    parallel_launch(world_size, _pplx_moe_loop2, dp_size, use_internode)
