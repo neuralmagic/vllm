@@ -184,16 +184,6 @@ def test_batched_mm(num_experts: int, max_tokens_per_expert: int, K: int,
     torch.testing.assert_close(test_output, q_ref_output, atol=atol, rtol=rtol)
 
 
-# @pytest.mark.parametrize("m", [6, 16, 199, 200, 256])
-# @pytest.mark.parametrize("n", [2816//2])
-# @pytest.mark.parametrize("k", [2048])
-# @pytest.mark.parametrize("e", [32])
-# @pytest.mark.parametrize("topk", [6])
-# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-# @pytest.mark.parametrize("per_act_token_quant", [False])
-# @pytest.mark.parametrize("block_shape", [None])
-
-
 @pytest.mark.parametrize("m", [1, 32, 45, 64, 222])
 @pytest.mark.parametrize("n", [128, 512, 1024, 2048])
 @pytest.mark.parametrize("k", [128, 512, 1024, 2048])
