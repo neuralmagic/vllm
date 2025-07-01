@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: str = "NONE"
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: Optional[int] = None
+    VLLM_USE_FLASHINFER_ALLREDUCE: Optional[bool] = None
 
 
 def get_default_cache_root():
@@ -955,7 +956,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # generations on machines < 100 for compressed-tensors
     # models
     "VLLM_USE_NVFP4_CT_EMULATIONS":
-    lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0")))
+    lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0"))),
+
+    # If set, vllm will use flashinfer fused allreduce kernels
+    "VLLM_USE_FLASHINFER_ALLREDUCE":
+    lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_ALLREDUCE"), "0")),
+
 }
 
 # --8<-- [end:env-vars-definition]
