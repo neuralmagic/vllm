@@ -960,8 +960,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # If set, vllm will use flashinfer fused allreduce kernels
     "VLLM_USE_FLASHINFER_ALLREDUCE":
-    lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_ALLREDUCE"), "0")),
-
+    lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_ALLREDUCE", "0"))),
 }
 
 # --8<-- [end:env-vars-definition]

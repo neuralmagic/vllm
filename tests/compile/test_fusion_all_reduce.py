@@ -9,7 +9,7 @@ import vllm.envs as envs
 from vllm.compilation.collective_fusion import AllReduceFusionPass
 from vllm.config import (CompilationConfig, DeviceConfig, ModelConfig,
                          PassConfig, VllmConfig)
-from vllm.distributed import (tensor_model_parallel_all_reduce)
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (init_distributed_environment,
                                              initialize_model_parallel)
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -113,8 +113,8 @@ def all_reduce_fusion_pass_on_test_model(local_rank: int, world_size: int,
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     vllm_config = VllmConfig()
-    vllm_config.compilation_config = CompilationConfig(
-        pass_config=PassConfig(enable_flashinfer_allreduce_fusion=True))
+    vllm_config.compilation_config = CompilationConfig(pass_config=PassConfig(
+        enable_flashinfer_allreduce_fusion=True))
     vllm_config.device_config = DeviceConfig(device=torch.device("cuda"))
 
     # this is a fake model name to construct the model config
@@ -126,9 +126,7 @@ def all_reduce_fusion_pass_on_test_model(local_rank: int, world_size: int,
                                            tokenizer_mode="auto",
                                            trust_remote_code=True,
                                            dtype=dtype,
-                                           seed=42,
-                                           hidden_size=hidden_size,
-                                           max_model_len=4096)
+                                           seed=42)
 
     all_reduce_fusion_pass = AllReduceFusionPass(vllm_config)
     backend = TestBackend(all_reduce_fusion_pass)
@@ -139,8 +137,8 @@ def all_reduce_fusion_pass_on_test_model(local_rank: int, world_size: int,
                                 dtype=dtype,
                                 requires_grad=False)
     residual = torch.randn((batch_size * seq_len, hidden_size),
-                            dtype=dtype,
-                            requires_grad=False)
+                           dtype=dtype,
+                           requires_grad=False)
 
     compiled_model = torch.compile(model, backend=backend)
     compiled_model(hidden_states, residual)
