@@ -14,7 +14,8 @@ from flashinfer import (BatchDecodeWithPagedKVCacheWrapper,
 import vllm.envs as envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionType)
-from vllm.config import VllmConfig
+from vllm.attention.layer import Attention
+from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_attn import use_cascade_attention
 from vllm.v1.attention.backends.utils import (
@@ -23,7 +24,6 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
@@ -109,27 +109,21 @@ def get_per_layer_parameters(
     Scan all attention layers and determine some hyperparameters
     to use during `plan`.
     """
-    model_config = vllm_config.model_config
-
-    # This is a workaround for the fact that the attention backend
-    # in this standalone test does not have access to the full model,
-    # so we mock the layer access.
-    if not hasattr(model_config, 'get_num_layers'):
-        raise RuntimeError(
-            "The model config does not have a get_num_layers method. "
-            "This is required for the FlashInfer backend.")
-
+    layers = get_layers_from_vllm_config(vllm_config, Attention)
     per_layer_params: dict[str, PerLayerParameters] = {}
-    for i in range(model_config.get_num_layers()):
-        sliding_window = model_config.get_sliding_window_for_layer(i)
-        logits_soft_cap = model_config.get_logits_soft_cap_for_layer(i)
-        sm_scale = model_config.get_sm_scale_for_layer(i)
 
-        per_layer_params[str(i)] = PerLayerParameters(
-            sm_scale=sm_scale,
-            logits_soft_cap=logits_soft_cap,
-            window_left=sliding_window if sliding_window is not None else -1,
-        )
+    for key, layer in layers.items():
+        impl = layer.impl
+        assert isinstance(impl, FlashInferImpl)
+
+        # Infer hyperparameters from the attention layer
+        window_size = impl.sliding_window
+        window_left = window_size[0] if window_size is not None else -1
+        logits_soft_cap = impl.logits_soft_cap
+        sm_scale = impl.scale
+
+        per_layer_params[key] = PerLayerParameters(window_left,
+                                                   logits_soft_cap, sm_scale)
 
     return per_layer_params
 
