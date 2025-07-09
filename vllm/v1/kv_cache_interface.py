@@ -126,6 +126,17 @@ class FullAttentionSpec(AttentionSpec):
 
 
 @dataclass
+class ChunkedLocalAttentionSpec(AttentionSpec):
+    attention_chunk_size: int
+
+    @property
+    def type_id(self) -> str:
+        return (
+            f"local_attention_{self.attention_chunk_size}_{self.block_size}_{self.page_size_bytes}"
+        )  # noqa
+
+
+@dataclass
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
 
