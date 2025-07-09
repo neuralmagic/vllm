@@ -201,17 +201,17 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionLayer,
 from vllm.attention.backends.utils import get_mla_dims
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import get_flash_attn_version
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.platforms import current_platform
 from vllm.utils import cdiv, round_down
-from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
-                                              CommonAttentionMetadata,
-                                              slice_query_start_locs)
+from vllm.v1.attention.backends.utils import (
+    AttentionMetadataBuilder, CommonAttentionMetadata,
+    reoder_batch_to_split_decodes_and_prefills, split_decodes_and_prefills)
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.v1.worker.block_table import BlockTable
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -225,7 +225,6 @@ except ImportError:
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 
@@ -346,22 +345,23 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     """
 
     def __init__(self,
-                 runner: "GPUModelRunner",
                  kv_cache_spec: AttentionSpec,
-                 block_table: BlockTable,
+                 vllm_config: VllmConfig,
+                 device: torch.device,
                  metadata_cls: Optional[type[M]] = None):
         self.metadata_cls = metadata_cls \
             if metadata_cls is not None else MLACommonMetadata
-        self.runner = runner
-        scheduler_config = runner.scheduler_config
-        model_config = runner.model_config
-        cache_config = runner.cache_config
-        self.chunked_prefill_enabled = scheduler_config.chunked_prefill_enabled
-        self.num_heads = model_config.get_num_attention_heads(
-            runner.parallel_config)
-        self.mla_dims = get_mla_dims(model_config)
-        self.aot_schedule = current_platform.is_cuda()
         self.kv_cache_spec = kv_cache_spec
+        self.device = device
+        scheduler_config = vllm_config.scheduler_config
+        self.model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        parallel_config = vllm_config.parallel_config
+        self.chunked_prefill_enabled = scheduler_config.chunked_prefill_enabled
+        self.num_heads = self.model_config.get_num_attention_heads(
+            parallel_config)
+        self.mla_dims = get_mla_dims(self.model_config)
+        self.aot_schedule = current_platform.is_cuda()
 
         # Dont try to access the runner on AMD
         if self.aot_schedule:
@@ -372,7 +372,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 # Max sure there is enough for 8 full length request or at least
                 # 4 pages of cache per request
                 max(
-                    8 * model_config.max_model_len, 4 *
+                    8 * self.model_config.max_model_len, 4 *
                     scheduler_config.max_num_seqs * cache_config.block_size),
                 # For long-context models try not to over-allocate limiting
                 # kv-cache space, limiting it to 64k tokens,
@@ -387,63 +387,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 scheduler_config.max_num_seqs * cache_config.block_size
             self.chunked_prefill_workspace = torch.empty(
                 (self.chunked_prefill_workspace_size,
-                 model_config.get_head_size()),
-                dtype=model_config.dtype,
-                device=runner.device,
+                 self.model_config.get_head_size()),
+                dtype=self.model_config.dtype,
+                device=device,
             )
-        self.block_table = block_table
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
-        # We now want to reorder the batch so that the "decode" requests are and
-        # the front and the "prefill" requests are at the using the least amount
-        # swaps possible. (NOTE for now we loosely use "decode" to mean requests
-        # where attention is likely memory-bound and "prefill" to mean requests
-        # where attention is likely compute-bound, TODO(lucas): figure out a
-        # better naming here)
-        decodes = []
-        prefills = []
-        num_decode_tokens = 0
-        num_prefill_tokens = 0
-
-        for i, req_id in enumerate(input_batch.req_ids):
-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            # for now treat 1 scheduled token as "decode" even if its not,
-            # we should update this to something like < 8 in the future but
-            # currently the TritonMLA._forward_decode only supports
-            # num_tokens = 1
-            if num_tokens == 1:
-                decodes.append(i)
-                num_decode_tokens += num_tokens
-            else:
-                prefills.append(i)
-                num_prefill_tokens += num_tokens
-
-        # We hope that this is fairly minimal since decodes
-        # should be around for a number of iterations so hopefully they are
-        # relatively stationary (and new request are generally appended to the
-        # persistent batch so already should be at the back)
-        # To achieve this we loop over the decodes in descending order and
-        # the prefills in ascending order. We swap decodes from the  "back"
-        # i.e. past where the last decode should be in the reodorered with
-        # prefills from the front of the batch.
-        # `decodes` and `prefills` are already in ascending order just based on
-        # the above loop
-        num_decodes = len(decodes)
-        num_prefills = len(prefills)
-        modified_batch = False
-
-        for i in range(1, min(num_decodes, num_prefills) + 1):
-            # If the decode is at the "back" of the batch, i, we can swap it
-            # with the prefill closest to the front of the batch
-            decode_idx = decodes[num_decodes - i]
-            if decode_idx < num_decodes:
-                break
-
-            input_batch.swap_states(prefills[i - 1], decode_idx)
-            modified_batch = True
-
-        return modified_batch
+        return reoder_batch_to_split_decodes_and_prefills(input_batch,
+                                                          scheduler_output,
+                                                          decode_threshold=1)
 
     def _build_decode(self, block_table_tensor: torch.Tensor,
                       seq_lens: torch.Tensor):
@@ -462,53 +415,41 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         - num_decode_tokens: number of decode tokens
         - num_prefill_tokens: number of prefill tokens
         """
-        if max_query_len == 1:
-            # Pure decode
-            return num_reqs, 0, num_tokens, 0
-        else:
-            query_lens = query_start_loc[1:] - query_start_loc[:-1]
-            first_prefill = (query_lens > 1).int().argmax(dim=-1).item()
-            assert torch.all(query_lens[first_prefill:] > 1)
-            num_decodes = first_prefill
-            num_prefills = num_reqs - num_decodes
-            num_decode_tokens = first_prefill
-            num_prefill_tokens = num_tokens - query_start_loc[first_prefill]
-            return (num_decodes, num_prefills, num_decode_tokens,
-                    num_prefill_tokens)
+        m = common_attn_metadata
+        assert m.num_reqs == m.num_actual_tokens, \
+            "MLA only supports decode-only full CUDAGraph capture. " \
+            "Make sure all cudagraph capture sizes <= max_num_seq."
 
-    def build_slice(
-        self,
-        req_slice: slice,
-        token_slice: slice,
-        max_query_len: int,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-    ) -> M:
-        num_reqs = req_slice.stop - req_slice.start
-        num_tokens = token_slice.stop - token_slice.start
+        m.max_query_len = 1  # decode-only
+
+        return self.build(0, m)
+
+    def build(self,
+              common_prefix_len: int,
+              common_attn_metadata: CommonAttentionMetadata,
+              fast_build: bool = False) -> M:
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        max_query_len = common_attn_metadata.max_query_len
 
         # Note(simon): be careful about the CPU <> GPU memory movement in this
         # function. We should avoid GPU -> CPU sync as much as possible because
         # it blocks on all previous kernels.
-        device = self.runner.device
-        block_table = self.block_table
-        block_table_tensor = block_table.get_device_tensor()[req_slice]
-        block_table.slot_mapping[token_slice].copy_(
-            block_table.slot_mapping_cpu[token_slice],
-            non_blocking=True)
-        block_table.slot_mapping[token_slice.stop:].fill_(-1)
-        slot_mapping = block_table.slot_mapping[token_slice]
+        device = self.device
+        block_table_tensor = common_attn_metadata.block_table_tensor
+        slot_mapping = common_attn_metadata.slot_mapping
 
-        query_start_loc = slice_query_start_locs(
-            common_attn_metadata.query_start_loc, req_slice)
-        seq_lens = common_attn_metadata.seq_lens[req_slice]
+        query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        seq_lens = common_attn_metadata.seq_lens
 
-        num_computed_tokens = self.runner.input_batch.\
-            num_computed_tokens_cpu_tensor[req_slice]
+        query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+
+        num_computed_tokens_cpu = (common_attn_metadata.seq_lens_cpu -
+                                   query_seq_lens_cpu)
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
-            self._split_decodes_and_prefills(
-                max_query_len, num_reqs, num_tokens, query_start_loc)
+            split_decodes_and_prefills(common_attn_metadata)
 
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
@@ -517,7 +458,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         if num_prefills > 0:
             reqs_start = num_decodes  # prefill_start
 
-            context_lens_cpu = num_computed_tokens[reqs_start:num_reqs]
+            context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
             prefill_query_start_loc = query_start_loc[
@@ -600,28 +541,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             num_actual_tokens=num_tokens,
             query_start_loc=query_start_loc,
             slot_mapping=slot_mapping,
-            head_dim=self.runner.model_config.get_head_size(),
+            head_dim=self.model_config.get_head_size(),
             # MLACommonMetadata Chunk prefill specific
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             prefill=prefill_metadata,
             decode=decode_metadata,
-        )
-
-    def build(self, common_prefix_len: int,
-              common_attn_metadata: CommonAttentionMetadata) -> M:
-        num_reqs = common_attn_metadata.num_reqs
-        num_actual_tokens = common_attn_metadata.num_actual_tokens
-        max_query_len = common_attn_metadata.max_query_len
-
-        # assert self._num_decodes + self._num_prefills == num_reqs
-        return self.build_slice(
-            req_slice=slice(0, num_reqs),
-            token_slice=slice(0, num_actual_tokens),
-            max_query_len=max_query_len,
-            common_prefix_len=common_prefix_len,
-            common_attn_metadata=common_attn_metadata,
         )
 
     def build_for_cudagraph_capture(
