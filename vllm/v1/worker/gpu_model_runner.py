@@ -52,7 +52,8 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.mamba_attn import Mamba2AttentionBackend
 from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
-                                              CommonAttentionMetadata)
+                                              CommonAttentionMetadata,
+                                              slice_query_start_locs)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec, MambaSpec,
@@ -106,6 +107,73 @@ class UbatchMetadata:
     positions: torch.Tensor
     inputs_embeds: Optional[torch.Tensor]
     intermediate_tensors: Optional[IntermediateTensors]
+
+def make_metadata_with_slice(
+        ubatch_slice,
+        query_start_loc,
+        query_start_loc_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        num_computed_tokens_cpu,
+        num_reqs,
+        num_actual_tokens,
+        max_query_len,
+        block_table_tensor,
+        slot_mapping
+        ):
+
+        req_slice = ubatch_slice[0]
+        token_slice = ubatch_slice[1]
+
+        query_start_loc = slice_query_start_locs(query_start_loc, req_slice)
+
+        # TODO (Sage) Make sure that this is correct
+        query_start_loc_cpu = slice_query_start_locs(query_start_loc_cpu, req_slice)
+
+        seq_lens = seq_lens[req_slice]
+        seq_lens_cpu = seq_lens_cpu[req_slice]
+        num_computed_tokens_cpu = num_computed_tokens_cpu[req_slice]
+
+        num_requests = req_slice.stop - req_slice.start
+        num_actual_tokens = token_slice.stop - token_slice.start
+        max_query_len = int(torch.max(seq_lens).item())
+
+        block_table_tensor = block_table_tensor[token_slice]
+        slot_mapping = slot_mapping[token_slice]
+
+        return CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
+            num_reqs=num_requests,
+            num_actual_tokens=num_actual_tokens,
+            max_query_len=max_query_len,
+            block_table_tensor=block_table_tensor,
+            slot_mapping=slot_mapping,
+            )
+
+def split_attn_metadata(
+        ubatch_slices,
+        common_attn_metadata,
+        )-> list[CommonAttentionMetadata]:
+    results = []
+    for ubatch_slice in ubatch_slices:
+        results.append(make_metadata_with_slice(
+        ubatch_slice,
+        common_attn_metadata.query_start_loc,
+        common_attn_metadata.query_start_loc_cpu,
+        common_attn_metadata.seq_lens,
+        common_attn_metadata.seq_lens_cpu,
+        common_attn_metadata.num_computed_tokens_cpu,
+        common_attn_metadata.num_reqs,
+        common_attn_metadata.num_actual_tokens,
+        common_attn_metadata.max_query_len,
+        common_attn_metadata.block_table_tensor,
+        common_attn_metadata.slot_mapping
+        ))
+    return results
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -583,7 +651,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # is enabled
         if not self.parallel_config.enable_microbatching:
             return (None, 0, None)
-        assert False
 
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         num_reqs = self.input_batch.num_reqs
@@ -813,14 +880,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     .slot_mapping.fill_(-1)
 
             if ubatch_slices is not None:
-                for ubid, (req_slice, token_slice) in enumerate(ubatch_slices):
-                    assert token_slice.stop > token_slice.start
+                common_attn_metadata_list = split_attn_metadata(
+                                                ubatch_slices, 
+                                                common_attn_metadata
+                                            )
+                for ubid, common_attn_metadata in enumerate(common_attn_metadata_list):
                     attn_metadata_i = (
                         self.attn_metadata_builders[kv_cache_group_id].
-                        build_slice(
-                            req_slice=req_slice,
-                            token_slice=token_slice,
-                            max_query_len=max(tokens[req_slice]),
+                        build(
                             common_prefix_len=common_prefix_len,
                             common_attn_metadata=common_attn_metadata,
                         ))
