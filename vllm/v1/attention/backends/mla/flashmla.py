@@ -85,7 +85,7 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             n = num_splits.size(0)
             # First time around (CUDAGraph capture), allocate the static buffer
             if self.cg_buf_num_splits[ubatch_id] is None:
-                logger.info(f"ALLOCATING FLASH MLA DATA FOR SIZE {n}")
+                # logger.info(f"ALLOCATING FLASH MLA DATA FOR SIZE {n}")
                 self.cg_buf_num_splits[ubatch_id] = num_splits
                 self.cg_buf_tile_scheduler_metadata[ubatch_id] = tile_scheduler_metadata
             elif n <= self.cg_buf_num_splits[ubatch_id].size(0):

@@ -1699,8 +1699,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sorted_results = [value for position, value in sorted(results)]
                 result = torch.cat(sorted_results, dim=0)
                 cudagraph_metadata.outputs = result
-            if is_global_first_rank():
-                logger.info(f"IN UBATCH RUNNER: Capturing for {num_tokens} tokens")
+            # if is_global_first_rank():
+            #     logger.info(f"IN UBATCH RUNNER: Capturing for {num_tokens} tokens")
             self.cudagraphs[num_tokens] = cudagraph_metadata
         return cudagraph_metadata.outputs
 
@@ -1766,27 +1766,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_dummy_run=is_dummy_run)
             if num_scheduled_tokens not in self.cudagraphs \
                 and not skip_cuda_graphs and build_cuda_graph:
-                if is_global_first_rank():
-                    logger.info(f"CAPTURING {num_scheduled_tokens}")
+                # if is_global_first_rank():
+                #     logger.info(f"CAPTURING {num_scheduled_tokens}")
                 return self._capture_ubatches(ubatch_metadata, self.model)
             elif num_scheduled_tokens in self.cudagraphs and not skip_cuda_graphs:
                 # assert False
                 cudagraph_metadata = self.cudagraphs[num_scheduled_tokens]
-                if is_global_first_rank():
-                    logger.info(f"UBATCH REPLAY {num_scheduled_tokens}")
+                # if is_global_first_rank():
+                #     logger.info(f"UBATCH REPLAY {num_scheduled_tokens}")
                 cudagraph_metadata.cudagraph.replay()
                 return cudagraph_metadata.outputs
             else:
-                if is_global_first_rank():
-                    logger.info(f"RUNNING NORMALLY {num_scheduled_tokens}")
+                # if is_global_first_rank():
+                #     logger.info(f"RUNNING NORMALLY {num_scheduled_tokens}")
                 return self._run_ubatches(ubatch_metadata, self.model)
         # run normal batch
         else:
             input_ids, positions, inputs_embeds, intermediate_tensors = \
                 self.model_inputs(slice(0, num_scheduled_tokens), 
                                        scheduler_output, is_dummy_run)
-            if is_global_first_rank():
-                logger.info(f"RUNNING FULL BATCH {num_scheduled_tokens}")
+            # if is_global_first_rank():
+            #     logger.info(f"RUNNING FULL BATCH {num_scheduled_tokens}")
             with set_forward_context(attn_metadata,
                                      vllm_config=self.vllm_config,
                                      num_tokens=num_scheduled_tokens or 1,
@@ -2858,16 +2858,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                          desc="Capturing CUDA graph shapes")
             for num_tokens in compilation_cases:
                 # We skip EPLB here since we don't want to record dummy metrics
-                if is_global_first_rank():
-                    logger.info(f"CAPTURE SIZE {num_tokens} WARMING UP {self.compilation_config.cudagraph_num_of_warmups}")
+                # if is_global_first_rank():
+                #     logger.info(f"CAPTURE SIZE {num_tokens} WARMING UP {self.compilation_config.cudagraph_num_of_warmups}")
                 for _ in range(
                         self.compilation_config.cudagraph_num_of_warmups):
                     self._dummy_run(num_tokens,
                                     capture_attn_cudagraph=full_cg,
                                     allow_microbatching=allow_microbatching,
                                     skip_eplb=True)
-                if is_global_first_rank():
-                    logger.info(f"CAPTURE SIZE {num_tokens} STARTING CAPTURE")
+                # if is_global_first_rank():
+                #     logger.info(f"CAPTURE SIZE {num_tokens} STARTING CAPTURE")
                 self._dummy_run(num_tokens,
                                 capture_attn_cudagraph=full_cg,
                                 allow_microbatching=allow_microbatching,
