@@ -179,7 +179,7 @@ def split_attn_metadata(
 @dataclasses.dataclass
 class CUDAGraphMetaData:
     cudagraph: torch.cuda.CUDAGraph
-    using_ubatching: bool
+    ubatch_metadata: UbatchMetadata
     outputs: Optional[Any] = None
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1685,7 +1685,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_metadata = \
                 CUDAGraphMetaData(
                             cudagraph=torch.cuda.CUDAGraph(),
-                            using_ubatching=True
+                            ubatch_metadata=ubatch_metadata,
                         )
             with torch.cuda.graph(cudagraph_metadata.cudagraph, 
                                     stream=compute_stream):
