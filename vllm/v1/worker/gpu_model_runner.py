@@ -289,6 +289,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self.comm_stream = torch.cuda.Stream()
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1605,7 +1606,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             return self._get_model_inputs(tokens_slice, scheduler_output)
     def _make_ubatch_metadata(self, ubatch_slices, attn_metadata,
-                              compute_stream, num_tokens_across_dp, 
+                              compute_stream, num_tokens_across_dp,
                               skip_cuda_graphs,
                               scheduler_output, is_dummy_run) -> list[UbatchMetadata]:
 
@@ -1623,6 +1624,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         ubatch_ctxs = make_ubatch_contexts(
             num_micro_batches=len(ubatch_slices),
+            comm_stream=self.comm_stream,
             compute_stream=compute_stream,
             forward_contexts=forward_contexts,
             device=self.device)
@@ -1783,10 +1785,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # run normal batch
         else:
             input_ids, positions, inputs_embeds, intermediate_tensors = \
+<<<<<<< ours
                 self.model_inputs(slice(0, num_scheduled_tokens), 
                                        scheduler_output, is_dummy_run)
             # if is_global_first_rank():
             #     logger.info(f"RUNNING FULL BATCH {num_scheduled_tokens}")
+=======
+                self._get_model_inputs(slice(0, num_scheduled_tokens),
+                                       scheduler_output)
+>>>>>>> theirs
             with set_forward_context(attn_metadata,
                                      vllm_config=self.vllm_config,
                                      num_tokens=num_scheduled_tokens or 1,
