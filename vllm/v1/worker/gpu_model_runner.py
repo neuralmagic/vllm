@@ -1785,15 +1785,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # run normal batch
         else:
             input_ids, positions, inputs_embeds, intermediate_tensors = \
-<<<<<<< ours
                 self.model_inputs(slice(0, num_scheduled_tokens), 
                                        scheduler_output, is_dummy_run)
             # if is_global_first_rank():
             #     logger.info(f"RUNNING FULL BATCH {num_scheduled_tokens}")
-=======
-                self._get_model_inputs(slice(0, num_scheduled_tokens),
-                                       scheduler_output)
->>>>>>> theirs
             with set_forward_context(attn_metadata,
                                      vllm_config=self.vllm_config,
                                      num_tokens=num_scheduled_tokens or 1,
