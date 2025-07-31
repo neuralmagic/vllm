@@ -38,8 +38,21 @@ pushd flashinfer
     if [[ "${BUILD_WHEEL}" == "true" ]]; then
         # Build wheel for distribution
         TORCH_CUDA_ARCH_LIST="${FI_TORCH_CUDA_ARCH_LIST}" \
-            uv pip wheel --no-deps --wheel-dir /wheels .
-        mkdir -p /output && cp /wheels/*.whl /output/
+            uv build --wheel .
+        mkdir -p ../wheels
+        for wheel in dist/*.whl; do
+            if [[ -f "$wheel" ]]; then
+                # Extract CUDA major.minor version (e.g., 12.8.1 -> cu128)
+                cuda_tag="cu$(echo ${CUDA_VERSION} | cut -d. -f1,2 | tr -d .)"
+                # Get original wheel name parts
+                wheel_name=$(basename "$wheel")
+                # Replace version with version+cuda_tag and fix platform tag
+                new_wheel_name=$(echo "$wheel_name" | sed -E "s/(-[0-9]+\.[0-9]+\.[0-9]+[^-]*)/\1+${cuda_tag}/" | sed 's/linux_x86_64/manylinux1_x86_64/')
+                # Copy with new name
+                cp "$wheel" "../wheels/$new_wheel_name"
+                echo "📦 Created wheel: $new_wheel_name"
+            fi
+        done
         echo "✅ FlashInfer wheel built successfully"
     else
         # Install directly (for Dockerfile)
