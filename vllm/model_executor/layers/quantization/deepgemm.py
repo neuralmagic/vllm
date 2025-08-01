@@ -3,6 +3,7 @@
 import logging
 
 import torch
+from tqdm import tqdm
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
@@ -10,6 +11,37 @@ from vllm.utils import direct_register_custom_op
 from vllm.utils.deep_gemm import fp8_gemm_nt
 
 logger = logging.getLogger(__name__)
+
+warmup_cache: set[torch.Size] = set()
+
+
+def warmup_fp8_gemm_nt(w: torch.Tensor, ws: torch.Tensor):
+    key = w.size()
+    if key in warmup_cache:
+        return
+
+    n, k = w.size()
+    block_m = 128
+    MAX_M = 8192
+    MAX_BLOCKS = 8192 // 128
+
+    device = w.device
+    a1q = torch.empty((MAX_M, k), device=device).to(torch.float8_e4m3fn)
+    a1q_scales = torch.empty((MAX_M, k // block_m),
+                             device=device,
+                             dtype=torch.float32)
+    out = torch.empty((MAX_M, n), device=device, dtype=torch.bfloat16)
+
+    pbar = tqdm(total=MAX_BLOCKS,
+                desc=f"DeepGemm(fp8_gemm_nt) warmup (MAX_M={MAX_M})")
+    num_tokens = MAX_M
+    while num_tokens > 0:
+        fp8_gemm_nt((a1q[:num_tokens], a1q_scales[:num_tokens]), (w, ws),
+                    out[:num_tokens])
+        pbar.update(1)
+        num_tokens = num_tokens - block_m
+
+    warmup_cache.add(w.size())
 
 
 def prepare_block_fp8_matmul_inputs(
@@ -55,6 +87,7 @@ def w8a8_block_fp8_matmul_deepgemm(
                                                  output_dtype)
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16
+    warmup_fp8_gemm_nt(B, Bs)
     fp8_gemm_nt((A, As), (B, Bs), C)
     return C
 
