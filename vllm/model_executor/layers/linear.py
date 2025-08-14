@@ -201,6 +201,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+        self.my_data = layer.weight.data
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if current_platform.is_cpu() and envs.VLLM_CPU_SGL_KERNEL:
             N, K = layer.weight.size()
@@ -227,7 +229,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+        #return dispatch_unquantized_gemm()(
+        #    layer, x, layer.weight.data, bias)  # raises torch.compile error
+        return dispatch_unquantized_gemm()(layer, x, self.my_data,
+                                           bias)  # works, surprisingly
 
 
 class LinearBase(CustomOp):
