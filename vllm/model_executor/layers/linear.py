@@ -3,7 +3,7 @@
 
 import itertools
 from abc import abstractmethod
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,7 @@ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 # yapf: disable
 from vllm.model_executor.parameter import (BasevLLMParameter,
                                            BlockQuantScaleParameter,
+                                           ModelWeightParameter,
                                            PackedColumnParameter,
                                            PackedvLLMParameter,
                                            PerTensorScaleParameter,
@@ -189,12 +190,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
                        input_size_per_partition: int,
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
-                       **extra_weight_attrs):
-        weight = Parameter(torch.empty(sum(output_partition_sizes),
-                                       input_size_per_partition,
-                                       dtype=params_dtype),
-                           requires_grad=False)
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+                       weight_loader: Callable, **extra_weight_attrs):
+        weight = ModelWeightParameter(data=torch.empty(
+            sum(output_partition_sizes),
+            input_size_per_partition,
+            dtype=params_dtype),
+                                      input_dim=1,
+                                      output_dim=0,
+                                      weight_loader=weight_loader)
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
