@@ -2046,9 +2046,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self,
         tensorizer_config: "TensorizerConfig",
     ) -> None:
-        model = self.get_model()
         TensorizerLoader.save_model(
-            model,
+            self.get_model(),
             tensorizer_config=tensorizer_config,
             model_config=self.model_config,
         )
