@@ -2246,9 +2246,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             skip_eplb: If True, skip EPLB state update.
             is_profile: If True, this is a profile run.
         """
-        assert cudagraph_runtime_mode in {
-            CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
-        }
+        assert cudagraph_runtime_mode.is_valid_runtime_mode()
 
         # Padding for DP
         num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
@@ -2297,8 +2295,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
-        if force_attention or cudagraph_runtime_mode == \
-                CUDAGraphMode.FULL:
+        if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
             attn_metadata = {}
 
             # Make sure max_model_len is used at the graph capture time.

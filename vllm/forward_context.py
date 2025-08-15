@@ -179,8 +179,7 @@ class ForwardContext:
     batch_descriptor: Optional[BatchDescriptor] = None
 
     def __post_init__(self):
-        assert self.cudagraph_runtime_mode in [
-            CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL], \
+        assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), \
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
 
 

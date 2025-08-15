@@ -65,6 +65,12 @@ class CUDAGraphMode(enum.Enum):
     def separate_routine(self) -> bool:
         return isinstance(self.value, tuple)
 
+    def is_valid_runtime_mode(self) -> bool:
+        # slightly faster version of (since all other modes are compound for ):
+        # self in {
+        #   CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL }
+        return self.value is int and self.value <= 2
+
 
 @config
 @dataclass
