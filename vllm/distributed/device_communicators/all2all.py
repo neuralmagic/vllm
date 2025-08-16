@@ -278,6 +278,5 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
     def get_handles(self, kwargs):
         import deep_ep
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
-        first_handle = self.handle_caches[0].get_or_create(buffer_kwargs, deep_ep.Buffer)
-        second_handle = self.handle_caches[1].get_or_create(buffer_kwargs, deep_ep.Buffer)
-        return [first_handle, second_handle]
+        handle = self.handle_caches[0].get_or_create(buffer_kwargs, deep_ep.Buffer)
+        return [handle, handle]
