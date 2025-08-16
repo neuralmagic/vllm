@@ -414,20 +414,14 @@ class CompressedTensorsW4A4MoeMethod(CompressedTensorsMoEMethod):
                 activation=activation,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
-                w1_scale=layer.w13_blockscale_swizzled,
-                w2_scale=layer.w2_blockscale_swizzled,
-                g1_alphas=layer.g1_alphas,
-                g2_alphas=layer.g2_alphas,
-                a1_gscale=layer.w13_input_scale_quant,
-                a2_gscale=layer.w2_input_scale_quant,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                quant_config=self.moe_quant_config,
             )
 
         assert expert_map is None, ("Expert Parallelism / expert_map "
                                     "is currently not supported for "
                                     "CompressedTensorsW4A4MoeMethod.")
-        from vllm.model_executor.layers.fused_moe.cutlass_moe import (
-            cutlass_moe_fp4)
+        assert self.moe_quant_config is not None
 
         # Cutlass moe takes in activations in BF16/Half precision
         # and fp4 quantized weights loaded from the checkpoint
