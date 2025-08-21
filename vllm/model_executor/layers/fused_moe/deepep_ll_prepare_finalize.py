@@ -14,6 +14,98 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.v1.worker.ubatching import (get_current_ubatch_context,
                                       yield_and_switch_from_comm_to_compute,
                                       yield_and_switch_from_compute_to_comm)
+from vllm.distributed.parallel_state import (
+    get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
+    prepare_communication_buffer_for_model)
+
+import torch
+from collections import defaultdict
+
+def mib(x): return x / (1024**2)
+
+def external_usage(device=None):
+    if device is None: device = torch.cuda.current_device()
+    total, free = torch.cuda.mem_get_info(device)  # driver view
+    # PyTorch allocator view (reserved, not just allocated)
+    reserved = torch.cuda.memory_reserved(device)
+    allocated = torch.cuda.memory_allocated(device)
+
+    driver_used = total - free
+    external = max(0, driver_used - reserved)  # memory not accounted by torch allocator
+    return {
+        "device": device,
+        "driver_total_MiB": mib(total),
+        "driver_used_MiB": mib(driver_used),
+        "torch_reserved_MiB": mib(reserved),
+        "torch_allocated_MiB": mib(allocated),
+        "estimated_external_MiB": mib(external),
+    }
+
+def _iter_blocks(seg):
+    # PyTorch's snapshot format can vary a bit; be defensive
+    blocks = seg.get("blocks", [])
+    for b in blocks:
+        size = b.get("size", 0)
+        state = b.get("state", "")  # e.g., "active_allocated", "inactive_allocated", "inactive"
+        yield size, state
+
+def list_snapshot_segment_types():
+    """Quickly see which segment types exist in the current process."""
+    types = defaultdict(int)
+    for seg in torch.cuda.memory_snapshot():
+        t = seg.get("segment_type") or seg.get("segment_kind") or "unknown"
+        types[t] += 1
+    print("Segment types in snapshot (count of segments):")
+    for t, n in sorted(types.items(), key=lambda x: (-x[1], x[0])):
+        print(f"  {t}: {n}")
+    print("Hint: if you see 'graph', that's the CUDA Graph pool.")
+
+def pool_usage(segment_type_filter=None, device_filter=None):
+    """
+    Returns per-device usage for segments matching `segment_type_filter`.
+    - segment_type_filter: e.g. 'graph' for CUDA Graph pool (None = all)
+    - device_filter: int CUDA device index or None for all
+    """
+    allocated = defaultdict(int)  # sum of active_allocated block sizes
+    reserved  = defaultdict(int)  # sum of all block sizes (active + inactive)
+
+    for seg in torch.cuda.memory_snapshot():
+        seg_type = seg.get("segment_type") or seg.get("segment_kind") or "unknown"
+        if segment_type_filter is not None and seg_type != segment_type_filter:
+            continue
+
+        dev = seg.get("device")
+        if device_filter is not None and dev != device_filter:
+            continue
+
+        for size, state in _iter_blocks(seg):
+            reserved[dev]  += size
+            if state == "active_allocated":
+                allocated[dev] += size
+
+    # Format nicely
+    result = {}
+    for dev in sorted(set(list(allocated.keys()) + list(reserved.keys()))):
+        a = allocated[dev]
+        r = reserved[dev]
+        result[dev] = {
+            "allocated_bytes": a,
+            "reserved_bytes": r,
+            "allocated_MiB": a / (1024**2),
+            "reserved_MiB": r / (1024**2),
+        }
+    return result
+
+def pretty_print_pool_usage(segment_type_filter=None, device_filter=None, title=None):
+    title = title or f"CUDA allocator usage (segment_type={segment_type_filter!r}, device={device_filter})"
+    print(title)
+    stats = pool_usage(segment_type_filter, device_filter)
+    if not stats:
+        print("  <no matching segments>")
+        return
+    for dev, vals in stats.items():
+        print(f"  cuda:{dev} -> allocated {vals['allocated_MiB']:.2f} MiB / reserved {vals['reserved_MiB']:.2f} MiB")
+
 
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
@@ -129,8 +221,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         hidden_size = a1.size(1)
         ubatch_ctx = get_current_ubatch_context()
         a2a_idx = ubatch_ctx.id if ubatch_ctx is not None else 0
-        do_recv_hook = True if ubatch_ctx is not None and \
-                       ubatch_ctx.enable_async_comms else False
+        do_recv_hook = False
 
         if self.use_fp8_dispatch:
             assert hidden_size % 128 == 0, \
@@ -151,6 +242,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Dispatch
         yield_and_switch_from_compute_to_comm(schedule="default")
+        if is_global_first_rank():
+            print("Predispatch memory usage")
+            pretty_print_pool_usage()
+            print("External memory usage", external_usage())
         expert_x, expert_num_tokens, handle, _, recv_hook= \
                 self.buffers[a2a_idx].low_latency_dispatch(a1,
                                                 topk_ids,
@@ -161,7 +256,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                                                 return_recv_hook=do_recv_hook)
         self.handles[a2a_idx] = handle
         yield_and_switch_from_comm_to_compute(schedule="default", recv_hook=recv_hook)
-
+        if is_global_first_rank():
+            print("Postdispatch memory usage")
+            pretty_print_pool_usage()
+            print("External memory usage", external_usage())
         expert_x, expert_x_scale = self._do_quant(
             expert_x, a1_scale, a2_scale, a1.dtype, quant_config.quant_dtype,
             quant_config.per_act_token_quant, quant_config.block_shape)
@@ -182,8 +280,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         ubatch_ctx = get_current_ubatch_context()
         a2a_idx = ubatch_ctx.id if ubatch_ctx is not None else 0
         handle = self.handles[a2a_idx]
-        do_recv_hook = True if ubatch_ctx is not None and \
-                       ubatch_ctx.enable_async_comms else False
+        do_recv_hook = False
         assert handle is not None
 
         combine_topk_weights = topk_weights
@@ -193,6 +290,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # TODO (varun) : Enable zero copy mode
         yield_and_switch_from_compute_to_comm(schedule="default")
+        if is_global_first_rank():
+            print("Precombine memory usage")
+            pretty_print_pool_usage()
+            print("External memory usage", external_usage())
         _, _, recv_hook = self.buffers[a2a_idx].low_latency_combine(fused_expert_output,
                                                       topk_ids,
                                                       combine_topk_weights,
@@ -202,3 +303,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                                                       return_recv_hook=do_recv_hook,
                                                       out=output)
         yield_and_switch_from_comm_to_compute(schedule="default", recv_hook=recv_hook)
+        if is_global_first_rank():
+            print("Postcombine memory usage")
+            pretty_print_pool_usage()
+            print("External memory usage", external_usage())
