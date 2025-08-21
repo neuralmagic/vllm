@@ -107,12 +107,12 @@ class LlamaModel(nn.Module):
         # Single decoder layer following Eagle3 pattern
         # The layer ID is offset by target model depth to maintain
         # correct parameter naming and quantization mappings
-        self.layer = nn.ModuleList([
+        self.layers = nn.ModuleList([
             Llama4DecoderLayer(
                 self.config,
                 quant_config=quant_config,
-                prefix=maybe_prefix(prefix, f"layers.{start_layer_id}"),
-            )
+                prefix=maybe_prefix(prefix, f"layers.{i + start_layer_id}"),
+            ) for i in range(self.config.num_hidden_layers)
         ])
 
         # Eagle3 auxiliary hidden state combination layer
@@ -273,10 +273,11 @@ class LlamaModel(nn.Module):
             "Mixture of Experts layers are not supported in Eagle3 draft models"
         )
 
-        # Pad layer-specific configurations for start_layer_id offset
-        # This ensures correct behavior when draft layers have offset indices
-        self.config.no_rope_layers = (
-            [0] * start_layer_id + getattr(self.config, 'no_rope_layers', []))
+        # Draft model layer index is increased by start_layer_id,
+        # so we need to pad relevant configs accordingly
+        self.config.no_rope_layers = [
+            0
+        ] * start_layer_id + self.config.no_rope_layers
 
         # Update quantization configuration for layer offset
         if isinstance(quant_config, TorchAOConfig):
