@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional, TypeVar, Union
 import msgspec
 import zmq
 
+from vllm.distributed.parallel_state import is_global_first_rank
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.logger import init_logger

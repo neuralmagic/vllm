@@ -274,7 +274,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         # a part of the hash-key that identifies this object. If we are in a
         # situation where we make objects with different num_sms, the hash key
         # in get_or_create must be updated.
-        handle.set_num_sms(self.num_sms)
+        handle.set_num_sms(22)
         return handle
 
     def get_handles(self, kwargs):

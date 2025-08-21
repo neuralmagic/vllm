@@ -13,7 +13,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import (
     _validate_scale_shape, moe_kernel_quantize_input)
 from vllm.utils import cdiv, round_up
-from vllm.v1.worker.ubatching import (get_current_ubatch_context,
+from vllm.v1.worker.ubatching import (get_current_ubatch_context, currently_in_ubatch,
                                       yield_and_switch_from_comm_to_compute,
                                       yield_and_switch_from_compute_to_comm)
 
@@ -103,8 +103,11 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                Optional[torch.Tensor]]:
         num_tokens = a1.size(0)  # M
         hidden_dim = a1.size(-1)  # K
-        ubatch_ctx = get_current_ubatch_context()
-        a2a_idx = ubatch_ctx.id if ubatch_ctx is not None else 0
+        if currently_in_ubatch():
+            ubatch_ctx,_ = get_current_ubatch_context()
+            a2a_idx = ubatch_ctx.id
+        else:
+            a2a_idx = 0
 
         assert topk_ids.size(0) == num_tokens
         # expert_map should be None because with expert map, -1 id is used for
@@ -232,9 +235,11 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # This argument is optional
         # There's not much point setting this unless it is != topk_ids.size(0)
         bound_m: Optional[torch.Tensor] = None
-        ubatch_ctx = get_current_ubatch_context()
-        ubatch_id = ubatch_ctx.id if ubatch_ctx is not None else -1
-        a2a_idx = 0 if ubatch_id == -1 else ubatch_id
+        if currently_in_ubatch():
+            ubatch_ctx,_ = get_current_ubatch_context()
+            a2a_idx = ubatch_ctx.id
+        else:
+            a2a_idx = 0
 
         # TODO (bnell): fails in test_pplx_moe.py, figure out what's going on
         #num_tokens = output.size(0)  # M

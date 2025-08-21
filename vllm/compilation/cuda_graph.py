@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
@@ -10,7 +11,11 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+from vllm.compilation.monitor import (
+    validate_cudagraph_capturing_enabled,
+    enable_alloc_history,
+    graph_pool_usage_by_callsite,
+)
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
@@ -173,6 +178,55 @@ class CUDAGraphWrapper:
             entry.cudagraph = cudagraph
 
             compilation_counter.num_cudagraph_captured += 1
+
+            # Optional: emit a graph/private pool usage report to help debug
+            # excessive cudagraph memory. Enabled via env knob.
+            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL", "0") == "1":
+                try:
+                    from vllm.compilation.monitor import (
+                        snapshot_segment_summary,
+                        inactive_usage_by_callsite_via_snapshot,
+                        top_inactive_blocks_via_snapshot,
+                        external_usage,
+                    )
+                    enable_alloc_history()
+                    torch.cuda.synchronize()
+                    report = graph_pool_usage_by_callsite()
+                    # Only log on rank 0 to reduce noise.
+                    try:
+                        from vllm.distributed.parallel_state import is_global_first_rank
+                        is_rank0 = is_global_first_rank()
+                    except Exception:
+                        is_rank0 = True
+                    if is_rank0:
+                        logger.info("CUDA Graph Pool report after capture (%s, %s):",
+                                    self.runtime_mode.name, entry.batch_descriptor)
+                        if not report:
+                            logger.info("  <no graph/private segments found>; snapshot=%s",
+                                        snapshot_segment_summary())
+                            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL_SNAPSHOT", "0") == "1":
+                                inactive = inactive_usage_by_callsite_via_snapshot()
+                                if inactive:
+                                    for dev, rows in inactive.items():
+                                        tops = ", ".join(f"{mib:.1f}MiB {k}" for k, mib in rows[:5])
+                                        logger.info("  cuda:%s inactive (snapshot): %s", dev, tops)
+                                blocks = top_inactive_blocks_via_snapshot()
+                                if blocks:
+                                    for dev, rows in blocks.items():
+                                        logger.info("  cuda:%s top inactive blocks: %s", dev, rows[:3])
+                        for dev, info in report.items():
+                            logger.info("  cuda:%s total graph/private: %.2f MiB",
+                                        dev, info["total_graph_like_MiB"])
+                            top_calls = ", ".join(
+                                f"{mib:.1f}MiB {k}" for k, mib in info["top_callsites"][:5]
+                            )
+                            if top_calls:
+                                logger.info("    top callsites: %s", top_calls)
+                        eu = external_usage()
+                        logger.info("  driver_used=%.2fMiB torch_reserved=%.2fMiB external=%.2fMiB",
+                                    eu["driver_used_MiB"], eu["torch_reserved_MiB"], eu["external_MiB"])
+                except Exception as e:
+                    logger.debug("Failed to emit cudagraph pool report: %s", e)
 
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly

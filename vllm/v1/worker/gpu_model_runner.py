@@ -8,9 +8,11 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Iterator
+import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, TypeAlias, Union, cast
 
+import time
 import numpy as np
 import torch
 import torch.distributed
@@ -231,6 +233,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
         self.comm_stream = torch.cuda.Stream()
+        self.graph_pool = torch.cuda.graph_pool_handle()
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1860,18 +1863,79 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             cudagraph=torch.cuda.CUDAGraph(),
                             ubatch_metadata=ubatch_metadata,
                         )
+            logger.info("STARTING WAKEUP LOOP")
+            # profiler = torch.profiler.profile(
+            #     activities=[
+            #         torch.profiler.ProfilerActivity.CPU,
+            #         torch.profiler.ProfilerActivity.CUDA,
+            #     ],
+            #     record_shapes=envs.VLLM_TORCH_PROFILER_RECORD_SHAPES,
+            #     profile_memory=envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
+            #     with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
+            #     with_flops=envs.VLLM_TORCH_PROFILER_WITH_FLOPS,
+            #     on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            #         f"/home/vllm-dev/cudagraph_capture_traces/capture_size_{num_tokens}", use_gzip=True))
+        
+            # profiler.start()
+            compute_stream.wait_stream(self.comm_stream)
             with torch.cuda.graph(cudagraph_metadata.cudagraph,
+                                  pool=self.graph_pool,
                                   stream=compute_stream):
-                # logger.info("STARTING WAKEUP LOOP")
                 for start_signal in start_signals:
                     start_signal.set()
-                # logger.info("FINISHED WAKEUP LOOP")
+                logger.info("FINISHED WAKEUP LOOP")
                 ubatch_metadata[0].context.cpu_wait_event.set()
                 for thread in ubatch_threads:
                     thread.join()
                 sorted_results = [value for position, value in sorted(results)]
                 result = torch.cat(sorted_results, dim=0)
                 cudagraph_metadata.outputs = result
+            logger.info("UBATCH CAPTURE DONE")
+            torch.cuda.empty_cache()
+            # Optional: emit a graph/private pool usage report after capture
+            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL", "0") == "1":
+                try:
+                    from vllm.compilation.monitor import (
+                        enable_alloc_history,
+                        graph_pool_usage_by_callsite,
+                        snapshot_segment_summary,
+                        inactive_usage_by_callsite_via_snapshot,
+                        top_inactive_blocks_via_snapshot,
+                        external_usage,
+                    )
+                    enable_alloc_history()
+                    torch.cuda.synchronize()
+                    report = graph_pool_usage_by_callsite()
+                    if is_global_first_rank():
+                        logger.info("CUDA Graph Pool report after ubatch capture (%s tokens):",
+                                    num_tokens)
+                        if not report:
+                            logger.info("  <no graph/private segments found>; snapshot=%s",
+                                        snapshot_segment_summary())
+                            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL_SNAPSHOT", "0") == "1":
+                                inactive = inactive_usage_by_callsite_via_snapshot()
+                                if inactive:
+                                    for dev, rows in inactive.items():
+                                        tops = ", ".join(f"{mib:.1f}MiB {k}" for k, mib in rows[:5])
+                                        logger.info("  cuda:%s inactive (snapshot): %s", dev, tops)
+                                blocks = top_inactive_blocks_via_snapshot()
+                                if blocks:
+                                    for dev, rows in blocks.items():
+                                        logger.info("  cuda:%s top inactive blocks: %s", dev, rows[:3])
+                        eu = external_usage()
+                        logger.info("  driver_used=%.2fMiB torch_reserved=%.2fMiB external=%.2fMiB",
+                                    eu["driver_used_MiB"], eu["torch_reserved_MiB"], eu["external_MiB"])
+                        for dev, info in report.items():
+                            logger.info("  cuda:%s total graph/private: %.2f MiB",
+                                        dev, info["total_graph_like_MiB"])
+                            top_calls = ", ".join(
+                                f"{mib:.1f}MiB {k}" for k, mib in info["top_callsites"][:5]
+                            )
+                            if top_calls:
+                                logger.info("    top callsites: %s", top_calls)
+                except Exception as e:
+                    logger.debug("Failed to emit cudagraph pool report (ubatch): %s", e)
+            # profiler.stop()
             # if is_global_first_rank():
             #     logger.info(f"IN UBATCH RUNNER: "
             #                 f"Capturing for {num_tokens} tokens")
@@ -1943,6 +2007,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 and cudagraph_runtime_mode is CUDAGraphMode.FULL:
                 if is_global_first_rank():
                     logger.debug(f"CAPTURING {num_scheduled_tokens}")
+                torch.cuda.empty_cache()
                 return self._capture_ubatches(ubatch_metadata, self.model)
             elif num_scheduled_tokens in self.cudagraphs \
                 and cudagraph_runtime_mode is CUDAGraphMode.FULL:
@@ -2825,7 +2890,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
             # Make sure max_model_len is used at the graph capture time.
-            self.seq_lens_np[:num_reqs] = self.max_model_len
+            self.seq_lens_np[:num_reqs] = 1
             self.seq_lens_np[num_reqs:] = 0
             self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
                                            non_blocking=True)
@@ -3112,8 +3177,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         enumerate(dummy_encoder_outputs))
 
         # Add `is_profile` here to pre-allocate communication buffers
+        print("Starting profile run!!!!")
         hidden_states, last_hidden_states \
             = self._dummy_run(self.max_num_tokens, is_profile=True)
+        print("Ending profile run!!!!")
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
@@ -3162,10 +3229,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with freeze_gc(), graph_capture(device=self.device):
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
+            print("CUDAGRAPH MODE", cudagraph_mode)
             if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
                 cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
 
                 compilation_cases = list(reversed(self.cudagraph_batch_sizes))
+                print("COMPILATION CASES MIXED", compilation_cases)
                 self._capture_cudagraphs(
                     compilation_cases,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -3177,12 +3246,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_mode.separate_routine():
                 max_num_tokens = self.scheduler_config.max_num_seqs * \
                         self.uniform_decode_query_len
+                min_num_tokens = self.uniform_decode_query_len \
+                    if not self.parallel_config.enable_microbatching else self.parallel_config.microbatching_token_threshold
                 decode_cudagraph_batch_sizes = [
                     x for x in self.cudagraph_batch_sizes if
-                    x <= max_num_tokens and x >= self.uniform_decode_query_len
+                    x <= max_num_tokens and x >= min_num_tokens
                 ]
                 compilation_cases_decode = list(
                     reversed(decode_cudagraph_batch_sizes))
+                print("COMPILATION CASES DECODE", compilation_cases_decode)
                 self._capture_cudagraphs(
                     compilation_cases=compilation_cases_decode,
                     cudagraph_runtime_mode=CUDAGraphMode.FULL,
@@ -3224,7 +3296,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert uniform_decode is True
         # We skip EPLB here since we don't want to record dummy metrics
         for num_tokens in compilation_cases:
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+            # profiler = torch.profiler.profile(
+            #     activities=[
+            #         torch.profiler.ProfilerActivity.CPU,
+            #         torch.profiler.ProfilerActivity.CUDA,
+            #     ],
+            #     record_shapes=envs.VLLM_TORCH_PROFILER_RECORD_SHAPES,
+            #     profile_memory=envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
+            #     with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
+            #     with_flops=envs.VLLM_TORCH_PROFILER_WITH_FLOPS,
+            #     on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            #         f"/home/vllm-dev/cudagraph_capture_traces/capture_size_{num_tokens}", use_gzip=True))
+        
+            # profiler.start()
+            for i in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
                 # But be careful, warm up with `NONE`is orthogonal to
                 # if we want to warm up attention or not. This is
@@ -3232,18 +3317,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # attention while `PIECEWISE` implies no attention.
                 force_attention = (
                     cudagraph_runtime_mode == CUDAGraphMode.FULL)
+                time_start = time.perf_counter()
                 self._dummy_run(num_tokens,
                                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                                 force_attention=force_attention,
                                 uniform_decode=uniform_decode,
                                 allow_microbatching=enable_microbatching,
                                 skip_eplb=True)
+                time_taken = time.perf_counter() - time_start
+                logger.info(f"WARMUP RUN {i} TIME TAKEN: {time_taken}")
+            gc.collect()
+            time_start = time.perf_counter()
             self._dummy_run(num_tokens,
                             cudagraph_runtime_mode=cudagraph_runtime_mode,
                             uniform_decode=uniform_decode,
                             allow_microbatching=enable_microbatching,
                             skip_eplb=True)
-
+            time_taken = time.perf_counter() - time_start
+            logger.info(f"CAPTURE TIME TAKEN: {time_taken}")
+            gc.collect()
+            # profiler.stop()
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize the attention backends and attention metadata builders.
