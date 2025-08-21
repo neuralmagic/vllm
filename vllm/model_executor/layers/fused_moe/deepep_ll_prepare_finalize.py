@@ -46,7 +46,7 @@ def _iter_blocks(seg):
     blocks = seg.get("blocks", [])
     for b in blocks:
         size = b.get("size", 0)
-        state = b.get("state", "")  # e.g., "active_allocated", "inactive_allocated", "inactive"
+        state = b.get("state", "")  # "active_allocated", "inactive_allocated", "inactive"
         yield size, state
 
 def list_snapshot_segment_types():
@@ -68,6 +68,7 @@ def pool_usage(segment_type_filter=None, device_filter=None):
     """
     allocated = defaultdict(int)  # sum of active_allocated block sizes
     reserved  = defaultdict(int)  # sum of all block sizes (active + inactive)
+    inactive  = defaultdict(int)  # sum of inactive block sizes
 
     for seg in torch.cuda.memory_snapshot():
         seg_type = seg.get("segment_type") or seg.get("segment_kind") or "unknown"
@@ -82,17 +83,22 @@ def pool_usage(segment_type_filter=None, device_filter=None):
             reserved[dev]  += size
             if state == "active_allocated":
                 allocated[dev] += size
+            elif state == "inactive":
+                inactive[dev] += size
 
     # Format nicely
     result = {}
     for dev in sorted(set(list(allocated.keys()) + list(reserved.keys()))):
         a = allocated[dev]
         r = reserved[dev]
+        i = inactive[dev]
         result[dev] = {
             "allocated_bytes": a,
             "reserved_bytes": r,
+            "inactive_bytes": i,
             "allocated_MiB": a / (1024**2),
             "reserved_MiB": r / (1024**2),
+            "inactive_MiB": i / (1024**2),
         }
     return result
 
@@ -104,8 +110,10 @@ def pretty_print_pool_usage(segment_type_filter=None, device_filter=None, title=
         print("  <no matching segments>")
         return
     for dev, vals in stats.items():
-        print(f"  cuda:{dev} -> allocated {vals['allocated_MiB']:.2f} MiB / reserved {vals['reserved_MiB']:.2f} MiB")
-
+        print(f"  cuda:{dev} -> "
+              f"allocated {vals['allocated_MiB']:.2f} MiB / "
+              f"reserved {vals['reserved_MiB']:.2f} MiB / "
+              f"inactive {vals['inactive_MiB']:.2f} MiB")
 
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
