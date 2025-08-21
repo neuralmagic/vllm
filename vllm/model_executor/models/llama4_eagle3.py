@@ -143,6 +143,7 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
+        multimodal_embeddings: Optional[NestedTensors] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for Eagle3 draft generation.
@@ -152,6 +153,7 @@ class LlamaModel(nn.Module):
             positions: Position indices for rotary embeddings
             hidden_states: Auxiliary hidden states from target model
             inputs_embeds: Pre-computed input embeddings (optional)
+            multimodal_embeddings: Multimodal embeddings (optional)
             
         Returns:
             Tuple of (hidden_states, hidden_states) following vLLM convention
@@ -159,6 +161,15 @@ class LlamaModel(nn.Module):
         # Get input embeddings
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
+
+            # Apply multimodal embeddings if provided
+            if multimodal_embeddings is not None:
+                inputs_embeds = merge_multimodal_embeddings(
+                    input_ids,
+                    inputs_embeds,
+                    multimodal_embeddings,
+                    getattr(self.config, "image_token_index", None),
+                )
 
         # Eagle3 pattern: auxiliary hidden states have same dimension as embeddings
         # This assertion ensures compatibility for the single decoder layer
@@ -376,12 +387,6 @@ class Eagle3Llama4ForCausalLM(Llama4ForCausalLM):
         Returns:
             Tuple of (hidden_states, hidden_states) for vLLM compatibility
         """
-        if inputs_embeds is not None:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support multimodal inputs yet. "
-                "Multimodal support for Eagle3 is planned for future releases."
-            )
-
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
 
     def compute_logits(
