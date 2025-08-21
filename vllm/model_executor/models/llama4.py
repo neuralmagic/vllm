@@ -39,6 +39,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 
+from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
                     is_pp_missing_parameter)
@@ -636,7 +637,8 @@ class Llama4Model(LlamaModel):
         return loaded_params
 
 
-class Llama4ForCausalLM(LlamaForCausalLM):
+class Llama4ForCausalLM(LlamaForCausalLM, SupportsLoRA, SupportsPP,
+                        SupportsEagle3):
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -678,6 +680,30 @@ class Llama4ForCausalLM(LlamaForCausalLM):
             for name, loaded_weight in weights
         ]
         return loader.load_weights(weights)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """
+        Set auxiliary hidden state layers for Eagle3 speculation.
+        
+        Args:
+            layers: Tuple of layer indices that should output auxiliary
+                   hidden states for Eagle3 speculation.
+        """
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """
+        Get the layer indices for Eagle3 auxiliary hidden states.
+        
+        Returns:
+            Tuple of layer indices for auxiliary hidden state outputs.
+            Typically includes early, middle, and late layers for optimal
+            speculation performance.
+        """
+        num_layers = len(self.model.layers)
+        # Standard Eagle3 strategy: early, middle, and late layers
+        # Ensures good representation across model depth
+        return (2, num_layers // 2, num_layers - 3)
 
     def permute_qk_weight_for_rotary(
         self,
