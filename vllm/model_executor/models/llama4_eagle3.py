@@ -275,9 +275,16 @@ class LlamaModel(nn.Module):
 
         # Draft model layer index is increased by start_layer_id,
         # so we need to pad relevant configs accordingly
-        self.config.no_rope_layers = [
-            0
-        ] * start_layer_id + self.config.no_rope_layers
+        if not hasattr(self.config, 'no_rope_layers'):
+            # Initialize no_rope_layers if it doesn't exist
+            # Default to all layers having rope (value of 1)
+            total_layers = start_layer_id + getattr(self.config, 'num_hidden_layers', 1)
+            self.config.no_rope_layers = [1] * total_layers
+        else:
+            # Pad existing no_rope_layers for the layer offset
+            self.config.no_rope_layers = [
+                0
+            ] * start_layer_id + self.config.no_rope_layers
 
         # Update quantization configuration for layer offset
         if isinstance(quant_config, TorchAOConfig):
