@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -450,6 +450,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self,
         prepare_finalize: mk.FusedMoEPrepareAndFinalize,
         moe: FusedMoEConfig,
+        layer: Any,
     ) -> mk.FusedMoEPermuteExpertsUnpermute:
         if (prepare_finalize.activation_format ==
                 mk.FusedMoEActivationFormat.BatchedExperts):
@@ -464,16 +465,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_precision=self.w2_precision_config,
             )
         else:
-            #pass
-
-            if (envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
-                    or envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16):
-                # B200 code ??
-                # Quant config shouldn't be None !!
-                return TrtLlmGenExperts(moe)
+            if should_use_flashinfer_mxfp4():
+                # B200 code-path
+                return TrtLlmGenExperts(moe, layer)
             else:
-                # H100 code ??
-                # you use matmul_ogs kernel here!
+                # Use matmul_ogs from triton_kernels here!
                 raise NotImplementedError(
                     "Mxfp4 does not support non-batched experts format for EP")
 
@@ -521,7 +517,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
             torch.bfloat16).view(torch.int16)
 
-        if envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:
+        from flashinfer import (mxfp8_quantize,
+                                trtllm_fp4_block_scale_routed_moe)
+
+        if _should_use_flashinfer_mxfp4_bf16():
             assert x.dtype == torch.bfloat16
             x_quant = x
             x_scale = None
@@ -560,7 +559,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "do_finalize": True,
             "output": output,
         }
-
         trtllm_fp4_block_scale_routed_moe(**kwargs)
         return output
 
