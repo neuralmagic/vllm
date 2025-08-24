@@ -21,6 +21,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8)
 from vllm.utils import has_deep_gemm, run_once
 from vllm.utils.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+import deep_gemm
+
+deep_gemm.set_num_sms(110)
 
 logger = init_logger(__name__)
 

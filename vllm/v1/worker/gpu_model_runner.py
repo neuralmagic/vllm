@@ -8,6 +8,7 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Iterator
+import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, TypeAlias, Union, cast
 
@@ -232,6 +233,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
         self.comm_stream = torch.cuda.Stream()
+        self.graph_pool = torch.cuda.graph_pool_handle()
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1875,7 +1877,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             #         f"/home/vllm-dev/cudagraph_capture_traces/capture_size_{num_tokens}", use_gzip=True))
         
             # profiler.start()
+            compute_stream.wait_stream(self.comm_stream)
             with torch.cuda.graph(cudagraph_metadata.cudagraph,
+                                  pool=self.graph_pool,
                                   stream=compute_stream):
                 for start_signal in start_signals:
                     start_signal.set()
@@ -1887,6 +1891,50 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 result = torch.cat(sorted_results, dim=0)
                 cudagraph_metadata.outputs = result
             logger.info("UBATCH CAPTURE DONE")
+            torch.cuda.empty_cache()
+            # Optional: emit a graph/private pool usage report after capture
+            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL", "0") == "1":
+                try:
+                    from vllm.compilation.monitor import (
+                        enable_alloc_history,
+                        graph_pool_usage_by_callsite,
+                        snapshot_segment_summary,
+                        inactive_usage_by_callsite_via_snapshot,
+                        top_inactive_blocks_via_snapshot,
+                        external_usage,
+                    )
+                    enable_alloc_history()
+                    torch.cuda.synchronize()
+                    report = graph_pool_usage_by_callsite()
+                    if is_global_first_rank():
+                        logger.info("CUDA Graph Pool report after ubatch capture (%s tokens):",
+                                    num_tokens)
+                        if not report:
+                            logger.info("  <no graph/private segments found>; snapshot=%s",
+                                        snapshot_segment_summary())
+                            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL_SNAPSHOT", "0") == "1":
+                                inactive = inactive_usage_by_callsite_via_snapshot()
+                                if inactive:
+                                    for dev, rows in inactive.items():
+                                        tops = ", ".join(f"{mib:.1f}MiB {k}" for k, mib in rows[:5])
+                                        logger.info("  cuda:%s inactive (snapshot): %s", dev, tops)
+                                blocks = top_inactive_blocks_via_snapshot()
+                                if blocks:
+                                    for dev, rows in blocks.items():
+                                        logger.info("  cuda:%s top inactive blocks: %s", dev, rows[:3])
+                        eu = external_usage()
+                        logger.info("  driver_used=%.2fMiB torch_reserved=%.2fMiB external=%.2fMiB",
+                                    eu["driver_used_MiB"], eu["torch_reserved_MiB"], eu["external_MiB"])
+                        for dev, info in report.items():
+                            logger.info("  cuda:%s total graph/private: %.2f MiB",
+                                        dev, info["total_graph_like_MiB"])
+                            top_calls = ", ".join(
+                                f"{mib:.1f}MiB {k}" for k, mib in info["top_callsites"][:5]
+                            )
+                            if top_calls:
+                                logger.info("    top callsites: %s", top_calls)
+                except Exception as e:
+                    logger.debug("Failed to emit cudagraph pool report (ubatch): %s", e)
             # profiler.stop()
             # if is_global_first_rank():
             #     logger.info(f"IN UBATCH RUNNER: "
@@ -1959,6 +2007,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 and cudagraph_runtime_mode is CUDAGraphMode.FULL:
                 if is_global_first_rank():
                     logger.debug(f"CAPTURING {num_scheduled_tokens}")
+                torch.cuda.empty_cache()
                 return self._capture_ubatches(ubatch_metadata, self.model)
             elif num_scheduled_tokens in self.cudagraphs \
                 and cudagraph_runtime_mode is CUDAGraphMode.FULL:
@@ -3180,10 +3229,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         with freeze_gc(), graph_capture(device=self.device):
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
+            print("CUDAGRAPH MODE", cudagraph_mode)
             if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
                 cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
 
                 compilation_cases = list(reversed(self.cudagraph_batch_sizes))
+                print("COMPILATION CASES MIXED", compilation_cases)
                 self._capture_cudagraphs(
                     compilation_cases,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -3195,12 +3246,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_mode.separate_routine():
                 max_num_tokens = self.scheduler_config.max_num_seqs * \
                         self.uniform_decode_query_len
+                min_num_tokens = self.uniform_decode_query_len \
+                    if not self.parallel_config.enable_microbatching else self.parallel_config.microbatching_token_threshold
                 decode_cudagraph_batch_sizes = [
                     x for x in self.cudagraph_batch_sizes if
-                    x <= max_num_tokens and x >= self.uniform_decode_query_len
+                    x <= max_num_tokens and x >= min_num_tokens
                 ]
                 compilation_cases_decode = list(
                     reversed(decode_cudagraph_batch_sizes))
+                print("COMPILATION CASES DECODE", compilation_cases_decode)
                 self._capture_cudagraphs(
                     compilation_cases=compilation_cases_decode,
                     cudagraph_runtime_mode=CUDAGraphMode.FULL,

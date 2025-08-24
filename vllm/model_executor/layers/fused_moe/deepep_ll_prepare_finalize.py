@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, DefaultDict, Dict, List
+from contextlib import AbstractContextManager, nullcontext
+import sys
 
 import deep_ep
 import torch
@@ -11,7 +13,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input, normalize_batched_scales_shape)
-from vllm.v1.worker.ubatching import (get_current_ubatch_context,
+from vllm.v1.worker.ubatching import (get_current_ubatch_context, currently_in_ubatch,
                                       yield_and_switch_from_comm_to_compute,
                                       yield_and_switch_from_compute_to_comm)
 from vllm.distributed.parallel_state import (
@@ -20,6 +22,7 @@ from vllm.distributed.parallel_state import (
 
 import torch
 from collections import defaultdict
+import os
 
 def mib(x): return x / (1024**2)
 
@@ -51,10 +54,10 @@ def _iter_blocks(seg):
 
 def list_snapshot_segment_types():
     """Quickly see which segment types exist in the current process."""
-    types = defaultdict(int)
+    types: Dict[str, int] = {}
     for seg in torch.cuda.memory_snapshot():
         t = seg.get("segment_type") or seg.get("segment_kind") or "unknown"
-        types[t] += 1
+        types[t] = types.get(t, 0) + 1
     print("Segment types in snapshot (count of segments):")
     for t, n in sorted(types.items(), key=lambda x: (-x[1], x[0])):
         print(f"  {t}: {n}")
@@ -66,9 +69,9 @@ def pool_usage(segment_type_filter=None, device_filter=None):
     - segment_type_filter: e.g. 'graph' for CUDA Graph pool (None = all)
     - device_filter: int CUDA device index or None for all
     """
-    allocated = defaultdict(int)  # sum of active_allocated block sizes
-    reserved  = defaultdict(int)  # sum of all block sizes (active + inactive)
-    inactive  = defaultdict(int)  # sum of inactive block sizes
+    allocated: Dict[int, int] = {}  # sum of active_allocated block sizes
+    reserved: Dict[int, int] = {}  # sum of all block sizes (active + inactive)
+    inactive: Dict[int, int] = {}  # sum of inactive block sizes
 
     for seg in torch.cuda.memory_snapshot():
         seg_type = seg.get("segment_type") or seg.get("segment_kind") or "unknown"
@@ -80,11 +83,11 @@ def pool_usage(segment_type_filter=None, device_filter=None):
             continue
 
         for size, state in _iter_blocks(seg):
-            reserved[dev]  += size
+            reserved[dev] = reserved.get(dev, 0) + size
             if state == "active_allocated":
-                allocated[dev] += size
+                allocated[dev] = allocated.get(dev, 0) + size
             elif state == "inactive":
-                inactive[dev] += size
+                inactive[dev] = inactive.get(dev, 0) + size
 
     # Format nicely
     result = {}
@@ -102,6 +105,34 @@ def pool_usage(segment_type_filter=None, device_filter=None):
         }
     return result
 
+def inactive_block_stats(topn=5):
+    snap = torch.cuda.memory_snapshot()
+    dev_blocks: Dict[int, List[int]] = {}
+    for seg in snap:
+        dev = seg.get("device")
+        for b in seg.get("blocks", []):
+            if b.get("state") == "inactive":  # totally free inside reserved
+                dev_blocks.setdefault(dev, []).append(b.get("size", 0))
+    out = {}
+    for dev, sizes in dev_blocks.items():
+        sizes.sort(reverse=True)
+        out[dev] = {
+            "largest_free_mib": mib(sizes[0]) if sizes else 0.0,
+            "top_inactive_mib": [mib(x) for x in sizes[:topn]],
+            "total_inactive_mib": mib(sum(sizes)),
+        }
+    return out
+
+def pool_shape_summary():
+    s = torch.cuda.memory_stats()
+    return {
+        "active_allocated_MiB": mib(s.get("active_bytes.all.current", 0)),
+        "reserved_MiB": mib(s.get("reserved_bytes.all.current", 0)),
+        "inactive_split_MiB": mib(s.get("inactive_split_bytes.all.current", 0)),
+        "peak_reserved_MiB": mib(torch.cuda.max_memory_reserved()),
+        "peak_allocated_MiB": mib(torch.cuda.max_memory_allocated()),
+    }
+
 def pretty_print_pool_usage(segment_type_filter=None, device_filter=None, title=None):
     title = title or f"CUDA allocator usage (segment_type={segment_type_filter!r}, device={device_filter})"
     print(title)
@@ -114,6 +145,8 @@ def pretty_print_pool_usage(segment_type_filter=None, device_filter=None, title=
               f"allocated {vals['allocated_MiB']:.2f} MiB / "
               f"reserved {vals['reserved_MiB']:.2f} MiB / "
               f"inactive {vals['inactive_MiB']:.2f} MiB")
+    print(inactive_block_stats())
+    print(pool_shape_summary())
 
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
@@ -153,8 +186,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         super().__init__()
 
         self.buffers = buffers
-        for buffer in self.buffers:
-            buffer.set_num_sms(4)
+        # for buffer in self.buffers:
+        #     buffer.set_num_sms(4)
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
         # The dispatch function returns a handle that the combine function
@@ -227,9 +260,15 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                Optional[torch.Tensor]]:
 
         hidden_size = a1.size(1)
-        ubatch_ctx = get_current_ubatch_context()
-        a2a_idx = ubatch_ctx.id if ubatch_ctx is not None else 0
-        do_recv_hook = False
+
+        if currently_in_ubatch():
+            ubatch_ctx, next_ubatch_ctx = get_current_ubatch_context()
+            a2a_idx = ubatch_ctx.id
+            do_recv_hook = ubatch_ctx.enable_async_comms
+        else:
+            ubatch_ctx, next_ubatch_ctx = None, None
+            a2a_idx = 0
+            do_recv_hook = False
 
         if self.use_fp8_dispatch:
             assert hidden_size % 128 == 0, \
@@ -250,21 +289,35 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # Dispatch
         yield_and_switch_from_compute_to_comm(schedule="default")
-        if is_global_first_rank():
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_UBATCH", "0") == "1":
+            print(f"[deepep] dispatch enter a2a_idx={a2a_idx} async_comms={do_recv_hook}")
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_ALLOC_SUMMARY", "0") == "1":
             print("Predispatch memory usage")
             pretty_print_pool_usage()
             print("External memory usage", external_usage())
-        expert_x, expert_num_tokens, handle, _, recv_hook= \
-                self.buffers[a2a_idx].low_latency_dispatch(a1,
-                                                topk_ids,
-                                                self.max_tokens_per_rank,
-                                                num_experts,
-                                                use_fp8=self.use_fp8_dispatch,
-                                                async_finish=False,
-                                                return_recv_hook=do_recv_hook)
+        if os.environ.get("VLLM_DEBUG_ALLOC_TAGS", "0") == "1":
+            from vllm.compilation.monitor import alloc_tag
+            tag_cm: AbstractContextManager[Any] = alloc_tag("DEEPEP:low_latency_dispatch")
+        else:
+            tag_cm: AbstractContextManager[Any] = nullcontext()
+        with tag_cm:
+            expert_x, expert_num_tokens, handle, _, recv_hook= \
+                    self.buffers[a2a_idx].low_latency_dispatch(a1,
+                                                    topk_ids,
+                                                    self.max_tokens_per_rank,
+                                                    num_experts,
+                                                    use_fp8=self.use_fp8_dispatch,
+                                                    async_finish=False,
+                                                    return_recv_hook=do_recv_hook)
         self.handles[a2a_idx] = handle
-        yield_and_switch_from_comm_to_compute(schedule="default", recv_hook=recv_hook)
         if is_global_first_rank():
+            print("recv_hook dispatch", a2a_idx, recv_hook)
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_UBATCH", "0") == "1":
+            print(f"[deepep] dispatch exit a2a_idx={a2a_idx} recv_hook={(recv_hook is not None)} handle_set={(handle is not None)}")
+        if recv_hook is not None and next_ubatch_ctx is not None:
+            next_ubatch_ctx.set_recv_hook(recv_hook, ubatch_ctx.gpu_comm_done_event)
+        yield_and_switch_from_comm_to_compute(schedule="default")
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_ALLOC_SUMMARY", "0") == "1":
             print("Postdispatch memory usage")
             pretty_print_pool_usage()
             print("External memory usage", external_usage())
@@ -285,10 +338,15 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert isinstance(
             weight_and_reduce_impl, TopKWeightAndReduceDelegate
         ), ("Weight application and reduction happens in the combine kernel.")
-        ubatch_ctx = get_current_ubatch_context()
-        a2a_idx = ubatch_ctx.id if ubatch_ctx is not None else 0
+        if currently_in_ubatch():
+            ubatch_ctx, next_ubatch_ctx = get_current_ubatch_context()
+            a2a_idx = ubatch_ctx.id
+            do_recv_hook = ubatch_ctx.enable_async_comms
+        else:
+            ubatch_ctx, next_ubatch_ctx = None, None
+            a2a_idx = 0
+            do_recv_hook = False
         handle = self.handles[a2a_idx]
-        do_recv_hook = False
         assert handle is not None
 
         combine_topk_weights = topk_weights
@@ -298,20 +356,49 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         # TODO (varun) : Enable zero copy mode
         yield_and_switch_from_compute_to_comm(schedule="default")
-        if is_global_first_rank():
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_UBATCH", "0") == "1":
+            print(f"[deepep] combine enter a2a_idx={a2a_idx} async_comms={do_recv_hook}")
+            sys.stdout.flush()
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_ALLOC_SUMMARY", "0") == "1":
             print("Precombine memory usage")
             pretty_print_pool_usage()
             print("External memory usage", external_usage())
-        _, _, recv_hook = self.buffers[a2a_idx].low_latency_combine(fused_expert_output,
-                                                      topk_ids,
-                                                      combine_topk_weights,
-                                                      handle,
-                                                      async_finish=False,
-                                                      zero_copy=False,
-                                                      return_recv_hook=do_recv_hook,
-                                                      out=output)
-        yield_and_switch_from_comm_to_compute(schedule="default", recv_hook=recv_hook)
+        if os.environ.get("VLLM_DEBUG_ALLOC_TAGS", "0") == "1":
+            from vllm.compilation.monitor import alloc_tag
+            tag_cm2: AbstractContextManager[Any] = alloc_tag("DEEPEP:low_latency_combine")
+        else:
+            tag_cm2: AbstractContextManager[Any] = nullcontext()
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_UBATCH", "0") == "1":
+            print(f"[deepep] about to enter combine ctx a2a_idx={a2a_idx} tag={type(tag_cm2)}")
+            sys.stdout.flush()
+        with tag_cm2:
+            if is_global_first_rank() and os.environ.get("VLLM_DEBUG_UBATCH", "0") == "1":
+                print(f"[deepep] entered combine ctx a2a_idx={a2a_idx}")
+                sys.stdout.flush()
+            if is_global_first_rank():
+                # Avoid printing the Tensor handle to prevent potential sync/repr overhead
+                print(f"calling low_latency_combine a2a_idx={a2a_idx} handle_id={id(handle)} handle_type={type(handle)}")
+                sys.stdout.flush()
+            _, _, recv_hook = self.buffers[a2a_idx].low_latency_combine(fused_expert_output,
+                                                          topk_ids,
+                                                          combine_topk_weights,
+                                                          handle,
+                                                          async_finish=False,
+                                                          zero_copy=False,
+                                                          return_recv_hook=do_recv_hook,
+                                                          out=output)
+            if is_global_first_rank() and os.environ.get("VLLM_DEBUG_UBATCH", "0") == "1":
+                print(f"[deepep] low_latency_combine returned a2a_idx={a2a_idx} recv_hook={(recv_hook is not None)}")
+                sys.stdout.flush()
+
         if is_global_first_rank():
+            print("recv_hook combine", a2a_idx, recv_hook)
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_UBATCH", "0") == "1":
+            print(f"[deepep] combine exit a2a_idx={a2a_idx} recv_hook={(recv_hook is not None)}")
+        if recv_hook is not None and next_ubatch_ctx is not None:
+            next_ubatch_ctx.set_recv_hook(recv_hook, ubatch_ctx.gpu_comm_done_event)
+        yield_and_switch_from_comm_to_compute(schedule="default")
+        if is_global_first_rank() and os.environ.get("VLLM_DEBUG_ALLOC_SUMMARY", "0") == "1":
             print("Postcombine memory usage")
             pretty_print_pool_usage()
             print("External memory usage", external_usage())
