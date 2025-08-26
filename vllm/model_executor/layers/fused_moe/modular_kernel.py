@@ -481,8 +481,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                 f"{prepare_finalize.activation_format} == "
                 f"{fused_experts.__class__.__name__}."
                 f"{fused_experts.activation_formats[0]}")
-        if is_global_first_rank():
-          print("Initializing FusedMoEModularKernel")
 
 
     def _do_fused_experts(

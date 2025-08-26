@@ -1817,8 +1817,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _capture_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
 
+        @torch.inference_mode()
         def _capture_ubatch_thread(results, ubatch_metadata, start_signal):
-            # print(f"Starting Request on ubatch: {ubatch_ctx.id}", flush=True)
             context = ubatch_metadata.context
             with torch.cuda.stream(context.compute_stream):
                 _ = torch.cuda.current_blas_handle()
@@ -1891,50 +1891,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 result = torch.cat(sorted_results, dim=0)
                 cudagraph_metadata.outputs = result
             logger.info("UBATCH CAPTURE DONE")
-            torch.cuda.empty_cache()
-            # Optional: emit a graph/private pool usage report after capture
-            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL", "0") == "1":
-                try:
-                    from vllm.compilation.monitor import (
-                        enable_alloc_history,
-                        graph_pool_usage_by_callsite,
-                        snapshot_segment_summary,
-                        inactive_usage_by_callsite_via_snapshot,
-                        top_inactive_blocks_via_snapshot,
-                        external_usage,
-                    )
-                    enable_alloc_history()
-                    torch.cuda.synchronize()
-                    report = graph_pool_usage_by_callsite()
-                    if is_global_first_rank():
-                        logger.info("CUDA Graph Pool report after ubatch capture (%s tokens):",
-                                    num_tokens)
-                        if not report:
-                            logger.info("  <no graph/private segments found>; snapshot=%s",
-                                        snapshot_segment_summary())
-                            if os.environ.get("VLLM_DEBUG_CUDAGRAPH_POOL_SNAPSHOT", "0") == "1":
-                                inactive = inactive_usage_by_callsite_via_snapshot()
-                                if inactive:
-                                    for dev, rows in inactive.items():
-                                        tops = ", ".join(f"{mib:.1f}MiB {k}" for k, mib in rows[:5])
-                                        logger.info("  cuda:%s inactive (snapshot): %s", dev, tops)
-                                blocks = top_inactive_blocks_via_snapshot()
-                                if blocks:
-                                    for dev, rows in blocks.items():
-                                        logger.info("  cuda:%s top inactive blocks: %s", dev, rows[:3])
-                        eu = external_usage()
-                        logger.info("  driver_used=%.2fMiB torch_reserved=%.2fMiB external=%.2fMiB",
-                                    eu["driver_used_MiB"], eu["torch_reserved_MiB"], eu["external_MiB"])
-                        for dev, info in report.items():
-                            logger.info("  cuda:%s total graph/private: %.2f MiB",
-                                        dev, info["total_graph_like_MiB"])
-                            top_calls = ", ".join(
-                                f"{mib:.1f}MiB {k}" for k, mib in info["top_callsites"][:5]
-                            )
-                            if top_calls:
-                                logger.info("    top callsites: %s", top_calls)
-                except Exception as e:
-                    logger.debug("Failed to emit cudagraph pool report (ubatch): %s", e)
             # profiler.stop()
             # if is_global_first_rank():
             #     logger.info(f"IN UBATCH RUNNER: "

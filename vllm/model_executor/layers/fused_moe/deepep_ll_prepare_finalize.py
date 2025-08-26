@@ -13,9 +13,13 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input, normalize_batched_scales_shape)
-from vllm.v1.worker.ubatching import (get_current_ubatch_context, currently_in_ubatch,
-                                      yield_and_switch_from_comm_to_compute,
-                                      yield_and_switch_from_compute_to_comm)
+from vllm.v1.worker.ubatching import (dbo_enabled,
+                                      dbo_current_ubatch_id,
+                                      dbo_yield_and_switch_from_comm_to_compute,
+                                      dbo_yield,
+                                      dbo_switch_to_comm_sync,
+                                      dbo_maybe_run_recv_hook,
+                                      dbo_register_recv_hook)
 from vllm.distributed.parallel_state import (
     get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
     prepare_communication_buffer_for_model)
@@ -137,15 +141,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                Optional[torch.Tensor]]:
 
         hidden_size = a1.size(1)
-
-        if currently_in_ubatch():
-            ubatch_ctx, next_ubatch_ctx = get_current_ubatch_context()
-            a2a_idx = ubatch_ctx.id
-            do_recv_hook = ubatch_ctx.enable_async_comms
-        else:
-            ubatch_ctx, next_ubatch_ctx = None, None
-            a2a_idx = 0
-            do_recv_hook = False
+        a2a_idx = dbo_current_ubatch_id()
+        do_recv_hook = dbo_enabled()
 
         if self.use_fp8_dispatch:
             assert hidden_size % 128 == 0, \
@@ -165,7 +162,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             a1 = a1 * topk_weights.to(a1.dtype)
 
         # Dispatch
-        yield_and_switch_from_compute_to_comm(schedule="default")
+        
+        dbo_maybe_run_recv_hook()
         expert_x, expert_num_tokens, handle, _, recv_hook= \
                 self.buffers[a2a_idx].low_latency_dispatch(a1,
                                                 topk_ids,
@@ -175,9 +173,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                                                 async_finish=False,
                                                 return_recv_hook=do_recv_hook)
         self.handles[a2a_idx] = handle
-        if recv_hook is not None and next_ubatch_ctx is not None:
-            next_ubatch_ctx.set_recv_hook(recv_hook, ubatch_ctx.gpu_comm_done_event)
-        yield_and_switch_from_comm_to_compute(schedule="default")
+        if recv_hook is not None:
+            dbo_register_recv_hook(recv_hook)            
+        dbo_yield()
+
         expert_x, expert_x_scale = self._do_quant(
             expert_x, a1_scale, a2_scale, a1.dtype, quant_config.quant_dtype,
             quant_config.per_act_token_quant, quant_config.block_shape)
@@ -195,14 +194,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert isinstance(
             weight_and_reduce_impl, TopKWeightAndReduceDelegate
         ), ("Weight application and reduction happens in the combine kernel.")
-        if currently_in_ubatch():
-            ubatch_ctx, next_ubatch_ctx = get_current_ubatch_context()
-            a2a_idx = ubatch_ctx.id
-            do_recv_hook = ubatch_ctx.enable_async_comms
-        else:
-            ubatch_ctx, next_ubatch_ctx = None, None
-            a2a_idx = 0
-            do_recv_hook = False
+
+        a2a_idx = dbo_current_ubatch_id()
+        do_recv_hook = dbo_enabled()
         handle = self.handles[a2a_idx]
         assert handle is not None
 
@@ -212,7 +206,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             combine_topk_weights = torch.ones_like(topk_weights)
 
         # TODO (varun) : Enable zero copy mode
-        yield_and_switch_from_compute_to_comm(schedule="default")
+        # Switch to comm and sync compute and comm streams
+        # Run recv hook other microbatch if needed
+        dbo_maybe_run_recv_hook()
         _, _, recv_hook = self.buffers[a2a_idx].low_latency_combine(fused_expert_output,
                                                         topk_ids,
                                                         combine_topk_weights,
@@ -221,6 +217,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                                                         zero_copy=False,
                                                         return_recv_hook=do_recv_hook,
                                                         out=output)
-        if recv_hook is not None and next_ubatch_ctx is not None:
-            next_ubatch_ctx.set_recv_hook(recv_hook, ubatch_ctx.gpu_comm_done_event)
-        yield_and_switch_from_comm_to_compute(schedule="default")
+        if recv_hook is not None:
+            dbo_register_recv_hook(recv_hook)            
+        dbo_yield()
