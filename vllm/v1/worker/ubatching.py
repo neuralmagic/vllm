@@ -4,6 +4,7 @@ import threading
 from typing import Optional
 
 import torch
+from enum import Enum
 
 from vllm import forward_context
 from vllm.forward_context import ForwardContext
@@ -11,6 +12,11 @@ from vllm.utils import current_stream
 
 _THREAD_ID_TO_CONTEXT: dict = {}
 _CURRENT_CONTEXTS: list[Optional['UBatchContext']] = [None, None]
+
+
+class Schedule(Enum):
+    MLP_OVERLAP = "mlp_overlap"
+    ATTN_OVERLAP = "attn_overlap"
 
 class UBatchContext:
     """
@@ -28,7 +34,7 @@ class UBatchContext:
                  gpu_comm_done_event: torch.cuda.Event,
                  gpu_compute_done_event: torch.cuda.Event,
                  enable_async_comms: bool,
-                 schedule: str = "default"):
+                 schedule: Schedule = Schedule.MLP_OVERLAP):
         self.id = id
         self.comm_stream = comm_stream
         self.compute_stream = compute_stream
@@ -139,7 +145,6 @@ class UBatchContext:
         self.update_stream(self.compute_stream)
         self._wait_comm_done()
 
-
 def dbo_enabled() -> bool:
     return len(_THREAD_ID_TO_CONTEXT) > 0
 
@@ -148,19 +153,22 @@ def dbo_current_ubatch_id() -> int:
         return 0
     return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
 
-def _register_ubatch_function(func, context_offset):
-    def wrapper(*args, **kwargs):
+def _register_ubatch_function(func):
+    def wrapper(schedule: Schedule = Schedule.MLP_OVERLAP):
         if len(_THREAD_ID_TO_CONTEXT) > 0:
-            ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()] + context_offset
+            ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
             ctx = _CURRENT_CONTEXTS[ctx_idx]
-            func(ctx, *args, **kwargs)
+            if ctx.schedule == schedule:
+                func(ctx)
     return wrapper
 
-dbo_yield_and_switch_from_compute_to_comm = _register_ubatch_function(UBatchContext.yield_and_switch_from_compute_to_comm, 0)
-dbo_yield_and_switch_from_comm_to_compute = _register_ubatch_function(UBatchContext.yield_and_switch_from_comm_to_compute, 0)
-dbo_yield = _register_ubatch_function(UBatchContext.yield_, 0)
-dbo_maybe_run_recv_hook = _register_ubatch_function(UBatchContext.maybe_run_recv_hook, 0)
-dbo_switch_to_comm_sync = _register_ubatch_function(UBatchContext.switch_to_comm_sync, 0)
+dbo_yield_and_switch_from_compute_to_comm = _register_ubatch_function(UBatchContext.yield_and_switch_from_compute_to_comm)
+dbo_yield_and_switch_from_comm_to_compute = _register_ubatch_function(UBatchContext.yield_and_switch_from_comm_to_compute)
+dbo_yield = _register_ubatch_function(UBatchContext.yield_)
+dbo_maybe_run_recv_hook = _register_ubatch_function(UBatchContext.maybe_run_recv_hook)
+dbo_switch_to_comm_sync = _register_ubatch_function(UBatchContext.switch_to_comm_sync)
+
+
 
 def dbo_register_recv_hook(recv_hook):
     if len(_THREAD_ID_TO_CONTEXT) > 0:
