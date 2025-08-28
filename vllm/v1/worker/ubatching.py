@@ -16,7 +16,7 @@ _CURRENT_CONTEXTS: list[Optional['UBatchContext']] = [None, None]
 
 class Schedule(Enum):
     MLP_OVERLAP = "mlp_overlap"
-    ATTN_OVERLAP = "attn_overlap"
+    MLA_ATTN_OVERLAP = "mla_attn_overlap"
 
 class UBatchContext:
     """
@@ -154,11 +154,11 @@ def dbo_current_ubatch_id() -> int:
     return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
 
 def _register_ubatch_function(func):
-    def wrapper(schedule: Schedule = Schedule.MLP_OVERLAP):
+    def wrapper(schedules: list[Schedule] = [Schedule.MLP_OVERLAP]):
         if len(_THREAD_ID_TO_CONTEXT) > 0:
             ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
             ctx = _CURRENT_CONTEXTS[ctx_idx]
-            if ctx.schedule == schedule:
+            if ctx.schedule in schedules:
                 func(ctx)
     return wrapper
 
@@ -170,11 +170,14 @@ dbo_switch_to_comm_sync = _register_ubatch_function(UBatchContext.switch_to_comm
 
 
 
-def dbo_register_recv_hook(recv_hook):
+def dbo_register_recv_hook(recv_hook, schedules: list[Schedule] = [Schedule.MLP_OVERLAP]) -> bool:
     if len(_THREAD_ID_TO_CONTEXT) > 0:
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-        next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % 2]
-        next_ctx.recv_hook = recv_hook
+        if _CURRENT_CONTEXTS[ctx_idx].schedule in schedules:
+            next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % 2]
+            next_ctx.recv_hook = recv_hook
+            return True
+    return False
 
 def make_ubatch_contexts(
     num_micro_batches: int,
