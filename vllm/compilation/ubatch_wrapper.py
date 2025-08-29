@@ -22,6 +22,7 @@ from vllm.utils import weak_ref_tensors
 from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.distributed.parallel_state import is_global_first_rank
 
 
 
@@ -262,6 +263,8 @@ class UBatchWrapper:
 
         if num_tokens not in self.cudagraphs \
             and cudagraph_runtime_mode is CUDAGraphMode.FULL:
+            if is_global_first_rank():
+                logger.debug(f"CAPTURING CUDAGRAPH {num_tokens}")
             ubatch_metadata = self._make_ubatch_metadata(
                     ubatch_slices=ubatch_slices,
                     attn_metadata=attn_metadata,
@@ -275,12 +278,15 @@ class UBatchWrapper:
                     cudagraph_runtime_mode=CUDAGraphMode.NONE)
 
             return self._capture_ubatches(ubatch_metadata, self.model)
-        elif num_tokens in self.cudagraphs \
-            and cudagraph_runtime_mode is CUDAGraphMode.FULL:
+        elif num_tokens in self.cudagraphs:
+            if is_global_first_rank():
+                logger.debug(f"REPLAYING CUDAGRAPH {num_tokens}")
             cudagraph_metadata = self.cudagraphs[num_tokens]
             cudagraph_metadata.cudagraph.replay()
             return cudagraph_metadata.outputs
         else:
+            if is_global_first_rank():
+                logger.debug(f"RUNNING UBATCHED {num_tokens} CUDAGRAPH MODE {cudagraph_runtime_mode}")
             ubatch_metadata = self._make_ubatch_metadata(
                     ubatch_slices=ubatch_slices,
                     attn_metadata=attn_metadata,
