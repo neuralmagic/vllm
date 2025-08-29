@@ -152,7 +152,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             a1 = a1 * topk_weights.to(a1.dtype)
 
         # Dispatch
-        dbo_maybe_run_recv_hook()
+        # dbo_maybe_run_recv_hook()
         expert_x, expert_num_tokens, handle, _, recv_hook= \
                 self.buffers[a2a_idx].low_latency_dispatch(a1,
                                                 topk_ids,
@@ -162,9 +162,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                                                 async_finish=False,
                                                 return_recv_hook=True)
         self.handles[a2a_idx] = handle
-        if recv_hook is not None:
-            dbo_register_recv_hook(recv_hook)            
-        dbo_yield()
+        # if recv_hook is not None:
+        #     dbo_register_recv_hook(recv_hook)            
+        # dbo_yield()
 
         return (recv_hook, lambda hook: self._receiver(hook, expert_x, expert_num_tokens,
                                       a1_scale, a1.dtype, quant_config))
