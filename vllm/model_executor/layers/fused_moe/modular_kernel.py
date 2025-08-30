@@ -829,8 +829,7 @@ class FusedMoEModularKernel(torch.nn.Module):
 
         shared_output: torch.Tensor
 
-        if (not self.prepare_finalize.supports_async()
-                or self.shared_experts is None):
+        if not self.prepare_finalize.supports_async():
             assert False
 
             # Run shared experts serially with dispatch.
@@ -864,8 +863,10 @@ class FusedMoEModularKernel(torch.nn.Module):
                 self.fused_experts.quant_config,
             )
 
-            assert self.shared_experts is not None
-            shared_output = self.shared_experts(a1)
+            # assert self.shared_experts is not None
+            if self.shared_experts is not None:
+                assert False
+                shared_output = self.shared_experts(a1)
 
             dbo_register_recv_hook(hook)
             dbo_yield()
