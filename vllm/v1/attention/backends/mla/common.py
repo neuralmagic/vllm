@@ -585,7 +585,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             seq_lens=seq_lens,
         )
 
-    def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):
+    def build_for_cudagraph_capture(
+            self, common_attn_metadata: CommonAttentionMetadata):
         """
         return 
         - num_decodes: number of decode requests
@@ -1269,11 +1270,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if fp8_attention:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
-        if has_prefill:
-            output[num_decode_tokens:] = self._forward_prefill(
-                prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
-                attn_metadata, layer._k_scale)
-
         if has_decode:
             assert attn_metadata.decode is not None
             decode_q_nope, decode_q_pe = decode_q.split(
@@ -1308,6 +1304,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     layer._q_scale)
                 decode_q_pe = decode_q_pe.reshape(q_pe_shape)
 
+        #dbo_yield(schedules=(Schedule.MLA_ATTN_OVERLAP,))
+
+        if has_prefill:
+            output[num_decode_tokens:] = self._forward_prefill(
+                prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
+                attn_metadata, layer._k_scale)
+
+        if has_decode:
             output[:num_decode_tokens] = self._forward_decode(
                 decode_ql_nope, decode_q_pe, kv_cache, attn_metadata, layer)
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from contextlib import contextmanager
+from enum import Enum
 from typing import Optional
 
 import torch
@@ -11,6 +13,12 @@ from vllm.utils import current_stream
 
 _THREAD_ID_TO_CONTEXT: dict = {}
 _CURRENT_CONTEXTS: list[Optional['UBatchContext']] = [None, None]
+
+
+class Schedule(Enum):
+    MLP_OVERLAP = "mlp_overlap"
+    MLA_ATTN_OVERLAP = "mla_attn_overlap"
+
 
 class UBatchContext:
     """
@@ -27,8 +35,7 @@ class UBatchContext:
                  cpu_signal_event: threading.Event,
                  gpu_comm_done_event: torch.cuda.Event,
                  gpu_compute_done_event: torch.cuda.Event,
-                 enable_async_comms: bool,
-                 schedule: str = "default"):
+                 schedule: Schedule = Schedule.MLP_OVERLAP):
         self.id = id
         self.comm_stream = comm_stream
         self.compute_stream = compute_stream
@@ -39,7 +46,6 @@ class UBatchContext:
         self.current_stream = compute_stream
         self.gpu_comm_done_event = gpu_comm_done_event
         self.gpu_compute_done_event = gpu_compute_done_event
-        self.enable_async_comms = enable_async_comms
         self.schedule = schedule
         self.recv_hook = None
 
@@ -111,9 +117,15 @@ class UBatchContext:
         self._signal_compute_done()
         self.update_stream(self.comm_stream)
         self._wait_comm_done()
-    
+
+    def switch_to_compute_sync(self):
+        self._signal_comm_done()
+        self.update_stream(self.compute_stream)
+        self._wait_compute_done()
+
     def maybe_run_recv_hook(self):
         if self.recv_hook is not None:
+            print("run recv hook", self.id, self.recv_hook)
             self.recv_hook()
             self.recv_hook = None
 
@@ -122,7 +134,7 @@ class UBatchContext:
         self._cpu_yield()
         if self.current_stream == current_stream():
             self.update_stream(self.current_stream)
-    
+
     def yield_and_switch_from_compute_to_comm(self):
         assert current_stream() == self.compute_stream
         self._signal_compute_done()
@@ -143,30 +155,83 @@ class UBatchContext:
 def dbo_enabled() -> bool:
     return len(_THREAD_ID_TO_CONTEXT) > 0
 
+
 def dbo_current_ubatch_id() -> int:
     if len(_THREAD_ID_TO_CONTEXT) == 0:
         return 0
     return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
 
-def _register_ubatch_function(func, context_offset):
-    def wrapper(*args, **kwargs):
+
+def _register_ubatch_function(func, all_schedules_default: bool = False):
+
+    def wrapper(schedules: tuple[Schedule] = (),
+                all_schedules: bool = all_schedules_default):
         if len(_THREAD_ID_TO_CONTEXT) > 0:
-            ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()] + context_offset
+            ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
             ctx = _CURRENT_CONTEXTS[ctx_idx]
-            func(ctx, *args, **kwargs)
+            if all_schedules or ctx.schedule in schedules:
+                func(ctx)
+
     return wrapper
 
-dbo_yield_and_switch_from_compute_to_comm = _register_ubatch_function(UBatchContext.yield_and_switch_from_compute_to_comm, 0)
-dbo_yield_and_switch_from_comm_to_compute = _register_ubatch_function(UBatchContext.yield_and_switch_from_comm_to_compute, 0)
-dbo_yield = _register_ubatch_function(UBatchContext.yield_, 0)
-dbo_maybe_run_recv_hook = _register_ubatch_function(UBatchContext.maybe_run_recv_hook, 0)
-dbo_switch_to_comm_sync = _register_ubatch_function(UBatchContext.switch_to_comm_sync, 0)
 
-def dbo_register_recv_hook(recv_hook):
+dbo_yield_and_switch_from_compute_to_comm = _register_ubatch_function(
+    UBatchContext.yield_and_switch_from_compute_to_comm)
+dbo_yield_and_switch_from_comm_to_compute = _register_ubatch_function(
+    UBatchContext.yield_and_switch_from_comm_to_compute)
+dbo_yield = _register_ubatch_function(UBatchContext.yield_)
+# For `dbo_maybe_run_recv_hook` we usually want to run the recv hook for
+# since its already conditional on a recv_hook being registered, so we default
+# all_schedules to True to make the code a bit simpler.
+dbo_maybe_run_recv_hook = _register_ubatch_function(
+    UBatchContext.maybe_run_recv_hook, all_schedules_default=True)
+dbo_switch_to_comm_sync = _register_ubatch_function(
+    UBatchContext.switch_to_comm_sync)
+dbo_switch_to_compute_sync = _register_ubatch_function(
+    UBatchContext.switch_to_compute_sync)
+
+
+@contextmanager
+def dbo_switch_to_compute_sync():
+    if dbo_enabled():
+        dbo_switch_to_compute_sync()
+        yield
+        dbo_switch_to_comm_sync()
+    else:
+        yield
+
+
+@contextmanager
+def dbo_switch_to_comm_sync():
+    if dbo_enabled():
+        dbo_switch_to_comm_sync()
+        yield
+        dbo_switch_to_compute_sync()
+    else:
+        yield
+
+
+@contextmanager
+def dbo_run_on_comm_async():
+    if dbo_enabled():
+        dbo_run_on_comm_async()
+        yield
+    else:
+        yield
+
+
+def dbo_register_recv_hook(recv_hook,
+                           schedules: tuple[Schedule] = (),
+                           all_schedules: bool = False) -> bool:
     if len(_THREAD_ID_TO_CONTEXT) > 0:
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-        next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % 2]
-        next_ctx.recv_hook = recv_hook
+        if all_schedules or _CURRENT_CONTEXTS[ctx_idx].schedule in schedules:
+            next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % 2]
+            print("register recv hook", next_ctx.id, recv_hook)
+            next_ctx.recv_hook = recv_hook
+            return True
+    return False
+
 
 def make_ubatch_contexts(
     num_micro_batches: int,
@@ -175,8 +240,7 @@ def make_ubatch_contexts(
     forward_contexts: list[ForwardContext],
     ready_barrier: threading.Barrier,
     device: Optional[torch.device] = None,
-    enable_async_comms: bool = False,
-    schedule: str = "default",
+    schedule: Schedule = Schedule.MLP_OVERLAP,
 ) -> list[UBatchContext]:
     assert num_micro_batches == 2, "only been tested with 2 micro-batches"
     """
@@ -206,7 +270,6 @@ def make_ubatch_contexts(
                                                         num_micro_batches],
                             gpu_comm_done_event=gpu_comm_done_events[i],
                             gpu_compute_done_event=gpu_compute_done_events[i],
-                            enable_async_comms=enable_async_comms,
                             schedule=schedule)
         ctxs.append(ctx)
 
