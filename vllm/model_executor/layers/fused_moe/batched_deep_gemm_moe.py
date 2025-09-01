@@ -101,6 +101,53 @@ def _silu_mul_fp8_quant_deep_gemm(
         tl.store(y_s_ptr + base_ys_offset + t * stride_ys_t, y_s)
 
 
+def silu_mul_fp8_quant_deep_gemm_cuda(
+    y: torch.Tensor,  # (E, T, 2*H)
+    tokens_per_expert: torch.Tensor,  # (E,) number of valid tokens per expert
+    group_size: int = 128,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert y.ndim == 3, "y must be (E, T, 2*H)"
+    E, T, H2 = y.shape
+    assert H2 % 2 == 0, "last dim of y must be even (2*H)"
+    H = H2 // 2
+    G = H // group_size
+    assert H % group_size == 0, "H must be divisible by group_size"
+    assert tokens_per_expert.ndim == 1 and tokens_per_expert.shape[0] == E
+
+    tokens_per_expert = tokens_per_expert.to(device=y.device,
+                                             dtype=torch.int32)
+
+    fp8_dtype = torch.float8_e4m3fn
+    y_q = torch.empty((E, T, H), dtype=fp8_dtype, device=y.device).contiguous()
+
+    stride_ys_e = T * G
+    stride_ys_t = 1
+    stride_ys_g = T
+    y_s = torch.empty_strided((E, T, G),
+                              (stride_ys_e, stride_ys_t, stride_ys_g),
+                              dtype=torch.float32,
+                              device=y.device).contiguous()
+
+    f_info = torch.finfo(fp8_dtype)
+    fp8_max = f_info.max
+    fp8_min = f_info.min
+    use_ue8m0 = is_deep_gemm_e8m0_used()
+    torch.ops._C.silu_mul_fp8_quant_deep_gemm_cuda(
+        y,
+        tokens_per_expert,
+        y_q,
+        y_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        use_ue8m0,
+    )
+
+    return y_q, y_s
+
+
 def silu_mul_fp8_quant_deep_gemm(
     y: torch.Tensor,  # (E, T, 2*H)
     tokens_per_expert: torch.Tensor,  # (E,) number of valid tokens per expert
