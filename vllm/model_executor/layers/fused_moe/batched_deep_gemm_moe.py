@@ -135,8 +135,7 @@ def silu_mul_fp8_quant_deep_gemm_cuda(
     f_info = torch.finfo(fp8_dtype)
     fp8_max = f_info.max
     fp8_min = f_info.min
-    use_ue8m0 = False  # is_blackwell_deep_gemm_e8m0_used()
-
+    use_ue8m0 = is_deep_gemm_e8m0_used()
     torch.ops._C.silu_mul_fp8_quant_deep_gemm_cuda(
         y,
         tokens_per_expert,

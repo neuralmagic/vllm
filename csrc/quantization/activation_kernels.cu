@@ -1,3 +1,5 @@
+#include "cuda_utils.h"
+
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -534,7 +536,7 @@ void silu_mul_fp8_quant_deep_gemm_cuda(
   Idx_t E = input.size(0);
   Idx_t T = input.size(1);
   Idx_t H = input.size(2) / 2;
-  Idx_t G = H / (group_size * NUM_WARPS);
+  Idx_t G = cuda_utils::ceil_div(H, Idx_t(group_size * NUM_WARPS));
   Idx_t stride_i_e = input.stride(0);
   Idx_t stride_i_t = input.stride(1);
   Idx_t stride_i_h = input.stride(2);
