@@ -350,8 +350,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         fp8_m_grouped_gemm_nt_masked((a1q, a1q_scale), (w1, w1_scale),
                                      workspace1, expert_num_tokens, expected_m)
 
-        a2q, a2q_scale = silu_mul_fp8_quant_deep_gemm(workspace1,
-                                                      expert_num_tokens)
+        a2q, a2q_scale = silu_mul_fp8_quant_deep_gemm_cuda(workspace1, expert_num_tokens)
 
         fp8_m_grouped_gemm_nt_masked((a2q, a2q_scale), (w2, w2_scale), output,
                                      expert_num_tokens, expected_m)
