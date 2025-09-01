@@ -101,7 +101,7 @@ def _silu_mul_fp8_quant_deep_gemm(
         tl.store(y_s_ptr + base_ys_offset + t * stride_ys_t, y_s)
 
 
-def silu_mul_fp8_quant_deep_gemm_cuda(
+def silu_mul_fp8_quant_deep_gemm(
     y: torch.Tensor,  # (E, T, 2*H)
     tokens_per_expert: torch.Tensor,  # (E,) number of valid tokens per expert
     group_size: int = 128,
@@ -148,7 +148,7 @@ def silu_mul_fp8_quant_deep_gemm_cuda(
     return y_q, y_s
 
 
-def silu_mul_fp8_quant_deep_gemm(
+def silu_mul_fp8_quant_deep_gemm_old(
     y: torch.Tensor,  # (E, T, 2*H)
     tokens_per_expert: torch.Tensor,  # (E,) number of valid tokens per expert
     group_size: int = 128,
