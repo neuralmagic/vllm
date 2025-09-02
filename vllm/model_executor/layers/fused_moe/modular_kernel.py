@@ -847,7 +847,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         else:
             # Overlap shared expert compute with all2all dispatch.
             dbo_maybe_run_recv_hook()
-            hook, receiver = self.prepare_finalize.prepare_async(
+            _hook, receiver = self.prepare_finalize.prepare_async(
                 a1,
                 a1_scale,
                 a2_scale,
@@ -858,20 +858,15 @@ class FusedMoEModularKernel(torch.nn.Module):
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
             )
-
             if dbo_register_recv_hook(hook,
                                       schedules=(Schedule.MLP_OVERLAP, )):
                 hook = lambda: None
+                dbo_yield(schedules=(Schedule.MLP_OVERLAP, ))
 
-            dbo_yield(schedules=(Schedule.MLP_OVERLAP, ))
-
-            # assert self.shared_experts is not None
             if self.shared_experts is not None:
-                assert False
                 shared_output = self.shared_experts(a1)
 
             dbo_yield(schedules=(Schedule.MLA_ATTN_OVERLAP, ))
-
             hook()
 
             (a1q, a1q_scale, expert_tokens_meta, _expert_topk_ids,

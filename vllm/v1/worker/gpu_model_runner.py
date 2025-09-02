@@ -84,7 +84,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin, KVConnectorOutput)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
 
 from .utils import (AttentionGroup, MultiModalBudget,
                     add_kv_sharing_layers_to_kv_cache_groups, bind_kv_cache,
@@ -2348,10 +2347,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                           self.vllm_config,
                                           runtime_mode=CUDAGraphMode.FULL)
         elif self.parallel_config.enable_microbatching:
+            delayed_start = getattr(self.model, "delayed_dbo_start", False)
+            
             if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-                self.model = UBatchWrapper(self.model, self.vllm_config, CUDAGraphMode.FULL, self.device)
+                self.model = UBatchWrapper(self.model, self.vllm_config, 
+                                           CUDAGraphMode.FULL, self.device, 
+                                           delayed_start=delayed_start)
             else:
-                self.model = UBatchWrapper(self.model, self.vllm_config, CUDAGraphMode.NONE, self.device)
+                self.model = UBatchWrapper(self.model, self.vllm_config, 
+                                           CUDAGraphMode.NONE, self.device, 
+                                           delayed_start=delayed_start)
 
 
     def reload_weights(self) -> None:

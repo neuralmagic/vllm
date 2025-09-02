@@ -135,6 +135,13 @@ class ParallelConfig:
     request is greater than this threshold, microbatching will be used.
     Otherwise, the request will be processed in a single batch."""
 
+    microbatch_schedule: Literal["mlp_overlap", "mla_attn_overlap"] = "mlp_overlap"
+    """Schedule policy for microbatch overlap coordination.
+
+    - "mlp_overlap": overlap MLP compute and communication across ubatches
+    - "mla_attn_overlap": overlap MLA attention and communication across ubatches
+    """
+
     enable_async_comms: bool = False
     """enable async comms"""
 

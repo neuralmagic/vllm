@@ -4,7 +4,8 @@ import threading
 from contextlib import contextmanager
 from enum import Enum
 from typing import Optional
-
+from torch.library import Library
+from functools import lru_cache
 import torch
 
 from vllm import forward_context
@@ -18,6 +19,10 @@ _CURRENT_CONTEXTS: list[Optional['UBatchContext']] = [None, None]
 class Schedule(Enum):
     MLP_OVERLAP = "mlp_overlap"
     MLA_ATTN_OVERLAP = "mla_attn_overlap"
+    
+_SCHEDULE_WAIT_STAGES = {
+    Schedule.MLA_ATTN_OVERLAP: 2,
+}
 
 
 class UBatchContext:
@@ -35,6 +40,7 @@ class UBatchContext:
                  cpu_signal_event: threading.Event,
                  gpu_comm_done_event: torch.cuda.Event,
                  gpu_compute_done_event: torch.cuda.Event,
+                 started: bool = True,
                  schedule: Schedule = Schedule.MLP_OVERLAP):
         self.id = id
         self.comm_stream = comm_stream
@@ -47,6 +53,7 @@ class UBatchContext:
         self.gpu_comm_done_event = gpu_comm_done_event
         self.gpu_compute_done_event = gpu_compute_done_event
         self.schedule = schedule
+        self.started = started
         self.recv_hook = None
 
     def __enter__(self):
@@ -55,8 +62,13 @@ class UBatchContext:
         _CURRENT_CONTEXTS[self.id] = self
         self.ready_barrier.wait()
 
+        wait_stages = _SCHEDULE_WAIT_STAGES.get(self.schedule, 1) if self.id > 0 else 1
+        for _ in range(wait_stages - 1):
+            self.yield_()
+        
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+
         self._restore_context()
         # Assume we start on the compute stream
         assert current_stream() == self.compute_stream
@@ -64,10 +76,20 @@ class UBatchContext:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
-        _CURRENT_CONTEXTS[self.id] = None
-        del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+
+        wait_stages = _SCHEDULE_WAIT_STAGES.get(self.schedule, 1)
+        if self.id == 0:
+            # Keep advance in the next micro-batch
+            for _ in range(wait_stages - 1):
+                self.yield_()
+                self.maybe_run_recv_hook()
+        
         self.cpu_signal_event.set()
         self.cpu_wait_event.clear()
+        
+        del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+        _CURRENT_CONTEXTS[self.id] = None
+
         self.current_stream = self.compute_stream
         torch.cuda.set_stream(self.current_stream)
         return False
@@ -125,7 +147,6 @@ class UBatchContext:
 
     def maybe_run_recv_hook(self):
         if self.recv_hook is not None:
-            print("run recv hook", self.id, self.recv_hook)
             self.recv_hook()
             self.recv_hook = None
 
@@ -162,6 +183,13 @@ def dbo_current_ubatch_id() -> int:
     return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
 
 
+def dbo_start():
+    if len(_THREAD_ID_TO_CONTEXT) > 0:
+        ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+        ctx = _CURRENT_CONTEXTS[ctx_idx]
+        ctx.started = True
+
+
 def _register_ubatch_function(func, all_schedules_default: bool = False):
 
     def wrapper(schedules: tuple[Schedule] = (),
@@ -169,6 +197,8 @@ def _register_ubatch_function(func, all_schedules_default: bool = False):
         if len(_THREAD_ID_TO_CONTEXT) > 0:
             ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
             ctx = _CURRENT_CONTEXTS[ctx_idx]
+            if ctx.started:
+                return
             if all_schedules or ctx.schedule in schedules:
                 func(ctx)
 
@@ -191,34 +221,19 @@ dbo_switch_to_compute_sync = _register_ubatch_function(
     UBatchContext.switch_to_compute_sync)
 
 
-@contextmanager
-def dbo_switch_to_compute_sync():
-    if dbo_enabled():
-        dbo_switch_to_compute_sync()
-        yield
-        dbo_switch_to_comm_sync()
-    else:
-        yield
+
+lib = Library("vllm_dbo", "DEF")
+lib.define("start(Tensor! x) -> ()")  # in-place, returns x
+
+@torch.library.impl("vllm_dbo::start", "CompositeImplicitAutograd")
+def _dbo_start_impl(x: torch.Tensor):
+    dbo_start()
+    return None
 
 
-@contextmanager
-def dbo_switch_to_comm_sync():
-    if dbo_enabled():
-        dbo_switch_to_comm_sync()
-        yield
-        dbo_switch_to_compute_sync()
-    else:
-        yield
-
-
-@contextmanager
-def dbo_run_on_comm_async():
-    if dbo_enabled():
-        dbo_run_on_comm_async()
-        yield
-    else:
-        yield
-
+@lru_cache(maxsize=1)
+def dbo_debug_annotate():
+    return True
 
 def dbo_register_recv_hook(recv_hook,
                            schedules: tuple[Schedule] = (),
@@ -227,7 +242,6 @@ def dbo_register_recv_hook(recv_hook,
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         if all_schedules or _CURRENT_CONTEXTS[ctx_idx].schedule in schedules:
             next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % 2]
-            print("register recv hook", next_ctx.id, recv_hook)
             next_ctx.recv_hook = recv_hook
             return True
     return False
@@ -241,6 +255,7 @@ def make_ubatch_contexts(
     ready_barrier: threading.Barrier,
     device: Optional[torch.device] = None,
     schedule: Schedule = Schedule.MLP_OVERLAP,
+    delayed_start: bool = False,
 ) -> list[UBatchContext]:
     assert num_micro_batches == 2, "only been tested with 2 micro-batches"
     """
@@ -270,6 +285,7 @@ def make_ubatch_contexts(
                                                         num_micro_batches],
                             gpu_comm_done_event=gpu_comm_done_events[i],
                             gpu_compute_done_event=gpu_compute_done_events[i],
+                            started=not delayed_start,
                             schedule=schedule)
         ctxs.append(ctx)
 

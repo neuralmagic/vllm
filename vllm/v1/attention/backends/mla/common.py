@@ -218,6 +218,7 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               infer_global_hyperparameters,
                                               split_decodes_and_prefills)
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.ubatching import Schedule, dbo_yield
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -1304,7 +1305,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     layer._q_scale)
                 decode_q_pe = decode_q_pe.reshape(q_pe_shape)
 
-        #dbo_yield(schedules=(Schedule.MLA_ATTN_OVERLAP,))
+        dbo_yield(schedules=(Schedule.MLA_ATTN_OVERLAP,))
 
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(

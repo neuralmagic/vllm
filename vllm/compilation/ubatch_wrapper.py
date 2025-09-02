@@ -42,14 +42,15 @@ class CUDAGraphMetaData:
 class UBatchWrapper:
 
     def __init__(self, runnable: Callable, vllm_config: VllmConfig,
-                 runtime_mode: CUDAGraphMode, device: torch.cuda.device):
+                 runtime_mode: CUDAGraphMode, device: torch.cuda.device,
+                 delayed_start: bool = False):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.comm_stream = torch.cuda.Stream()
         self.device = device
         self.ready_barrier = threading.Barrier(3)
-
+        self.delayed_start = delayed_start
         self.cudagraphs = {}
 
         self.cudagraph_wrapper = None
@@ -75,7 +76,6 @@ class UBatchWrapper:
 
         @torch.inference_mode()
         def _capture_ubatch_thread(results, ubatch_metadata):
-            # print(f"Starting Request on ubatch: {ubatch_ctx.id}", flush=True)
             context = ubatch_metadata.context
             with torch.cuda.stream(context.compute_stream):
                 _ = torch.cuda.current_blas_handle()
@@ -170,7 +170,8 @@ class UBatchWrapper:
                               positions, inputs_embeds, intermediate_tensors,
                               compute_stream, num_tokens_across_dp,
                               batch_descriptor,
-                              cudagraph_runtime_mode) -> list[UbatchMetadata]:
+                              cudagraph_runtime_mode,
+                              delayed_start: bool = False) -> list[UbatchMetadata]:
 
         # Create one forward context per ubatch
         forward_contexts = []
@@ -186,6 +187,12 @@ class UBatchWrapper:
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode))
 
+        # Map CLI/config schedule string to Schedule enum
+        schedule_str = self.vllm_config.parallel_config.microbatch_schedule
+        schedule = Schedule.MLP_OVERLAP
+        if schedule_str == Schedule.MLA_ATTN_OVERLAP.value:
+            schedule = Schedule.MLA_ATTN_OVERLAP
+
         ubatch_ctxs = make_ubatch_contexts(
             num_micro_batches=len(ubatch_slices),
             comm_stream=self.comm_stream,
@@ -193,7 +200,8 @@ class UBatchWrapper:
             forward_contexts=forward_contexts,
             ready_barrier=self.ready_barrier,
             device=self.device,
-            schedule=Schedule.MLP_OVERLAP,
+            schedule=schedule,
+            delayed_start=delayed_start,
         )
 
         ubatch_metadata: list[UbatchMetadata] = []
