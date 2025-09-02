@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional, Union
+from typing import Optional, Union, Callable
 
 import deep_ep
 import torch
@@ -11,9 +11,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input, normalize_batched_scales_shape)
-from vllm.v1.worker.ubatching import (dbo_current_ubatch_id, dbo_enabled,
-                                      dbo_maybe_run_recv_hook,
-                                      dbo_register_recv_hook, dbo_yield)
+from vllm.v1.worker.ubatching import (dbo_current_ubatch_id)
 
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
@@ -115,7 +113,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def supports_async(self) -> bool:
         return True
 
-    def prepare_async(
+    def _create_prepare_ops(
         self,
         a1: torch.Tensor,
         a1_scale: Optional[torch.Tensor],
@@ -126,10 +124,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: Optional[torch.Tensor],
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
-    ) -> mk.ReceiverType:
-
-        hidden_size = a1.size(1)
+    ) -> mk.PrepareResultType:
         a2a_idx = dbo_current_ubatch_id()
+        hidden_size = a1.size(1)
 
         if self.use_fp8_dispatch:
             assert hidden_size % 128 == 0, \
@@ -147,6 +144,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             assert topk == 1, (
                 "apply_router_weight_on_input is only implemented for topk=1")
             a1 = a1 * topk_weights.to(a1.dtype)
+        
+        ########################################################################
+        yield # Pre-dispatch done
+        ########################################################################
 
         # Dispatch
         _expert_x, expert_num_tokens, handle, _, recv_hook= \
@@ -158,21 +159,28 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                                                 async_finish=False,
                                                 return_recv_hook=True)
         self.handles[a2a_idx] = handle
+        
+        ########################################################################
+        yield # Dispatch send done
+        ########################################################################
+        
+        recv_hook()
+        
+        ########################################################################
+        yield # Dispatch recv done
+        ########################################################################
 
-        def _post_recv() -> mk.PrepareResultType:
-            expert_x, expert_x_scale = self._do_quant(
-                _expert_x, a1_scale, a1.dtype, quant_config.quant_dtype,
-                quant_config.per_act_token_quant, quant_config.block_shape)
+        expert_x, expert_x_scale = self._do_quant(
+            _expert_x, a1_scale, a1.dtype, quant_config.quant_dtype,
+            quant_config.per_act_token_quant, quant_config.block_shape)
 
-            expert_tokens_meta = mk.ExpertTokensMetadata(
-                expert_num_tokens=expert_num_tokens,
-                expert_num_tokens_cpu=None)
+        expert_tokens_meta = mk.ExpertTokensMetadata(
+            expert_num_tokens=expert_num_tokens,
+            expert_num_tokens_cpu=None)
 
-            return expert_x, expert_x_scale, expert_tokens_meta, None, None
+        return expert_x, expert_x_scale, expert_tokens_meta, None, None
 
-        return (recv_hook, _post_recv)
-
-    def prepare(
+    def create_prepare_ops(
         self,
         a1: torch.Tensor,
         a1_scale: Optional[torch.Tensor],
@@ -183,22 +191,20 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_map: Optional[torch.Tensor],
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
-    ) -> mk.PrepareResultType:
-        recv_hook, post_recv = self.prepare_async(
-            a1,
-            a1_scale,
-            a2_scale,
-            topk_weights,
-            topk_ids,
-            num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-            quant_config,
-        )
-        recv_hook()
-        return post_recv()
+    ) -> mk.AsyncPrepareOps:
+        return mk.AsyncPrepareOps.from_generator(
+            self._create_prepare_ops(
+                a1, 
+                a1_scale, 
+                a2_scale, 
+                topk_weights, 
+                topk_ids, 
+                num_experts, 
+                expert_map, 
+                apply_router_weight_on_input, 
+                quant_config))
 
-    def finalize(
+    def _create_finalize_ops(
         self,
         output: torch.Tensor,
         fused_expert_output: torch.Tensor,
@@ -212,7 +218,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         ), ("Weight application and reduction happens in the combine kernel.")
 
         a2a_idx = dbo_current_ubatch_id()
-        do_recv_hook = dbo_enabled()
         handle = self.handles[a2a_idx]
         assert handle is not None
 
@@ -220,9 +225,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if apply_router_weight_on_input:
             # weights have already been applied.
             combine_topk_weights = torch.ones_like(topk_weights)
+            
+        ########################################################################
+        yield # Pre-combine done
+        ########################################################################
 
-        # TODO (varun) : Enable zero copy mode
-        dbo_maybe_run_recv_hook()
         _, _, recv_hook = self.buffers[a2a_idx].low_latency_combine(
             fused_expert_output,
             topk_ids,
@@ -230,8 +237,35 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             handle,
             async_finish=False,
             zero_copy=False,
-            return_recv_hook=do_recv_hook,
+            return_recv_hook=True,
             out=output)
-        if recv_hook is not None:
-            dbo_register_recv_hook(recv_hook, all_schedules=True)
-        dbo_yield(all_schedules=True)
+        
+        ########################################################################
+        yield # Combine send done
+        ########################################################################
+        
+        recv_hook()
+        
+        ########################################################################
+        yield # Combine recv done
+        ########################################################################
+        
+        return None
+        
+    def create_finalize_ops(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> mk.AsyncFinalizeOps:
+        return mk.AsyncFinalizeOps.from_generator(
+            self._create_finalize_ops(output, 
+                           fused_expert_output, 
+                           topk_weights, 
+                           topk_ids, 
+                           apply_router_weight_on_input, 
+                           weight_and_reduce_impl))
+        
