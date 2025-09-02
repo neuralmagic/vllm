@@ -5,9 +5,9 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
-    silu_mul_fp8_quant_deep_gemm_cuda)
-from vllm.model_executor.layers.fused_moe.old_batched_deep_gemm_moe import (
     silu_mul_fp8_quant_deep_gemm as gold)
+from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
+    silu_mul_fp8_quant_deep_gemm_cuda)
 from vllm.platforms import current_platform
 
 # (E, T, H, group_size, seed)

@@ -6,10 +6,10 @@ import time
 import torch
 
 from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
-    silu_mul_fp8_quant_deep_gemm_cuda,
-)
-from vllm.model_executor.layers.fused_moe.old_batched_deep_gemm_moe import (
     silu_mul_fp8_quant_deep_gemm as gold,
+)
+from vllm.model_executor.layers.fused_moe.batched_deep_gemm_moe import (
+    silu_mul_fp8_quant_deep_gemm_cuda,
 )
 from vllm.platforms import current_platform
 
@@ -70,15 +70,6 @@ configs = [
     (9, 256, 7168),
     (9, 512, 7168),
     (9, 1024, 7168),
-    # (16, 64, 2048),
-    # (32, 128, 4096),
-    # (256, 16, 7168),
-    # (256, 32, 7168),
-    # (256, 64, 7168),
-    # (256, 128, 7168),
-    # (256, 256, 7168),
-    # (256, 512, 7168),
-    # (256, 1024, 7168),
 ]
 
 
