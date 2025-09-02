@@ -221,7 +221,7 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
 
   Idx_t gate_off_128 = (base_i / 8u);
   auto input_128_ptr = reinterpret_cast<const __int128_t*>(_input);
-  auto gate_128_ptr = input_128_ptr + gate_off_128 + (tid % 64) +
+  auto gate_128_ptr = input_128_ptr + gate_off_128 + (tid % HALF_THREAD_COUNT) +
                       stride_i_t_128 * n_tokens_lower;
   auto up_128_ptr = gate_128_ptr + (H * stride_i_h) / 8u;
 
@@ -325,10 +325,11 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
   }
 }
 
+#if 0
 template <typename scalar_t, uint32_t NUM_WARPS, typename Idx_t,
           int NUM_PARALLEL_TOKENS, bool USE_UE8M0, int GROUP_SIZE = 128,
           int NUM_STAGES = 3>
-__global__ void __silu_mul_fp8_quant_deep_gemm_kernel(
+__global__ void unused_silu_mul_fp8_quant_deep_gemm_bf16_kernel(
     const scalar_t* __restrict__ _input, __nv_fp8_e4m3* __restrict__ _y_q,
     float* __restrict__ _y_s, const uint32_t* __restrict__ counts,
 
@@ -385,7 +386,7 @@ __global__ void __silu_mul_fp8_quant_deep_gemm_kernel(
 
   Idx_t gate_off_128 = (base_i / 8u);
   auto input_128_ptr = reinterpret_cast<const __int128_t*>(_input);
-  auto gate_128_ptr = input_128_ptr + gate_off_128 + (tid % 64) +
+  auto gate_128_ptr = input_128_ptr + gate_off_128 + (tid % HALF_THREAD_COUNT) +
                       stride_i_t_128 * n_tokens_lower;
   auto up_128_ptr = gate_128_ptr + (H * stride_i_h) / 8u;
 
@@ -418,7 +419,7 @@ __global__ void __silu_mul_fp8_quant_deep_gemm_kernel(
     cp_async_fence();
   };
 
-#pragma unroll
+  #pragma unroll
   for (int i = 0; i < NUM_STAGES - 1; i++) {
     load_and_advance_y_pred();
   }
@@ -444,7 +445,7 @@ __global__ void __silu_mul_fp8_quant_deep_gemm_kernel(
     auto s_gate_compute = s_gate_ptr + compute_pipeline_offset;
     auto s_up_compute = s_up_ptr + compute_pipeline_offset;
 
-#pragma unroll
+  #pragma unroll
     for (int i = 0; i < 2; i++) {
       bf16x2 gate = __float22bfloat162_rn(__bfloat1622float2(*s_gate_compute));
       bf16x2 upv = *s_up_compute;
@@ -464,14 +465,14 @@ __global__ void __silu_mul_fp8_quant_deep_gemm_kernel(
     const auto fp8max2 = make_bfloat162(fp8_max, fp8_max);
 
     auto y_s2 = make_bfloat162(y_s, y_s);
-#pragma unroll
+  #pragma unroll
     for (Idx_t i = 0; i < 2; ++i) {
       results[i] /= y_s2;
       results[i] = clip(results[i], fp8min2, fp8max2);
     }
 
     auto local_y_q_ptr = reinterpret_cast<unsigned char*>(y_q_ptr);
-#pragma unroll
+  #pragma unroll
     for (Idx_t i = 0; i < 2; ++i) {
       auto resultfp8x2 = __nv_fp8x2_e4m3(results[i]);
       auto res_u8 = reinterpret_cast<unsigned char*>(&resultfp8x2.__x);
@@ -488,6 +489,7 @@ __global__ void __silu_mul_fp8_quant_deep_gemm_kernel(
     }
   }
 }
+#endif
 
 }  // namespace vllm
 
@@ -529,14 +531,13 @@ void silu_mul_fp8_quant_deep_gemm_cuda(
     at::Tensor& y_s,           // (E, T, H//group_size) [OUT]
     int64_t group_size, double eps, double fp8_min, double fp8_max,
     bool use_ue8m0) {
-  static constexpr int NUM_WARPS = 4;
+  TORCH_CHECK(input.size(-1) % 256 == 0);
 
   using Idx_t = uint32_t;
 
   Idx_t E = input.size(0);
   Idx_t T = input.size(1);
   Idx_t H = input.size(2) / 2;
-  Idx_t G = cuda_utils::ceil_div(H, Idx_t(group_size * NUM_WARPS));
   Idx_t stride_i_e = input.stride(0);
   Idx_t stride_i_t = input.stride(1);
   Idx_t stride_i_h = input.stride(2);
@@ -550,30 +551,56 @@ void silu_mul_fp8_quant_deep_gemm_cuda(
   int stride_counts_e = counts.stride(0);
 
   static constexpr int NUM_PARALLEL_TOKENS = 16;
-  dim3 grid(E * G, NUM_PARALLEL_TOKENS);
-  dim3 block(NUM_WARPS * 32);
+  static constexpr int GROUP_SIZE = 128;
 
-  if (use_ue8m0) {
-    vllm::silu_mul_fp8_quant_deep_gemm_kernel<__nv_bfloat16, NUM_WARPS, Idx_t,
-                                              NUM_PARALLEL_TOKENS, true>
-        <<<grid, block>>>(
-            reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
-            reinterpret_cast<__nv_fp8_e4m3*>(y_q.data_ptr<at::Float8_e4m3fn>()),
-            y_s.data_ptr<float>(),
-            reinterpret_cast<uint32_t*>(counts.data_ptr<int>()), H, G,
-            stride_i_e, stride_i_t, stride_i_h, stride_yq_e, stride_yq_t,
-            stride_yq_h, stride_ys_e, stride_ys_t, stride_ys_g, stride_counts_e,
-            static_cast<float>(fp8_min), static_cast<float>(fp8_max));
+  Idx_t G;
+  dim3 block, grid;
+  auto populate_launch_params = [&](int num_warps) {
+    G = H / Idx_t(group_size * num_warps);
+    grid = dim3(E * G, NUM_PARALLEL_TOKENS);
+    block = dim3(num_warps * WARP_SIZE);
+  };
+
+#define KERNEL_FN                                                              \
+  if (use_ue8m0) {                                                             \
+    vllm::silu_mul_fp8_quant_deep_gemm_kernel<__nv_bfloat16, NUM_WARPS, Idx_t, \
+                                              NUM_PARALLEL_TOKENS, true>       \
+        <<<grid, block>>>(                                                     \
+            reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),                \
+            (__nv_fp8_e4m3*)y_q.data_ptr(), y_s.data_ptr<float>(),             \
+            reinterpret_cast<uint32_t*>(counts.data_ptr<int>()), H, G,         \
+            stride_i_e, stride_i_t, stride_i_h, stride_yq_e, stride_yq_t,      \
+            stride_yq_h, stride_ys_e, stride_ys_t, stride_ys_g,                \
+            stride_counts_e, static_cast<float>(fp8_min),                      \
+            static_cast<float>(fp8_max));                                      \
+  } else {                                                                     \
+    vllm::silu_mul_fp8_quant_deep_gemm_kernel<__nv_bfloat16, NUM_WARPS, Idx_t, \
+                                              NUM_PARALLEL_TOKENS, false>      \
+        <<<grid, block>>>(                                                     \
+            reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),                \
+            (__nv_fp8_e4m3*)y_q.data_ptr(), y_s.data_ptr<float>(),             \
+            reinterpret_cast<uint32_t*>(counts.data_ptr<int>()), H, G,         \
+            stride_i_e, stride_i_t, stride_i_h, stride_yq_e, stride_yq_t,      \
+            stride_yq_h, stride_ys_e, stride_ys_t, stride_ys_g,                \
+            stride_counts_e, static_cast<float>(fp8_min),                      \
+            static_cast<float>(fp8_max));                                      \
+  }
+
+  if (H == 3 * GROUP_SIZE) {
+    static constexpr int NUM_WARPS = 3;
+    populate_launch_params(NUM_WARPS);
+    KERNEL_FN
+  } else if (H == 2 * GROUP_SIZE) {
+    static constexpr int NUM_WARPS = 2;
+    populate_launch_params(NUM_WARPS);
+    KERNEL_FN
+  } else if (H == GROUP_SIZE) {
+    static constexpr int NUM_WARPS = 1;
+    populate_launch_params(NUM_WARPS);
+    KERNEL_FN
   } else {
-    vllm::silu_mul_fp8_quant_deep_gemm_kernel<__nv_bfloat16, NUM_WARPS, Idx_t,
-                                              NUM_PARALLEL_TOKENS, false>
-        <<<grid, block>>>(
-            reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
-            reinterpret_cast<__nv_fp8_e4m3*>(y_q.data_ptr<at::Float8_e4m3fn>()),
-            y_s.data_ptr<float>(),
-            reinterpret_cast<uint32_t*>(counts.data_ptr<int>()), H, G,
-            stride_i_e, stride_i_t, stride_i_h, stride_yq_e, stride_yq_t,
-            stride_yq_h, stride_ys_e, stride_ys_t, stride_ys_g, stride_counts_e,
-            static_cast<float>(fp8_min), static_cast<float>(fp8_max));
+    static constexpr int NUM_WARPS = 4;
+    populate_launch_params(NUM_WARPS);
+    KERNEL_FN
   }
 }
