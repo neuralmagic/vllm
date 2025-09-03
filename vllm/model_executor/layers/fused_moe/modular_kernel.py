@@ -14,7 +14,8 @@ from vllm.model_executor.layers.fused_moe.utils import (  # yapf: disable
     _resize_cache, count_expert_num_tokens)
 from vllm.utils import cdiv
 from vllm.v1.worker.ubatching import (Schedule, dbo_maybe_run_recv_hook,
-                                      dbo_register_recv_hook, dbo_yield)
+                                      dbo_register_recv_hook, dbo_yield,
+                                      dbo_current_schedule)
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -921,13 +922,17 @@ class FusedMoEModularKernel(torch.nn.Module):
 
             recv_done = dbo_register_recv_hook(
                 lambda: prepare_ops.recv(), 
-                schedules=(Schedule.MLP_OVERLAP, ))
+                schedules=(Schedule.MLP_OVERLAP, Schedule.MLP_SHARED_OVERLAP))
             dbo_yield(schedules=(Schedule.MLP_OVERLAP, ))
 
-            if self.shared_experts is not None:
+            # If we are using the MLP_SHARED_OVERLAP schedule, we overlap with 
+            # the combine instead of the dispatch.
+            # TODO(lucas): refactor this scheduling logic
+            if self.shared_experts is not None \
+                and dbo_current_schedule() != Schedule.MLP_SHARED_OVERLAP:
                 shared_output = self.shared_experts(a1)
 
-            dbo_yield(schedules=(Schedule.MLA_ATTN_OVERLAP, ))
+            dbo_yield(schedules=(Schedule.ATTN_SHARED_OVERLAP, Schedule.MLP_SHARED_OVERLAP))
 
             if not recv_done:
                 prepare_ops.recv()
@@ -990,6 +995,11 @@ class FusedMoEModularKernel(torch.nn.Module):
             finalize_ops.prepare()
             dbo_maybe_run_recv_hook()
             finalize_ops.send()
+
+            # If we didn't overlap with the dispatch overlap with the combine
+            # TODO(lucas): refactor this scheduling logic
+            if self.shared_experts is not None and shared_output is None:
+                shared_output = self.shared_experts(a1)
 
             if dbo_register_recv_hook(
                 lambda: finalize_ops.recv(), all_schedules=True):

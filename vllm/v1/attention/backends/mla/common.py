@@ -1305,7 +1305,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     layer._q_scale)
                 decode_q_pe = decode_q_pe.reshape(q_pe_shape)
 
-        dbo_yield(schedules=(Schedule.MLA_ATTN_OVERLAP,))
+        dbo_yield(schedules=(Schedule.ATTN_SHARED_OVERLAP,))
 
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(

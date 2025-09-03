@@ -190,8 +190,8 @@ class UBatchWrapper:
         # Map CLI/config schedule string to Schedule enum
         schedule_str = self.vllm_config.parallel_config.microbatch_schedule
         schedule = Schedule.MLP_OVERLAP
-        if schedule_str == Schedule.MLA_ATTN_OVERLAP.value:
-            schedule = Schedule.MLA_ATTN_OVERLAP
+        if schedule_str == Schedule.ATTN_SHARED_OVERLAP.value:
+            schedule = Schedule.ATTN_SHARED_OVERLAP
 
         ubatch_ctxs = make_ubatch_contexts(
             num_micro_batches=len(ubatch_slices),
