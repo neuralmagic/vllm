@@ -99,6 +99,11 @@ def parse_args():
         help=("Compilation optimization (O) level 0-3."),
     )
     parser.add_argument(
+        "--compilation-config",
+        type=int,
+        help=("Compilation optimization (O) level 0-3."),
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
     )

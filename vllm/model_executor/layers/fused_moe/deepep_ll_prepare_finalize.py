@@ -44,13 +44,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     SUPPORTED_HIDDEN_SIZES = [2048, 2560, 4096, 5120, 6144, 7168]
 
     def __init__(self,
-                 buffers: list[deep_ep.Buffer],
+                 buffer: deep_ep.Buffer,
                  max_tokens_per_rank: int,
                  num_dispatchers: int,
                  use_fp8_dispatch: bool = False):
         super().__init__()
 
-        self.buffers = buffers
+        self.buffer = buffer
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
         # The dispatch function returns a handle that the combine function

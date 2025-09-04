@@ -29,6 +29,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm.compilation.ubatch_utils import UbatchSlice
+
 logger = init_logger(__name__)
 _KV_CACHE_LAYOUT_OVERRIDE = None
 
@@ -71,12 +73,6 @@ class CommonAttentionMetadata:
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: Optional[torch.Tensor] = None
     num_logits_indices: Optional[int] = None
-
-
-@dataclass
-class UbatchSlice:
-    request_slice: slice
-    token_slice: slice
 
 
 def slice_query_start_locs(
@@ -124,6 +120,11 @@ def _make_metadata_with_slice(
     max_query_len = int(
         torch.max(torch.abs(query_start_loc_cpu[1:] -
                             query_start_loc_cpu[:-1])).item())
+
+    # This is to account for the case where we are in a dummy 
+    # run and query_start_loc_cpu is full of 0s
+    if max_query_len == 0:
+        max_query_len = attn_metadata.max_query_len
 
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
@@ -209,6 +210,23 @@ class AttentionMetadataBuilder(abc.ABC, Generic[M]):
             fast_build: The meta-data will prioritize speed of building over
                 then speed at execution. Can be used for spec-decode where the
                 result of a build call may only be used for few layers/iters.
+        """
+        raise NotImplementedError
+
+    def reorder_batch(self, input_batch: "InputBatch",
+                      scheduler_output: "SchedulerOutput") -> bool:
+        """
+        Update the order of requests in the batch based on the attention
+        backend's needs. For example, some attention backends (namely MLA) may
+        want to separate requests based on if the attention computation will be
+        compute-bound or memory-bound.
+
+        Args:
+            input_batch: input batch
+            scheduler_output: scheduler output.
+
+        Returns:
+            True if the batch was modified, False otherwise.
         """
         raise NotImplementedError
 
@@ -692,7 +710,7 @@ def reorder_batch_to_split_decodes_and_prefills(
 
     for i, req_id in enumerate(input_batch.req_ids):
         num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-        # for now treat 1 scheduled token as "decode" even if its not,
+        # for now treat 1 scheduled token as "decode" even if it's not,
         # we should update this to something like < 8 in the future but
         # currently the TritonMLA._forward_decode only supports
         # num_tokens = 1

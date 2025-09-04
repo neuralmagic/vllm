@@ -325,6 +325,51 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         raise NotImplementedError
 
+    def supports_async(self) -> bool:
+        """
+        Indicates whether or not this class implements prepare_async.
+        """
+        return False
+
+    def prepare_async(
+        self,
+        a1: torch.Tensor,
+        a1_scale: Optional[torch.Tensor],
+        a2_scale: Optional[torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: Optional[torch.Tensor],
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+    ) -> ReceiverType:
+        """
+        Perform any quantization (and/or) dispatching needed for this kernel
+        but do not wait for results from other workers.
+        - a1: The (unquantized) input to the MoE layer.
+        - a1_scale: Optional scales for a1
+        - a2_scale: Optional scales for the second MoE gemm.  Required to make
+          sure the quantization is consistent for both gemms.
+        - topk_ids: The topk ids.
+        - topk_weights: The topk weights.
+        - num_experts: The total number of experts in the global expert space.
+        - expert_map: A tensor mapping expert indices from the global expert
+          space to the local expert space of the expert parallel shard.
+        - apply_router_weight_on_input: When True, apply the weights to the
+          activations, before quantization + dispatching.
+
+        Returns a callback that when invoked waits for results from other
+        workers and has the same return signature as `prepare`, e.g.
+
+        receiver = obj.prepare_async(...)
+        a, a_scales, expert_meta, topk_ids, topk_weights = receiver()
+
+        is equivalent to:
+
+        a, a_scales, expert_meta, topk_ids, topk_weights = obj.prepare(...)
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def create_finalize_ops(
         self,

@@ -142,10 +142,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 all_to_all_args[
                     "group_name"] = all2all_manager.cpu_group.group_name
 
-            handles = all2all_manager.get_handles(all_to_all_args)
+            handle = all2all_manager.get_handle(all_to_all_args)
 
             prepare_finalize = PplxPrepareAndFinalize(
-                handles,
+                handle,
                 max_num_tokens=moe.max_num_tokens,
                 num_local_experts=moe.num_local_experts,
                 num_dispatchers=num_dispatchers,
@@ -171,7 +171,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_global_experts=moe.num_experts,
                 num_local_experts=moe.num_experts //
                 all2all_manager.world_size)
-            handles = all2all_manager.get_handles(all_to_all_args)
+            handle = all2all_manager.get_handle(all_to_all_args)
 
             # Note : We may want to use FP8 dispatch even otherwise just to
             # reduce datamovement
@@ -182,7 +182,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                                 == DEEPEP_QUANT_BLOCK_SHAPE)
 
             prepare_finalize = DeepEPLLPrepareAndFinalize(
-                handles,
+                handle,
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 use_fp8_dispatch=use_fp8_dispatch,
@@ -246,6 +246,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -402,6 +403,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -429,6 +431,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_map=expert_map,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
@@ -452,6 +455,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -471,6 +475,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype,
             enable_eplb=enable_eplb,
@@ -536,6 +541,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -562,6 +568,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_map,
             custom_routing_function,
             scoring_func,
+            routed_scaling_factor,
             e_score_correction_bias,
             apply_router_weight_on_input,
             activation,
@@ -581,6 +588,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -619,6 +627,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -639,6 +648,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             raise NotImplementedError(
                 "Expert score correction bias is not supported for TPU.")
         assert activation == "silu", f"{activation} is not supported for TPU."
+        assert routed_scaling_factor == 1.0, \
+            f"routed_scaling_factor {routed_scaling_factor} is not supported " \
+            f"for TPU."
         if enable_eplb is not False or expert_load_view is not None or \
                 logical_to_physical_map is not None or \
                 logical_replica_count is not None:
@@ -768,6 +780,7 @@ class FusedMoE(CustomOp):
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -850,6 +863,7 @@ class FusedMoE(CustomOp):
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
         self.scoring_func = scoring_func
+        self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
@@ -1392,6 +1406,7 @@ class FusedMoE(CustomOp):
         return [
             weight.view(self.local_num_experts, -1) for name, weight in weights
             if name not in NON_EXPERT_WEIGHTS
+            and not name.startswith("_shared_experts.")
         ]
 
     def set_eplb_state(
@@ -1422,6 +1437,7 @@ class FusedMoE(CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         indices_type: Optional[torch.dtype] = None,
         enable_eplb: bool = False,
@@ -1466,6 +1482,7 @@ class FusedMoE(CustomOp):
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
                 e_score_correction_bias=e_score_correction_bias)
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
@@ -1665,6 +1682,7 @@ class FusedMoE(CustomOp):
                 num_expert_group=self.num_expert_group,
                 custom_routing_function=self.custom_routing_function,
                 scoring_func=self.scoring_func,
+                routed_scaling_factor=self.routed_scaling_factor,
                 e_score_correction_bias=self.e_score_correction_bias,
                 activation=self.activation,
                 enable_eplb=self.enable_eplb,
@@ -1761,6 +1779,7 @@ class FusedMoE(CustomOp):
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
+            routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,

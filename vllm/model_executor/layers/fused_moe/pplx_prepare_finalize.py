@@ -64,7 +64,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     def __init__(
         self,
-        a2as: list[pplx.AllToAll],
+        a2a: pplx.AllToAll,
         max_num_tokens: int,
         num_local_experts: int,
         num_dispatchers: int,
@@ -72,7 +72,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         super().__init__()
         assert max_num_tokens > 0
         assert num_local_experts > 0
-        self.a2as = a2as
+        self.a2a = a2a
         self.max_num_tokens = max_num_tokens
         self.num_local_experts = num_local_experts
         self.num_dispatchers_ = num_dispatchers
@@ -107,7 +107,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     ) -> mk.ReceiverType:
         num_tokens = a1.size(0)  # M
         hidden_dim = a1.size(-1)  # K
-        a2a_idx = dbo_current_ubatch_id()
 
         assert topk_ids.size(0) == num_tokens
         # expert_map should be None because with expert map, -1 id is used for
@@ -291,7 +290,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # This argument is optional
         # There's not much point setting this unless it is != topk_ids.size(0)
         bound_m: Optional[torch.Tensor] = None
-        a2a_idx = dbo_current_ubatch_id()
 
         # TODO (bnell): fails in test_pplx_moe.py, figure out what's going on
         #num_tokens = output.size(0)  # M

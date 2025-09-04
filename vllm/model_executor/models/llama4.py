@@ -100,8 +100,8 @@ class Llama4MoE(nn.Module):
 
     def forward(self, hidden_states):
         router_logits, _ = self.router(hidden_states)
-        shared_out = self.shared_expert(hidden_states)
-        routed_out = self.experts(
+
+        shared_out, routed_out = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )

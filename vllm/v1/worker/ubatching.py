@@ -304,8 +304,6 @@ def make_ubatch_contexts(
     gpu_compute_done_events = [
         torch.cuda.Event() for _ in range(num_micro_batches)
     ]
-    device = device or torch.cuda.current_device()
-    # comm_stream = torch.cuda.Stream(device)
 
     assert len(forward_contexts) == 2
 

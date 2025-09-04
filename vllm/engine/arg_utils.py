@@ -318,7 +318,6 @@ class EngineArgs:
     enable_microbatching: bool = ParallelConfig.enable_microbatching
     microbatching_token_threshold: int = ParallelConfig.microbatching_token_threshold
     microbatch_schedule: str = ParallelConfig.microbatch_schedule
-    enable_async_comms: bool = ParallelConfig.enable_async_comms
     eplb_config: EPLBConfig = get_field(ParallelConfig, "eplb_config")
     enable_eplb: bool = ParallelConfig.enable_eplb
     num_redundant_experts: int = EPLBConfig.num_redundant_experts
@@ -368,6 +367,7 @@ class EngineArgs:
     disable_mm_preprocessor_cache: bool = False  # DEPRECATED
     mm_processor_cache_gb: float = MultiModalConfig.mm_processor_cache_gb
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    io_processor_plugin: Optional[str] = None
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     # LoRA fields
     enable_lora: bool = False
@@ -581,6 +581,8 @@ class EngineArgs:
                                  **model_kwargs["override_attention_dtype"])
         model_group.add_argument("--logits-processors",
                                  **model_kwargs["logits_processors"])
+        model_group.add_argument("--io-processor-plugin",
+                                 **model_kwargs["io_processor_plugin"])
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -1007,6 +1009,7 @@ class EngineArgs:
             model_impl=self.model_impl,
             override_attention_dtype=self.override_attention_dtype,
             logits_processors=self.logits_processors,
+            io_processor_plugin=self.io_processor_plugin,
         )
 
     def validate_tensorizer_args(self):
@@ -1309,7 +1312,6 @@ class EngineArgs:
             enable_microbatching=self.enable_microbatching,
             microbatching_token_threshold=self.microbatching_token_threshold,
             microbatch_schedule=self.microbatch_schedule,
-            enable_async_comms=self.enable_async_comms,
             enable_eplb=self.enable_eplb,
             eplb_config=self.eplb_config,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
@@ -1450,17 +1452,6 @@ class EngineArgs:
                                recommend_to_remove=True)
             return False
 
-        # Triton v3.3 has f16 conversion regression issue on Turing and Volta,
-        # which broke fp16 inference
-        # see: https://github.com/triton-lang/triton/issues/6698
-        if (current_platform.is_cuda()
-                and not current_platform.has_device_capability(80)
-                and model_config.dtype == torch.float16):
-            _raise_or_fallback(
-                feature_name="Compute Capability < 8.0 with FP16",
-                recommend_to_remove=False)
-            return False
-
         if self.kv_cache_dtype != "auto":
             supported = current_platform.is_kv_cache_dtype_supported(
                 self.kv_cache_dtype, model_config)
@@ -1513,6 +1504,8 @@ class EngineArgs:
             "TRITON_MLA",
             "CUTLASS_MLA",
             "FLASHMLA",
+            "FLASHMLA_VLLM_V1",
+            "FLASH_ATTN_MLA",
             "FLASHINFER",
             "FLASHINFER_VLLM_V1",
             "ROCM_AITER_MLA",

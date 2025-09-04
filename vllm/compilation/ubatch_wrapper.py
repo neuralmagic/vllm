@@ -10,14 +10,12 @@ import torch
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed.parallel_state import is_global_first_rank
 from vllm.forward_context import (create_forward_context, get_forward_context,
                                   override_forward_context)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.v1.worker.ubatching import (Schedule, UBatchContext,
-                                      make_ubatch_contexts)
+from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts, Schedule
 
 logger = init_logger(__name__)
 
@@ -44,14 +42,14 @@ class UBatchWrapper:
     def __init__(self, runnable: Callable, vllm_config: VllmConfig,
                  runtime_mode: CUDAGraphMode, device: torch.cuda.device,
                  delayed_start: bool = False):
+
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
-        self.comm_stream = torch.cuda.Stream()
-        self.device = device
+        self.comm_stream = torch.cuda.Stream(device=device)
         self.ready_barrier = threading.Barrier(3)
         self.delayed_start = delayed_start
-        self.cudagraphs = {}
+        self.cudagraphs: dict[int, CUDAGraphMetaData] = {}
 
         self.cudagraph_wrapper = None
         self.graph_pool = None
@@ -73,15 +71,36 @@ class UBatchWrapper:
         return self.runnable
 
     def _capture_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
+        """
+        Capture a cudagraph for a microbatched run.
+
+        The logic here is somewhat complicated because we need to make sure that
+        each of the ubatch threads initialize the cuda context before we start
+        the graph capture.
+
+        The flow is as follows:
+        1. The main thread starts up each ubatch thread. Each thread will 
+        initialize its cuda context (torch.cuda.current_blas_handle())
+        before going to sleep upon entering the ubatch_context.
+
+        2. The main thread starts the graph capture and wakes up the first 
+        ubatch thread.
+
+        3. Each ubatch thread runs the model to completion and returns the 
+        completed output tensors back to the main thread.
+
+        4. The main thread stores the captured cudagraph along with its metadata
+        and returns
+        """
 
         @torch.inference_mode()
         def _capture_ubatch_thread(results, ubatch_metadata):
-            context = ubatch_metadata.context
-            with torch.cuda.stream(context.compute_stream):
+            ubatch_context = ubatch_metadata.context
+            with torch.cuda.stream(ubatch_context.compute_stream):
                 _ = torch.cuda.current_blas_handle()
-            with torch.cuda.stream(context.comm_stream):
+            with torch.cuda.stream(ubatch_context.comm_stream):
                 _ = torch.cuda.current_blas_handle()
-            with context:
+            with ubatch_context:
                 model_output = model(
                     input_ids=ubatch_metadata.input_ids,
                     positions=ubatch_metadata.positions,
@@ -101,7 +120,6 @@ class UBatchWrapper:
         with override_forward_context(None):
             ubatch_threads = []
             for metadata in ubatch_metadata:
-                start_signal = threading.Event()
                 thread = threading.Thread(target=_capture_ubatch_thread,
                                           args=(
                                               results,
@@ -111,7 +129,7 @@ class UBatchWrapper:
                 thread.start()
             self.ready_barrier.wait()  # Wait for both threads to be ready
 
-            # DO capture
+            # Capture the cudagraph
             cudagraph_metadata = \
                 CUDAGraphMetaData(
                             cudagraph=torch.cuda.CUDAGraph(),
@@ -168,22 +186,18 @@ class UBatchWrapper:
 
     def _make_ubatch_metadata(self, ubatch_slices, attn_metadata, input_ids,
                               positions, inputs_embeds, intermediate_tensors,
-                              compute_stream, num_tokens_across_dp,
-                              batch_descriptor,
+                              compute_stream, dp_metadata, batch_descriptor,
                               cudagraph_runtime_mode,
                               delayed_start: bool = False) -> list[UbatchMetadata]:
 
         # Create one forward context per ubatch
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
-            num_tokens = (ubatch_slice.token_slice.stop -
-                          ubatch_slice.token_slice.start)
             forward_contexts.append(
                 create_forward_context(
                     attn_metadata[i] if attn_metadata is not None else None,
                     self.vllm_config,
-                    num_tokens=num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
+                    dp_metadata=dp_metadata,
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode))
 
@@ -199,10 +213,8 @@ class UBatchWrapper:
             compute_stream=compute_stream,
             forward_contexts=forward_contexts,
             ready_barrier=self.ready_barrier,
-            device=self.device,
-            schedule=schedule,
-            delayed_start=delayed_start,
-        )
+            delayed_start=delayed_start)
+
 
         ubatch_metadata: list[UbatchMetadata] = []
         for i, ubatch_slice in enumerate(ubatch_slices):
@@ -243,11 +255,12 @@ class UBatchWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         ubatch_slices = forward_context.ubatch_slices
-        # If there's no ubatching, just run the runnable object
-        # Check the cudagraph_runtime_mode
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+
+        # If there's no ubatching, just run the runnable object
         if ubatch_slices is None:
-            if cudagraph_runtime_mode is CUDAGraphMode.NONE:
+            if cudagraph_runtime_mode in (CUDAGraphMode.NONE,
+                                          CUDAGraphMode.PIECEWISE):
                 return self.runnable(*args, **kwargs)
             else:
                 assert self.cudagraph_wrapper is not None
@@ -262,16 +275,13 @@ class UBatchWrapper:
         inputs_embeds = kwargs['inputs_embeds']
         compute_stream = torch.cuda.current_stream()
 
-        # TODO (Sage) I'm not sure this is exactly correct.
-        # We'll have to figure this out
         dp_metadata = forward_context.dp_metadata
+
+        # We shouldn't be here unless we are running with multiple DP ranks
         assert dp_metadata is not None
-        num_tokens_across_dp = dp_metadata._num_tokens_across_dp
 
         if num_tokens not in self.cudagraphs \
             and cudagraph_runtime_mode is CUDAGraphMode.FULL:
-            if is_global_first_rank():
-                logger.debug(f"CAPTURING CUDAGRAPH {num_tokens}")
             ubatch_metadata = self._make_ubatch_metadata(
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,
@@ -280,22 +290,16 @@ class UBatchWrapper:
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 compute_stream=compute_stream,
-                num_tokens_across_dp=num_tokens_across_dp,
+                dp_metadata=dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE)
 
             return self._capture_ubatches(ubatch_metadata, self.model)
         elif num_tokens in self.cudagraphs:
-            if is_global_first_rank():
-                logger.debug(f"REPLAYING CUDAGRAPH {num_tokens}")
             cudagraph_metadata = self.cudagraphs[num_tokens]
             cudagraph_metadata.cudagraph.replay()
             return cudagraph_metadata.outputs
         else:
-            if is_global_first_rank():
-                logger.debug(
-                    f"RUNNING UBATCHED {num_tokens} CUDAGRAPH MODE {cudagraph_runtime_mode}"
-                )
             ubatch_metadata = self._make_ubatch_metadata(
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,
@@ -304,7 +308,7 @@ class UBatchWrapper:
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 compute_stream=compute_stream,
-                num_tokens_across_dp=num_tokens_across_dp,
+                dp_metadata=dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE)
             return self._run_ubatches(ubatch_metadata, self.model)
