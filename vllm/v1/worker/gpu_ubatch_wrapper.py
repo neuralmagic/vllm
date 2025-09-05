@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import dataclasses
 import threading
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import numpy as np
 import torch
 
 import vllm.envs as envs
@@ -20,7 +21,7 @@ from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
 logger = init_logger(__name__)
 
 
-@dataclasses.dataclass
+@dataclass
 class UbatchMetadata:
     context: UBatchContext
     input_ids: torch.Tensor
@@ -30,12 +31,11 @@ class UbatchMetadata:
     num_tokens: int
 
 
-@dataclasses.dataclass
+@dataclass
 class CUDAGraphMetaData:
     cudagraph: torch.cuda.CUDAGraph
     ubatch_metadata: UbatchMetadata
     outputs: Optional[Any] = None
-
 
 class UBatchWrapper:
 
