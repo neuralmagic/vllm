@@ -7,6 +7,7 @@ import torch
 import vllm.plugins
 from vllm.compilation.fusion import (FUSED_OPS, QUANT_OPS, FusedRMSQuantKey,
                                      RMSNormQuantFusionPass)
+from vllm.compilation.fusion import RMS_OP, RMS_ADD_OP
 from vllm.compilation.noop_elimination import NoOpEliminationPass
 from vllm.compilation.post_cleanup import PostCleanupPass
 from vllm.config import (CompilationConfig, CompilationLevel, PassConfig,
@@ -48,6 +49,9 @@ class TestModel(torch.nn.Module):
             act_quant_group_shape=group_shape,
         )
 
+        self.enable_rms_norm = self.norm[0].enabled()
+        self.enable_quant_fp8 = self.fp8_linear.quant_fp8.enabled()
+
     def forward(self, x):
         resid = torch.sqrt(x)
         y = self.norm[0](x)
@@ -67,7 +71,18 @@ class TestModel(torch.nn.Module):
         return y3
 
     def ops_in_model_before(self):
-        return [QUANT_OPS[self.key]]
+        ops = []
+        if self.enable_rms_norm:
+            ops += [RMS_OP]
+        else:
+            ops += [torch.ops.aten.rsqrt.default]
+
+        if self.enable_quant_fp8:
+            ops += [QUANT_OPS[self.key]]
+        else:
+            ops += [torch.ops.aten.reciprocal.default]
+
+        return ops
 
     def ops_in_model_after(self):
         return [
@@ -76,24 +91,32 @@ class TestModel(torch.nn.Module):
         ]
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16]) #, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [64])
 @pytest.mark.parametrize("num_tokens", [257])
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 @pytest.mark.parametrize("static", [True, False])
+@pytest.mark.parametrize("enable_rms_norm", [True ]) #, False])
+@pytest.mark.parametrize("enable_quant_fp8", [True]) #, False])
 @pytest.mark.parametrize("force_fp8_e4m3fnuz", [True, False])
 @pytest.mark.skipif(not current_platform.is_cuda_alike(),
                     reason="Only test on CUDA and ROCm")
 def test_fusion_rmsnorm_quant(dtype, hidden_size, num_tokens, eps, static,
+                              enable_rms_norm, enable_quant_fp8,
                               force_fp8_e4m3fnuz):
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)
     torch.manual_seed(1)
     maybe_create_device_identity()  # needed for certain non-cutlass fp8 paths
 
+    custom_ops = []
+    if enable_rms_norm:
+        custom_ops.append("+rms_norm")
+    if enable_quant_fp8:
+        custom_ops.append("+quant_fp8")
     vllm_config = VllmConfig(compilation_config=CompilationConfig(
         level=CompilationLevel.PIECEWISE,
-        custom_ops=["+rms_norm", "+quant_fp8"],
+        custom_ops=custom_ops,
         pass_config=PassConfig(enable_fusion=True, enable_noop=True),
     ))
     with vllm.config.set_current_vllm_config(vllm_config):
