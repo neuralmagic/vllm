@@ -8,6 +8,7 @@ import vllm.plugins
 from vllm.compilation.fusion import (FUSED_OPS, QUANT_OPS, FusedRMSQuantKey,
                                      RMSNormQuantFusionPass)
 from vllm.compilation.noop_elimination import NoOpEliminationPass
+from vllm.compilation.post_cleanup import PostCleanupPass
 from vllm.config import (CompilationConfig, CompilationLevel, PassConfig,
                          VllmConfig)
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -99,8 +100,9 @@ def test_fusion_rmsnorm_quant(dtype, hidden_size, num_tokens, eps, static,
         # Reshape pass is needed for the fusion pass to work
         noop_pass = NoOpEliminationPass(vllm_config)
         fusion_pass = RMSNormQuantFusionPass(vllm_config)
+        cleanup_pass = PostCleanupPass(vllm_config)
 
-        backend = TestBackend(noop_pass, fusion_pass)
+        backend = TestBackend(noop_pass, fusion_pass, cleanup_pass)
         model = TestModel(hidden_size, eps, static, force_fp8_e4m3fnuz)
 
         # First dimension dynamic
