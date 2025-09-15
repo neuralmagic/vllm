@@ -325,8 +325,9 @@ class EngineArgs:
     data_parallel_backend: str = ParallelConfig.data_parallel_backend
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_dbo: bool = ParallelConfig.enable_dbo
-    dbo_decode_token_threshold: int = \
-        ParallelConfig.dbo_decode_token_threshold
+    dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
+    dbo_prefill_token_threshold: int = \
+        ParallelConfig.dbo_prefill_token_threshold
     eplb_config: EPLBConfig = get_field(ParallelConfig, "eplb_config")
     enable_eplb: bool = ParallelConfig.enable_eplb
     num_redundant_experts: int = EPLBConfig.num_redundant_experts
@@ -698,6 +699,9 @@ class EngineArgs:
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
             **parallel_kwargs["dbo_decode_token_threshold"])
+        parallel_group.add_argument(
+            "--dbo-prefill-token-threshold",
+            **parallel_kwargs["dbo_prefill_token_threshold"])
         parallel_group.add_argument("--enable-eplb",
                                     **parallel_kwargs["enable_eplb"])
         parallel_group.add_argument("--eplb-config",
@@ -1341,6 +1345,7 @@ class EngineArgs:
             enable_expert_parallel=self.enable_expert_parallel,
             enable_dbo=self.enable_dbo,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,
+            dbo_prefill_token_threshold=self.dbo_prefill_token_threshold,
             enable_eplb=self.enable_eplb,
             eplb_config=self.eplb_config,
             max_parallel_loading_workers=self.max_parallel_loading_workers,

@@ -13,7 +13,8 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.utils import (  # yapf: disable
     _resize_cache, count_expert_num_tokens)
 from vllm.utils import cdiv
-from vllm.v1.worker.ubatching import (dbo_enabled, dbo_maybe_run_recv_hook,
+from vllm.v1.worker.ubatching import (dbo_current_ubatch_id, dbo_enabled,
+                                      dbo_maybe_run_recv_hook,
                                       dbo_register_recv_hook, dbo_yield)
 
 #
@@ -528,9 +529,15 @@ class FusedMoEModularKernel(torch.nn.Module):
     layer due to any layer specific state that may be used by the component
     objects.
     """
-    fused_out_buffer = SharedResizableBuffer()
-    workspace13_buffer = SharedResizableBuffer()
-    workspace2_buffer = SharedResizableBuffer()
+
+    class SharedBuffers:
+
+        def __init__(self) -> None:
+            self.fused_out = SharedResizableBuffer()
+            self.workspace13 = SharedResizableBuffer()
+            self.workspace2 = SharedResizableBuffer()
+
+    shared_buffers: list[SharedBuffers] = [SharedBuffers(), SharedBuffers()]
 
     def __init__(
         self,
@@ -579,14 +586,18 @@ class FusedMoEModularKernel(torch.nn.Module):
              a1, a1q, M, N, K, top_k, global_num_experts, local_num_experts,
              expert_tokens_meta)
 
+        # select per-ubatch buffers to avoid cross-ubatch reuse under DBO
+        ubatch_idx = dbo_current_ubatch_id()
+        buffers = self.shared_buffers[ubatch_idx]
+
         # We can reuse the memory between cache1 and cache3 because by the
         # time we need cache3, we're done with cache1.
-        workspace13 = self.workspace13_buffer.get(workspace13_shape,
-                                                  device=a1.device,
-                                                  dtype=workspace_dtype)
-        workspace2 = self.workspace2_buffer.get(workspace2_shape,
-                                                device=a1.device,
-                                                dtype=workspace_dtype)
+        workspace13 = buffers.workspace13.get(workspace13_shape,
+                                              device=a1.device,
+                                              dtype=workspace_dtype)
+        workspace2 = buffers.workspace2.get(workspace2_shape,
+                                            device=a1.device,
+                                            dtype=workspace_dtype)
 
         assert fused_out is None or fused_out.shape == fused_out_shape, (
             f"fused_out {fused_out.shape} but expected {fused_out_shape}")
@@ -678,9 +689,11 @@ class FusedMoEModularKernel(torch.nn.Module):
         (_, _, fused_out_shape, _) = self.fused_experts.workspace_shapes(
             a1, a1q, M, N, K, top_k, global_num_experts, local_num_experts,
             expert_tokens_meta)
-        fused_out = self.fused_out_buffer.get(fused_out_shape,
-                                              device=a1q.device,
-                                              dtype=a1.dtype)
+        ubatch_idx = dbo_current_ubatch_id()
+        buffers = self.shared_buffers[ubatch_idx]
+        fused_out = buffers.fused_out.get(fused_out_shape,
+                                          device=a1q.device,
+                                          dtype=a1.dtype)
 
         def slice_input_tensors(
             chunk_idx: int
@@ -826,7 +839,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         if not self.prepare_finalize.supports_async():
             # We shouldn't be running an a2a kernel that doesn't
             # support async prepare/finalize
-            assert not dbo_enabled()
 
             # Run shared experts serially with dispatch.
             if self.shared_experts is not None:
@@ -847,7 +859,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         else:
             # Overlap shared expert compute with all2all dispatch.
             dbo_maybe_run_recv_hook()
-            hook, receiver = self.prepare_finalize.prepare_async(
+            prepare_ret = self.prepare_finalize.prepare_async(
                 a1,
                 a1_scale,
                 a2_scale,
@@ -862,13 +874,19 @@ class FusedMoEModularKernel(torch.nn.Module):
             if self.shared_experts is not None:
                 shared_output = self.shared_experts(a1)
 
-            # If DBO is being used, register the hook with the ubatch context
-            # and call it in dbo_maybe_run_recv_hook instead of passing it to
-            # the receiver.
-            dbo_register_recv_hook(hook)
-            dbo_yield()
-            if not dbo_enabled():
-                hook()
+            # TODO(lucas): refactor this in the alternative schedules followup
+            if isinstance(prepare_ret, tuple):
+                hook, receiver = prepare_ret
+            else:
+                hook = None
+                receiver = prepare_ret
+
+            if hook is not None:
+                if dbo_enabled():
+                    dbo_register_recv_hook(hook)
+                    dbo_yield()
+                else:
+                    hook()
 
             (a1q, a1q_scale, expert_tokens_meta, _expert_topk_ids,
              _expert_topk_weights) = receiver()
