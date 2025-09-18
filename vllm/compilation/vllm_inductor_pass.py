@@ -14,8 +14,8 @@ from torch._inductor.pattern_matcher import PatternMatcherPass
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-from .inductor_pass import InductorPass
 from ..utils import unique_filepath
+from .inductor_pass import InductorPass
 
 logger = init_logger(__name__)
 
@@ -67,6 +67,9 @@ class VllmInductorPass(InductorPass):
 class VllmPatternMatcherPass(VllmInductorPass):
     """
     A VllmInductorPass that uses the Inductor pattern matcher.
+    Its main use is providing the dump_patterns utility that dumps the
+    Inductor pattern matcher patterns into a file, which greatly aids debugging.
+
     TODO(luka) move more utilities to this pass.
     """
     matched_count: int = 0
@@ -78,6 +81,20 @@ class VllmPatternMatcherPass(VllmInductorPass):
     _FUNC_PATTERN: ClassVar[re.Pattern] = re.compile(
         r"<function ([^ ]+) at 0x[0-9a-fA-F]+>")
 
+    def _replace_op_overloads(self, string: str) -> str:
+        """Replace <OpOverload(..., ...)> with nicer formulations"""
+        return self._OP_OVERLOAD_PATTERN.sub(
+            lambda m: f"torch.ops.{m.group(1)}.{m.group(2)}",
+            string,
+        )
+
+    def _replace_func_repr(self, string: str) -> str:
+        # Replace <function a.<locals>.b at 0x75d...> with 'a.b'
+        return self._FUNC_PATTERN.sub(
+            lambda m: f"'{m.group(1).replace('<locals>.', '')}'",
+            string,
+        )
+
     def dump_patterns(self, config: VllmConfig, pm_pass: PatternMatcherPass):
         """
         If debug dumping is enabled, dump the Inductor pattern-matcher patterns
@@ -86,6 +103,9 @@ class VllmPatternMatcherPass(VllmInductorPass):
         This method does its best to print something that looks like Python code
         for easier debugging and potentially navigation. If any errors appear in
         the output, please add to this method.
+
+        TODO PatternPrettyPrinter, return pattern, manually trace graph to print.
+        Also TODO: maybe add pattern base class with utilities.
         """
         debug_dump_path = config.compilation_config.debug_dump_path
         if not debug_dump_path:
@@ -116,23 +136,39 @@ class VllmPatternMatcherPass(VllmInductorPass):
                 else:
                     node_repr = repr(node)
 
+                node_repr = self._replace_op_overloads(node_repr)
+
                 print(f"{node_repr}: [", file=f)
                 for pattern in patterns:
-                    # Replace <OpOverload(..., ...)> with nicer formulations
-                    pattern_repr = self._OP_OVERLOAD_PATTERN.sub(
-                        lambda m: f"torch.ops.{m.group(1)}.{m.group(2)}",
-                        repr(pattern),
-                    )
-                    # Replace '<function a.<locals>.b at 0x75d...>' with 'a.b'
-                    pattern_repr = self._FUNC_PATTERN.sub(
-                        lambda m: f"'{m.group(1).replace('<locals>.', '')}'",
-                        pattern_repr,
-                    )
+                    pattern_repr = self._replace_op_overloads(repr(pattern))
+                    pattern_repr = self._replace_func_repr(pattern_repr)
 
                     # also wrap wildcards (and make yapf happy)
-                    print(f"  {pattern_repr.replace('*', '\'*\'')},", file=f)
+                    pattern_repr = pattern_repr.replace('*', '\'*\'')
+
+                    print(f"  {pattern_repr},", file=f)
                 print("]", file=f)
-            print("}", file=f)
+            print("}\n\n\n", file=f)
+            print(
+                "# ===============\n"
+                "# PATTERN GRAPHS:\n"
+                "# A pattern might have multiple graphs associated with it.\n"
+                "# That's because search patterns ignore scalars and shapes,\n"
+                "# so different traced patterns could produce the same search pattern.\n"
+                "# ===============\n",
+                file=f)
+
+            for i, (pattern,
+                    graphs) in enumerate(pm_pass.seen_patterns.items()):
+                print("\n")
+                print(f"# Pattern {i}:", file=f)
+                print(pattern, file=f)
+                print("\n\n")
+                for j, graph in enumerate(graphs):
+                    print(f"# Pattern {i}, graph {j}:", file=f)
+                    print('"""', file=f)
+                    print(graph, file=f)
+                    print('"""\n', file=f)
 
 
 class PrinterInductorPass(VllmInductorPass):
