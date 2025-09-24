@@ -375,7 +375,7 @@ class UBatchWrapper:
             return cudagraph_metadata.outputs
         else:
             if is_global_first_rank():
-                logger.info(f"UBATCH NORMAL{num_tokens}")
+                logger.info(f"UBATCH NORMAL {num_tokens}")
             ubatch_metadata = self._make_ubatch_metadata(
                 ubatch_slices=ubatch_slices,
                 attn_metadata=attn_metadata,
