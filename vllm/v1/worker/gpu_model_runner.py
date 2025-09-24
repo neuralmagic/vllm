@@ -3419,6 +3419,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             allow_microbatching_options = [True, False] if \
                 capture_ubatched_graph else [False]
             for allow_microbatching in allow_microbatching_options:
+                logger.info(f"CAPTURE SIZE {num_tokens} ALLOW_MICROBATCHING {allow_microbatching}")
                 for _ in range(
                         self.compilation_config.cudagraph_num_of_warmups):
                     # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
