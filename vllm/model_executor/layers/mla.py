@@ -163,6 +163,9 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
         if llama_4_scaling is not None:
             q *= llama_4_scaling
 
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+
         attn_out = self.mla_attn(
             q,
             kv_c_normed,

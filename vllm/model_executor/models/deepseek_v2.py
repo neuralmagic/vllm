@@ -1660,6 +1660,16 @@ class DeepseekV2ForCausalLM(
                         if name.endswith(".bias") and name not in params_dict:
                             continue
 
+                        # Skip loading extra fake quantized qkv scales for now
+                        if (
+                            any(
+                                name.endswith(f"mla_attn.mla_attn.{k}_scale")
+                                for k in ["q", "k", "v"]
+                            )
+                            and name not in params_dict
+                        ):
+                            continue
+
                         # Remapping the name of FP8 kv-scale.
                         name = maybe_remap_kv_scale_name(name, params_dict)
                         if name is None:
