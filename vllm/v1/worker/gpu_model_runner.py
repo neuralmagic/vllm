@@ -3419,7 +3419,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             allow_microbatching_options = [True, False] if \
                 capture_ubatched_graph else [False]
             for allow_microbatching in allow_microbatching_options:
-                logger.info(f"CAPTURE SIZE {num_tokens} ALLOW_MICROBATCHING {allow_microbatching}")
+                if is_global_first_rank():
+                    logger.info(f"CAPTURE SIZE {num_tokens} ALLOW_MICROBATCHING {allow_microbatching}")
                 for _ in range(
                         self.compilation_config.cudagraph_num_of_warmups):
                     # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
@@ -3429,6 +3430,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     # attention while `PIECEWISE` implies no attention.
                     force_attention = (
                         cudagraph_runtime_mode == CUDAGraphMode.FULL)
+                    if is_global_first_rank():
+                        logger.info(f"WARMUP {num_tokens}")
                     self._dummy_run(num_tokens,
                                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
                                     force_attention=force_attention,
@@ -3436,6 +3439,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                     allow_microbatching=allow_microbatching,
                                     skip_eplb=True,
                                     remove_lora=False)
+                if is_global_first_rank():
+                    logger.info(f"CAPTURE {num_tokens}")
                 self._dummy_run(num_tokens,
                                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                                 uniform_decode=uniform_decode,
