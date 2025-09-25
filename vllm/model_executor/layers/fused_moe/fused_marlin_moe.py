@@ -19,6 +19,131 @@ from vllm.scalar_type import ScalarType, scalar_types
 from vllm.utils import direct_register_custom_op
 
 
+def _fused_marlin_moe(
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        bias1: Optional[torch.Tensor],
+        bias2: Optional[torch.Tensor],
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        topk_weights: Optional[torch.Tensor],
+        num_topk: int,
+        quant_type: ScalarType,
+        apply_router_weight_on_input: bool,
+        activation: str,
+        expert_map: Optional[torch.Tensor],
+        # Information about token indexing.
+        # From moe_align_block_size for contiguous case.
+        block_size_m: int,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        global_scale1: Optional[torch.Tensor] = None,
+        global_scale2: Optional[torch.Tensor] = None,
+        g_idx1: Optional[torch.Tensor] = None,
+        g_idx2: Optional[torch.Tensor] = None,
+        sort_indices1: Optional[torch.Tensor] = None,
+        sort_indices2: Optional[torch.Tensor] = None,
+        w1_zeros: Optional[torch.Tensor] = None,
+        w2_zeros: Optional[torch.Tensor] = None,
+        workspace: Optional[torch.Tensor] = None,
+        intermediate_cache13: Optional[torch.Tensor] = None,
+        intermediate_cache2: Optional[torch.Tensor] = None,
+        is_k_full: bool = True) -> torch.Tensor:
+
+    assert hidden_states.ndim == 2
+    M, K = hidden_states.size()
+    N = marlin_moe_intermediate_size(w1, w2)
+
+    if workspace is None:
+        workspace = marlin_make_workspace_new(hidden_states.device, 4)
+
+    assert intermediate_cache13 is not None
+    assert intermediate_cache2 is not None
+    intermediate_cache1 = _resize_cache(intermediate_cache13,
+                                        (M * num_topk, 2 * N))
+    intermediate_cache3 = _resize_cache(intermediate_cache13,
+                                        (M * num_topk, K))
+    intermediate_cache2 = _resize_cache(intermediate_cache2, (M * num_topk, N))
+
+    maybe_warn_marlin_atomic_add(hidden_states.device, hidden_states.dtype)
+    use_atomic_add = hidden_states.dtype == torch.half or \
+        torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+
+    intermediate_cache1 = ops.moe_wna16_marlin_gemm(
+        hidden_states,
+        intermediate_cache1,
+        w1,
+        bias1,
+        w1_scale,
+        global_scale1,
+        w1_zeros,
+        g_idx1,
+        sort_indices1,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=num_topk,
+        mul_topk_weights=apply_router_weight_on_input,
+        is_ep=expert_map is not None,
+        b_q_type=quant_type,
+        size_m=M,
+        size_n=2 * N,
+        size_k=K,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False)
+
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(intermediate_cache2,
+                                  intermediate_cache1.view(-1, 2 * N))
+    elif activation == "swigluoai":
+        # alpha = 1.702, limit = 7.0
+        torch.ops._C.swigluoai_and_mul(intermediate_cache2,
+                                       intermediate_cache1.view(-1, 2 * N))
+    else:
+        raise ValueError(f"Unsupported activation: {activation}. "
+                         "Only silu and swigluoai activations are supported.")
+
+    if expert_map is not None:
+        intermediate_cache3.zero_()
+
+    intermediate_cache3 = ops.moe_wna16_marlin_gemm(
+        intermediate_cache2,
+        intermediate_cache3,
+        w2,
+        bias2,
+        w2_scale,
+        global_scale2,
+        w2_zeros,
+        g_idx2,
+        sort_indices2,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=1,
+        mul_topk_weights=not apply_router_weight_on_input,
+        is_ep=expert_map is not None,
+        b_q_type=quant_type,
+        size_m=M * num_topk,
+        size_n=K,
+        size_k=N,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False).view(-1, num_topk, K)
+
+    return intermediate_cache3
+
+
 def fused_marlin_moe(hidden_states: torch.Tensor,
                      w1: torch.Tensor,
                      w2: torch.Tensor,
@@ -86,14 +211,17 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
     ]
     num_bits = 4 if quant_type in bit4_scalar_types else 8
 
+    is_batched = hidden_states.ndim == 3
+    if is_batched:
+        M, K = hidden_states.shape[-2:]
+    else:
+        M, K = hidden_states.shape
+
     # Check constraints.
     if gating_output is not None:
-        assert hidden_states.shape[0] == gating_output.shape[
-            0], "Number of tokens mismatch"
-    assert hidden_states.shape[
-        1] == w1.shape[1] * 16, "Hidden size mismatch w1"
-    assert hidden_states.shape[1] == w2.shape[2] // (
-        num_bits // 2), "Hidden size mismatch w2"
+        assert gating_output.shape[0] == M, "Number of tokens mismatch"
+    assert w1.shape[1] * 16 == K, "Hidden size mismatch w1"
+    assert w2.shape[2] // (num_bits // 2) == K, "Hidden size mismatch w2"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
@@ -101,7 +229,6 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
     assert num_bits in [4, 8]
     assert topk_weights.dtype == torch.float32
 
-    M, K = hidden_states.shape
     E = w1.shape[0]
     N = marlin_moe_intermediate_size(w1, w2)
     topk = topk_ids.shape[1]
@@ -118,9 +245,6 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
         moe_align_block_size(topk_ids, block_size_m, global_num_experts,
                              expert_map)
 
-    if workspace is None:
-        workspace = marlin_make_workspace_new(hidden_states.device, 4)
-
     if intermediate_cache2 is None:
         intermediate_cache2 = torch.empty(
             (M * topk, N),
@@ -135,84 +259,37 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
             dtype=hidden_states.dtype,
         )
 
-    intermediate_cache1 = _resize_cache(intermediate_cache13,
-                                        (M * topk, 2 * N))
-    intermediate_cache3 = _resize_cache(intermediate_cache13, (M * topk, K))
-    intermediate_cache2 = _resize_cache(intermediate_cache2, (M * topk, N))
-
-    maybe_warn_marlin_atomic_add(hidden_states.device, hidden_states.dtype)
-    use_atomic_add = hidden_states.dtype == torch.half or \
-        torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-
-    intermediate_cache1 = ops.moe_wna16_marlin_gemm(
-        hidden_states,
-        intermediate_cache1,
-        w1,
-        bias1,
-        w1_scale,
-        global_scale1,
-        w1_zeros,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=topk,
-        mul_topk_weights=apply_router_weight_on_input,
-        is_ep=expert_map is not None,
-        b_q_type=quant_type,
-        size_m=M,
-        size_n=2 * N,
-        size_k=K,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=True,
-        is_zp_float=False)
-
-    if activation == "silu":
-        torch.ops._C.silu_and_mul(intermediate_cache2,
-                                  intermediate_cache1.view(-1, 2 * N))
-    elif activation == "swigluoai":
-        # alpha = 1.702, limit = 7.0
-        torch.ops._C.swigluoai_and_mul(intermediate_cache2,
-                                       intermediate_cache1.view(-1, 2 * N))
-    else:
-        raise ValueError(f"Unsupported activation: {activation}. "
-                         "Only silu and swigluoai activations are supported.")
-
-    if expert_map is not None:
-        intermediate_cache3.zero_()
-
-    intermediate_cache3 = ops.moe_wna16_marlin_gemm(
-        intermediate_cache2,
-        intermediate_cache3,
-        w2,
-        bias2,
-        w2_scale,
-        global_scale2,
-        w2_zeros,
-        g_idx2,
-        sort_indices2,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=1,
-        mul_topk_weights=not apply_router_weight_on_input,
-        is_ep=expert_map is not None,
-        b_q_type=quant_type,
-        size_m=M * topk,
-        size_n=K,
-        size_k=N,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=True,
-        is_zp_float=False).view(-1, topk, K)
+    assert activation is not None
+    intermediate_cache3 = _fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        bias1=bias1,
+        bias2=bias2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        topk_weights=topk_weights,
+        num_topk=topk,
+        quant_type=quant_type,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        activation=activation,
+        expert_map=expert_map,
+        block_size_m=block_size_m,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        global_scale1=global_scale1,
+        global_scale2=global_scale2,
+        g_idx1=g_idx1,
+        g_idx2=g_idx2,
+        sort_indices1=sort_indices1,
+        sort_indices2=sort_indices2,
+        w1_zeros=w1_zeros,
+        w2_zeros=w2_zeros,
+        workspace=workspace,
+        intermediate_cache13=intermediate_cache13,
+        intermediate_cache2=intermediate_cache2,
+        is_k_full=is_k_full).view(-1, topk, K)
 
     if output is None:
         output = hidden_states if inplace else torch.empty_like(hidden_states)
