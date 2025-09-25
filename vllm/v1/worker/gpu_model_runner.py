@@ -2587,8 +2587,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.drafter.load_model(self.model)
             if self.use_aux_hidden_state_outputs:
                 if supports_eagle3(self.model):
-                    self.model.set_aux_hidden_state_layers(
-                        self.model.get_eagle3_aux_hidden_state_layers())
+                    # Get auxiliary layers from speculative config if available
+                    aux_layers = self._get_eagle3_aux_layers_from_config()
+                    if aux_layers is not None:
+                        logger.info(f"Using auxiliary layers from speculative config: {aux_layers}")
+                        self.model.set_aux_hidden_state_layers(aux_layers)
+                    else:
+                        # Fallback to model's default implementation
+                        self.model.set_aux_hidden_state_layers(
+                            self.model.get_eagle3_aux_hidden_state_layers())
                 else:
                     raise RuntimeError(
                         "Model does not support EAGLE3 interface but "
@@ -2638,6 +2645,24 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 self.model = UBatchWrapper(self.model, self.vllm_config,
                                            CUDAGraphMode.NONE, self.device)
+    def _get_eagle3_aux_layers_from_config(self) -> Optional[tuple[int, ...]]:
+        """
+        Extract Eagle3 auxiliary layer IDs from the speculative config.
+
+        Returns:
+            Tuple of layer indices from draft model config, or None if not found.
+        """
+        try:
+            if (self.speculative_config and
+                self.speculative_config.draft_model_config and
+                hasattr(self.speculative_config.draft_model_config.hf_config,
+                    'eagle_aux_hidden_state_layer_ids')):
+                layer_ids = self.speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids
+                if layer_ids and isinstance(layer_ids, (list, tuple)):
+                    return tuple(layer_ids)
+        except Exception as e:
+            logger.warning(f"Failed to read auxiliary layers from speculative config: {e}")
+        return None
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \

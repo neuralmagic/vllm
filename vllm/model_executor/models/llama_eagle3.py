@@ -21,8 +21,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.llama import (LlamaDecoderLayer,
                                               LlamaForCausalLM)
+from vllm.multimodal.inputs import NestedTensors
 
-from .utils import AutoWeightsLoader, maybe_prefix
+from .utils import AutoWeightsLoader, maybe_prefix, merge_multimodal_embeddings
 
 logger = init_logger(__name__)
 
@@ -147,12 +148,20 @@ class LlamaModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_embeds = self.embed_tokens(input_ids)
-        assert hidden_states.shape[-1] == input_embeds.shape[-1]
+        if inputs_embeds is not None:
+            input_embeds = inputs_embeds
+        else:
+            input_embeds = self.embed_tokens(input_ids)
+
+        # Only check dimension compatibility after we have the input embeddings
+        # For multimodal cases, hidden_states dimensions may differ and need adaptation
+        if hidden_states.shape[-1] != input_embeds.shape[-1]:
+            hidden_states = self.fc(hidden_states)
 
         residual = None
         hidden_states, residual = self.layers[0](
@@ -200,6 +209,7 @@ class LlamaModel(nn.Module):
 class Eagle3LlamaForCausalLM(LlamaForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        logger.info("Eagle3LlamaForCausalLM initialized")
         nn.Module.__init__(self)
         self.config = vllm_config. \
             speculative_config.draft_model_config.hf_config
@@ -232,6 +242,35 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
             requires_grad=False,
         )
 
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Optional[NestedTensors] = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self.model.embed_tokens(input_ids)
+
+        # Check if this drafter is configured for text-only inference
+        inference_type = getattr(self.config, 'inference_type', 'multimodal')
+
+        if multimodal_embeddings is not None and inference_type != 'text':
+            # For Eagle3, multimodal content is already processed by the verifier
+            # The auxiliary hidden states contain the multimodal context
+            # So we just return the text embeddings here
+            # Note: merge_multimodal_embeddings requires image_token_index
+            if hasattr(self.config, 'image_token_index'):
+                inputs_embeds = merge_multimodal_embeddings(
+                    input_ids,
+                    inputs_embeds,
+                    multimodal_embeddings,
+                    self.config.image_token_index,
+                )
+        elif multimodal_embeddings is not None and inference_type == 'text':
+            # Text-only drafter: ignore multimodal embeddings
+            # The verifier handles all multimodal processing, drafter only processes text tokens
+            pass
+
+        return inputs_embeds
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -239,11 +278,25 @@ class Eagle3LlamaForCausalLM(LlamaForCausalLM):
         hidden_states: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Eagle3 drafter processes auxiliary hidden states from verifier model
+        # For multimodal inputs, the verifier already processed the multimodal content
+        # and generated auxiliary hidden states that contain this context.
+        # This drafter is configured for text-only inference (inference_type: "text")
+
         if inputs_embeds is not None:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support multimodal inputs yet."
-            )
-        return self.model(input_ids, positions, hidden_states)
+            # Handle edge cases (e.g., warmup) where pre-computed embeddings are provided
+            input_embeds = inputs_embeds
+        else:
+            # Standard case: use text embeddings for current token prediction
+            input_embeds = self.model.embed_tokens(input_ids)
+
+        # Adapt auxiliary hidden state dimensions if they don't match text embeddings
+        # Critical for multimodal models where auxiliary hidden states may have different dimensions
+        if hidden_states.shape[-1] != input_embeds.shape[-1]:
+            hidden_states = self.model.fc(hidden_states)
+
+        # Eagle3 architecture: combines text embeddings + multimodal hidden states
+        return self.model(None, positions, hidden_states, input_embeds)
 
     def compute_logits(
         self,
