@@ -466,6 +466,7 @@ def test_mixtral_moe(dist_init, dtype: torch.dtype, padding: bool,
 
 def marlin_moe_generate_valid_test_cases():
     import itertools
+
     #m_list = [1, 123, 666]
     #n_list = [128, 1024]
     #k_list = [256, 2048]
@@ -553,7 +554,9 @@ def test_fused_marlin_moe(
     quant_type: ScalarType,
     is_k_full: bool,
 ):
-    print (f"testing m={m}, n={n}, k={k}, e={e}, topk={topk}, ep_size={ep_size}, dtype={dtype}, act_order={act_order}, quant_type={quant_type}, is_k_full={is_k_full} ...")
+    print(
+        f"testing m={m}, n={n}, k={k}, e={e}, topk={topk}, ep_size={ep_size}, dtype={dtype}, act_order={act_order}, quant_type={quant_type}, is_k_full={is_k_full} ..."
+    )
     torch.cuda.manual_seed(0)
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
 
