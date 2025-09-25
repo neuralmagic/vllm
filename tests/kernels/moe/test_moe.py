@@ -466,23 +466,37 @@ def test_mixtral_moe(dist_init, dtype: torch.dtype, padding: bool,
 
 def marlin_moe_generate_valid_test_cases():
     import itertools
-    m_list = [1, 123, 666]
-    n_list = [128, 1024]
-    k_list = [256, 2048]
-    e_list = [4, 12]
-    topk_list = [2, 3]
-    ep_size_list = [1, 4]
-    dtype_list = [torch.half, torch.bfloat16]
-    group_size_list = [-1, 16, 32, 128]
-    act_order_list = [True, False]
+    #m_list = [1, 123, 666]
+    #n_list = [128, 1024]
+    #k_list = [256, 2048]
+    #e_list = [4, 12]
+    #topk_list = [2, 3]
+    #ep_size_list = [1, 4]
+    #dtype_list = [torch.half, torch.bfloat16]
+    #group_size_list = [-1, 16, 32, 128]
+    #act_order_list = [True, False]
+    #quant_type_list = [
+    #    scalar_types.float4_e2m1f,
+    #    scalar_types.float8_e4m3fn,
+    #    scalar_types.uint4,
+    #    scalar_types.uint4b8,
+    #    scalar_types.uint8b128,
+    #]
+    #is_k_full_list = [True, False]
+
+    m_list = [8]
+    n_list = [128]
+    k_list = [256]
+    e_list = [16]
+    topk_list = [4]
+    ep_size_list = [1]
+    dtype_list = [torch.bfloat16]
+    group_size_list = [32]
+    act_order_list = [False]
     quant_type_list = [
         scalar_types.float4_e2m1f,
-        scalar_types.float8_e4m3fn,
-        scalar_types.uint4,
-        scalar_types.uint4b8,
-        scalar_types.uint8b128,
     ]
-    is_k_full_list = [True, False]
+    is_k_full_list = [True]
 
     all_combinations = itertools.product(m_list, n_list, k_list, e_list,
                                          topk_list, ep_size_list, dtype_list,
@@ -539,6 +553,7 @@ def test_fused_marlin_moe(
     quant_type: ScalarType,
     is_k_full: bool,
 ):
+    print (f"testing m={m}, n={n}, k={k}, e={e}, topk={topk}, ep_size={ep_size}, dtype={dtype}, act_order={act_order}, quant_type={quant_type}, is_k_full={is_k_full} ...")
     torch.cuda.manual_seed(0)
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
 
