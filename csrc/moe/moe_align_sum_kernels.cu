@@ -16,11 +16,17 @@ namespace moe {
 
 template <typename scalar_t>
 __global__ void moe_align_block_size_kernel(
-    const scalar_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
-    int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
-    size_t numel, int32_t* __restrict__ cumsum, int32_t max_num_tokens_padded) {
+    const scalar_t* __restrict__ topk_ids, // [numel]
+    int32_t* __restrict__ sorted_token_ids, // [max_num_tokens]
+    int32_t* __restrict__ expert_ids, // [max_num_blocks]
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t num_experts,
+    int32_t padded_num_experts,
+    int32_t experts_per_warp, // 32
+    int32_t block_size, // 64
+    size_t numel, // topk numel
+    int32_t* __restrict__ cumsum, // [num_experts + 1]
+    int32_t max_num_tokens_padded) {
   extern __shared__ int32_t shared_counts[];
 
   // Initialize sorted_token_ids with numel
@@ -91,10 +97,13 @@ __global__ void moe_align_block_size_kernel(
   }
 }
 
+// num threads 256
+// num blocks (based on numel)
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
-    const scalar_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
+    const scalar_t* __restrict__ topk_ids, // [numel]
+    int32_t* __restrict__ sorted_token_ids, // [max_num_tokens]
+    int32_t* __restrict__ cumsum_buffer, // [num_experts + 1]
     size_t numel) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
@@ -124,10 +133,17 @@ __global__ void moe_sum_kernel(
 
 template <typename scalar_t>
 __global__ void moe_align_block_size_small_batch_expert_kernel(
-    const scalar_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad, int32_t num_experts,
-    int32_t block_size, size_t numel, int32_t max_num_tokens_padded) {
+    const scalar_t* __restrict__ topk_ids, // topk_ids
+    int32_t* __restrict__ sorted_token_ids, // output sorted token ids (as big as padded num tokens) 
+    int32_t* __restrict__ expert_ids, // expert ids (as big as max num blocks)
+    int32_t* __restrict__ total_tokens_post_pad, // output integer
+    int32_t num_experts, // total num experts
+    int32_t block_size, // size of each block
+    size_t numel, // topk numel
+    int32_t max_num_tokens_padded) {
+
+  // number of threads -- 1024 // num blocks -- 1
+
   // Initialize sorted_token_ids with numel
   for (size_t it = threadIdx.x; it < max_num_tokens_padded; it += blockDim.x) {
     sorted_token_ids[it] = numel;
@@ -138,7 +154,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
   extern __shared__ int32_t shared_mem[];
   int32_t* cumsum = shared_mem;
-  int32_t* tokens_cnts = (int32_t*)(shared_mem + num_experts + 1);
+  int32_t* tokens_cnts = (int32_t*)(shared_mem + num_experts + 1); // as big as num_experts
 
   for (int i = 0; i < num_experts; ++i) {
     tokens_cnts[(threadIdx.x + 1) * num_experts + i] = 0;

@@ -65,6 +65,17 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+
+
+    s = "moe align block size : \n"
+    s += f"  - topk_ids {topk_ids.shape} \n"
+    s += f"  - block_size {block_size} \n"
+    s += f"  - num_experts {num_experts} \n"
+    s += f"  - expert_map {expert_map} \n"
+    s += f"  - pad_sorted_ids {pad_sorted_ids} \n"
+
+    print (s)
+
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
