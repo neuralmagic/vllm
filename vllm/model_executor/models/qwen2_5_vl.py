@@ -66,7 +66,7 @@ from vllm.utils import is_pin_memory_available
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
-                         SupportsMultiModal, SupportsPP, SupportsQuant)
+                         SupportsMultiModal, SupportsPP, SupportsQuant, SupportsEagle3)
 from .qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
 from .qwen2_vl import (Qwen2VLMultiModalProcessor, Qwen2VLProcessingInfo,
                        apply_rotary_pos_emb_vision)
@@ -912,7 +912,7 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
     dummy_inputs=Qwen2_5_VLDummyInputsBuilder)
 class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                                          SupportsLoRA, SupportsPP,
-                                         SupportsQuant):
+                                         SupportsQuant, SupportsEagle3):
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1137,6 +1137,20 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
+    
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Set which layers should output auxiliary hidden states for EAGLE3."""
+        # Delegate to underlying language model (Llama4ForCausalLM)
+        assert hasattr(self.language_model, 'set_aux_hidden_state_layers')
+        self.get_language_model().set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Get the layer indices for auxiliary hidden state outputs.
+
+        Note: The GPU model runner will override this with layers from
+        the speculative config if available, providing dynamic configuration.
+        """
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
     def get_multimodal_embeddings(self,
                                   **kwargs: object) -> MultiModalEmbeddings:
