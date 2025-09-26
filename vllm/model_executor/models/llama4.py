@@ -671,6 +671,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
                            prefix=prefix,
                            layer_type=layer_type)
 
+
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
