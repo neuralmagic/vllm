@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import itertools
 
 import pytest
 import torch._dynamo
@@ -110,13 +111,15 @@ class AttentionQuantPatternModel(torch.nn.Module):
             dtype=self.kv_cache_dtype,
             device=self.device,
         )
+
+        # TODO use get_kv_cache_stride_order
         if current_platform.is_rocm():
             # k/v as 1st dimention
             if use_hnd:
                 kv_cache = kv_cache.permute(1, 0, 2, 3, 4)
             else:
                 kv_cache = kv_cache.permute(1, 0, 3, 2, 4)
-        else:
+        elif self.attn.backend == _Backend.FLASHINFER:
             # k/v as 2nd dimention
             # Create kv_cache in HND layout and permute to NHD layout
             # (later will be permuted back to HND layout in forward pass)
@@ -213,7 +216,8 @@ MODELS_FP8 = []
 MODELS_FP4 = []
 HEADS = []
 SPLIT_ATTENTION = []
-BACKENDS: list[_Backend] = []
+BACKENDS_FP8: list[_Backend] = []
+BACKENDS_FP4: list[_Backend] = []
 
 if current_platform.is_cuda():
     MODELS_FP8 = [
@@ -224,10 +228,11 @@ if current_platform.is_cuda():
     ]
     HEADS = [(64, 8), (40, 8)]
     SPLIT_ATTENTION = [False]
-    BACKENDS = []  # TODO [_Backend.TRITON_ATTN]
+    BACKENDS_FP8 = [_Backend.TRITON_ATTN]
 
     if current_platform.is_device_capability((10, 0)):
-        BACKENDS += [_Backend.FLASHINFER]
+        BACKENDS_FP8 += [_Backend.FLASHINFER]
+        BACKENDS_FP4 += [_Backend.FLASHINFER]
         MODELS_FP4 += [
             (
                 "nvidia/Llama-4-Scout-17B-16E-Instruct-FP4",
@@ -257,13 +262,12 @@ else:
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "model_name, model_class, custom_ops",
+    "backend, model, custom_ops",
     # Test attention+quant_fp8 fusion with custom and torch impls
-    [(*model, c) for model in MODELS_FP8 for c in ["+quant_fp8", "-quant_fp8"]]
+    list(itertools.product(BACKENDS_FP8, MODELS_FP8, ["+quant_fp8", "-quant_fp8"]))
     # quant_fp4 only has the custom impl
-    + [(*model, c) for model in MODELS_FP4 for c in [""]],
+    + list(itertools.product(BACKENDS_FP4, MODELS_FP4, [""])),
 )
-@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("split_attention", SPLIT_ATTENTION)
 @pytest.mark.parametrize("use_inductor_graph_partition", USE_INDUCTOR_GRAPH_PARTITION)
 @pytest.mark.skipif(
@@ -277,8 +281,7 @@ def test_attention_quant_pattern(
     batch_size: int,
     dtype: torch.dtype,
     custom_ops: str,
-    model_name: str,
-    model_class: type[AttentionQuantPatternModel],
+    model: tuple[str, type[AttentionQuantPatternModel]],
     backend: _Backend,
     split_attention: bool,
     use_inductor_graph_partition: bool,
@@ -289,6 +292,7 @@ def test_attention_quant_pattern(
     """Test AttentionStaticQuantPattern fusion pass"""
 
     custom_ops_list = custom_ops.split(",") if custom_ops else []
+    model_name, model_class = model
 
     monkeypatch.setenv("VLLM_USE_V1", "1")
     if split_attention:
