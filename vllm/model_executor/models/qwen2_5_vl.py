@@ -1150,9 +1150,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         Note: The GPU model runner will override this with layers from
         the speculative config if available, providing dynamic configuration.
         """
-        # Delegate to underlying language model (Llama4ForCausalLM)
-        assert hasattr(self.language_model, 'get_eagle3_aux_hidden_state_layers')
-        self.language_model.get_eagle3_aux_hidden_state_layers()
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
     def get_multimodal_embeddings(self,
                                   **kwargs: object) -> MultiModalEmbeddings:
