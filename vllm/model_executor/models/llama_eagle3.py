@@ -118,6 +118,10 @@ class LlamaModel(nn.Module):
             speculative_config.draft_model_config.hf_config
         self.vocab_size = self.config.vocab_size
 
+        # Get cache_config and quant_config from vllm_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+
         current_vllm_config = get_current_vllm_config()
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -128,10 +132,11 @@ class LlamaModel(nn.Module):
 
         self.layers = nn.ModuleList([
             LlamaDecoderLayer(
-                config=self.config,
-                cache_config=current_vllm_config.cache_config,
-                prefix=maybe_prefix(prefix, f"layers.{start_layer_id}"),
-            )
+                self.config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, f"layers.{i + start_layer_id}"),
+            ) for i in range(self.config.num_hidden_layers)
         ])
         if hasattr(self.config, "target_hidden_size"):
             self.fc = torch.nn.Linear(self.config.target_hidden_size * 3,
