@@ -11,7 +11,8 @@ from vllm.compilation.fix_functionalization import FixFunctionalizationPass
 from vllm.compilation.noop_elimination import NoOpEliminationPass
 from vllm.compilation.post_cleanup import PostCleanupPass
 from vllm.config import (CompilationConfig, CompilationLevel, DeviceConfig,
-                         ModelConfig, PassConfig, VllmConfig)
+                         ModelConfig, PassConfig, VllmConfig,
+                         set_current_vllm_config)
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (init_distributed_environment,
                                              initialize_model_parallel)
@@ -212,25 +213,27 @@ def all_reduce_fusion_pass_on_test_model(local_rank: int, world_size: int,
                                            trust_remote_code=True,
                                            dtype=dtype,
                                            seed=42)
+    with set_current_vllm_config(vllm_config):
+        all_reduce_fusion_pass = AllReduceFusionPass(vllm_config)
+        noop_pass = NoOpEliminationPass(vllm_config)
+        func_pass = FixFunctionalizationPass(vllm_config)
+        cleanup_pass = PostCleanupPass(vllm_config)
 
-    all_reduce_fusion_pass = AllReduceFusionPass(vllm_config)
-    noop_pass = NoOpEliminationPass(vllm_config)
-    func_pass = FixFunctionalizationPass(vllm_config)
-    cleanup_pass = PostCleanupPass(vllm_config)
+        backend = TestBackend(all_reduce_fusion_pass, noop_pass, func_pass,
+                              cleanup_pass)
 
-    backend = TestBackend(all_reduce_fusion_pass, noop_pass, func_pass,
-                          cleanup_pass)
+        token_num = batch_size * seq_len
+        model = test_model_cls(hidden_size, token_num)
 
-    token_num = batch_size * seq_len
-    model = test_model_cls(hidden_size, token_num)
+        hidden_states = torch.randn((token_num, hidden_size),
+                                    requires_grad=False)
+        residual = torch.randn((token_num, hidden_size), requires_grad=False)
 
-    hidden_states = torch.randn((token_num, hidden_size), requires_grad=False)
-    residual = torch.randn((token_num, hidden_size), requires_grad=False)
+        compiled_model = torch.compile(model, backend=backend)
+        compiled_model(hidden_states, residual)
 
-    compiled_model = torch.compile(model, backend=backend)
-    compiled_model(hidden_states, residual)
-
-    assert all_reduce_fusion_pass.matched_count == 1
-    backend.check_before_ops(model.ops_in_model_before(), fully_replaced=False)
-    backend.check_after_ops(model.ops_in_model_after())
-    del all_reduce_fusion_pass
+        assert all_reduce_fusion_pass.matched_count == 1
+        backend.check_before_ops(model.ops_in_model_before(),
+                                 fully_replaced=False)
+        backend.check_after_ops(model.ops_in_model_after())
+        del all_reduce_fusion_pass
