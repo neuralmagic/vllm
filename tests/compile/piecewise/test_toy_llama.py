@@ -273,6 +273,7 @@ def run_model(
     else:
         compilation_config = CompilationConfig(
             level=CompilationLevel.NO_COMPILATION,
+            use_inductor_graph_partition=False,  # TODO try both?
         )
         cudagraph_runtime_mode = CUDAGraphMode.NONE
 
