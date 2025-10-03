@@ -20,6 +20,7 @@ from vllm.config import (CompilationConfig, CompilationLevel, CUDAGraphMode,
                          PassConfig)
 from vllm.platforms import current_platform
 from vllm.utils import is_torch_equal_or_newer
+from vllm.utils.flashinfer import has_flashinfer
 
 from ..utils import (create_new_process_for_each_test, flat_product,
                      multi_gpu_test)
@@ -193,7 +194,7 @@ INDUCTOR_GRAPH_PARTITION = [True, False] if (
     is_torch_equal_or_newer("2.9.0.dev")) else [False]
 
 # TODO(luka) test both in nightly
-CUSTOM_OPS_FP8 = ["-quant_fp8"]  #, "+quant_fp8"]
+CUSTOM_OPS_FP8 = ["-quant_fp8"]  # , "+quant_fp8"]
 
 
 @pytest.mark.parametrize(
@@ -248,7 +249,7 @@ def test_e2e_fusion_attn_quant(model_name: str, model_kwargs: dict[str, Any],
 
 # TODO(luka) test both in nightly
 # TODO(luka) change to -
-CUSTOM_OPS_RMS_NORM = ["+rms_norm"]  #, "+rms_norm"]
+CUSTOM_OPS_RMS_NORM = ["+rms_norm"]  # , "+rms_norm"]
 
 
 def custom_ops_product(*custom_ops_lists: list[str]) -> Iterable[str]:
@@ -265,10 +266,9 @@ def custom_ops_product(*custom_ops_lists: list[str]) -> Iterable[str]:
     # Toggle RMSNorm for FP4 models and unquant models
     + list(flat_product(MODELS_FP4 + MODELS, CUSTOM_OPS_RMS_NORM)))
 @pytest.mark.parametrize("inductor_graph_partition", INDUCTOR_GRAPH_PARTITION)
-@pytest.mark.skipif(
-    not current_platform.is_cuda()
-    or not current_platform.has_device_capability((10, 0)),
-    reason="allreduce+rmsnorm fusion only supported on blackwell")
+@pytest.mark.skipif(not current_platform.is_cuda() or not has_flashinfer()
+                    or not current_platform.has_device_capability(90),
+                    reason="allreduce+rmsnorm fusion requires flashinfer")
 def test_e2e_fusion_tp2_attn_quant_allreduce_rmsnorm(
         model_name, model_kwargs, backend, custom_ops: str,
         inductor_graph_partition: bool, caplog_mp_spawn, monkeypatch):
