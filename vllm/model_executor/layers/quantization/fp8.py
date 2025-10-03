@@ -396,6 +396,9 @@ class Fp8LinearMethod(LinearMethodBase):
             maybe_post_process_fp8_weight_block(
                 layer, self.cutlass_block_fp8_supported)
 
+        print("layer.weight.shape", layer.weight.shape)
+        print("layer.weight_scale.shape", layer.weight_scale.shape)
+
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,

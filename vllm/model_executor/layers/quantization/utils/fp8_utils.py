@@ -291,7 +291,7 @@ class W8A8BlockFp8LinearOp:
     ) -> torch.Tensor:
         assert self.input_quant_op is not None
         q_input, input_scale = self.input_quant_op(input_2d)
-        if self.is_hopper:
+        if False and self.is_hopper:
             return torch.ops.vllm.padded_cutlass(q_input, weight, input_scale,
                                                  weight_scale,
                                                  list(self.weight_group_shape),
@@ -1060,10 +1060,10 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module,
         requant_weight_ue8m0_inplace(layer.weight.data,
                                      layer.weight_scale.data, block_sz)
     # SM90 Block FP8 CUTLASS requires row-major weight scales
-    elif (current_platform.is_device_capability(90)
-          and cutlass_block_fp8_supported and not should_use_deepgemm):
-        layer.weight_scale = torch.nn.Parameter(
-            layer.weight_scale.data.T.contiguous(), requires_grad=False)
+    # elif (current_platform.is_device_capability(90)
+    #       and cutlass_block_fp8_supported and not should_use_deepgemm):
+    #     layer.weight_scale = torch.nn.Parameter(
+    #         layer.weight_scale.data.T.contiguous(), requires_grad=False)
 
 
 def expert_weight_is_col_major(x: torch.Tensor) -> bool:
