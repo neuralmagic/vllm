@@ -78,17 +78,13 @@ class TestAllReduceFusedAddRMSNormStaticQuantFP8Model(torch.nn.Module):
         self.quant_fp8 = QuantFP8(static=True,
                                   group_shape=GroupShape.PER_TENSOR)
         self.scale = torch.rand(1, dtype=torch.float32)
-        self.output = torch.empty((token_num, hidden_size),
-                                  dtype=torch.float32)
 
     def forward(self, hidden_states, residual):
         view = hidden_states.reshape(-1, self.hidden_size)
         all_reduce = tensor_model_parallel_all_reduce(view)
         norm_output, residual_output = self.norm(all_reduce, residual)
-        torch.ops._C.static_scaled_fp8_quant(self.output,
-                                             norm_output.contiguous(),
-                                             self.scale)
-        return self.output, residual_output
+        quant_out, _ = self.quant_fp8(norm_output, self.scale)
+        return quant_out, residual_output
 
     def ops_in_model_after(self):
         return [torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default]
@@ -205,6 +201,7 @@ def all_reduce_fusion_pass_on_test_model(local_rank: int, world_size: int,
     vllm_config.compilation_config.pass_config = PassConfig(
         enable_fi_allreduce_fusion=True, enable_noop=True)
     vllm_config.device_config = DeviceConfig(device=torch.device("cuda"))
+    vllm_config.parallel_config.rank = local_rank  # Setup rank for debug path
 
     # this is a fake model name to construct the model config
     # in the vllm_config, it's not really used.
