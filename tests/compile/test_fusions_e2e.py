@@ -30,7 +30,7 @@ if current_platform.is_cuda():
         "max_model_len": 1024
     }, _Backend.TRITON_ATTN)]
 
-    if current_platform.is_device_capability((10, 0)):
+    if current_platform.is_device_capability((10, 0)) and has_flashinfer():
         MODELS_FP8 += [("nvidia/Llama-4-Scout-17B-16E-Instruct-FP8", {
             "kv_cache_dtype": "fp8",
             "max_model_len": 1024
@@ -78,7 +78,6 @@ def test_attn_quant(model_name: str, model_kwargs: dict[str, Any],
 
     # Disable, compile cache to make sure custom passes run.
     # Otherwise, we can't verify fusion happened through the logs.
-    # Log capture also doesn't work with multiprocessing yet.
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
 
     # To capture subprocess logs, we need to know whether spawn or fork is used.
@@ -143,7 +142,6 @@ def test_tp2_attn_quant_allreduce_rmsnorm(model_name, model_kwargs, backend,
 
     # Disable, compile cache to make sure custom passes run.
     # Otherwise, we can't verify fusion happened through the logs.
-    # Log capture also doesn't work with multiprocessing yet.
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
 
     # To capture subprocess logs, we need to know whether spawn or fork is used.
