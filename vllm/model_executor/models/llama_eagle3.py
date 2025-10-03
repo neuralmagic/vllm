@@ -188,7 +188,7 @@ class LlamaModel(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
             )
-
+        hidden_states = hidden_states + residual
         hidden_states, hidden_prenorm = self.norm(hidden_states, residual)
         return hidden_states, hidden_prenorm
 
