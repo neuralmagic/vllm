@@ -137,16 +137,13 @@ class TestAllReduceFusedAddRMSNormStaticQuantFP4Model(torch.nn.Module):
 
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize(
-    "test_model, enable_quant_fp8",
-    [
-        (TestAllReduceRMSNormModel, False),
-        (TestAllReduceFusedAddRMSNormModel, False),
-        (TestAllReduceFusedAddRMSNormStaticQuantFP8Model, True),
-        (TestAllReduceFusedAddRMSNormStaticQuantFP8Model, False),
-        # TODO: Enable with torch==2.8.0
-        # (TestAllReduceFusedAddRMSNormStaticQuantFP4Model, False),
-    ])
+@pytest.mark.parametrize("test_model, enable_quant_fp8", [
+    (TestAllReduceRMSNormModel, False),
+    (TestAllReduceFusedAddRMSNormModel, False),
+    (TestAllReduceFusedAddRMSNormStaticQuantFP8Model, True),
+    (TestAllReduceFusedAddRMSNormStaticQuantFP8Model, False),
+    (TestAllReduceFusedAddRMSNormStaticQuantFP4Model, False),
+])
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("seq_len", [8])
 @pytest.mark.parametrize("hidden_size", [16])
