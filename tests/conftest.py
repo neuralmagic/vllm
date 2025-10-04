@@ -1092,7 +1092,7 @@ class LogHolder:
 def caplog_mp_spawn(tmp_path, monkeypatch):
     """
     This fixture enables capturing logs from a forked MP subprocess.
-    It does not require caplog_vllm (but it only contains log
+    It does not require caplog_vllm (but it only contains logs from the child).
 
     By default, subprocess logs do not go through the parent process.
     We instead add a FileHandler to the config so the spawned child process
@@ -1105,7 +1105,7 @@ def caplog_mp_spawn(tmp_path, monkeypatch):
     """
 
     @contextlib.contextmanager
-    def ctx(level: int | str):
+    def ctx(level: Union[int, str]):
         from vllm.logger import DEFAULT_LOGGING_CONFIG
 
         config_path = tmp_path / "vllm_logging_config.json"
