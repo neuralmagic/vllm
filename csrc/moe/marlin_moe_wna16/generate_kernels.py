@@ -28,21 +28,31 @@ FILE_HEAD = FILE_HEAD_COMMENT + """
 namespace MARLIN_NAMESPACE_NAME {
 """
 
-TEMPLATE = ("template __global__ void Marlin<"
-            "{{a_type_id}}, "
-            "{{b_type_id}}, "
-            "{{c_type_id}}, "
-            "{{s_type_id}}, "
-            "{{threads}}, "
-            "{{thread_m_blocks}}, "
-            "{{thread_n_blocks}}, "
-            "{{thread_k_blocks}}, "
-            "{{m_block_size_8}}, "
-            "{{stages}}, "
-            "{{group_blocks}}, "
-            "{{is_zp_float}}>"
-            "( MARLIN_KERNEL_PARAMS );")
+TEMPLATE = (
+    "template __global__ void Marlin<"
+    "{{scalar_t}}, "
+    "{{w_type_id}}, "
+    "{{s_type_id}}, "
+    "{{threads}}, "
+    "{{thread_m_blocks}}, "
+    "{{thread_n_blocks}}, "
+    "{{thread_k_blocks}}, "
+    "{{'true' if m_block_size_8 else 'false'}}, "
+    "{{stages}}, "
+    "{{group_blocks}}, "
+    "{{'true' if is_zp_float else 'false'}}>"
+    "( MARLIN_KERNEL_PARAMS );"
+)
 
+# int8 with zero point case (vllm::kU8) is also supported,
+# we don't add it to reduce wheel size.
+SCALAR_TYPES = [
+    "vllm::kU4",
+    "vllm::kU4B8",
+    "vllm::kU8B128",
+    "vllm::kFE4M3fn",
+    "vllm::kFE2M1f",
+]
 THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128)]
 
 THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
@@ -138,6 +148,27 @@ QUANT_CONFIGS = [
 ]
 
 
+# int8 with zero point case (vllm::kU8) is also supported,
+# we don't add it to reduce wheel size.
+SCALAR_TYPES = [
+    "vllm::kU4",
+    "vllm::kU4B8",
+    "vllm::kU8B128",
+    "vllm::kFE4M3fn",
+    "vllm::kFE2M1f",
+]
+THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128)]
+
+THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
+# group_blocks:
+#   = 0 : act order case
+#   = -1 : channelwise quantization
+#   > 0 : group_size=16*group_blocks
+GROUP_BLOCKS = [0, -1, 1, 2, 4, 8]
+DTYPES = ["fp16", "bf16"]
+
+
+
 def remove_old_kernels():
     for filename in glob.glob(os.path.dirname(__file__) + "/*kernel_*.cu"):
         subprocess.call(["rm", "-f", filename])
@@ -199,8 +230,55 @@ def generate_new_kernels():
 
     for (a_type, b_type, c_type), config_list in result_dict.items():
         all_template_str_list = []
-        for config in config_list:
-            s_type = config["s_type"]
+
+        # TODO(elvircrn): This merge may need to be revised.
+        for group_blocks, m_blocks, thread_configs, scalar_type, dtype in itertools.product(
+            GROUP_BLOCKS, THREAD_M_BLOCKS, THREAD_CONFIGS, config["s_type"], DTYPES
+        ):
+            # act order case only support gptq-int4 and gptq-int8
+            if group_blocks == 0 and scalar_type not in [
+                "vllm::kU4B8",
+                "vllm::kU8B128",
+            ]:
+                continue
+            if thread_configs[2] == 256:
+                # for small batch (m_blocks == 1), we only need (128, 128, 256)
+                # for large batch (m_blocks > 1), we only need (64, 256, 256)
+                if m_blocks <= 1 and thread_configs[0] != 128:
+                    continue
+                if m_blocks > 1 and thread_configs[0] != 64:
+                    continue
+
+            # we only support channelwise quantization and group_size == 128
+            # for fp8
+            if scalar_type == "vllm::kFE4M3fn" and group_blocks not in [-1, 8]:
+                continue
+            # nvfp4 only supports group_size == 16
+            # mxfp4 only supports group_size == 32
+            if scalar_type == "vllm::kFE2M1f" and group_blocks not in [1, 2]:
+                continue
+            # other quantization methods don't support group_size = 16
+            if scalar_type != "vllm::kFE2M1f" and group_blocks == 1:
+                continue
+
+            k_blocks = thread_configs[0] // 16
+            n_blocks = thread_configs[1] // 16
+            threads = thread_configs[2]
+
+            c_dtype = "half" if dtype == "fp16" else "nv_bfloat16"
+
+            if scalar_type == "vllm::kFE2M1f" and group_blocks == 1:
+                s_type = "vllm::kFE4M3fn"
+            elif scalar_type == "vllm::kFE2M1f" and group_blocks == 2:
+                s_type = "vllm::kFE8M0fnu"
+                if dtype == "fp16":
+                    # we cannot safely dequantize e8m0 to fp16, so skip this
+                    continue
+            elif dtype == "fp16":
+                s_type = "vllm::kFloat16"
+            elif dtype == "bf16":
+                s_type = "vllm::kBFloat16"
+
             template_str = jinja2.Template(TEMPLATE).render(
                 a_type_id=f"vllm::{a_type}.id()",
                 b_type_id=f"vllm::{b_type}.id()",
