@@ -34,7 +34,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
-    QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
@@ -48,23 +47,20 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     select_cutlass_fp8_gemm_impl,
     swap_w13_to_w31,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (    W8A8BlockFp8LinearOp,
-                                                                         check_aiter_fp8_linear_support,
-                                                                         create_fp8_input_scale,
-                                                                         create_fp8_scale_parameter,
-                                                                         create_fp8_weight_parameter,
-                                                                         expert_weight_is_col_major,
-                                                                         maybe_post_process_fp8_weight_block,
-                                                                         process_fp8_weight_block_strategy,
-                                                                         process_fp8_weight_tensor_strategy,
-                                                                         requant_weight_ue8m0_inplace,
-                                                                         validate_fp8_block_shape,
-                                                                         get_col_major_tma_aligned_tensor, requant_weight_ue8m0_inplace,
-                                                                         should_use_deepgemm_for_fp8_linear
-                                                                         )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (W8A8BlockFp8LinearOp,
+                                                                     check_aiter_fp8_linear_support,
+                                                                     create_fp8_input_scale,
+                                                                     create_fp8_scale_parameter,
+                                                                     create_fp8_weight_parameter,
+                                                                     expert_weight_is_col_major,
+                                                                     maybe_post_process_fp8_weight_block,
+                                                                     process_fp8_weight_block_strategy,
+                                                                     process_fp8_weight_tensor_strategy,
+                                                                     validate_fp8_block_shape,
+                                                                     requant_weight_ue8m0_inplace
+                                                                     )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype)
-
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
@@ -100,7 +96,7 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.flashinfer import has_flashinfer_moe
 
 if TYPE_CHECKING:
-    from vllm.model_executor.models.utils import WeightsMapper
+    pass
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 

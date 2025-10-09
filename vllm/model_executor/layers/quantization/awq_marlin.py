@@ -26,7 +26,7 @@ from vllm.model_executor.layers.linear import (
     set_weight_attrs,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
-from vllm.model_executor.layers.quantization.awq import AWQConfig, is_layer_skipped_awq
+from vllm.model_executor.layers.quantization.awq import is_layer_skipped_awq, AWQConfig
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )

@@ -14,10 +14,8 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
-from vllm.model_executor.layers.quantization.awq_marlin import AWQMoEMethod
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
-    QuantizeMethodBase,
 )
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 
@@ -126,7 +124,7 @@ class AWQConfig(QuantizationConfig):
             awq_marlin_config = AWQMarlinConfig.from_config(
                 marlin_compatible_config_dict
             )
-            return AWQMoEMethod(awq_marlin_config, layer.moe_config)
+            return AWQMarlinMoEMethod(awq_marlin_config, layer.moe_config)
         return None
 
 
