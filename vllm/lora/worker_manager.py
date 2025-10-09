@@ -17,6 +17,7 @@ from vllm.lora.models import (
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
+from vllm.model_executor.models.module_mapping import MultiModelKeys
 
 logger = init_logger(__name__)
 
@@ -113,6 +114,14 @@ class WorkerLoRAManager:
             model = self._adapter_manager.model
             hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
 
+            # Ignore these modules even if they are found in the LoRA
+            # checkpoint. (e.g. vision/audio towers in MM models)
+            ignore_modules = []
+            if self._adapter_manager.supports_mm:
+                mm : MultiModelKeys = model.get_mm_mapping()
+                ignore_modules = mm.connector + mm.tower_model
+
+
             lora = self._lora_model_cls.from_local_checkpoint(
                 lora_path,
                 expected_lora_modules,
@@ -126,6 +135,7 @@ class WorkerLoRAManager:
                 embedding_padding_modules=self.embedding_padding_modules,
                 tensorizer_config_dict=lora_request.tensorizer_config_dict,
                 weights_mapper=hf_to_vllm_mapper,
+                ignore_modules=ignore_modules,
             )
 
         except FileNotFoundError as e:

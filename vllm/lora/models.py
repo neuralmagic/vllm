@@ -205,6 +205,7 @@ class LoRAModel:
         embedding_padding_modules: Optional[list[str]] = None,
         weights_mapper: Optional[WeightsMapper] = None,
         tensorizer_config_dict: Optional[dict] = None,
+        ignore_modules: list[str] = [],
     ) -> "LoRAModel":
         """Create a LoRAModel from a local checkpoint.
 
@@ -230,6 +231,16 @@ class LoRAModel:
         new_embeddings_bin_file_path = os.path.join(lora_dir, "new_embeddings.bin")
         tensors: dict[str, torch.Tensor] = {}
         unexpected_modules: list[Union[list[str], str]] = []
+
+
+        def filter_ignored_lora_module_keys(modules: dict) -> list[str]:
+            supported_keys = []
+            for lora_module in modules.keys():  # noqa
+                module_name, _, _ = parse_fine_tuned_lora_name(
+                    lora_module, weights_mapper)
+                if not any([module_name.startswith(prefix) for prefix in ignore_modules]):
+                    supported_keys.append(lora_module)
+            return supported_keys 
 
         def check_unexpected_modules(modules: dict):
             for lora_module in modules.keys():  # noqa
@@ -260,6 +271,10 @@ class LoRAModel:
                 dtype=tensorizer_config.dtype,
                 **tensorizer_args.deserialization_kwargs,
             )
+
+            # Remove explicitly ignored modules.
+            tensors = {k: v for k, v in tensors.items() if k in filter_ignored_lora_module_keys(tensors)}
+            # Check that tensors have only expected LoRA modules.
             check_unexpected_modules(tensors)
 
         elif os.path.isfile(lora_tensor_path):
@@ -271,10 +286,14 @@ class LoRAModel:
             # the target_modules of the adapter_config.json.
             unexpected_modules = []
             with safetensors.safe_open(lora_tensor_path, framework="pt") as f:  # type: ignore
-                # Load tensors if there are only expected modules.
-                check_unexpected_modules(f)
                 for module in f.keys():  # noqa
                     tensors[module] = f.get_tensor(module)
+
+            # Remove explicitly ignored modules.
+            tensors = {k: v for k, v in tensors.items() if k in filter_ignored_lora_module_keys(tensors)}
+            # Check that tensors have only expected LoRA modules.
+            check_unexpected_modules(tensors)
+
         elif os.path.isfile(lora_bin_file_path) or os.path.isfile(lora_pt_file_path):
             # When a bin/pt file is provided, we rely on config to find
             # unexpected modules.
