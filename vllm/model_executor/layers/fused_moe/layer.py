@@ -67,6 +67,7 @@ if current_platform.is_cuda_alike():
     if has_pplx():
         from .pplx_prepare_finalize import (
             PplxPrepareAndFinalize,
+            pplx_hidden_dim_scale,
             pplx_hidden_dim_scale_bytes,
         )
     if has_deep_ep():
@@ -191,6 +192,43 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
             handle = all2all_manager.get_handle(all_to_all_args)
 
+            prepare_finalize = PplxPrepareAndFinalize(
+                handle,
+                max_num_tokens=moe.max_num_tokens,
+                num_local_experts=moe.num_local_experts,
+                num_dispatchers=num_dispatchers,
+            )
+        elif moe.use_pplx_efa_kernels:
+            assert quant_config is not None
+
+            hidden_dim_scale = pplx_hidden_dim_scale(
+                moe.hidden_dim,
+                quant_config.quant_dtype,
+                per_act_token_quant=quant_config.per_act_token_quant,
+                block_shape=quant_config.block_shape,
+            )
+
+            all_to_all_args = dict(
+                max_num_tokens=moe.max_num_tokens,
+                num_experts=moe.num_experts,
+                num_experts_per_token=moe.experts_per_token,
+                expert_padding=1,  # TODO: tests use 1 or 16
+                hidden_dim=moe.hidden_dim,
+                hidden_dim_scale=hidden_dim_scale,
+                in_dtype=moe.in_dtype,
+                out_dtype=moe.in_dtype,  # or quant type?
+                scale_dtype=torch.float32,
+                max_private_tokens=None,  # For tuning
+            )
+
+            num_dispatchers = (
+                all2all_manager.world_size // all2all_manager.tp_group.world_size
+            )
+
+            handle = all2all_manager.get_handle(all_to_all_args)
+
+            # Note: the API for EFA appears identical to the regular pplx kernels,
+            # so we can reuse the PplxPrepareAndFinalize class for both.
             prepare_finalize = PplxPrepareAndFinalize(
                 handle,
                 max_num_tokens=moe.max_num_tokens,
@@ -1380,6 +1418,10 @@ class FusedMoE(CustomOp):
         return self.moe_parallel_config.use_pplx_kernels
 
     @property
+    def use_pplx_efa_kernels(self):
+        return self.moe_parallel_config.use_pplx_efa_kernels
+
+    @property
     def use_deepep_ht_kernels(self):
         return self.moe_parallel_config.use_deepep_ht_kernels
 
@@ -1401,6 +1443,7 @@ class FusedMoE(CustomOp):
         # only when data parallelism (DP) is enabled.
         return (
             self.moe_parallel_config.use_pplx_kernels
+            or self.moe_parallel_config.use_pplx_efa_kernels
             or self.moe_parallel_config.use_deepep_ll_kernels
             or (self.dp_size > 1 and self.use_flashinfer_cutlass_kernels)
         )
