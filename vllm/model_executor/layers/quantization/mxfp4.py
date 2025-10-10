@@ -27,15 +27,10 @@ from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
 from vllm.model_executor.layers.fused_moe.trtllm_moe import TrtLlmGenExperts
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig, QuantizeMethodBase)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    get_marlin_input_dtype,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (prepare_moe_fp4_layer_for_marlin,
-    prepare_moe_fp4_layer_for_marlin,
-)
+from vllm.model_executor.layers.quantization.utils.marlin_utils import get_marlin_input_dtype
+from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import prepare_moe_fp4_layer_for_marlin
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import _can_support_mxfp4
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import set_weight_attrs
@@ -44,7 +39,6 @@ from vllm.scalar_type import scalar_types
 from vllm.utils import has_triton_kernels, is_torch_equal_or_newer, next_power_of_2, round_up
 
 from vllm.utils.flashinfer import has_flashinfer
-import vllm.utils.flashinfer as flashinfer
 
 logger = init_logger(__name__)
 
@@ -357,7 +351,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
             prepare_moe_fp4_layer_for_marlin(
                 layer, input_dtype=self.marlin_input_dtype)
-            prepare_moe_fp4_layer_for_marlin(layer)
         elif (
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
             or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
