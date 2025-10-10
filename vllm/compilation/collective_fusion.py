@@ -889,10 +889,6 @@ class AllReduceFusedRMSNormStaticQuantNVFP4Pattern(BasePattern):
             input = torch.empty([1, 16, 16],
                                 device=self.device,
                                 dtype=self.dtype)
-
-            rmsnorm_result = torch.empty([1, 16, 16],
-                                         device=self.device,
-                                         dtype=self.dtype)
             quant_result = torch.empty((16, 8),
                                        device=self.device,
                                        dtype=torch.uint8)
@@ -905,13 +901,11 @@ class AllReduceFusedRMSNormStaticQuantNVFP4Pattern(BasePattern):
                                        dtype=torch.int32)
 
             return [
-                input, rmsnorm_result, quant_result, weight,
-                input_global_scale, output_scale
+                input, quant_result, weight, input_global_scale, output_scale
             ]
 
         def pattern(
             input: torch.Tensor,
-            rmsnorm_result: torch.Tensor,
             quant_result: torch.Tensor,
             weight: torch.Tensor,
             input_global_scale: torch.Tensor,
@@ -929,11 +923,11 @@ class AllReduceFusedRMSNormStaticQuantNVFP4Pattern(BasePattern):
             # quant_out, allreduce_output, output_scale
             return quant_out_tuple[1], all_reduce, quant_out_tuple[2]
 
-        def replacement(input: torch.Tensor, result_rms: torch.Tensor,
-                        quant_result: torch.Tensor, weight: torch.Tensor,
-                        input_global_scale: torch.Tensor,
+        def replacement(input: torch.Tensor, quant_result: torch.Tensor,
+                        weight: torch.Tensor, input_global_scale: torch.Tensor,
                         output_scale: torch.Tensor):
             residual = torch.zeros_like(input)
+            result_rms = torch.empty_like(input)
             allreduce = auto_functionalized(
                 flashinfer_trtllm_fused_allreduce_norm,
                 allreduce_in=input,
