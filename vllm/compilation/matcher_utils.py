@@ -98,8 +98,9 @@ class MatcherRMSNorm(MatcherCustomOp):
         input: torch.Tensor,
         weight: torch.Tensor,
     ) -> torch.Tensor:
-        return RMSNorm.forward_static(input, self.epsilon, input.size(-1),
-                                      self.model_dtype, weight)
+        return RMSNorm.forward_static(
+            input, self.epsilon, input.size(-1), self.model_dtype, weight
+        )
 
 
 class MatcherFusedAddRMSNorm(MatcherCustomOp):
@@ -140,8 +141,9 @@ class MatcherFusedAddRMSNorm(MatcherCustomOp):
         weight: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return RMSNorm.forward_static(input, self.epsilon, input.size(-1),
-                                      self.model_dtype, weight, residual)
+        return RMSNorm.forward_static(
+            input, self.epsilon, input.size(-1), self.model_dtype, weight, residual
+        )
 
 
 class MatcherQuant:
