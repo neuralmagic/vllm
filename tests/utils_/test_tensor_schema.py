@@ -22,7 +22,9 @@ def test_tensor_schema_optional_fields():
         image_sizes=None,
     )
 
-    Phi3VImagePixelInputs(data=torch.randn(16, 64, 3, 32, 32), )
+    Phi3VImagePixelInputs(
+        data=torch.randn(16, 64, 3, 32, 32),
+    )
 
 
 def test_tensor_schema_constant_dim_failure():
@@ -55,7 +57,9 @@ def test_tensor_schema_rank_mismatch():
 
 def test_tensor_schema_missing_required_field():
     with pytest.raises(ValueError, match="Required field 'data' is missing"):
-        Phi3VImagePixelInputs(image_sizes=torch.randint(0, 256, (16, 2)), )
+        Phi3VImagePixelInputs(
+            image_sizes=torch.randint(0, 256, (16, 2)),
+        )
 
 
 def test_tensor_schema_symbolic_dim_mismatch():
@@ -98,9 +102,8 @@ def test_tensor_schema_tuple_tensor_valid():
 def test_tensor_schema_inconsistent_shapes_in_list():
     with pytest.raises(ValueError, match="contains inconsistent shapes"):
         Phi3VImagePixelInputs(
-            data=[torch.randn(64, 3, 32, 32),
-                  torch.randn(64, 3, 16, 16)] +
-            [torch.randn(64, 3, 32, 32) for _ in range(14)],
+            data=[torch.randn(64, 3, 32, 32), torch.randn(64, 3, 16, 16)]
+            + [torch.randn(64, 3, 32, 32) for _ in range(14)],
             image_sizes=torch.randint(0, 256, (16, 2)),
         )
 
@@ -130,10 +133,7 @@ def test_tensor_schema_with_valid_resolve_binding_dims():
     Phi3VImagePixelInputs(
         data=data,
         image_sizes=image_sizes,
-        resolve_bindings={
-            "h": 336,
-            "w": 336
-        },
+        resolve_bindings={"h": 336, "w": 336},
     )
 
 
@@ -146,10 +146,7 @@ def test_tensor_schema_with_invalid_resolve_binding_dims():
         Phi3VImagePixelInputs(
             data=data,
             image_sizes=image_sizes,
-            resolve_bindings={
-                "h": 336,
-                "w": 336
-            },
+            resolve_bindings={"h": 336, "w": 336},
         )
 
 

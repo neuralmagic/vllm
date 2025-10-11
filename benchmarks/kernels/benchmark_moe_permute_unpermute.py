@@ -405,7 +405,7 @@ def main(args: argparse.Namespace):
         ],
     )
 
-    for batch_size, (permute, unpermute) in zip(batch_sizes, outputs):
+    for batch_size, (permute, unpermute) in zip(batch_sizes, outputs, strict=False):
         print(f"Batch size: {batch_size}")
         print(f"Permute time: {permute:.2f} us")
         print(f"Unpermute time: {unpermute:.2f} us")

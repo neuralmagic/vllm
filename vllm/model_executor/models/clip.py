@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Minimal implementation of CLIPVisionModel intended to be only used
 within a vision language model."""
+
 from collections.abc import Iterable
 from typing import Optional, Union
 
@@ -12,26 +13,30 @@ from transformers import CLIPVisionConfig
 from vllm.attention.layer import MultiHeadAttention
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsQuant
 
-from .vision import (VisionEncoderInfo, VisionFeatureSelectStrategy,
-                     resolve_visual_encoder_outputs)
+from .vision import (
+    VisionEncoderInfo,
+    VisionFeatureSelectStrategy,
+    resolve_visual_encoder_outputs,
+)
 
 
 class CLIPEncoderInfo(VisionEncoderInfo[CLIPVisionConfig]):
-
     def get_num_image_tokens(
         self,
         *,
         image_width: int,
         image_height: int,
     ) -> int:
-        return self.get_patch_grid_length()**2 + 1
+        return self.get_patch_grid_length() ** 2 + 1
 
     def get_image_size(self) -> int:
         return self.vision_config.image_size
@@ -47,7 +52,6 @@ class CLIPEncoderInfo(VisionEncoderInfo[CLIPVisionConfig]):
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/clip/modeling_clip.py#L164 # noqa
 class CLIPVisionEmbeddings(nn.Module):
-
     def __init__(self, config: CLIPVisionConfig):
         super().__init__()
         self.config = config
@@ -66,19 +70,21 @@ class CLIPVisionEmbeddings(nn.Module):
             bias=False,
         )
 
-        self.num_patches = (self.image_size // self.patch_size)**2
+        self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
-        self.position_embedding = nn.Embedding(self.num_positions,
-                                               self.embed_dim)
-        self.register_buffer("position_ids",
-                             torch.arange(self.num_positions).expand((1, -1)),
-                             persistent=False)
+        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+        self.register_buffer(
+            "position_ids",
+            torch.arange(self.num_positions).expand((1, -1)),
+            persistent=False,
+        )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         batch_size = pixel_values.shape[0]
         target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(pixel_values.to(
-            dtype=target_dtype))  # shape = [*, width, grid, grid]
+        patch_embeds = self.patch_embedding(
+            pixel_values.to(dtype=target_dtype)
+        )  # shape = [*, width, grid, grid]
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
@@ -106,7 +112,8 @@ class CLIPAttention(nn.Module):
             raise ValueError(
                 "embed_dim must be divisible by num_heads "
                 f"(got `embed_dim`: {self.embed_dim} and `num_heads`:"
-                f" {self.num_heads}).")
+                f" {self.num_heads})."
+            )
         self.scale = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
@@ -127,8 +134,9 @@ class CLIPAttention(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
-        self.attn = MultiHeadAttention(self.num_heads_per_partition,
-                                       self.head_dim, self.scale)
+        self.attn = MultiHeadAttention(
+            self.num_heads_per_partition, self.head_dim, self.scale
+        )
 
     def forward(
         self,
@@ -145,7 +153,6 @@ class CLIPAttention(nn.Module):
 
 
 class CLIPMLP(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -155,16 +162,20 @@ class CLIPMLP(nn.Module):
         super().__init__()
         self.config = config
         self.activation_fn = get_act_fn(config.hidden_act)
-        self.fc1 = ColumnParallelLinear(config.hidden_size,
-                                        config.intermediate_size,
-                                        bias=True,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.fc1")
-        self.fc2 = RowParallelLinear(config.intermediate_size,
-                                     config.hidden_size,
-                                     bias=True,
-                                     quant_config=quant_config,
-                                     prefix=f"{prefix}.fc2")
+        self.fc1 = ColumnParallelLinear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc1",
+        )
+        self.fc2 = RowParallelLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.fc2",
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, _ = self.fc1(hidden_states)
@@ -175,7 +186,6 @@ class CLIPMLP(nn.Module):
 
 
 class CLIPEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -188,16 +198,11 @@ class CLIPEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.layer_norm1 = nn.LayerNorm(config.hidden_size,
-                                        eps=config.layer_norm_eps)
-        self.mlp = CLIPMLP(config,
-                           quant_config=quant_config,
-                           prefix=f"{prefix}.mlp")
-        self.layer_norm2 = nn.LayerNorm(config.hidden_size,
-                                        eps=config.layer_norm_eps)
+        self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp = CLIPMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
@@ -236,12 +241,16 @@ class CLIPEncoder(nn.Module):
             num_hidden_layers = config.num_hidden_layers
         else:
             num_hidden_layers = num_hidden_layers_override
-        self.layers = nn.ModuleList([
-            CLIPEncoderLayer(config=config,
-                             quant_config=quant_config,
-                             prefix=f"{prefix}.layers.{layer_idx}")
-            for layer_idx in range(num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                CLIPEncoderLayer(
+                    config=config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{layer_idx}",
+                )
+                for layer_idx in range(num_hidden_layers)
+            ]
+        )
 
     def forward(
         self, inputs_embeds: torch.Tensor, return_all_hidden_states: bool
@@ -261,7 +270,6 @@ class CLIPEncoder(nn.Module):
 
 
 class CLIPVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -301,8 +309,7 @@ class CLIPVisionTransformer(nn.Module):
             require_post_norm = len(self.encoder.layers) == num_hidden_layers
 
         if require_post_norm:
-            self.post_layernorm = nn.LayerNorm(embed_dim,
-                                               eps=config.layer_norm_eps)
+            self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         else:
             self.post_layernorm = None
 
@@ -313,7 +320,6 @@ class CLIPVisionTransformer(nn.Module):
         select_layers: Optional[list[int]] = None,
         feature_select_strategy: Optional[VisionFeatureSelectStrategy] = None,
     ) -> torch.Tensor:
-
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.pre_layrnorm(hidden_states)
 
@@ -356,7 +362,8 @@ class CLIPVisionModel(nn.Module, SupportsQuant):
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override,
             require_post_norm=require_post_norm,
-            prefix=f"{prefix}.vision_model")
+            prefix=f"{prefix}.vision_model",
+        )
 
     def forward(
         self,
@@ -376,8 +383,7 @@ class CLIPVisionModel(nn.Module, SupportsQuant):
 
     # (TODO) Add prefix argument for filtering out weights to be loaded
     #        ref: https://github.com/vllm-project/vllm/pull/7186#discussion_r1734163986
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -390,8 +396,10 @@ class CLIPVisionModel(nn.Module, SupportsQuant):
 
         for name, loaded_weight in weights:
             # post_layernorm is not needed in CLIPVisionModel
-            if (name.startswith("vision_model.post_layernorm")
-                    and self.vision_model.post_layernorm is None):
+            if (
+                name.startswith("vision_model.post_layernorm")
+                and self.vision_model.post_layernorm is None
+            ):
                 continue
 
             # omit layers when num_hidden_layers_override is set
@@ -400,7 +408,7 @@ class CLIPVisionModel(nn.Module, SupportsQuant):
                 if layer_idx >= layer_count:
                     continue
 
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -411,8 +419,7 @@ class CLIPVisionModel(nn.Module, SupportsQuant):
                 break
             else:
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

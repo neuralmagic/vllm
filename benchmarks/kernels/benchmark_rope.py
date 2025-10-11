@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from itertools import accumulate
-from typing import Optional
 
 import nvtx
 import torch
@@ -18,7 +17,7 @@ def benchmark_rope_kernels_multi_lora(
     seq_len: int,
     num_heads: int,
     head_size: int,
-    rotary_dim: Optional[int],
+    rotary_dim: int | None,
     dtype: torch.dtype,
     seed: int,
     device: str,
@@ -83,7 +82,7 @@ def benchmark_rope_kernels_multi_lora(
     # batched queries of the same type together for non-batched RoPE
     queries = [query[query_types == i] for i in range(len(scaling_factors))]
     keys = [key[query_types == i] for i in range(len(scaling_factors))]
-    packed_qkr = zip(queries, keys, non_batched_ropes)
+    packed_qkr = zip(queries, keys, non_batched_ropes, strict=False)
     # synchronize before start timing
     torch.cuda.synchronize()
     with nvtx.annotate("non-batched", color="yellow"):

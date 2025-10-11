@@ -14,8 +14,7 @@ from black.cache import NamedTuple
 
 from tests.v1.attention.utils import _Backend
 from vllm import LLM, SamplingParams
-from vllm.config import (CompilationConfig, CompilationLevel, CUDAGraphMode,
-                         PassConfig)
+from vllm.config import CompilationConfig, CompilationLevel, CUDAGraphMode, PassConfig
 from vllm.platforms import current_platform
 from vllm.utils import is_torch_equal_or_newer
 from vllm.utils.flashinfer import has_flashinfer
@@ -106,16 +105,23 @@ CUSTOM_OPS_FP8 = ["-quant_fp8"]  # , "+quant_fp8"]
     # Test attention+quant_fp8 fusion with custom and torch impls of QuantFP8
     list(flat_product(MODELS_FP8, CUSTOM_OPS_FP8))
     # quant_fp4 only has the custom impl
-    + list(flat_product(MODELS_FP4, [""])))
+    + list(flat_product(MODELS_FP4, [""])),
+)
 @pytest.mark.parametrize("inductor_graph_partition", [True, False])
-def test_attn_quant(model_name: str, model_kwargs: dict[str, Any],
-                    backend: _Backend, attention_fusions: int,
-                    allreduce_fusions: int, custom_ops: str,
-                    inductor_graph_partition: bool, caplog_mp_spawn,
-                    monkeypatch):
+def test_attn_quant(
+    model_name: str,
+    model_kwargs: dict[str, Any],
+    backend: _Backend,
+    attention_fusions: int,
+    allreduce_fusions: int,
+    custom_ops: str,
+    inductor_graph_partition: bool,
+    caplog_mp_spawn,
+    monkeypatch,
+):
     if backend == _Backend.FLASHINFER and (
-            not current_platform.is_device_capability(
-                (10, 0)) or not has_flashinfer()):
+        not current_platform.is_device_capability((10, 0)) or not has_flashinfer()
+    ):
         pytest.skip("FlashInfer attn fusion requires Blackwell and flashinfer")
     if inductor_graph_partition and not is_torch_equal_or_newer("2.9.0.dev"):
         pytest.skip("Inductor graph partition requires torch>=2.9")
@@ -154,8 +160,9 @@ def test_attn_quant(model_name: str, model_kwargs: dict[str, Any],
     with caplog_mp_spawn(logging.DEBUG) as log_holder:
         run_model(compilation_config, model_name, **model_kwargs)
 
-    assert (f"Fused quant onto {attention_fusions} attention nodes"
-            in log_holder.text), log_holder.text
+    assert f"Fused quant onto {attention_fusions} attention nodes" in log_holder.text, (
+        log_holder.text
+    )
 
 
 # TODO(luka) test both in nightly
@@ -164,7 +171,7 @@ CUSTOM_OPS_RMS_NORM = ["-rms_norm"]  # , "+rms_norm"]
 
 def custom_ops_product(*custom_ops_lists: list[str]) -> Iterable[str]:
     for op_list in itertools.product(*custom_ops_lists):
-        yield ','.join(op_list)
+        yield ",".join(op_list)
 
 
 @multi_gpu_test(num_gpus=2)
@@ -173,15 +180,20 @@ def custom_ops_product(*custom_ops_lists: list[str]) -> Iterable[str]:
     "attention_fusions, allreduce_fusions, custom_ops",
     # Toggle RMSNorm and QuantFP8 for FP8 models
     list(
-        flat_product(MODELS_FP8,
-                     custom_ops_product(CUSTOM_OPS_FP8, CUSTOM_OPS_RMS_NORM))
+        flat_product(
+            MODELS_FP8, custom_ops_product(CUSTOM_OPS_FP8, CUSTOM_OPS_RMS_NORM)
+        )
     )  # TODO
     # Toggle RMSNorm for FP4 models and unquant models
-    + list(flat_product(MODELS_FP4 + MODELS, CUSTOM_OPS_RMS_NORM)))
+    + list(flat_product(MODELS_FP4 + MODELS, CUSTOM_OPS_RMS_NORM)),
+)
 @pytest.mark.parametrize("inductor_graph_partition", [True, False])
-@pytest.mark.skipif(not current_platform.is_cuda() or not has_flashinfer()
-                    or not current_platform.has_device_capability(90),
-                    reason="allreduce+rmsnorm fusion requires flashinfer")
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not has_flashinfer()
+    or not current_platform.has_device_capability(90),
+    reason="allreduce+rmsnorm fusion requires flashinfer",
+)
 def test_tp2_attn_quant_allreduce_rmsnorm(
     model_name: str,
     model_kwargs: dict,
@@ -232,32 +244,38 @@ def test_tp2_attn_quant_allreduce_rmsnorm(
     )
 
     with caplog_mp_spawn(logging.DEBUG) as log_holder:
-        run_model(compilation_config,
-                  model_name,
-                  tensor_parallel_size=2,
-                  **model_kwargs)
+        run_model(
+            compilation_config, model_name, tensor_parallel_size=2, **model_kwargs
+        )
     matches = re.findall(
-        r'\[compilation/fusion_attn.py:\d+] '
-        r'Fused quant onto (\d+) attention nodes', log_holder.text)
+        r"\[compilation/fusion_attn.py:\d+] "
+        r"Fused quant onto (\d+) attention nodes",
+        log_holder.text,
+    )
     assert len(matches) == 2, log_holder.text
 
     assert int(matches[0]) == attention_fusions
     assert int(matches[1]) == attention_fusions
 
     matches = re.findall(
-        r'\[compilation/collective_fusion.py:\d+] '
-        r'Replaced (\d+) patterns', log_holder.text)
+        r"\[compilation/collective_fusion.py:\d+] "
+        r"Replaced (\d+) patterns",
+        log_holder.text,
+    )
     assert len(matches) == 2, log_holder.text
 
     assert int(matches[0]) == allreduce_fusions
     assert int(matches[1]) == allreduce_fusions
 
 
-def run_model(compile_config: Union[int, CompilationConfig], model: str,
-              **model_kwargs):
-    compilation_config = compile_config if \
-        isinstance(compile_config, CompilationConfig) else \
-        CompilationConfig(level=compile_config)
+def run_model(
+    compile_config: Union[int, CompilationConfig], model: str, **model_kwargs
+):
+    compilation_config = (
+        compile_config
+        if isinstance(compile_config, CompilationConfig)
+        else CompilationConfig(level=compile_config)
+    )
 
     prompts = [
         "Hello, my name is",
@@ -267,8 +285,8 @@ def run_model(compile_config: Union[int, CompilationConfig], model: str,
     ]
     sampling_params = SamplingParams(temperature=0)
     # Allow override from model_kwargs
-    model_kwargs = {'tensor_parallel_size': 1, **model_kwargs}
-    model_kwargs = {'disable_custom_all_reduce': True, **model_kwargs}
+    model_kwargs = {"tensor_parallel_size": 1, **model_kwargs}
+    model_kwargs = {"disable_custom_all_reduce": True, **model_kwargs}
 
     # No cudagraphs by default
     if compilation_config.cudagraph_mode is None:

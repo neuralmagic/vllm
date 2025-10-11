@@ -61,7 +61,7 @@ def main(args):
     assert len(tokens) == len(predictions)
 
     # Print results
-    for token, label in zip(tokens, labels):
+    for token, label in zip(tokens, labels, strict=False):
         if token not in tokenizer.all_special_tokens:
             print(f"{token:15} → {label}")
 

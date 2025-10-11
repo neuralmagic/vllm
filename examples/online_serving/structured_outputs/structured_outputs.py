@@ -244,7 +244,7 @@ async def cli():
                 for name in constraints
             ]
         )
-        for constraint, stream in zip(constraints, results):
+        for constraint, stream in zip(constraints, results, strict=False):
             await print_stream_response(stream, constraint, args)
     else:
         results = await asyncio.gather(
@@ -258,7 +258,7 @@ async def cli():
                 for name in constraints
             ]
         )
-        for constraint, response in zip(constraints, results):
+        for constraint, response in zip(constraints, results, strict=False):
             print(f"\n\n{constraint}:")
             message = response.choices[0].message
             if args.reasoning and hasattr(message, "reasoning_content"):

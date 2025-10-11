@@ -619,7 +619,7 @@ def create_total_tokens_plot(all_results):
                     label.set_fontweight("bold")
 
             # Add value labels on speedup points
-            for x, y in zip(total_tokens_values, ratios):
+            for x, y in zip(total_tokens_values, ratios, strict=False):
                 ax_speedup.annotate(
                     f"{y:.2f}x",
                     (x, y),
@@ -632,7 +632,9 @@ def create_total_tokens_plot(all_results):
                 )
 
             # Add value labels on CUDA bandwidth points
-            for x, y in zip(total_tokens_values, cuda_bandwidth_percentages):
+            for x, y in zip(
+                total_tokens_values, cuda_bandwidth_percentages, strict=False
+            ):
                 ax_bandwidth.annotate(
                     f"{y:.1f}%",
                     (x, y),
@@ -645,7 +647,9 @@ def create_total_tokens_plot(all_results):
                 )
 
             # Add value labels on Triton bandwidth points
-            for x, y in zip(total_tokens_values, triton_bandwidth_percentages):
+            for x, y in zip(
+                total_tokens_values, triton_bandwidth_percentages, strict=False
+            ):
                 ax_bandwidth.annotate(
                     f"{y:.1f}%",
                     (x, y),

@@ -315,7 +315,9 @@ def tune_on_gpu(args_dict):
             )
             for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
         ]
-        best_configs = {M: config for M, config in zip(batch_sizes, benchmark_results)}
+        best_configs = {
+            M: config for M, config in zip(batch_sizes, benchmark_results, strict=False)
+        }
         save_configs(N, K, block_n, block_k, best_configs, save_path, input_type)
 
     end = time.time()

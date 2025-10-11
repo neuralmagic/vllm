@@ -6,8 +6,7 @@ import copy
 import itertools
 import pickle as pkl
 import time
-from collections.abc import Iterable
-from typing import Callable
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.utils.benchmark as TBenchmark
@@ -386,7 +385,7 @@ def make_output(
 
 def run_square_bench(args):
     dim_sizes = list(range(args.dim_start, args.dim_end + 1, args.dim_increment))
-    MKNs = list(zip(dim_sizes, dim_sizes, dim_sizes))
+    MKNs = list(zip(dim_sizes, dim_sizes, dim_sizes, strict=False))
     data = run(args.dtype, MKNs)
 
     make_output(data, MKNs, f"square_bench-{args.dtype}")
@@ -398,7 +397,7 @@ def run_range_bench(args):
     Ms = [args.m_constant] * n if args.m_constant is not None else dim_sizes
     Ks = [args.k_constant] * n if args.k_constant is not None else dim_sizes
     Ns = [args.n_constant] * n if args.n_constant is not None else dim_sizes
-    MKNs = list(zip(Ms, Ks, Ns))
+    MKNs = list(zip(Ms, Ks, Ns, strict=False))
     data = run(args.dtype, MKNs)
 
     make_output(data, MKNs, f"range_bench-{args.dtype}")
@@ -430,7 +429,7 @@ def run_model_bench(args):
         model_bench_data.append(data)
 
     # Print all results
-    for data, model_tp in zip(model_bench_data, models_tps):
+    for data, model_tp in zip(model_bench_data, models_tps, strict=False):
         model, tp_size = model_tp
         print(f"== Results {args.dtype} {model}-TP{tp_size} ====")
         print_timers(data)

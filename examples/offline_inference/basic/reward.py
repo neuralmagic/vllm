@@ -39,7 +39,7 @@ def main(args: Namespace):
 
     # Print the outputs.
     print("\nGenerated Outputs:\n" + "-" * 60)
-    for prompt, output in zip(prompts, outputs):
+    for prompt, output in zip(prompts, outputs, strict=False):
         rewards = output.outputs.data
         rewards_trimmed = (
             (str(rewards[:16])[:-1] + ", ...]") if len(rewards) > 16 else rewards

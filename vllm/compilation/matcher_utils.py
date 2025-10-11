@@ -11,29 +11,29 @@ from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    QuantKey, _normalize_quant_group_shape, kFp8DynamicTensorSym,
-    kFp8DynamicTokenSym, kFp8StaticTensorSym, kNvfp4Quant)
+    QuantKey,
+    _normalize_quant_group_shape,
+    kFp8DynamicTensorSym,
+    kFp8DynamicTokenSym,
+    kFp8StaticTensorSym,
+    kNvfp4Quant,
+)
 from vllm.platforms import current_platform
 
 RMS_OP = torch.ops._C.rms_norm.default
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
 
 QUANT_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym:
-    torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTensorSym:
-    torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
-    kFp8DynamicTokenSym:
-    torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
+    kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
+    kFp8DynamicTensorSym: torch.ops._C.dynamic_scaled_fp8_quant.default,  # noqa: E501
+    kFp8DynamicTokenSym: torch.ops._C.dynamic_per_token_scaled_fp8_quant.default,  # noqa: E501
 }
 
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
-    QUANT_OPS[
-        kNvfp4Quant] = torch.ops._C.scaled_fp4_quant.default  # noqa: E501
+    QUANT_OPS[kNvfp4Quant] = torch.ops._C.scaled_fp4_quant.default  # noqa: E501
 
 
 class MatcherCustomOp(ABC):
-
     def __init__(self, enabled: bool):
         self.model_dtype = get_current_vllm_config().model_config.dtype
 
@@ -63,7 +63,6 @@ class MatcherCustomOp(ABC):
 
 
 class MatcherRMSNorm(MatcherCustomOp):
-
     def __init__(self, epsilon: float, enabled: Optional[bool] = None):
         if enabled is None:
             enabled = RMSNorm.enabled()
@@ -73,7 +72,9 @@ class MatcherRMSNorm(MatcherCustomOp):
 
     def inputs(self):
         input = self.empty(5, 16) if self.enabled else self.empty_f32(5, 16)
-        weight = self.empty(16, )
+        weight = self.empty(
+            16,
+        )
         return [input, weight]
 
     def forward_custom(
@@ -97,12 +98,12 @@ class MatcherRMSNorm(MatcherCustomOp):
         input: torch.Tensor,
         weight: torch.Tensor,
     ) -> torch.Tensor:
-        return RMSNorm.forward_static(input, self.epsilon, input.size(-1),
-                                      self.model_dtype, weight)
+        return RMSNorm.forward_static(
+            input, self.epsilon, input.size(-1), self.model_dtype, weight
+        )
 
 
 class MatcherFusedAddRMSNorm(MatcherCustomOp):
-
     def __init__(self, epsilon: float, enabled: Optional[bool] = None):
         if enabled is None:
             enabled = RMSNorm.enabled()
@@ -112,7 +113,9 @@ class MatcherFusedAddRMSNorm(MatcherCustomOp):
 
     def inputs(self):
         input = self.empty(5, 16) if self.enabled else self.empty_f32(5, 16)
-        weight = self.empty(16, )
+        weight = self.empty(
+            16,
+        )
         residual = self.empty(5, 16)
         return [input, weight, residual]
 
@@ -122,11 +125,13 @@ class MatcherFusedAddRMSNorm(MatcherCustomOp):
         weight: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _, result, residual = auto_functionalized(RMS_ADD_OP,
-                                                  input=input,
-                                                  residual=residual,
-                                                  weight=weight,
-                                                  epsilon=self.epsilon)
+        _, result, residual = auto_functionalized(
+            RMS_ADD_OP,
+            input=input,
+            residual=residual,
+            weight=weight,
+            epsilon=self.epsilon,
+        )
 
         return result, residual
 
@@ -136,22 +141,19 @@ class MatcherFusedAddRMSNorm(MatcherCustomOp):
         weight: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return RMSNorm.forward_static(input, self.epsilon, input.size(-1),
-                                      self.model_dtype, weight, residual)
+        return RMSNorm.forward_static(
+            input, self.epsilon, input.size(-1), self.model_dtype, weight, residual
+        )
 
 
 class MatcherQuant:
-
     def __init__(self, quant_key: QuantKey, enabled: Optional[bool] = None):
-
         self.quant_key = quant_key
-        assert quant_key in QUANT_OPS, \
-            f"unsupported quantization scheme {quant_key}"
+        assert quant_key in QUANT_OPS, f"unsupported quantization scheme {quant_key}"
         self.QUANT_OP = QUANT_OPS[quant_key]
 
         assert quant_key.scale2 is None
-        self.quant_fp8 = QuantFP8(quant_key.scale.static,
-                                  quant_key.scale.group_shape)
+        self.quant_fp8 = QuantFP8(quant_key.scale.static, quant_key.scale.group_shape)
 
         if enabled is None:
             # TODO either pass config to enabled or set it globally
@@ -167,25 +169,22 @@ class MatcherQuant:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # TODO: why does empty_like produce a permute but
         #  empty via shape doesn't?
-        result = torch.empty(input.shape,
-                             device=input.device,
-                             dtype=self.quant_key.dtype)
+        result = torch.empty(
+            input.shape, device=input.device, dtype=self.quant_key.dtype
+        )
 
         if self.quant_key.scale.static:
             assert scale is not None
-            _, result = auto_functionalized(self.QUANT_OP,
-                                            result=result,
-                                            input=input,
-                                            scale=scale)
+            _, result = auto_functionalized(
+                self.QUANT_OP, result=result, input=input, scale=scale
+            )
             return result, scale
         else:
             assert scale is None
             scale = self.make_scale(input)
-            _, result, scale = auto_functionalized(self.QUANT_OP,
-                                                   result=result,
-                                                   input=input,
-                                                   scale=scale,
-                                                   scale_ub=None)
+            _, result, scale = auto_functionalized(
+                self.QUANT_OP, result=result, input=input, scale=scale, scale_ub=None
+            )
             return result, scale
 
     def forward_native(
@@ -197,18 +196,16 @@ class MatcherQuant:
 
     def make_scale(self, input: torch.Tensor):
         normalized_group_shape = _normalize_quant_group_shape(
-            input, self.quant_key.scale.group_shape)
+            input, self.quant_key.scale.group_shape
+        )
         scale_shape = (
             input.shape[0] // normalized_group_shape[0],
             input.shape[1] // normalized_group_shape[1],
         )
 
-        return torch.empty(scale_shape,
-                           device=input.device,
-                           dtype=torch.float32)
+        return torch.empty(scale_shape, device=input.device, dtype=torch.float32)
 
-    def __call__(self,
-                 input: torch.Tensor,
-                 scale: Optional[torch.Tensor] = None
-                 ) -> tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self, input: torch.Tensor, scale: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward(input, scale)

@@ -256,9 +256,9 @@ def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int
             "num_stages": num_stage_range,
         }
 
-    keys, values = zip(*param_ranges.items())
+    keys, values = zip(*param_ranges.items(), strict=False)
     for config_values in product(*values):
-        config = dict(zip(keys, config_values))
+        config = dict(zip(keys, config_values, strict=False))
         configs.append(config)
 
     # Remove configs that are not compatible with fp8 block quantization
@@ -706,7 +706,8 @@ def main(args: argparse.Namespace):
             ],
         )
         best_configs = {
-            M: sort_config(config) for M, config in zip(batch_sizes, configs)
+            M: sort_config(config)
+            for M, config in zip(batch_sizes, configs, strict=False)
         }
         save_configs(
             best_configs,
@@ -742,7 +743,9 @@ def main(args: argparse.Namespace):
             ],
         )
 
-        for batch_size, (config, kernel_time) in zip(batch_sizes, outputs):
+        for batch_size, (config, kernel_time) in zip(
+            batch_sizes, outputs, strict=False
+        ):
             print(f"Batch size: {batch_size}, config: {config}")
             print(f"Kernel time: {kernel_time:.2f} us")
 

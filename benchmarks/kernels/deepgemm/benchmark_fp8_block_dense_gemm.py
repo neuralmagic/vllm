@@ -184,7 +184,7 @@ def benchmark_shape(m: int,
 def format_table_row(values, widths):
     """Format a row with specified column widths."""
     return "| " + " | ".join(f"{val:{w}}"
-                             for val, w in zip(values, widths)) + " |"
+                             for val, w in zip(values, widths, strict=False)) + " |"
 
 
 def print_table(headers, rows, title=None):

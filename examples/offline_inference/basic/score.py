@@ -36,7 +36,7 @@ def main(args: Namespace):
 
     # Print the outputs.
     print("\nGenerated Outputs:\n" + "-" * 60)
-    for text_2, output in zip(texts_2, outputs):
+    for text_2, output in zip(texts_2, outputs, strict=False):
         score = output.outputs.score
         print(f"Pair: {[text_1, text_2]!r} \nScore: {score}")
         print("-" * 60)

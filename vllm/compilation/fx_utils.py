@@ -19,8 +19,9 @@ def is_auto_func(node: fx.Node, op: OpOverload) -> bool:
 
 
 # Returns the first specified node with the given op (if it exists)
-def find_specified_fn_maybe(nodes: Iterable[fx.Node],
-                            op: OpOverload) -> Optional[fx.Node]:
+def find_specified_fn_maybe(
+    nodes: Iterable[fx.Node], op: OpOverload
+) -> Optional[fx.Node]:
     for node in nodes:
         if node.target == op:
             return node
@@ -35,8 +36,7 @@ def find_specified_fn(nodes: Iterable[fx.Node], op: OpOverload) -> fx.Node:
 
 
 # Returns the first auto_functionalized node with the given op (if it exists)
-def find_auto_fn_maybe(nodes: Iterable[fx.Node],
-                       op: OpOverload) -> Optional[fx.Node]:
+def find_auto_fn_maybe(nodes: Iterable[fx.Node], op: OpOverload) -> Optional[fx.Node]:
     for node in nodes:
         if is_func(node, auto_functionalized) and node.args[0] == op:  # noqa
             return node
@@ -68,8 +68,9 @@ def find_getitem(node: fx.Node, idx: int) -> fx.Node:
 
 # An auto-functionalization-aware utility for finding nodes with a specific op
 # Also handles op overload packets and finds all overloads
-def find_op_nodes(op: Union[OpOverload, OpOverloadPacket],
-                  graph: fx.Graph) -> Iterator[fx.Node]:
+def find_op_nodes(
+    op: Union[OpOverload, OpOverloadPacket], graph: fx.Graph
+) -> Iterator[fx.Node]:
     if isinstance(op, OpOverloadPacket):
         for overload in op.overloads():
             overload_op = getattr(op, overload)

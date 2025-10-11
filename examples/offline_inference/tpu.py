@@ -46,7 +46,7 @@ def main():
     llm = LLM(**llm_args)
     outputs = llm.generate(prompts, sampling_params)
     print("-" * 50)
-    for output, answer in zip(outputs, answers):
+    for output, answer in zip(outputs, answers, strict=False):
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"Prompt: {prompt!r}\nGenerated text: {generated_text!r}")

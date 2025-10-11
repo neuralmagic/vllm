@@ -35,7 +35,7 @@ def main(args: Namespace):
     # Run inference
     outputs = llm.encode(prompts)
 
-    for prompt, output in zip(prompts, outputs):
+    for prompt, output in zip(prompts, outputs, strict=False):
         logits = output.outputs.data
         predictions = logits.argmax(dim=-1)
 
@@ -44,7 +44,7 @@ def main(args: Namespace):
         labels = [label_map[p.item()] for p in predictions]
 
         # Print results
-        for token, label in zip(tokens, labels):
+        for token, label in zip(tokens, labels, strict=False):
             if token not in tokenizer.all_special_tokens:
                 print(f"{token:15} → {label}")
 

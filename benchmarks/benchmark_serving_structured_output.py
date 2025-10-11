@@ -32,7 +32,6 @@ import uuid
 import warnings
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import Optional
 
 import datasets
 import numpy as np
@@ -317,7 +316,7 @@ def calculate_metrics(
     tokenizer: PreTrainedTokenizerBase,
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
-    goodput_config_dict: Optional[dict[str, float]] = None,
+    goodput_config_dict: dict[str, float] | None = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -374,8 +373,10 @@ def calculate_metrics(
                 goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION
             )
 
-        for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+        for req_metric in zip(*valid_metrics, strict=False):
+            is_good_req = all(
+                [s >= r for s, r in zip(slo_values, req_metric, strict=False)]
+            )
             if is_good_req:
                 good_completed += 1
 
@@ -437,9 +438,9 @@ async def benchmark(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[str],
     ignore_eos: bool,
-    max_concurrency: Optional[int],
+    max_concurrency: int | None,
     structured_output_ratio: float,
-    goodput_config_dict: Optional[dict[str, float]] = None,
+    goodput_config_dict: dict[str, float] | None = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -608,7 +609,7 @@ async def benchmark(
 
     ret = [
         {"generated": output.generated_text, "expected": gt}
-        for output, gt in zip(outputs, expected)
+        for output, gt in zip(outputs, expected, strict=False)
     ]
 
     def process_one_metric(

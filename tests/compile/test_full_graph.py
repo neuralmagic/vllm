@@ -11,8 +11,7 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm import LLM, SamplingParams
-from vllm.config import (CompilationConfig, CompilationLevel, CUDAGraphMode,
-                         PassConfig)
+from vllm.config import CompilationConfig, CompilationLevel, CUDAGraphMode, PassConfig
 from vllm.platforms import current_platform
 from vllm.utils import is_torch_equal_or_newer
 
@@ -22,48 +21,61 @@ from ..utils import create_new_process_for_each_test
 def models_list(*, all: bool = True, keywords: Optional[list[str]] = None):
     TEST_MODELS: list[tuple[str, dict[str, Any]]] = [
         ("facebook/opt-125m", {}),
-        ("neuralmagic/Llama-3.2-1B-Instruct-FP8-dynamic", {
-            "dtype": torch.float16,
-        }),
+        (
+            "neuralmagic/Llama-3.2-1B-Instruct-FP8-dynamic",
+            {
+                "dtype": torch.float16,
+            },
+        ),
         ("meta-llama/Llama-3.2-1B-Instruct", {}),
     ]
 
     if all:
         if not current_platform.has_device_capability((10, 0)):
             # int8 removed on Blackwell
-            TEST_MODELS.extend([
-                ("neuralmagic/Llama-3.2-1B-Instruct-quantized.w8a8", {}),
-                ("nm-testing/tinyllama-oneshot-w8w8-test-static-shape-change",
-                 {
-                     "dtype": torch.float16,
-                 }),
-            ])
+            TEST_MODELS.extend(
+                [
+                    ("neuralmagic/Llama-3.2-1B-Instruct-quantized.w8a8", {}),
+                    (
+                        "nm-testing/tinyllama-oneshot-w8w8-test-static-shape-change",
+                        {
+                            "dtype": torch.float16,
+                        },
+                    ),
+                ]
+            )
 
         # TODO: figure out why this fails.
         if False and is_quant_method_supported("gguf"):  # noqa: SIM223
-            TEST_MODELS.append(("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", {
-                "quantization": "gguf"
-            }))
+            TEST_MODELS.append(
+                ("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", {"quantization": "gguf"})
+            )
 
         if is_quant_method_supported("gptq"):
-            TEST_MODELS.append(("TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ", {
-                "quantization": "gptq"
-            }))
+            TEST_MODELS.append(
+                ("TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ", {"quantization": "gptq"})
+            )
 
         if is_quant_method_supported("gptq_marlin"):
-            TEST_MODELS.append(("TheBloke/TinyLlama-1.1B-Chat-v1.0-GPTQ", {
-                "quantization": "gptq_marlin"
-            }))
+            TEST_MODELS.append(
+                (
+                    "TheBloke/TinyLlama-1.1B-Chat-v1.0-GPTQ",
+                    {"quantization": "gptq_marlin"},
+                )
+            )
 
         if is_quant_method_supported("gptq_marlin_24"):
-            TEST_MODELS.append(("alexm-nm/tinyllama-24-marlin24-4bit-g128", {
-                "quantization": "gptq_marlin_24"
-            }))
+            TEST_MODELS.append(
+                (
+                    "alexm-nm/tinyllama-24-marlin24-4bit-g128",
+                    {"quantization": "gptq_marlin_24"},
+                )
+            )
 
         if not current_platform.is_rocm() and is_quant_method_supported("awq"):
-            TEST_MODELS.append(("TheBloke/TinyLlama-1.1B-Chat-v0.3-AWQ", {
-                "quantization": "AWQ"
-            }))
+            TEST_MODELS.append(
+                ("TheBloke/TinyLlama-1.1B-Chat-v0.3-AWQ", {"quantization": "AWQ"})
+            )
 
     if keywords is None:
         return TEST_MODELS
@@ -96,22 +108,34 @@ def test_full_graph(
     "compilation_config, model_info",
     [
         # additional compile sizes, only some of the models
-        (CompilationConfig(level=CompilationLevel.PIECEWISE,
-                           compile_sizes=[1, 2]), model)
+        (
+            CompilationConfig(level=CompilationLevel.PIECEWISE, compile_sizes=[1, 2]),
+            model,
+        )
         for model in models_list(all=False)
-    ] + [
+    ]
+    + [
         # RMSNorm + quant fusion, only 8-bit quant models
-        (CompilationConfig(level=CompilationLevel.PIECEWISE,
-                           custom_ops=["+rms_norm"],
-                           pass_config=PassConfig(enable_fusion=True,
-                                                  enable_noop=True)), model)
+        (
+            CompilationConfig(
+                level=CompilationLevel.PIECEWISE,
+                custom_ops=["+rms_norm"],
+                pass_config=PassConfig(enable_fusion=True, enable_noop=True),
+            ),
+            model,
+        )
         for model in models_list(keywords=["FP8-dynamic", "quantized.w8a8"])
-    ] + [
+    ]
+    + [
         # Test depyf integration works
-        (CompilationConfig(level=CompilationLevel.PIECEWISE,
-                           debug_dump_path=tempfile.gettempdir()),
-         ("facebook/opt-125m", {})),
-    ] + [
+        (
+            CompilationConfig(
+                level=CompilationLevel.PIECEWISE, debug_dump_path=tempfile.gettempdir()
+            ),
+            ("facebook/opt-125m", {}),
+        ),
+    ]
+    + [
         # graph inductor partition
         (
             CompilationConfig(
@@ -120,20 +144,24 @@ def test_full_graph(
                 # torch._C.Tag.cudagraph_unsafe to specify splitting ops
                 use_inductor_graph_partition=True,
                 cudagraph_mode=CUDAGraphMode.PIECEWISE,
-                compile_sizes=[1, 2]),
-            model) for model in models_list(all=False)
+                compile_sizes=[1, 2],
+            ),
+            model,
+        )
+        for model in models_list(all=False)
         if is_torch_equal_or_newer("2.9.0.dev")
-    ])
+    ],
+)
 # only test some of the models
 @create_new_process_for_each_test()
 def test_custom_compile_config(
     compilation_config: CompilationConfig,
     model_info: tuple[str, dict[str, Any]],
 ):
-    if (compilation_config.use_inductor_graph_partition
-            and not is_torch_equal_or_newer("2.9.0.dev")):
-        pytest.skip("inductor graph partition is only available "
-                    "in PyTorch 2.9+")
+    if compilation_config.use_inductor_graph_partition and not is_torch_equal_or_newer(
+        "2.9.0.dev"
+    ):
+        pytest.skip("inductor graph partition is only available in PyTorch 2.9+")
 
     model, model_kwargs = model_info
     print(f"MODEL={model}")
@@ -155,11 +183,14 @@ def test_fp8_kv_scale_compile(optimization_level: int):
     run_model(optimization_level, model, **model_kwargs)
 
 
-def run_model(compile_config: Union[int, CompilationConfig], model: str,
-              **model_kwargs):
-    compilation_config = compile_config if \
-        isinstance(compile_config, CompilationConfig) else \
-        CompilationConfig(level=compile_config)
+def run_model(
+    compile_config: Union[int, CompilationConfig], model: str, **model_kwargs
+):
+    compilation_config = (
+        compile_config
+        if isinstance(compile_config, CompilationConfig)
+        else CompilationConfig(level=compile_config)
+    )
 
     prompts = [
         "Hello, my name is",
@@ -169,8 +200,8 @@ def run_model(compile_config: Union[int, CompilationConfig], model: str,
     ]
     sampling_params = SamplingParams(temperature=0)
     # Allow override from model_kwargs
-    model_kwargs = {'tensor_parallel_size': 1, **model_kwargs}
-    model_kwargs = {'disable_custom_all_reduce': True, **model_kwargs}
+    model_kwargs = {"tensor_parallel_size": 1, **model_kwargs}
+    model_kwargs = {"disable_custom_all_reduce": True, **model_kwargs}
 
     # No cudagraphs by default
     if compilation_config.cudagraph_mode is None:

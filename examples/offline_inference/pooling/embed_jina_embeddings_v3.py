@@ -42,7 +42,7 @@ def main(args: Namespace):
     print("\nGenerated Outputs:")
     print("Only text matching task is supported for now. See #16120")
     print("-" * 60)
-    for prompt, output in zip(prompts, outputs):
+    for prompt, output in zip(prompts, outputs, strict=False):
         embeds = output.outputs.embedding
         embeds_trimmed = (
             (str(embeds[:16])[:-1] + ", ...]") if len(embeds) > 16 else embeds

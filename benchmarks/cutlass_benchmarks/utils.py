@@ -96,5 +96,5 @@ def make_n_rand_sparse_tensors(
         b_comp, e, a, b = make_rand_sparse_tensors(dtype, m, n, k)
         if b_comp is not None:
             ABs.append(make_rand_sparse_tensors(dtype, m, n, k))
-    BComps, Es, As, Bs = zip(*ABs)
+    BComps, Es, As, Bs = zip(*ABs, strict=False)
     return list(BComps), list(Es), list(As), list(Bs)

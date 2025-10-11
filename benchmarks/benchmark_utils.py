@@ -6,7 +6,7 @@ import math
 import os
 import time
 from types import TracebackType
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 
 def convert_to_pytorch_benchmark_format(
@@ -92,7 +92,7 @@ class TimeCollector:
     def __init__(self, scale: int) -> None:
         self.cnt: int = 0
         self._sum: int = 0
-        self._max: Optional[int] = None
+        self._max: int | None = None
         self.scale = scale
         self.start_time: int = time.monotonic_ns()
 
@@ -118,8 +118,8 @@ class TimeCollector:
 
     def __exit__(
         self,
-        exc_type: Optional[type[BaseException]],
-        exc_value: Optional[BaseException],
-        exc_traceback: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        exc_traceback: TracebackType | None,
     ) -> None:
         self.collect(time.monotonic_ns() - self.start_time)

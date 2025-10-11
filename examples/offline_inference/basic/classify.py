@@ -37,7 +37,7 @@ def main(args: Namespace):
 
     # Print the outputs.
     print("\nGenerated Outputs:\n" + "-" * 60)
-    for prompt, output in zip(prompts, outputs):
+    for prompt, output in zip(prompts, outputs, strict=False):
         probs = output.outputs.probs
         probs_trimmed = (str(probs[:16])[:-1] + ", ...]") if len(probs) > 16 else probs
         print(
