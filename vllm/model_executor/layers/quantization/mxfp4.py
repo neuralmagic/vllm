@@ -925,6 +925,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routed_scaling_factor=routed_scaling_factor,
                 e_score_correction_bias=e_score_correction_bias)
 
+            # logger.info(self.marlin_input_dtype) # = 8
+
             return torch.ops.vllm.fused_marlin_moe(
                 x,
                 layer.w13_weight,

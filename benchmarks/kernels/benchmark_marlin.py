@@ -24,7 +24,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     FP4_MARLIN_SUPPORTED_GROUP_SIZES,
-    rand_marlin_weight_fp4_like,
+    rand_marlin_weight_mxfp4_like as rand_marlin_weight_fp4_like,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     marlin_quant_fp8_torch,
@@ -179,6 +179,10 @@ def bench_run(
             CUBLAS_M_THRESHOLD,
         )
 
+    params = gen_marlin_params()
+
+    if params is None: return
+
     (
         marlin_w_ref,
         marlin_q_w,
@@ -187,7 +191,7 @@ def bench_run(
         marlin_zp,
         marlin_g_idx,
         marlin_sort_indices,
-    ) = gen_marlin_params()
+    ) = params
     marlin_24_w_ref, marlin_24_q_w_comp, marlin_24_meta, marlin_24_s = (
         gen_marlin_24_params()
     )
@@ -261,9 +265,10 @@ def bench_run(
         ).blocked_autorange(min_run_time=min_run_time)
     )
 
+    # NOTE(elvircrn): global_scale set to None
     results.append(
         benchmark.Timer(
-            stmt="output = gptq_marlin_gemm(a, None, marlin_q_w, marlin_s, None, marlin_s2, marlin_zp, marlin_g_idx, marlin_sort_indices, marlin_workspace.scratch, quant_type, size_m, size_n, size_k, is_k_full, False, False, False)",  # noqa: E501
+            stmt="output = gptq_marlin_gemm(a, None, marlin_q_w, None, marlin_s, marlin_s2, None, marlin_zp, marlin_g_idx, marlin_sort_indices, marlin_workspace.scratch, quant_type, size_m, size_n, size_k, is_k_full, False, False, False)",  # noqa: E501
             globals=globals,
             label=label,
             sub_label=sub_label,
@@ -273,7 +278,7 @@ def bench_run(
 
     results.append(
         benchmark.Timer(
-            stmt="output = gptq_marlin_gemm(a, None, marlin_q_w, marlin_s, None, marlin_s2, marlin_zp, marlin_g_idx, marlin_sort_indices, marlin_workspace.scratch, quant_type, size_m, size_n, size_k, is_k_full, False, True, False)",  # noqa: E501
+            stmt="output = gptq_marlin_gemm(a, None, marlin_q_w, None, marlin_s, marlin_s2, None, marlin_zp, marlin_g_idx, marlin_sort_indices, marlin_workspace.scratch, quant_type, size_m, size_n, size_k, is_k_full, False, True, False)",  # noqa: E501
             globals=globals,
             label=label,
             sub_label=sub_label,

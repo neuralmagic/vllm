@@ -532,6 +532,7 @@ if hasattr(torch.ops._C, "gptq_marlin_24_gemm"):
         b_q_weight: torch.Tensor,
         b_bias: Optional[torch.Tensor],
         b_scales: torch.Tensor,
+        a_scales: Optional[torch.Tensor],
         global_scale: Optional[torch.Tensor],
         b_zeros: Optional[torch.Tensor],
         g_idx: Optional[torch.Tensor],

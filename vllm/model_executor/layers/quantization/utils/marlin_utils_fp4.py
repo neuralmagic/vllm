@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
-FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16]
+FP4_MARLIN_SUPPORTED_GROUP_SIZES = [32]
 
 logger = init_logger(__name__)
 
@@ -437,4 +437,6 @@ def rand_marlin_weight_mxfp4_like(weight, group_size, input_dtype=None):
     marlin_scales = mxfp4_marlin_process_scales(marlin_scales,
                                                 input_dtype=input_dtype)
 
-    return weight_ref.T, marlin_qweight, marlin_scales.to(torch.float8_e8m0fnu)
+    marlin_zp = None
+
+    return weight_ref.T, marlin_qweight, marlin_scales.to(torch.float8_e8m0fnu), marlin_zp

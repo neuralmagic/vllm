@@ -166,11 +166,12 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = ops.scaled_fp8_quant(
             hidden_states, use_per_token_if_dynamic=True)
-    maybe_warn_marlin_atomic_add(hidden_states.device, hidden_states.dtype)
-    use_atomic_add = (
-            hidden_states.dtype == torch.half
-            or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    )
+    # TODO(elvircrn): Is this necessary?
+    # maybe_warn_marlin_atomic_add(hidden_states.device, hidden_states.dtype)
+    # use_atomic_add = (
+    #         hidden_states.dtype == torch.half
+    #         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+    # )
 
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
@@ -255,6 +256,7 @@ def fused_marlin_moe(hidden_states: torch.Tensor,
         size_n=K,
         size_k=N,
         is_k_full=is_k_full,
+        # TODO(elvircrn): Plug use_atomic_add here?
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,

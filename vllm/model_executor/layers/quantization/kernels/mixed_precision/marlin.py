@@ -118,13 +118,6 @@ class MarlinLinearKernel(MPLinearKernel):
                     "input_global_scale",
                     torch.nn.Parameter(input_global_scale,
                                        requires_grad=False))
-            # TODO(elvircrn): Does this make sense?
-            # x.data = marlin_permute_scales(
-            #     x.data.contiguous(),
-            #     size_k=c.partition_weight_shape[0],
-            #     size_n=c.partition_weight_shape[1],
-            #     group_size=c.group_size,
-            # )
             return x
 
         if c.has_g_idx:
