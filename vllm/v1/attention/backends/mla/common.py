@@ -279,6 +279,7 @@ CUDNN_WORKSPACE_SIZE = 12800
 
 class MLACommonBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    forward_includes_kv_cache: bool = False
 
     @staticmethod
     def get_name() -> str:
@@ -1788,17 +1789,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         prefill_k_pe = k_pe[num_decode_tokens:]
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
-        # write the latent and rope to kv cache
-        if kv_cache.numel() > 0:
-            ops.concat_and_cache_mla(
-                k_c_normed,
-                k_pe.squeeze(1),
-                kv_cache,
-                attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=layer._k_scale,
-            )
-
         if fp8_attention:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -1891,3 +1881,26 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])
         return output_padded
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        k_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> None:
+        if attn_metadata is None:
+            # Profiling run.
+            return
+
+        num_actual_toks = attn_metadata.num_actual_tokens
+        if kv_cache.numel() > 0:
+            ops.concat_and_cache_mla(
+                k_c_normed[:num_actual_toks, ...],
+                k_pe[:num_actual_toks, ...].squeeze(1),
+                kv_cache,
+                attn_metadata.slot_mapping.flatten(),
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=layer._k_scale,
+            )

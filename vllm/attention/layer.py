@@ -701,6 +701,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             ):
                 self.calc_kv_scales(q, kv_c_normed, k_pe)
 
+            if not self.attn_backend.forward_includes_kv_cache:
+                self.impl.do_kv_cache_update(
+                    self, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+                )
+
             if self.attn_backend.accept_output_buffer:
                 output = torch.zeros(output_shape, dtype=q.dtype, device=q.device)
                 self.impl.forward(
@@ -720,6 +725,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         else:
             if self.attn_backend.accept_output_buffer:
                 output = torch.zeros(output_shape, dtype=q.dtype, device=q.device)
+                if not self.attn_backend.forward_includes_kv_cache:
+                    torch.ops.vllm.unified_kv_cache_update(
+                        kv_c_normed, k_pe, output, self.layer_name
+                    )
                 torch.ops.vllm.unified_mla_attention_with_output(
                     q,
                     kv_c_normed,
@@ -886,6 +895,7 @@ def unified_kv_cache_update(
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
+    output = output  # fake dependency to make sure op is not optimized out
     wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
