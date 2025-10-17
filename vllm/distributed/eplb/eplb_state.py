@@ -447,7 +447,6 @@ class EplbState:
             - `max_tokens`: The maximum load across ranks.
             - `balancedness`: The ratio of average load to maximum load.
         """
-        logger.info("STEP")
         ep_group = get_ep_group().device_group
         if is_profile:
             self.rearrange(model, is_profile=True)
