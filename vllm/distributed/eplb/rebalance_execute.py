@@ -18,6 +18,10 @@ from torch.distributed import (
     get_global_rank,
 )
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 def idx_local_to_global(
     local_idx: int,
@@ -112,6 +116,7 @@ def move_to_buffer(
     """
     Perform expert weights rearrangement of one layer.
     """
+    logger.info("MOVE TO BUFFER")
     ep_rank = ep_group.rank()
     local2global = partial(
         idx_local_to_global,
@@ -227,6 +232,7 @@ def move_to_buffer(
         ]
 
     # 4. Execute the P2P operations. The real communication happens here.
+    logger.info("STARTING ISEND/RECV")
     if p2p_ops and cuda_stream is not None:
         with torch.cuda.stream(cuda_stream):
             reqs = batch_isend_irecv(p2p_ops)
@@ -236,6 +242,7 @@ def move_to_buffer(
         reqs = batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
+    logger.info("FINISHED ISEND/RECV")
     # wait for the communication to finish
     return is_unchanged, is_received_locally, experts_recv_loc
 
@@ -249,6 +256,7 @@ def move_from_buffer(
     new_indices: Sequence[int],
     ep_group: ProcessGroup,
 ) -> None:
+    logger.info("MOVE FROM BUFFER")
     ep_rank = ep_group.rank()
     num_local_experts = len(is_unchanged)
 
@@ -300,6 +308,7 @@ async def transfer_layer(
             This is used during profile run, where we only perform dummy
             communications to reserve enough memory for the buffers.
     """
+    logger.info("TRANSFER LAYER")
     ep_size = ep_group.size()
     if rank_mapping is not None:
         if len(rank_mapping) == ep_group.size():
@@ -404,12 +413,14 @@ def rearrange_expert_weights_inplace(
             dummy_recv_buffer = [buffer for _ in range(ep_size)]
             # NOTE(bowen): Needed this barrier to avoid OOM during actual
             # execution. I'm not very sure why this is needed
+            logger.info("CALLING ALL GATHER")
             torch.distributed.barrier()
             all_gather(
                 dummy_recv_buffer,
                 weight,
                 group=ep_group,
             )
+            logger.info("ALL GATHER DONE")
         return
 
     for layer in range(num_moe_layers):

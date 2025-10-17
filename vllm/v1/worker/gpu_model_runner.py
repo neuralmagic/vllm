@@ -3194,6 +3194,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         create_mixed_batch: bool = False,
         remove_lora: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info("DUMMY RUN START")
         """
         Run a dummy forward pass to warm up/profile run or capture the
         CUDA graph for the model.
@@ -3478,6 +3479,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        logger.info("DUMMY RUN END")
         return hidden_states, hidden_states[logit_indices]
 
     @torch.inference_mode()

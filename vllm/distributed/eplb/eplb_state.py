@@ -262,6 +262,7 @@ class EplbState:
         """
         Build the initial EPLB state.
         """
+        logger.info("BUILD")
         is_async = parallel_config.eplb_config.use_async
 
         physical_to_logical_map_list = cls.build_initial_global_physical_to_logical_map(
@@ -401,6 +402,7 @@ class EplbState:
             if device_index is None and torch.cuda.is_available():
                 device_index = torch.cuda.current_device()
         expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
+        logger.info("BUILD END")
         return cls(
             physical_to_logical_map,
             logical_to_physical_map,
@@ -445,6 +447,7 @@ class EplbState:
             - `max_tokens`: The maximum load across ranks.
             - `balancedness`: The ratio of average load to maximum load.
         """
+        logger.info("STEP")
         ep_group = get_ep_group().device_group
         if is_profile:
             self.rearrange(model, is_profile=True)
@@ -544,6 +547,7 @@ class EplbState:
         """
         Rearrange the experts according to the current load.
         """
+        logger.info("CALLING REARRANGE")
 
         ep_group = get_ep_group().device_group
         ep_rank = ep_group.rank()
@@ -592,14 +596,18 @@ class EplbState:
 
             # Perform all-reduce to get the expert load across all ranks
             global_expert_load_window = logical_expert_load_window.sum(dim=0)
+            logger.info("CALLING ALL REDUCE")
             all_reduce(global_expert_load_window, group=ep_group)
+            logger.info("ALL REDUCE DONE")
 
             if not execute_shuffle:
                 # (num_moe_layers, old_num_physical_experts)
                 old_global_expert_indices = self.physical_to_logical_map
+                logger.info("CALLING BROADCAST")
                 torch.distributed.broadcast(
                     old_global_expert_indices, group=ep_group, group_src=0
                 )
+                logger.info("BROADCAST DONE")
                 return global_expert_load_window
         else:
             assert execute_shuffle
@@ -668,6 +676,7 @@ class EplbState:
 
         # Signal async thread to start transferring layers
         if self.is_async and (not is_profile):
+            logger.info("SETTING REARRANGE EVENT")
             self.rebalanced = True
             self.layer_to_transfer = 0  # Reset for new rearrangement
             self.pending_global_ready_check = True
@@ -718,6 +727,7 @@ class EplbState:
         )
 
     def _all_ranks_buffer_ready(self) -> bool:
+        logger.info("ALL RANKS READY")
         parallel_state = get_ep_group()
         cpu_group = getattr(parallel_state, "cpu_group", None)
         if cpu_group is not None and cpu_group.size() > 1:
@@ -736,6 +746,7 @@ class EplbState:
             (int(self.ep_buffer_ready),), dtype=torch.int32, device=device
         )
         all_reduce(flag, group=device_group)
+        logger.info("RETURNING FROM ALL RANKS READY")
         return int(flag.item()) == device_group.size()
 
     def move_to_workspace(
@@ -784,6 +795,7 @@ class EplbState:
         """
         Receive the expert load and old placement from the master rank.
         """
+        logger.info("RECV STATE")
         ep_group = get_ep_group()
         metadata = torch.empty(3, dtype=torch.int32, device="cpu")
         torch.distributed.broadcast(metadata, group=ep_group.cpu_group, group_src=0)

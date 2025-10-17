@@ -67,14 +67,18 @@ async def transfer_run_periodically(
     rank_mapping: dict[int, int] | None = None,
     cuda_stream: torch.cuda.Stream = None,
 ) -> None:
+    logger.info("GETTING TO TRANSFER RUN PERIODICALLY")
     while True:
         await asyncio.to_thread(state.rearrange_event.wait)
 
+        logger.info("WAKING UP FROM EVENT")
         current_num_layers = model.num_moe_layers
         while state.layer_to_transfer < current_num_layers:
             if not state.ep_buffer_ready and state.rebalanced:
                 assert state.new_physical_to_logical_map is not None
+                logger.info("ACQUIRE LOCK START")
                 await asyncio.to_thread(state.buffer_lock.acquire)
+                logger.info("ACQUIRE LOCK END")
                 try:
                     if state.layer_to_transfer >= current_num_layers:
                         break
