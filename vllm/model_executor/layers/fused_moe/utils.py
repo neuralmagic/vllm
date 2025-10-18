@@ -99,11 +99,16 @@ def count_expert_num_tokens(
     return expert_num_tokens
 
 
-def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
+def _resize_cache(
+    x: torch.Tensor, v: tuple[int, ...], dtype: torch.dtype | None = None
+) -> torch.Tensor:
     """
     Shrink the given tensor and apply the given view to it.  This is
     used to resize the intermediate fused_moe caches.
     """
+    if dtype is not None:
+        x = x.view(dtype)
+
     assert prod(v) <= x.numel(), (
         f"{v} ({prod(v)}) <= {x.shape} ({x.numel()})"
     )  # CUDAGRAPH unfriendly?
