@@ -55,7 +55,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
-from vllm.utils import cdiv, has_deep_ep, has_pplx, round_up
+from vllm.utils import cdiv, has_deep_ep, has_pplx, has_rose, round_up
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -67,8 +67,12 @@ if current_platform.is_cuda_alike():
     if has_pplx():
         from .pplx_prepare_finalize import (
             PplxPrepareAndFinalize,
-            pplx_hidden_dim_scale,
             pplx_hidden_dim_scale_bytes,
+        )
+    if has_rose():
+        from .rose_prepare_finalize import (
+            RosePrepareAndFinalize,
+            rose_hidden_dim_scale,
         )
     if has_deep_ep():
         from .deepep_ht_prepare_finalize import DeepEPHTPrepareAndFinalize
@@ -198,10 +202,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 num_local_experts=moe.num_local_experts,
                 num_dispatchers=num_dispatchers,
             )
-        elif moe.use_pplx_efa_kernels:
+        elif moe.use_rose_kernels:
             assert quant_config is not None
 
-            hidden_dim_scale = pplx_hidden_dim_scale(
+            hidden_dim_scale = rose_hidden_dim_scale(
                 moe.hidden_dim,
                 quant_config.quant_dtype,
                 per_act_token_quant=quant_config.per_act_token_quant,
@@ -227,9 +231,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
             handle = all2all_manager.get_handle(all_to_all_args)
 
-            # Note: the API for EFA appears identical to the regular pplx kernels,
-            # so we can reuse the PplxPrepareAndFinalize class for both.
-            prepare_finalize = PplxPrepareAndFinalize(
+            prepare_finalize = RosePrepareAndFinalize(
                 handle,
                 max_num_tokens=moe.max_num_tokens,
                 num_local_experts=moe.num_local_experts,
@@ -1418,8 +1420,8 @@ class FusedMoE(CustomOp):
         return self.moe_parallel_config.use_pplx_kernels
 
     @property
-    def use_pplx_efa_kernels(self):
-        return self.moe_parallel_config.use_pplx_efa_kernels
+    def use_rose_kernels(self):
+        return self.moe_parallel_config.use_rose_kernels
 
     @property
     def use_deepep_ht_kernels(self):
@@ -1443,7 +1445,7 @@ class FusedMoE(CustomOp):
         # only when data parallelism (DP) is enabled.
         return (
             self.moe_parallel_config.use_pplx_kernels
-            or self.moe_parallel_config.use_pplx_efa_kernels
+            or self.moe_parallel_config.use_rose_kernels
             or self.moe_parallel_config.use_deepep_ll_kernels
             or (self.dp_size > 1 and self.use_flashinfer_cutlass_kernels)
         )
