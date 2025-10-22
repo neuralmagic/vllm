@@ -35,7 +35,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_fp8_supported,
 )
 from vllm.platforms import current_platform
-from vllm.utils import has_deep_ep, has_deep_gemm, has_pplx
+from vllm.utils import has_deep_ep, has_deep_gemm, has_pplx, has_rose
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 
@@ -229,6 +229,19 @@ if has_pplx():
         common_float_and_int_types,
         blocked_quantization_support=True,
         backend="pplx",
+    )
+
+if has_rose():
+    from vllm.model_executor.layers.fused_moe.rose_prepare_finalize import (
+        RosePrepareAndFinalize,
+    )
+
+    register_prepare_and_finalize(
+        RosePrepareAndFinalize,
+        batched_format,
+        common_float_and_int_types,
+        blocked_quantization_support=True,
+        backend="rose",
     )
 
 if has_flashinfer_cutlass_fused_moe() and current_platform.has_device_capability(100):
