@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     mxfp4_mxfp8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
+    mxfp4_w4a4_moe_quant_config,
     ocp_mx_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
@@ -71,6 +72,13 @@ class Mxfp4Backend(Enum):
 
     # Triton Backend
     TRITON = 6
+    SM100_OAI_MXFP4_MXFP8 = 7
+    SM100_OAI_MXFP4_MXFP4 = 8
+
+    def use_oai_kernels(self):
+        return self in [Mxfp4Backend.TRITON,
+                        Mxfp4Backend.SM100_OAI_MXFP4_MXFP4,
+                        Mxfp4Backend.SM100_OAI_MXFP4_MXFP8]
 
 
 def get_mxfp4_backend():
@@ -96,6 +104,15 @@ def get_mxfp4_backend():
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
         ):
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
+        elif (
+            current_platform.is_device_capability(100) and has_triton_kernels() and envs.VLLM_USE_OAI_MOE_MXFP4_MXFP4
+        ):
+            return Mxfp4Backend.SM100_OAI_MXFP4_MXFP4
+        elif (
+            current_platform.is_device_capability(100) and has_triton_kernels() and envs.VLLM_USE_OAI_MOE_MXFP4_MXFP8
+        ):
+
+            return Mxfp4Backend.SM100_OAI_MXFP4_MXFP8
         elif current_platform.is_device_capability(100) and has_flashinfer():
             logger.info_once(
                 "Using FlashInfer MXFP4 BF16 backend for SM100, "
@@ -681,7 +698,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale = torch.nn.Parameter(
                     w2_scales_interleaved, requires_grad=False
                 )
-        elif self.mxfp4_backend == Mxfp4Backend.TRITON:
+        elif self.mxfp4_backend.use_oai_kernels():
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_bias = layer.w13_bias.to(torch.float32)
@@ -746,6 +763,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
             )
+        elif self.mxfp4_backend == Mxfp4Backend.SM100_OAI_MXFP4_MXFP8:
+            w1_scale = self.w13_precision_config
+            w2_scale = self.w2_precision_config
+            return mxfp4_mxfp8_moe_quant_config(
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+            )
+        elif self.mxfp4_backend == Mxfp4Backend.SM100_OAI_MXFP4_MXFP4:
+            w1_scale = self.w13_precision_config
+            w2_scale = self.w2_precision_config
+            return mxfp4_w4a4_moe_quant_config(
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+            )
+
         elif self.mxfp4_backend in [
             Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM,
             Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS,
@@ -1105,7 +1141,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             return output
-        elif self.mxfp4_backend == Mxfp4Backend.TRITON:
+        elif self.mxfp4_backend.use_oai_kernels():
             from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (  # noqa: E501
                 triton_kernel_moe_forward,
             )
