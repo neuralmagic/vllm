@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
     VLLM_USE_OAI_MOE_MXFP4_MXFP4: bool = False
     VLLM_USE_OAI_MOE_MXFP4_MXFP8: bool = False
+    VLLM_USE_OAI_MOE_MXFP4_BF16: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = False
@@ -1117,15 +1118,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))
     ),
-
-    "VLLM_USE_OAI_MOE_MXFP4_MXFP8": lambda : bool(
+    "VLLM_USE_OAI_MOE_MXFP4_BF16": lambda: bool(
+        int(os.getenv("VLLM_USE_OAI_MOE_MXFP4_BF16", "0"))
+    ),
+    "VLLM_USE_OAI_MOE_MXFP4_MXFP8": lambda: bool(
         int(os.getenv("VLLM_USE_OAI_MOE_MXFP4_MXFP8", "0"))
     ),
-
-    "VLLM_USE_OAI_MOE_MXFP4_MXFP4": lambda : bool(
+    "VLLM_USE_OAI_MOE_MXFP4_MXFP4": lambda: bool(
         int(os.getenv("VLLM_USE_OAI_MOE_MXFP4_MXFP4", "0"))
     ),
-
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.
@@ -1493,6 +1494,7 @@ def compute_hash() -> str:
         "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16",
         "VLLM_USE_OAI_MOE_MXFP4_MXFP4",
         "VLLM_USE_OAI_MOE_MXFP4_MXFP8",
+        "VLLM_USE_OAI_MOE_MXFP4_BF16",
         "VLLM_USE_CUDNN_PREFILL",
         "VLLM_USE_TRTLLM_ATTENTION",
         "VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION",

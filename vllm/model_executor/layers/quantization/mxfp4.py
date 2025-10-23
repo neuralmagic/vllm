@@ -19,8 +19,8 @@ from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     mxfp4_mxfp8_moe_quant_config,
-    mxfp4_w4a16_moe_quant_config,
     mxfp4_w4a4_moe_quant_config,
+    mxfp4_w4a16_moe_quant_config,
     ocp_mx_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
@@ -76,9 +76,11 @@ class Mxfp4Backend(Enum):
     SM100_OAI_MXFP4_MXFP4 = 8
 
     def use_oai_kernels(self):
-        return self in [Mxfp4Backend.TRITON,
-                        Mxfp4Backend.SM100_OAI_MXFP4_MXFP4,
-                        Mxfp4Backend.SM100_OAI_MXFP4_MXFP8]
+        return self in [
+            Mxfp4Backend.TRITON,
+            Mxfp4Backend.SM100_OAI_MXFP4_MXFP4,
+            Mxfp4Backend.SM100_OAI_MXFP4_MXFP8,
+        ]
 
 
 def get_mxfp4_backend():
@@ -103,16 +105,29 @@ def get_mxfp4_backend():
             and has_flashinfer()
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
         ):
+            logger.info_once("Using FlashInfer MXFP4 MXFP8 TRTLLM backend for SM100")
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
         elif (
-            current_platform.is_device_capability(100) and has_triton_kernels() and envs.VLLM_USE_OAI_MOE_MXFP4_MXFP4
+            current_platform.is_device_capability(100)
+            and has_triton_kernels()
+            and envs.VLLM_USE_OAI_MOE_MXFP4_MXFP4
         ):
+            logger.info_once("Using OAI MXFP4 MXFP4 backend for SM100")
             return Mxfp4Backend.SM100_OAI_MXFP4_MXFP4
         elif (
-            current_platform.is_device_capability(100) and has_triton_kernels() and envs.VLLM_USE_OAI_MOE_MXFP4_MXFP8
+            current_platform.is_device_capability(100)
+            and has_triton_kernels()
+            and envs.VLLM_USE_OAI_MOE_MXFP4_MXFP8
         ):
-
+            logger.info_once("Using OAI MXFP4 MXFP8 backend for SM100")
             return Mxfp4Backend.SM100_OAI_MXFP4_MXFP8
+        elif (
+            current_platform.is_device_capability(100)
+            and has_triton_kernels()
+            and envs.VLLM_USE_OAI_MOE_MXFP4_BF16
+        ):
+            logger.info_once("Using TRITON backend for SM100")
+            return Mxfp4Backend.TRITON
         elif current_platform.is_device_capability(100) and has_flashinfer():
             logger.info_once(
                 "Using FlashInfer MXFP4 BF16 backend for SM100, "
@@ -120,7 +135,7 @@ def get_mxfp4_backend():
                 "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1, though this may impact "
                 "accuracy."
             )
-            return Mxfp4Backend.SM100_FI_MXFP4_BF16
+            # return Mxfp4Backend.SM100_FI_MXFP4_BF16
         elif (
             current_platform.is_device_capability(100)
             or current_platform.is_device_capability(90)

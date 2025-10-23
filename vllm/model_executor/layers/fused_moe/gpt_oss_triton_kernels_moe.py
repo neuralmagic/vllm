@@ -21,6 +21,10 @@ if has_triton_kernels():
     try:
         import triton_kernels.swiglu
         from triton_kernels.matmul_ogs import FnSpecs, FusedActivation, matmul_ogs
+        from triton_kernels.numerics_details.mxfp import (
+            downcast_to_mxfp,
+            upcast_from_mxfp,
+        )
         from triton_kernels.routing import RoutingData, routing, routing_from_bitmatrix
         from triton_kernels.tensor import Bitmatrix
     except (AttributeError, ImportError) as e:
@@ -146,6 +150,24 @@ def triton_kernel_fused_experts(
     )
     gammas = routing_data.gate_scal if routing_data else None
 
+    w1_pc = quant_config.w1_precision
+    if quant_config._a1.dtype == "mxfp8":
+        m_, _ = hidden_states.size()
+        _, k_, n_ = w1.size()
+        hidden_states, x_scale = downcast_to_mxfp(
+            hidden_states, out_quant_type=torch.float8_e4m3fn, axis=1
+        )
+        w1_pc.out_scale = torch.zeros(
+            (m_, n_ // 2 // 32), dtype=torch.uint8, device=hidden_states.device
+        )
+        w1_pc.act_scale = x_scale
+        # w1_pc.out_dtype = torch.float32
+
+    # if w1_pc.act_scale is not None:
+    #    print (f"mm1 - hidden_states : {hidden_states.size()} {hidden_states.dtype} ")
+    #    print (f"mm1 - act_scale : {w1_pc.act_scale.size()} {w1_pc.act_scale.dtype}")
+    #    print (f"mm1 - out_scale : {w1_pc.out_scale.size()} {w1_pc.out_scale.dtype}")
+
     intermediate_cache1 = matmul_ogs(
         hidden_states,
         w1,
@@ -157,6 +179,16 @@ def triton_kernel_fused_experts(
         fused_activation=act,
     )
 
+    if intermediate_cache1.dtype == torch.float8_e4m3fn:
+        intermediate_cache1 = upcast_from_mxfp(
+            intermediate_cache1, w1_pc.out_scale, target_dtype=torch.bfloat16, axis=1
+        )
+
+    print(f"intermediate cache 1 : {intermediate_cache1}")
+
+    intermediate_cache1 = intermediate_cache1.to(dtype=torch.bfloat16)
+
+    # assert intermediate_cache1.dtype == torch.bfloat16
     intermediate_cache3 = matmul_ogs(
         intermediate_cache1,
         w2,
