@@ -263,7 +263,7 @@ def triton_kernel_fused_experts(
         out_shape, dtype=w1_pc.out_dtype, device=hidden_states.device
     )
 
-    reset_opt_flags_constraints()
+    # reset_opt_flags_constraints()
     intermediate_cache1 = matmul_ogs(
         x_q,
         w1,
@@ -278,17 +278,17 @@ def triton_kernel_fused_experts(
     )
 
     w2_pc = quant_config.w2_precision
+    w2_pc.out_dtype = torch.bfloat16
     if quant_config._a2.dtype == "mxfp8":
         assert intermediate_cache1.dtype == torch.bfloat16
         intermediate_cache1, w2_pc.act_scale = quant_mxfp8(intermediate_cache1)
-        w2_pc.out_dtype = torch.bfloat16
 
     out_shape = (1, hidden_states.size(0), hidden_states.size(1))
     intermediate_cache3 = torch.zeros(
         out_shape, dtype=w2_pc.out_dtype, device=intermediate_cache1.device
     )
 
-    reset_opt_flags_constraints()
+    # reset_opt_flags_constraints()
     intermediate_cache3 = matmul_ogs(
         intermediate_cache1,
         w2,
