@@ -32,7 +32,6 @@ if has_triton_kernels():
         )
         from triton_kernels.matmul_ogs_details.opt_flags import (
             reset_opt_flags_constraints,
-            update_opt_flags_constraints,
         )
         from triton_kernels.numerics_details.mxfp import (
             downcast_to_mxfp,
@@ -229,13 +228,6 @@ def triton_kernel_fused_experts(
     def quant_mxfp8(x):
         return downcast_to_mxfp(x, out_quant_type=torch.float8_e4m3fn, axis=1)
 
-    def mxfp8_epilogue():
-        # for out mxfp8
-        quantize_mxfp8_spec = FnSpecs(
-            FnName.QUANTIZE_MXFP8.name, quantize_mxfp8_fn, (), ()
-        )
-        return Epilogue(quantize_mxfp8_spec, tuple(), tuple(), effective_itemsize=6.0)
-
     def bf16_bf16_args(x: torch.Tensor, m: int, n: int):
         """
         output x, x_scale, output_shape, output_dtype, out_scale_shape, epilogue
@@ -247,24 +239,12 @@ def triton_kernel_fused_experts(
         x_fp8, x_scale = quant_mxfp8(x)
         return x_fp8, x_scale, (1, m, n), torch.bfloat16, None, None
 
-    def mxfp8_mxfp8_args(x: torch.Tensor, m: int, n: int):
-        x_fp8, x_scale = quant_mxfp8(x)
-        return (
-            x_fp8,
-            x_scale,
-            (1, m, n),
-            torch.float8_e4m3fn,
-            (m, n // 32),
-            mxfp8_epilogue(),
-        )
-
     def mm1_output_m():
         return gather_indx.src_indx.shape[0]
 
     assert hidden_states.dtype == torch.bfloat16
     args_fn = bf16_bf16_args
     if quant_config._a1.dtype == "mxfp8":
-        # args_fn = mxfp8_mxfp8_args
         args_fn = mxfp8_bf16_args
 
     w1_pc = quant_config.w1_precision
@@ -276,15 +256,12 @@ def triton_kernel_fused_experts(
         out_scale_shape,
         epilogue,
     ) = args_fn(hidden_states, mm1_output_m(), w1.size(-1) // 2)
+    assert out_scale_shape is None
+    assert w1_pc.out_dtype == torch.bfloat16
 
     intermediate_cache1 = torch.zeros(
         out_shape, dtype=w1_pc.out_dtype, device=hidden_states.device
     )
-
-    if out_scale_shape is not None:
-        w1_pc.out_scale = torch.ones(
-            out_scale_shape, dtype=torch.uint8, device=hidden_states.device
-        )
 
     reset_opt_flags_constraints()
     intermediate_cache1 = matmul_ogs(
@@ -300,29 +277,18 @@ def triton_kernel_fused_experts(
         y=intermediate_cache1,
     )
 
-    # if intermediate_cache1.dtype == torch.float8_e4m3fn:
-    #    intermediate_cache1 = upcast_from_mxfp(
-    #        intermediate_cache1, w1_pc.out_scale, target_dtype=torch.bfloat16, axis=1
-    #    )
-
     w2_pc = quant_config.w2_precision
-    out_shape = (1, hidden_states.size(0), hidden_states.size(1))
     if quant_config._a2.dtype == "mxfp8":
-        # assert intermediate_cache1.dtype == torch.float8_e4m3fn and w1_pc.out_scale is not None
-        # w2_pc.act_scale = w1_pc.out_scale
-        # w2_pc.out_dtype = torch.bfloat16
-
         assert intermediate_cache1.dtype == torch.bfloat16
         intermediate_cache1, w2_pc.act_scale = quant_mxfp8(intermediate_cache1)
         w2_pc.out_dtype = torch.bfloat16
 
-    # assert output_tensor is None
+    out_shape = (1, hidden_states.size(0), hidden_states.size(1))
     intermediate_cache3 = torch.zeros(
         out_shape, dtype=w2_pc.out_dtype, device=intermediate_cache1.device
     )
 
-    # print (f"hidden states {hidden_states.size()} | intermediate cache 1 {intermediate_cache1.size()} | out scales {w1_pc.out_scale.size()}")
-
+    reset_opt_flags_constraints()
     intermediate_cache3 = matmul_ogs(
         intermediate_cache1,
         w2,
@@ -333,9 +299,6 @@ def triton_kernel_fused_experts(
         gammas=None if apply_router_weight_on_input else gammas,
         y=intermediate_cache3,
     )
-
-    reset_opt_flags_constraints()
-    # update_opt_flags_constraints({"block_m": 16, "is_persistent": True, "epilogue_subtile" : None})
 
     return intermediate_cache3
 
