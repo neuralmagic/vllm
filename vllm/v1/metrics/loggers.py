@@ -10,6 +10,7 @@ from typing import TypeAlias
 from prometheus_client import Counter, Gauge, Histogram
 
 from vllm.config import SupportsMetricsInfo, VllmConfig
+from vllm.distributed.eplb.metrics import EPLBProm
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorLogging
 from vllm.logger import init_logger
 from vllm.plugins import load_plugins_by_group
@@ -335,6 +336,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
     _counter_cls = Counter
     _histogram_cls = Histogram
     _spec_decoding_cls = SpecDecodingProm
+    _eplb_cls = EPLBProm
 
     def __init__(
         self, vllm_config: VllmConfig, engine_indexes: list[int] | None = None
@@ -360,6 +362,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         self.spec_decoding_prom = self._spec_decoding_cls(
             vllm_config.speculative_config, labelnames, spec_decode_labelvalues
+        )
+
+        eplb_labelvalues: dict[int, list[str]] = {
+            idx: [model_name, str(idx)] for idx in engine_indexes
+        }
+
+        self.eplb_prom = self._eplb_cls(
+            vllm_config.parallel_config.eplb_config, labelnames, eplb_labelvalues
         )
 
         #
@@ -940,6 +950,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if iteration_stats is None:
             return
 
+        self.eplb_prom.observe(iteration_stats.eplb_stats)
         self.counter_num_preempted_reqs[engine_idx].inc(
             iteration_stats.num_preempted_reqs
         )
