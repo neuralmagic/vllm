@@ -11,7 +11,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-# TODO: Move this to a common location with spec decode metrics
 def make_per_engine(
     counter: prometheus_client.Counter, per_engine_labelvalues: dict[int, list[str]]
 ):
@@ -36,7 +35,8 @@ class EPLBProm:
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[str]],
     ):
-        self.eplb_enabled = eplb_config is not None
+        # self.eplb_enabled = eplb_config is not None
+        self.eplb_enabled = True
         if not self.eplb_enabled:
             return
 
