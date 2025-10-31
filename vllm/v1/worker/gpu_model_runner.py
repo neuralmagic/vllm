@@ -2666,6 +2666,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
+            eplb_counter_a=1,
         )
 
         if not self.use_async_scheduling:

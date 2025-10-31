@@ -172,6 +172,8 @@ class SchedulerStats:
 
     num_corrupted_reqs: int = 0
 
+    eplb_stats: EPLBStats | None = None
+
 
 @dataclass
 class LoRAStats:
@@ -229,7 +231,6 @@ class IterationStats:
         self.inter_token_latencies_iter: list[float] = []
         self.waiting_lora_adapters: dict[str, int] = {}
         self.running_lora_adapters: dict[str, int] = {}
-        self.eplb_stats: EPLBStats = EPLBStats()
 
     def __repr__(self) -> str:
         field_to_value_str = ", ".join(f"{k}={v}" for k, v in vars(self).items())
@@ -250,7 +251,6 @@ class IterationStats:
     ):
         num_new_generation_tokens = len(output.new_token_ids)
 
-        self.eplb_stats.counter_a += 1
         self.num_generation_tokens += num_new_generation_tokens
         if is_prefilling:
             self.num_prompt_tokens += prompt_len

@@ -943,6 +943,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.spec_decoding_stats, engine_idx
                 )
 
+            if scheduler_stats.eplb_stats is not None:
+                self.eplb_prom.observe(scheduler_stats.eplb_stats)
+
         if mm_cache_stats is not None:
             self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)
             self.counter_mm_cache_hits[engine_idx].inc(mm_cache_stats.hits)
@@ -950,7 +953,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if iteration_stats is None:
             return
 
-        self.eplb_prom.observe(iteration_stats.eplb_stats)
         self.counter_num_preempted_reqs[engine_idx].inc(
             iteration_stats.num_preempted_reqs
         )
