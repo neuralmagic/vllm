@@ -132,7 +132,8 @@ def rank_worker(
 
 
 def run(config: Config, verbose: bool):
-    assert config.is_valid()[0]
+    is_config_valid = config.is_valid()
+    assert is_config_valid[0], f"{is_config_valid[1]}"
     assert not is_nyi_config(config)
 
     weights: WeightTensors = WeightTensors.make(config)
@@ -166,7 +167,10 @@ def is_nyi_config(config: Config) -> bool:
         ) == 1
         return unsupported_quant_config
 
-    return not info.supports_expert_map
+    return (
+        info.activation_format == mk.FusedMoEActivationFormat.Standard
+        and not info.supports_expert_map
+    )
 
 
 def generate_valid_test_cases(

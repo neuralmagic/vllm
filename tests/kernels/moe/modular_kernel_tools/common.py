@@ -147,6 +147,10 @@ class Config:
                 {"VLLM_FUSED_MOE_CHUNK_SIZE": str(self.fused_moe_chunk_size)}
             )
 
+        # With deepgemm, on SM100 we disable UE8M0 cast as the matching triton
+        # implementations dont use this
+        env_dict.update({"VLLM_USE_DEEP_GEMM_E8M0": "0"})
+
         return vllm_config, env_dict
 
     def is_fp8_block_quantized(self):
