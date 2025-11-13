@@ -90,6 +90,11 @@ common_float_and_int_types = common_float_types + [torch.int8]
 nvfp4_types = ["nvfp4"]
 fp8_types = [torch.float8_e4m3fn]
 
+PREPARE_FINALIZE_FILTER = [
+    "FlashInferAllToAllMoEPrepareAndFinalize",
+    "FlashInferAllGatherMoEPrepareAndFinalize",
+]
+
 
 def register_prepare_and_finalize(
     kind,
@@ -113,6 +118,13 @@ def register_prepare_and_finalize(
         backend,
         supports_apply_weight_on_input,
     )
+
+    if (
+        PREPARE_FINALIZE_FILTER is not None
+        and kind.__name__ not in PREPARE_FINALIZE_FILTER
+    ):
+        return
+
     MK_ALL_PREPARE_FINALIZE_TYPES.append(kind)
     if backend is not None or force_multigpu:
         MK_MULTI_GPU_PREPARE_FINALIZE_TYPES.append(kind)
@@ -234,17 +246,29 @@ if has_pplx():
         backend="pplx",
     )
 
-if has_flashinfer_cutlass_fused_moe() and current_platform.has_device_capability(100):
+if (
+    has_flashinfer_cutlass_fused_moe()
+):  # and current_platform.has_device_capability(100):
     from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_moe import (
         FlashInferExperts,
     )
     from vllm.model_executor.layers.fused_moe.flashinfer_cutlass_prepare_finalize import (  # noqa: E501
-        FlashInferCutlassMoEPrepareAndFinalize,
-        create_flashinfer_prepare_finalize,
+        FlashInferAllGatherMoEPrepareAndFinalize,
+        FlashInferAllToAllMoEPrepareAndFinalize,
     )
 
     register_prepare_and_finalize(
-        FlashInferCutlassMoEPrepareAndFinalize,
+        FlashInferAllToAllMoEPrepareAndFinalize,
+        standard_format,
+        nvfp4_types,
+        blocked_quantization_support=True,
+        backend=None,
+        force_multigpu=True,
+        supports_apply_weight_on_input=False,
+    )
+
+    register_prepare_and_finalize(
+        FlashInferAllGatherMoEPrepareAndFinalize,
         standard_format,
         nvfp4_types + fp8_types,
         blocked_quantization_support=True,
@@ -262,8 +286,6 @@ if has_flashinfer_cutlass_fused_moe() and current_platform.has_device_capability
         # Note: this is a hack to get it to run for now
         supports_expert_map=True,
     )
-else:
-    FlashInferCutlassMoEPrepareAndFinalize = None
 
 if has_deep_gemm() and is_deep_gemm_supported():
     register_experts(
@@ -405,10 +427,11 @@ def make_prepare_finalize(
         prepare_finalize = maybe_make_prepare_finalize(moe, quant_config)
         assert prepare_finalize is not None
         return prepare_finalize
-    elif prepare_finalize_type == FlashInferCutlassMoEPrepareAndFinalize:
-        return create_flashinfer_prepare_finalize(
-            use_dp=moe.moe_parallel_config.dp_size > 1
-        )
+    elif prepare_finalize_type in (
+        FlashInferAllToAllMoEPrepareAndFinalize,
+        FlashInferAllGatherMoEPrepareAndFinalize,
+    ):
+        return prepare_finalize_type(moe.moe_parallel_config.dp_size > 1)
     else:
         return MoEPrepareAndFinalizeNoEP()
 
