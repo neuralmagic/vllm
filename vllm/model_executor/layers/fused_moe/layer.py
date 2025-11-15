@@ -1955,8 +1955,14 @@ class FusedMoE(CustomOp):
                     dim=0,
                 )
 
+            w13_observers = self.w13_input_observer
+            for i in range(len(w13_observers)):
+                observer = w13_observers[i]
+                new_global_scale = observer.get_global_scale(hidden_states)
+                self.w13_input_global_scale[i, :].copy_(new_global_scale)
+
             # Matrix multiply.
-            final_hidden_states = self.quant_method.apply(
+            final_hidden_states, intermediate = self.quant_method.apply(
                 layer=self,
                 x=hidden_states_combined
                 if do_naive_dispatch_combine
@@ -1982,6 +1988,12 @@ class FusedMoE(CustomOp):
                 logical_to_physical_map=self.logical_to_physical_map,
                 logical_replica_count=self.logical_replica_count,
             )
+
+            w2_observers = self.w2_input_observer
+            for i in range(len(w2_observers)):
+                observer = w2_observers[i]
+                new_global_scale = observer.get_global_scale(intermediate)
+                self.w2_input_global_scale[i].copy_(new_global_scale)
 
             if has_separate_shared_experts:
                 assert self.shared_experts is not None
