@@ -88,6 +88,7 @@ from vllm.utils.deep_gemm import (
     get_col_major_tma_aligned_tensor,
     is_deep_gemm_e8m0_used,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import Observer
 
 logger = init_logger(__name__)
 
@@ -146,6 +147,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = quant_config.target_scheme_map[matched_target].get(
             "input_activations"
         )
+        return CompressedTensorsW4A4MoeMethod(layer.moe_config)
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             # group_size=None means channelwise
@@ -198,7 +200,7 @@ class CompressedTensorsW4A4Nvfp4MoeMethod(CompressedTensorsMoEMethod):
         _nvfp4 = detect_nvfp4_moe_support(self.__class__.__name__)
         self.cutlass_nvfp4_supported = _nvfp4.cutlass_supported
         self.allow_flashinfer = _nvfp4.allow_flashinfer
-        self.use_marlin = _nvfp4.use_marlin
+        self.use_marlin = True #_nvfp4.use_marlin
         self.group_size = 16
         self.flashinfer_moe_backend = None
         if self.allow_flashinfer:
@@ -305,22 +307,24 @@ class CompressedTensorsW4A4Nvfp4MoeMethod(CompressedTensorsMoEMethod):
 
         # Input Global Scales
         w13_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, 2, dtype=torch.float32), requires_grad=False
+            torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
         )
         layer.register_parameter("w13_input_global_scale", w13_input_scale)
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
+        layer.w13_input_observer = [Observer() for i in range(num_experts)]
 
         w2_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
+            torch.ones(num_experts, 1, dtype=torch.float32), requires_grad=False
         )
         layer.register_parameter("w2_input_global_scale", w2_input_scale)
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        layer.w2_input_observer = [Observer() for i in range(num_experts)]
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # From packed to weight

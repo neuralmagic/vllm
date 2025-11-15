@@ -17,6 +17,7 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import Observer
 
 __all__ = ["CompressedTensorsW4A16Fp4"]
 
@@ -78,6 +79,9 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         )
 
         layer.register_parameter("weight_scale", weight_scale)
+
+        layer.input_global_scale = Parameter(torch.ones(1), requires_grad=False)
+        layer.input_observer = Observer()
 
         if self.has_input_global_scale:
             input_global_scale = PerTensorScaleParameter(

@@ -393,6 +393,10 @@ class ReplicatedLinear(LinearBase):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if hasattr(self, "input_observer"):
+            input_global_scale = self.input_observer.get_global_scale(x)
+            self.input_global_scale.copy_(input_global_scale)
+
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
 
@@ -559,6 +563,10 @@ class ColumnParallelLinear(LinearBase):
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
+
+        if hasattr(self, "input_observer"):
+            input_global_scale = self.input_observer.get_global_scale(input_)
+            self.input_global_scale.copy_(input_global_scale)
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -1389,6 +1397,11 @@ class RowParallelLinear(LinearBase):
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        
+        if hasattr(self, "input_observer"):
+            input_global_scale = self.input_observer.get_global_scale(input_)
+            self.input_global_scale.copy_(input_global_scale)
+
         if self.input_is_parallel:
             input_parallel = input_
         else:
