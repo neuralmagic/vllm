@@ -17,16 +17,16 @@ if __name__ == '__main__':
     # Create a sampling params object for greedy sampling
     sampling_params = SamplingParams(temperature=0.80, top_p=0.95, max_tokens=40, min_tokens=10)
     engine_args = EngineArgs(
-        #model="/raid/engine/ml3-nvfp4a16",
-        model="nm-testing/Llama-4-Scout-17B-16E-NVFP4A16",
+        model="/raid/engine/ml3-nvfp4a16",
+        #model="nm-testing/Llama-4-Scout-17B-16E-NVFP4A16",
         #model="nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4A16-e2e",
-        tensor_parallel_size=2,
+        tensor_parallel_size=8,
         enforce_eager=True,
         max_model_len=2048,
         gpu_memory_utilization=0.95,
-        #tokenizer_mode="mistral", 
-        #config_format="mistral",
-        #load_format="mistral"
+        tokenizer_mode="mistral", 
+        config_format="mistral",
+        load_format="mistral"
     )
     llm = LLMEngine.from_engine_args(engine_args)
     counter = 0
