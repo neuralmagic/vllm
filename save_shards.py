@@ -167,9 +167,9 @@ def save_shards_if_rank0(model):
         tensor_size = tensor.numel() * tensor.element_size()
 
         if current_size + tensor_size > max_shard_size and current_shard:
-            file_path = os.path.join(PATH, f"model-{shard_index:05d}.safetensors")
+            file_path = os.path.join(PATH, "consolidated-00273-of-00273.safetensors")
             save_file(current_shard, file_path)
-            index_meta[file_path] = list(current_shard.keys())
+            index_meta["weight_map"] = {key: "consolidated-00273-of-00273.safetensors" for key in current_shard.keys()}
             print(f"[Rank 0] Saved shard {shard_index} ({len(current_shard)} tensors).")
 
             shard_index += 1
@@ -181,9 +181,9 @@ def save_shards_if_rank0(model):
 
     # Final shard
     if current_shard:
-        file_path = os.path.join(PATH, f"model-{shard_index:05d}.safetensors")
+        file_path = os.path.join(PATH, "consolidated-00273-of-00273.safetensors")
         save_file(current_shard, file_path)
-        index_meta["weight_map"] = list(current_shard.keys())
+        index_meta["weight_map"] = {key: "consolidated-00273-of-00273.safetensors" for key in current_shard.keys()}
         print(f"[Rank 0] Saved final shard {shard_index} ({len(current_shard)} tensors).")
 
     # Write global index JSON
