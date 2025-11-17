@@ -154,7 +154,7 @@ def save_shards_if_rank0(model):
     remapped_split = split_gate_up(remapped)
     remapped_final = split_expert_input_global_scales(remapped_split)
 
-    PATH = "/raid/engine/hub_cache/ml3-nvfp4"
+    PATH = "/raid/engine/dsikka/ml3-nvfp4-updated"
     os.makedirs(PATH, exist_ok=True)
     max_shard_size = 2 * 1024**3  # 2 GB
 
@@ -167,9 +167,9 @@ def save_shards_if_rank0(model):
         tensor_size = tensor.numel() * tensor.element_size()
 
         if current_size + tensor_size > max_shard_size and current_shard:
-            file_path = os.path.join(PATH, "consolidated-00273-of-00273.safetensors")
+            file_path = os.path.join(PATH, "consolidated-00256-of-00256.safetensors")
             save_file(current_shard, file_path)
-            index_meta["weight_map"] = {key: "consolidated-00273-of-00273.safetensors" for key in current_shard.keys()}
+            index_meta["weight_map"] = {key: "consolidated-00256-of-00256.safetensors" for key in current_shard.keys()}
             print(f"[Rank 0] Saved shard {shard_index} ({len(current_shard)} tensors).")
 
             shard_index += 1
@@ -181,9 +181,9 @@ def save_shards_if_rank0(model):
 
     # Final shard
     if current_shard:
-        file_path = os.path.join(PATH, "consolidated-00273-of-00273.safetensors")
+        file_path = os.path.join(PATH, "consolidated-00256-of-00256.safetensors")
         save_file(current_shard, file_path)
-        index_meta["weight_map"] = {key: "consolidated-00273-of-00273.safetensors" for key in current_shard.keys()}
+        index_meta["weight_map"] = {key: "consolidated-00256-of-00256.safetensors" for key in current_shard.keys()}
         print(f"[Rank 0] Saved final shard {shard_index} ({len(current_shard)} tensors).")
 
     # Write global index JSON
