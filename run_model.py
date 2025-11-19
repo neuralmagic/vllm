@@ -9,7 +9,7 @@ if __name__ == '__main__':
     DATASET_SPLIT = "train_sft"
 
     # Select number of samples
-    NUM_CALIBRATION_SAMPLES = 100
+    NUM_CALIBRATION_SAMPLES = 20
 
     ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
     ds = ds.shuffle(seed=42)
@@ -17,13 +17,11 @@ if __name__ == '__main__':
     # Create a sampling params object for greedy sampling
     sampling_params = SamplingParams(temperature=0.80, top_p=0.95, max_tokens=40, min_tokens=10)
     engine_args = EngineArgs(
-        model="/raid/engine/dsikka/ml3-nvfp4-updated",
-        #model="nm-testing/Llama-4-Scout-17B-16E-NVFP4A16",
-        #model="nm-testing/TinyLlama-1.1B-Chat-v1.0-NVFP4A16-e2e",
-        tensor_parallel_size=8,
+        model="/raid/engine/dsikka/mistral-large-3-NVFP4A16",
+        tensor_parallel_size=4,
         enforce_eager=True,
         max_model_len=2048,
-        gpu_memory_utilization=0.95,
+        max_num_seqs=1,
         tokenizer_mode="mistral", 
         config_format="mistral",
         load_format="mistral"

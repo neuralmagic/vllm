@@ -28,6 +28,7 @@ def remap_attention_substrings(state_dict):
         new_key = key
         for old, new in replacements.items():
             if old in new_key:
+                print("replacing", old, new)
                 new_key = new_key.replace(old, new)
                 new_key = new_key.replace("language_model.model.", "")
         new_state_dict[new_key] = value
@@ -78,7 +79,7 @@ def split_expert_input_global_scales(state_dict):
     # Find all relevant keys first (NO mutation during iteration)
     keys_to_process = [
         k for k in state_dict
-        if "feed_forward.experts." in k and (
+        if ".experts." in k and (
             k.endswith("w13_input_global_scale") or
             k.endswith("w2_input_global_scale")
         )
@@ -154,7 +155,7 @@ def save_shards_if_rank0(model):
     remapped_split = split_gate_up(remapped)
     remapped_final = split_expert_input_global_scales(remapped_split)
 
-    PATH = "/raid/engine/dsikka/ml3-nvfp4-updated"
+    PATH = "/raid/engine/dsikka/mistral-large-3-NVFP4A16/nvfp4"
     os.makedirs(PATH, exist_ok=True)
     max_shard_size = 2 * 1024**3  # 2 GB
 
@@ -167,9 +168,9 @@ def save_shards_if_rank0(model):
         tensor_size = tensor.numel() * tensor.element_size()
 
         if current_size + tensor_size > max_shard_size and current_shard:
-            file_path = os.path.join(PATH, "consolidated-00256-of-00256.safetensors")
+            file_path = os.path.join(PATH, "consolidated-00273-of-00273.safetensors")
             save_file(current_shard, file_path)
-            index_meta["weight_map"] = {key: "consolidated-00256-of-00256.safetensors" for key in current_shard.keys()}
+            index_meta["weight_map"] = {key: "consolidated-00273-of-00273.safetensors" for key in current_shard.keys()}
             print(f"[Rank 0] Saved shard {shard_index} ({len(current_shard)} tensors).")
 
             shard_index += 1
@@ -181,13 +182,13 @@ def save_shards_if_rank0(model):
 
     # Final shard
     if current_shard:
-        file_path = os.path.join(PATH, "consolidated-00256-of-00256.safetensors")
+        file_path = os.path.join(PATH, "consolidated-00273-of-00273.safetensors")
         save_file(current_shard, file_path)
-        index_meta["weight_map"] = {key: "consolidated-00256-of-00256.safetensors" for key in current_shard.keys()}
+        index_meta["weight_map"] = {key: "consolidated-00273-of-00273.safetensors" for key in current_shard.keys()}
         print(f"[Rank 0] Saved final shard {shard_index} ({len(current_shard)} tensors).")
 
     # Write global index JSON
-    index_path = os.path.join(PATH, "model_index.json")
+    index_path = os.path.join(PATH, "model.safetensors.index.json")
     with open(index_path, "w") as f:
         json.dump(index_meta, f, indent=2)
 
