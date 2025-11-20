@@ -19,7 +19,7 @@ if __name__ == '__main__':
     engine_args = EngineArgs(
         model="/raid/engine/dsikka/mistral-large-3-NVFP4A16",
         tensor_parallel_size=4,
-        enforce_eager=True,
+        max_num_seqs=1,
         max_model_len=2048,
         tokenizer_mode="mistral", 
         config_format="mistral",
