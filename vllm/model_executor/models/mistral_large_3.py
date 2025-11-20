@@ -12,7 +12,6 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
     # fmt: off
     remapping = {
         r"layers\.(\d+)\.attention_norm\.weight": r"model.layers.\1.input_layernorm.weight",  # noqa: E501
-        r"layers\.(\d+)\.attention\.wq\.(\w+)": r"model.layers.\1.self_attn.q_proj.\2",  # noqa: E501
         r"layers\.(\d+)\.attention\.wq_a\.(\w+)": r"model.layers.\1.self_attn.q_a_proj.\2",  # noqa: E501
         r"layers\.(\d+)\.attention\.q_a_norm\.weight": r"model.layers.\1.self_attn.q_a_layernorm.weight",  # noqa: E501
         r"layers\.(\d+)\.attention\.wq_b\.(\w+)": r"model.layers.\1.self_attn.q_b_proj.\2",  # noqa: E501
@@ -20,10 +19,6 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
         r"layers\.(\d+)\.attention\.kv_a_norm\.weight": r"model.layers.\1.self_attn.kv_a_layernorm.weight",  # noqa: E501
         r"layers\.(\d+)\.attention\.wkv_b\.(\w+)": r"model.layers.\1.self_attn.kv_b_proj.\2",  # noqa: E501
         r"layers\.(\d+)\.attention\.wo\.(\w+)": r"model.layers.\1.self_attn.o_proj.\2",  # noqa: E501
-        # FP8 scales
-        r"layers\.(\d+)\.attention\.k_fake_quantizer\.qscale_act": r"model.layers.\1.self_attn.mla_attn.mla_attn.k_scale",  # noqa: E501
-        r"layers\.(\d+)\.attention\.q_fake_quantizer\.qscale_act": r"model.layers.\1.self_attn.mla_attn.mla_attn.q_scale",  # noqa: E501
-        r"layers\.(\d+)\.attention\.v_fake_quantizer\.qscale_act": r"model.layers.\1.self_attn.mla_attn.mla_attn.v_scale",  # noqa: E501
         r"layers\.(\d+)\.ffn_norm\.weight": r"model.layers.\1.post_attention_layernorm.weight",  # noqa: E501
         r"layers\.(\d+)\.feed_forward\.w1\.(\w+)": r"model.layers.\1.mlp.gate_proj.\2",  # noqa: E501
         r"layers\.(\d+)\.feed_forward\.w2\.(\w+)": r"model.layers.\1.mlp.down_proj.\2",  # noqa: E501
@@ -35,7 +30,6 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
         r"layers\.(\d+)\.experts\.(\d+)\.w1\.(\w+)": r"model.layers.\1.mlp.experts.\2.gate_proj.\3",  # noqa: E501
         r"layers\.(\d+)\.experts\.(\d+)\.w2\.(\w+)": r"model.layers.\1.mlp.experts.\2.down_proj.\3",  # noqa: E501
         r"layers\.(\d+)\.experts\.(\d+)\.w3\.(\w+)": r"model.layers.\1.mlp.experts.\2.up_proj.\3",  # noqa: E501
-        r"layers\.(\d+)\.router_biases": r"model.layers.\1.mlp.gate.e_score_correction_bias",  # noqa: E501
         r"norm\.weight": "model.norm.weight",  # noqa: E501
         r"tok_embeddings\.weight": "model.embed_tokens.weight",  # noqa: E501
         r"output\.weight": "lm_head.weight",  # noqa: E501
@@ -58,10 +52,6 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
                 break
         else:
             raise ValueError(f"Cannot remap {name}")
-
-        # Note(Andy): Unlike Llama, this implementation uses
-        # is_neox_style=False for RoPE, which matches Mistral's implementation.
-        # Thus we don't need to permute the q/k weights (unlike Llama)
 
         # Remapping scale names. We could do this in the regex above but it
         # would triple the number of lines for most layers.
