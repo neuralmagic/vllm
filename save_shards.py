@@ -28,9 +28,7 @@ def remap_attention_substrings(state_dict):
         new_key = key
         for old, new in replacements.items():
             if old in new_key:
-                print("replacing", old, new)
                 new_key = new_key.replace(old, new)
-                new_key = new_key.replace("language_model.model.", "")
         new_state_dict[new_key] = value
 
     return new_state_dict
@@ -63,20 +61,6 @@ def split_gate_up(state_dict: dict):
     return new_state_dict
 
 def split_expert_input_global_scales(state_dict):
-    """
-    Handles:
-      - layers.{L}.mlp.experts.w13_input_global_scale  (shape [N,2])
-      - layers.{L}.mlp.experts.w2_input_global_scale   (shape [N,1])
-
-    Produces per-expert keys:
-      layers.{L}.experts.{i}.w1.input_global_scale
-      layers.{L}.experts.{i}.w3.input_global_scale
-      layers.{L}.experts.{i}.w2.input_global_scale
-
-    Removes the original combined keys (safely).
-    """
-
-    # Find all relevant keys first (NO mutation during iteration)
     keys_to_process = [
         k for k in state_dict
         if ".experts." in k and (
