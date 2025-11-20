@@ -9,7 +9,7 @@ if __name__ == '__main__':
     DATASET_SPLIT = "train_sft"
 
     # Select number of samples
-    NUM_CALIBRATION_SAMPLES = 20
+    NUM_CALIBRATION_SAMPLES = 100
 
     ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
     ds = ds.shuffle(seed=42)
@@ -21,7 +21,6 @@ if __name__ == '__main__':
         tensor_parallel_size=4,
         enforce_eager=True,
         max_model_len=2048,
-        max_num_seqs=1,
         tokenizer_mode="mistral", 
         config_format="mistral",
         load_format="mistral"
