@@ -13,7 +13,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 
-from .eplb_utils import distributed_run
+from .eplb_utils import distributed_run, set_env_vars_and_device
 
 
 def create_expert_indices_with_redundancy(
@@ -358,6 +358,7 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
     total_physical_experts = world_size * num_local_experts
     num_logical_experts = total_physical_experts // 2  # Some redundancy
     hidden_sizes = [32, 64]
+
 
     # Create redundancy configuration
     redundancy_config = [2] * num_logical_experts
