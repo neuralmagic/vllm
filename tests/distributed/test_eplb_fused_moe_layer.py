@@ -16,7 +16,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
-from .eplb_utils import distributed_run, set_env_vars_and_device 
+from .eplb_utils import distributed_run, set_env_vars_and_device
 
 
 @dataclass
@@ -179,10 +179,8 @@ def make_fused_moe_layer(
 
     return fml
 
-def _test_eplb_fml(env,
-                   world_size: int,
-                   test_config: TestConfig):
 
+def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
     # Initialize model parallel (using tensor parallel as an entrypoint
     # to expert parallel)
     set_env_vars_and_device(env)
@@ -238,9 +236,7 @@ def _test_eplb_fml(env,
                         tensor_device=w[e].device,
                         is_column_major=not w[e].is_contiguous(),
                     )
-                    assert (
-                        w[e].shape == ref.shape and w[e].stride() == ref.stride()
-                    ), (
+                    assert w[e].shape == ref.shape and w[e].stride() == ref.stride(), (
                         f"w[{e}] {w[e].size()} {w[e].stride()} vs "
                         f"ref {ref.size()} {ref.stride()}"
                     )
@@ -287,4 +283,3 @@ def test_eplb_fml(
         world_size,
         test_config,
     )
-

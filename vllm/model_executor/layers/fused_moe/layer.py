@@ -1419,8 +1419,9 @@ class FusedMoE(CustomOp):
             # expect the parameter's tensor to the same shape / stride. Instead,
             # make a new torch.nn.Parameter that is used just in the context of
             # EPLB.
-            return torch.nn.Parameter(torch.transpose(p.data, 1, 2),
-                                      requires_grad=False)
+            return torch.nn.Parameter(
+                torch.transpose(p.data, 1, 2), requires_grad=False
+            )
 
         weights = list(self.named_parameters())
         weights = [(name, _maybe_make_contiguous(name, p)) for name, p in weights]

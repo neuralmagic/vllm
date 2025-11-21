@@ -359,7 +359,6 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
     num_logical_experts = total_physical_experts // 2  # Some redundancy
     hidden_sizes = [32, 64]
 
-
     # Create redundancy configuration
     redundancy_config = [2] * num_logical_experts
 
