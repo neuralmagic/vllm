@@ -1391,7 +1391,40 @@ class FusedMoE(CustomOp):
                     yield param_name
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
+        def _maybe_make_contiguous(
+            name: str, p: torch.nn.Parameter
+        ) -> torch.nn.Parameter:
+            """
+            In some cases, the last 2 dimensions (the non-expert dimensions)
+            of the weight scale tensor are transposed. This function transposes
+            the tensor back so the tensor is contiguous().
+            Example: A scale tensor,
+              `x` of shape (E, 32, 16) and stride (512, 1, 32) is transposed to
+              `xt` of shape (E, 16, 32) and stride (512, 32, 1).
+              Note that we specifically use torch.transpose() so `xt` refers
+              to the same underlying memory. The tensors `x` and `xt`, pointing
+              to the same underlying memory make this transformation safe in the
+              context of EPLB. i.e. It is the same memory and just the view
+              is different.
+            Note: This function handles the "weight_scale" tensors specifically.
+            This could however be generalized to handle similar tensors.
+            """
+            # Check if the last 2 dimensions are trasposed
+            is_transposed = p.stride(1) == 1 and p.stride(2) != 1
+            if p.is_contiguous() or not is_transposed or "weight_scale" not in name:
+                # do nothing.
+                return p
+            assert p.ndim == 3
+            # Do not update the layer paramater as the layer's MoE operations would
+            # expect the parameter's tensor to the same shape / stride. Instead,
+            # make a new torch.nn.Parameter that is used just in the context of
+            # EPLB.
+            return torch.nn.Parameter(torch.transpose(p.data, 1, 2),
+                                      requires_grad=False)
+
         weights = list(self.named_parameters())
+        weights = [(name, _maybe_make_contiguous(name, p)) for name, p in weights]
+
         assert all(
             weight.is_contiguous()
             for name, weight in weights
