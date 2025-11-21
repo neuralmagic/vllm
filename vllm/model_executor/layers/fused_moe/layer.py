@@ -1411,11 +1411,17 @@ class FusedMoE(CustomOp):
             """
             if p.ndim != 3:
                 return p
-            # Check if the last 2 dimensions are trasposed
-            is_transposed = p.stride(1) == 1 and p.stride(2) != 1
-            if p.is_contiguous() or not is_transposed or "weight_scale" not in name:
+            if p.is_contiguous():
+                # Already contiguous. do nothing.
+                return p
+            # p is non-contiguous. We only handle the case where the last 2
+            # dimensions of the scales tensor is transposed. We can handle
+            # other cases when they become relevant.
+            is_transposed_12 = p.stride(1) == 1 and p.stride(2) != 1
+            if "weight_scale" not in name or not is_transposed_12:
                 # do nothing.
                 return p
+
             # Do not update the layer paramater as the layer's MoE operations would
             # expect the parameter's tensor to the same shape / stride. Instead,
             # make a new torch.nn.Parameter that is used just in the context of
