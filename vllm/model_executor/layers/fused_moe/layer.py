@@ -1396,13 +1396,13 @@ class FusedMoE(CustomOp):
         ) -> torch.nn.Parameter:
             """
             In some cases, the last 2 dimensions (the non-expert dimensions)
-            of the weight scale tensor are transposed. This function transposes
-            the tensor back so the tensor is contiguous().
-            Example: A scale tensor,
-              `x` of shape (E, 32, 16) and stride (512, 1, 32) is transposed to
-              `xt` of shape (E, 16, 32) and stride (512, 32, 1).
-              Note that we specifically use torch.transpose() so `xt` refers
-              to the same underlying memory. The tensors `x` and `xt`, pointing
+            of the weight scale tensor are transposed. This function
+            transforms the tensor (view update) so the tensor is contiguous().
+            Example: A non-contiguous scale tensor,
+              `x` of shape (E, 32, 16) and stride (512, 1, 32) is transformed to
+              `x_` of shape (E, 16, 32) and stride (512, 32, 1).
+              Note that we specifically use torch.transpose() so `x_` refers
+              to the same underlying memory. The tensors `x` and `x_`, pointing
               to the same underlying memory make this transformation safe in the
               context of EPLB. i.e. It is the same memory and just the view
               is different.
