@@ -118,9 +118,9 @@ cd pplx-kernels
 $PIP_CMD install --no-build-isolation -vvv -e .
 popd
 
-# build and install deepep, require pytorch installed
+# build and install deepep, require pytorelvircrnc
 pushd $WORKSPACE
-clone_repo "https://github.com/deepseek-ai/DeepEP" "DeepEP" "setup.py" "73b6ea4"
+clone_repo "https://github.com/elvircrn/DeepEP" "DeepEP" "setup.py" "main"
 cd DeepEP
 export NVSHMEM_DIR=$WORKSPACE/nvshmem_install
 $PIP_CMD install --no-build-isolation -vvv -e .
