@@ -138,13 +138,14 @@ do_build \
 
 # build DeepEP
 do_build \
-    "https://github.com/deepseek-ai/DeepEP" \
+    "https://github.com/elvircrn/DeepEP" \
     "DeepEP" \
     "setup.py" \
-    "73b6ea4" \
+    "main" \
     "export NVSHMEM_DIR=$WORKSPACE/nvshmem; "
 
 if [ "$MODE" = "wheel" ]; then
     echo "All wheels written to $WHEEL_DIR"
     ls -l "$WHEEL_DIR"
 fi
+

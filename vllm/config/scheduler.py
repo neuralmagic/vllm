@@ -203,12 +203,6 @@ class SchedulerConfig:
         self.max_num_encoder_input_tokens = self.max_num_batched_tokens
         self.encoder_cache_size = self.max_num_batched_tokens
 
-        if self.enable_chunked_prefill:
-            logger.info(
-                "Chunked prefill is enabled with max_num_batched_tokens=%d.",
-                self.max_num_batched_tokens,
-            )
-
         if self.max_num_partial_prefills > 1:
             if self.long_prefill_token_threshold == 0:
                 self.long_prefill_token_threshold = int(max_model_len * 0.04)
