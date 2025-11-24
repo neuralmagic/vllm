@@ -17,11 +17,11 @@ if __name__ == '__main__':
     # Create a sampling params object for greedy sampling
     sampling_params = SamplingParams(temperature=0.80, top_p=0.95, max_tokens=40, min_tokens=10)
     engine_args = EngineArgs(
-        model="/raid/engine/dsikka/mistral-large-3-NVFP4A16",
+        model="/raid/engine/hub_cache/mistral-large-3-NVFP4A16",
         tensor_parallel_size=4,
         enforce_eager=True,
         max_model_len=2048,
-        tokenizer_mode="mistral", 
+        tokenizer_mode="mistral",
         config_format="mistral",
         load_format="mistral"
     )
