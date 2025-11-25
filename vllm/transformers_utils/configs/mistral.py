@@ -22,7 +22,9 @@ def adapt_config_dict(
     is_mistral_large_3 = (
         is_moe and (config_dict["moe"].get("num_shared_experts") or 0) > 0
     )
-    if is_moe and is_mistral_large_3:
+    if config_dict.get("model_type") == "mamba":
+        config_dict["architectures"] = ["Mamba2ForCausalLM"]
+    elif is_moe and is_mistral_large_3:
         config_dict = _remap_moe_args(config_dict)
         config_dict["model_type"] = "deepseek_v3"
         config_dict["architectures"] = ["MistralLarge3ForCausalLM"]
@@ -42,8 +44,6 @@ def adapt_config_dict(
         )
     elif is_moe:
         config_dict["architectures"] = ["MixtralForCausalLM"]
-    elif config_dict.get("model_type") == "mamba":
-        config_dict["architectures"] = ["Mamba2ForCausalLM"]
     else:
         config_dict["architectures"] = ["MistralForCausalLM"]
 
