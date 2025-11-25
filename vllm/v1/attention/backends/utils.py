@@ -159,7 +159,6 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
         )
 
-
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,
     request_slice: slice,
