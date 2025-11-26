@@ -147,7 +147,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = quant_config.target_scheme_map[matched_target].get(
             "input_activations"
         )
-        return CompressedTensorsW4A4MoeMethod(layer.moe_config)
+        return CompressedTensorsW4A4Nvfp4MoeMethod(layer.moe_config)
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             # group_size=None means channelwise
