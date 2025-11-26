@@ -1,8 +1,9 @@
 import os
 import json
 import torch
+from torch.distributed import ReduceOp
 from safetensors.torch import save_file
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import get_tensor_model_parallel_rank, tensor_model_parallel_all_gather, get_tp_group
 
 
 def remap_attention_substrings(state_dict):
@@ -118,11 +119,6 @@ def save_shards_if_rank0(model):
     but only on rank 0 (to avoid multi-GPU overwrite issues).
     """
     rank = get_tensor_model_parallel_rank()
-    if rank != 0:
-        print(f"[Rank {rank}] Skipping save.")
-        return "skipped"
-
-    print("[Rank 0] Starting model save...")
 
     # Collect all tensors
     state_dict = {}
@@ -134,6 +130,25 @@ def save_shards_if_rank0(model):
 
         }
         state_dict.update(updated)
+
+    # for key, value in state_dict.items():
+    #     gathered = tensor_model_parallel_all_gather(value.unsqueeze(-1), dim=-1)
+    #     minned = torch.min(gathered, dim=-1).values
+    #     if rank == 0:
+    #         print(key)
+    #         print(value.shape)
+    #         print(gathered.shape)
+    #         print(minned.shape)
+    # return
+
+    # all gather min
+    state_dict = {
+        key: torch.min(tensor_model_parallel_all_gather(value.unsqueeze(-1), dim=-1), dim=-1).values
+        for key, value in state_dict.items()
+    }
+
+    if rank != 0:
+        return
     
     remapped = remap_attention_substrings(state_dict)
     remapped_split = split_gate_up(remapped)
@@ -169,12 +184,12 @@ def save_shards_if_rank0(model):
         file_path = os.path.join(PATH, "consolidated-00273-of-00273.safetensors")
         save_file(current_shard, file_path)
         index_meta["weight_map"] = {key: "consolidated-00273-of-00273.safetensors" for key in current_shard.keys()}
-        print(f"[Rank 0] Saved final shard {shard_index} ({len(current_shard)} tensors).")
+        print(f"[Rank {rank}] Saved final shard {shard_index} ({len(current_shard)} tensors).")
 
     # Write global index JSON
     # index_path = os.path.join(PATH, "model.safetensors.index.json")
     # with open(index_path, "w") as f:
     #     json.dump(index_meta, f, indent=2)
 
-    print("[Rank 0] Model save complete.")
+    print(f"[Rank {rank}] Model save complete.")
     return "saved"
