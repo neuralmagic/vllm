@@ -597,7 +597,6 @@ class CompressedTensorsW4A4Nvfp4MoeMethod(CompressedTensorsMoEMethod):
                 hidden_states=x,
                 router_logits=router_logits,
             )
-            print((before_shape, topk_ids.shape))
 
             _, all_calibrate_intermediate = fused_marlin_moe(
                 x.clone(),

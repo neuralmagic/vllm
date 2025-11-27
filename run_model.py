@@ -17,18 +17,18 @@ if __name__ == '__main__':
     # Create a sampling params object for greedy sampling
     sampling_params = SamplingParams(temperature=0.80, top_p=0.95, max_tokens=1, min_tokens=1)
     engine_args = EngineArgs(
-        #model="/raid/engine/hub_cache/mistral-large-3-NVFP4A16",
-        model="/home/kylesayrs/llm-compressor/Qwen1.5-MoE-A2.7B-NVFP4A16",
-        #tensor_parallel_size=4,
-        tensor_parallel_size=2,
+        model="/raid/engine/hub_cache/mistral-large-3-NVFP4A16",
+        #model="/home/kylesayrs/llm-compressor/Qwen1.5-MoE-A2.7B-NVFP4A16",
+        tensor_parallel_size=4,
+        #tensor_parallel_size=2,
         enforce_eager=True,
-        #max_model_len=2048,
+        max_model_len=2048,
         #max_model_len=128,
-        #tokenizer_mode="mistral",
-        #config_format="mistral",
-        #load_format="mistral",
+        tokenizer_mode="mistral",
+        config_format="mistral",
+        load_format="mistral",
         #max_num_seqs=1,
-        #gpu_memory_utilization=0.90
+        gpu_memory_utilization=0.90
     )
     llm = LLMEngine.from_engine_args(engine_args)
     counter = 0
