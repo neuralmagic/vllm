@@ -29,7 +29,6 @@ DEEPEP_QUANT_BLOCK_SIZE = 128
 DEEPEP_QUANT_BLOCK_SHAPE = [DEEPEP_QUANT_BLOCK_SIZE, DEEPEP_QUANT_BLOCK_SIZE]
 
 logger = init_logger(__name__)
-import torch.cuda.nvtx as nvtx
 
 def dequant_fp8(
     expert_x_fp8: torch.Tensor, expert_x_scales: torch.Tensor
@@ -344,7 +343,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         do_recv_hook = dbo_enabled() or do_async
         handle = self.handles[a2a_idx]
         assert handle is not None
-        nvtx.range_push("profile_now")
         combine_topk_weights = topk_weights
         if apply_router_weight_on_input:
             # weights have already been applied.
@@ -364,7 +362,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             out=output,
         )
 
-        nvtx.range_pop()
 
         return recv_hook, lambda: None
 
