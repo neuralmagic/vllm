@@ -111,6 +111,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         physical_to_global: torch.Tensor | None = None,
         local_expert_global_ids: torch.Tensor | None = None,
     ):
+        self.counter = 0
         super().__init__()
 
         self.buffer = buffer
@@ -273,7 +274,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
 
         print("======= Starting profiler =======")
-        profiler_start()
+
+        if self.counter > 1024: profiler_start()
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             # TODO: this only works for topK=1, will need to update for topK>1
@@ -298,7 +300,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         self.handles[a2a_idx] = handle
 
-        profiler_stop()
+        if self.counter > 1024: profiler_stop()
 
         return (
             hook,
