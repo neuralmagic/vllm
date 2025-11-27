@@ -116,6 +116,9 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        input_global_scale = layer.input_observer.get_global_scale(x)
+        layer.input_global_scale.copy_(input_global_scale)
+
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,
