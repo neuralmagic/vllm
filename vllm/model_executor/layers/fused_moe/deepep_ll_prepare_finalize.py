@@ -302,6 +302,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         if self.counter > 1024: profiler_stop()
 
+        self.counter += 1
+
         return (
             hook,
             lambda: self._receiver(
