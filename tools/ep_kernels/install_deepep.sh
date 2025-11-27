@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -ex
 
+PIP_CMD="uv pip"
+
 # prepare workspace directory
 WORKSPACE=$1
 if [ -z "$WORKSPACE" ]; then
