@@ -273,7 +273,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "low_latency kernels doesn't support dispatching per-token scales"
         )
 
-        if self.counter > 1024:
+        if self.counter > 1024 * 128:
             print("======= Starting profiler =======")
             profiler_start()
 
@@ -301,7 +301,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         self.handles[a2a_idx] = handle
 
-        if self.counter > 1024 * 1024: profiler_stop()
+        if self.counter > 1024 * 128: profiler_stop()
 
         self.counter += 1
 
