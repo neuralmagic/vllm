@@ -273,9 +273,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "low_latency kernels doesn't support dispatching per-token scales"
         )
 
-        print("======= Starting profiler =======")
+        if self.counter > 1024:
+            print("======= Starting profiler =======")
+            profiler_start()
 
-        if self.counter > 1024: profiler_start()
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             # TODO: this only works for topK=1, will need to update for topK>1
@@ -300,7 +301,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         self.handles[a2a_idx] = handle
 
-        if self.counter > 1024: profiler_stop()
+        if self.counter > 1024 * 1024: profiler_stop()
 
         self.counter += 1
 
