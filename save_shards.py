@@ -134,12 +134,13 @@ def save_shards_if_rank0(model):
     # for key, value in state_dict.items():
     #     gathered = tensor_model_parallel_all_gather(value.unsqueeze(-1), dim=-1)
     #     minned = torch.min(gathered, dim=-1).values
-    #     if rank == 0:
+    #     if rank == 0 and "w2" in key:
     #         print(key)
     #         print(value.shape)
     #         print(gathered.shape)
     #         print(minned.shape)
-    # return
+    #         print(gathered)
+    #         print(minned)
 
     # all gather min
     state_dict = {

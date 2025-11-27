@@ -569,8 +569,8 @@ class CompressedTensorsW4A4Nvfp4MoeMethod(CompressedTensorsMoEMethod):
         )
 
         if self.use_marlin:
-            return fused_marlin_moe(
-                x,
+            true_output, _ = fused_marlin_moe(
+                x.clone(),
                 layer.w13_weight,
                 layer.w2_weight,
                 None,
@@ -588,6 +588,39 @@ class CompressedTensorsW4A4Nvfp4MoeMethod(CompressedTensorsMoEMethod):
                 expert_map=expert_map,
                 workspace=layer.workspace,
             )
+
+            before_shape = topk_ids.shape
+
+            original_top_k = layer.top_k
+            layer.top_k = 128
+            topk_weights, topk_ids, _ = layer.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+            )
+            print((before_shape, topk_ids.shape))
+
+            _, all_calibrate_intermediate = fused_marlin_moe(
+                x.clone(),
+                layer.w13_weight,
+                layer.w2_weight,
+                None,
+                None,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                global_scale1=layer.w13_weight_scale_2,
+                global_scale2=layer.w2_weight_scale_2,
+                quant_type_id=scalar_types.float4_e2m1f.id,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                workspace=layer.workspace,
+            )
+
+            layer.top_k = original_top_k
+            return true_output, all_calibrate_intermediate
 
         # FlashInfer fused experts path
         elif self.allow_flashinfer:

@@ -247,13 +247,8 @@ class Observer:
         self.past_global_max_vals = None
 
     def get_global_scale(self, observed: torch.Tensor):
-        def _get_min_max(observed: torch.Tensor):
-            min_vals = torch.amin(observed, dim=(0, -1))
-            max_vals = torch.amax(observed, dim=(0, -1))
-
-            return min_vals, max_vals
-
-        min_vals, max_vals = _get_min_max(observed)
+        min_vals = torch.min(observed)
+        max_vals = torch.max(observed)
 
         if self.past_global_min_vals is not None:
             min_vals = torch.min(min_vals, self.past_global_min_vals)
