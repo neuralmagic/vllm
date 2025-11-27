@@ -48,6 +48,26 @@ def dequant_fp8(
     return (expert_x_fp32 * expert_x_scales).view(expert_x_fp8.size())
 
 
+import ctypes
+import os
+
+# Load CUDA runtime library
+libcudart = ctypes.CDLL("libcudart.so")
+
+cudaProfilerStart = libcudart.cudaProfilerStart
+cudaProfilerStop  = libcudart.cudaProfilerStop
+
+cudaProfilerStart.restype = ctypes.c_int
+cudaProfilerStop.restype  = ctypes.c_int
+
+
+def profiler_start():
+    assert cudaProfilerStart() == 0
+
+def profiler_stop():
+    assert cudaProfilerStop() == 0
+
+
 class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
     Prepare/Finalize using DeepEP low-latency kernels.
@@ -252,6 +272,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "low_latency kernels doesn't support dispatching per-token scales"
         )
 
+        print("======= Starting profiler =======")
+        profiler_start()
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             # TODO: this only works for topK=1, will need to update for topK>1
@@ -275,6 +297,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             return_recv_hook=True,
         )
         self.handles[a2a_idx] = handle
+
+        profiler_stop()
 
         return (
             hook,

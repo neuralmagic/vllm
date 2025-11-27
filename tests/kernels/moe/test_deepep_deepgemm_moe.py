@@ -171,7 +171,6 @@ def make_ll_modular_kernel(
 ) -> FusedMoEModularKernel:
     assert test_config.low_latency
     assert test_config.use_fp8_dispatch is not None
-
     a2a: DeepEPLLPrepareAndFinalize = make_deepep_a2a(
         pg=pg,
         pgi=pgi,
