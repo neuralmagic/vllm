@@ -155,7 +155,7 @@ def save_shards_if_rank0(model):
     remapped_split = split_gate_up(remapped)
     remapped_final = split_expert_input_global_scales(remapped_split)
 
-    PATH = "/raid/engine/kylesayrs/mistral-large-3-NVFP4"
+    PATH = "/raid/engine/hub_cache/Mistral-Large-3-675B-Instruct-2512-FP4-MoE"
     os.makedirs(PATH, exist_ok=True)
     max_shard_size = 2 * 1024**3  # 2 GB
 
@@ -188,9 +188,9 @@ def save_shards_if_rank0(model):
         print(f"[Rank {rank}] Saved final shard {shard_index} ({len(current_shard)} tensors).")
 
     # Write global index JSON
-    # index_path = os.path.join(PATH, "model.safetensors.index.json")
-    # with open(index_path, "w") as f:
-    #     json.dump(index_meta, f, indent=2)
+    index_path = os.path.join(PATH, "tmp.safetensors.index.json")
+    with open(index_path, "w") as f:
+        json.dump(index_meta, f, indent=2)
 
     print(f"[Rank {rank}] Model save complete.")
     return "saved"

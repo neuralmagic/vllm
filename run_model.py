@@ -17,7 +17,7 @@ if __name__ == '__main__':
     # Create a sampling params object for greedy sampling
     sampling_params = SamplingParams(temperature=0.80, top_p=0.95, max_tokens=1, min_tokens=1)
     engine_args = EngineArgs(
-        model="/raid/engine/hub_cache/mistral-large-3-NVFP4A16",
+        model="/raid/engine/hub_cache/Mistral-Large-3-675B-Instruct-2512-FP4-MoE",
         #model="/home/kylesayrs/llm-compressor/Qwen1.5-MoE-A2.7B-NVFP4A16",
         tensor_parallel_size=4,
         #tensor_parallel_size=2,
