@@ -68,7 +68,7 @@ def profiler_stop():
     assert cudaProfilerStop() == 0
 
 
-counter_dispatch = 0
+# counter_dispatch = 0
 
 class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     """
@@ -360,14 +360,14 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
         do_async: bool,
     ) -> tuple[Callable, Callable]:
-        global counter_dispatch
+        # global counter_dispatch
         assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate), (
             "Weight application and reduction happens in the combine kernel."
         )
 
-        if counter_dispatch == 64:
-            print("======= Starting profiler =======")
-            profiler_start()
+        # if counter_dispatch == 64:
+        #     print("======= Starting profiler =======")
+        #     profiler_start()
 
         a2a_idx = dbo_current_ubatch_id()
         do_recv_hook = dbo_enabled() or do_async
@@ -392,9 +392,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             out=output,
         )
 
-        if counter_dispatch == 80: profiler_stop()
+        # if counter_dispatch == 80: profiler_stop()
 
-        counter_dispatch += 1
+        # counter_dispatch += 1
 
         return recv_hook, lambda: None
 
