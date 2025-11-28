@@ -274,7 +274,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "low_latency kernels doesn't support dispatching per-token scales"
         )
 
-        if self.counter_dispatch == 32:
+        if self.counter_dispatch == 64:
             print("======= Starting profiler =======")
             profiler_start()
 
@@ -396,7 +396,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             out=output,
         )
 
-        if self.counter_combine == 32: profiler_stop()
+        if self.counter_combine == 64: profiler_stop()
 
         self.counter_combine += 1
 
