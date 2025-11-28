@@ -111,7 +111,8 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         physical_to_global: torch.Tensor | None = None,
         local_expert_global_ids: torch.Tensor | None = None,
     ):
-        self.counter = 0
+        self.counter_dispatch = 0
+        self.counter_combine = 0
         super().__init__()
 
         self.buffer = buffer
@@ -273,7 +274,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "low_latency kernels doesn't support dispatching per-token scales"
         )
 
-        if self.counter == 32:
+        if self.counter_dispatch == 32:
             print("======= Starting profiler =======")
             profiler_start()
 
@@ -301,9 +302,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         self.handles[a2a_idx] = handle
 
-        if self.counter == 32: profiler_stop()
+        if self.counter_dispatch == 32: profiler_stop()
 
-        self.counter += 1
+        self.counter_dispatch += 1
 
         return (
             hook,
@@ -368,6 +369,10 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "Weight application and reduction happens in the combine kernel."
         )
 
+        if self.counter_combine == 32:
+            print("======= Starting profiler =======")
+            profiler_start()
+
         a2a_idx = dbo_current_ubatch_id()
         do_recv_hook = dbo_enabled() or do_async
         handle = self.handles[a2a_idx]
@@ -391,6 +396,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             out=output,
         )
 
+        if self.counter_combine == 32: profiler_stop()
+
+        self.counter_combine += 1
 
         return recv_hook, lambda: None
 
