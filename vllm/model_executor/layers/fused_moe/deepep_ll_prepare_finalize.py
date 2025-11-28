@@ -112,7 +112,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         local_expert_global_ids: torch.Tensor | None = None,
     ):
         self.counter_dispatch = 0
-        self.counter_combine = 0
         super().__init__()
 
         self.buffer = buffer
@@ -369,10 +368,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "Weight application and reduction happens in the combine kernel."
         )
 
-        if self.counter_combine == 64:
-            print("======= Starting profiler =======")
-            profiler_start()
-
         a2a_idx = dbo_current_ubatch_id()
         do_recv_hook = dbo_enabled() or do_async
         handle = self.handles[a2a_idx]
@@ -395,10 +390,6 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             return_recv_hook=do_recv_hook,
             out=output,
         )
-
-        if self.counter_combine == 128: profiler_stop()
-
-        self.counter_combine += 1
 
         return recv_hook, lambda: None
 
