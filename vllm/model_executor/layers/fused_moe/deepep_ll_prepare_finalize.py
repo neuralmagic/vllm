@@ -360,6 +360,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
         do_async: bool,
     ) -> tuple[Callable, Callable]:
+        global counter_dispatch
         assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate), (
             "Weight application and reduction happens in the combine kernel."
         )
