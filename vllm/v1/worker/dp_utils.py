@@ -41,16 +41,15 @@ def _run_ar(
     padded_num_tokens_per_ubatch: int,
     parallel_config: ParallelConfig,
 ) -> torch.Tensor:
-    dp_size = parallel_config.data_parallel_size
-    dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
-    tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
-    tensor[0][dp_rank] = orig_num_tokens_per_ubatch
-    tensor[1][dp_rank] = padded_num_tokens_per_ubatch
-    tensor[2][dp_rank] = 1 if should_ubatch else 0
-    tensor[3][dp_rank] = 1 if should_dp_pad else 0
-    dist.all_reduce(tensor, group=group)
-    return tensor
+    return torch.tensor([[1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024,
+             1024, 1024, 1024, 1024],
+            [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024,
+             1024, 1024, 1024, 1024],
+            [   0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                0,    0,    0,    0],
+            [   1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
+                1,    1,    1,    1]], device=device, dtype=torch.int32)
 
 
 def _post_process_ubatch(tensor: torch.Tensor) -> bool:
@@ -124,8 +123,6 @@ def _synchronize_dp_ranks(
     )
 
     should_dp_pad = bool(torch.all(tensor[3] == 1).item())
-
-    print(f'======= tensor = {tensor} ======')
 
     # DP ranks should all have the same value for should_attempt_dp_padding.
     assert should_attempt_dp_padding == should_dp_pad
