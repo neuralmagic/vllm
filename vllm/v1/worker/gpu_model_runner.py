@@ -3722,7 +3722,6 @@ class GPUModelRunner(
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
         # Disable DP padding when running eager
-        print(f'========= self.compilation_config.cudagraph_mode = {self.compilation_config.cudagraph_mode}')
 
         allow_dp_padding = self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
 
