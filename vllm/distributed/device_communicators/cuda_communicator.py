@@ -30,15 +30,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
-        if "tp" not in unique_name:
-            # custom allreduce or torch symm mem can be used only by tp
-            use_custom_allreduce = False
-            use_torch_symm_mem = False
-        else:
-            from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
-            use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
+        # NOTE(elvircrn):
+        use_custom_allreduce = True
+        use_torch_symm_mem = True
+
+        # if "tp" not in unique_name:
+        #     # custom allreduce or torch symm mem can be used only by tp
+        #     use_custom_allreduce = False
+        #     use_torch_symm_mem = False
+        # else:
+        #     from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+        #
+        #     use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+        #     use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
