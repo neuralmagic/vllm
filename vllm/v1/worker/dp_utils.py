@@ -87,6 +87,36 @@ def _post_process_dp_padding(tensor: torch.Tensor, should_dp_pad: bool) -> torch
     else:
         return num_tokens_across_dp.cpu()
 
+_cache = {}
+
+def get_tensor_cached(
+        should_ubatch,
+        should_dp_pad,
+        num_tokens_unpadded,
+        num_tokens_padded,
+        parallel_config,
+):
+    key = (
+        should_ubatch,
+        should_dp_pad,
+        num_tokens_unpadded,
+        num_tokens_padded,
+        parallel_config.to_tuple(),   # ensure hashability
+    )
+
+    if key in _cache:
+        return _cache[key]
+
+    tensor = _run_ar(
+        should_ubatch=should_ubatch,
+        should_dp_pad=should_dp_pad,
+        orig_num_tokens_per_ubatch=num_tokens_unpadded,
+        padded_num_tokens_per_ubatch=num_tokens_padded,
+        parallel_config=parallel_config,
+    )
+
+    _cache[key] = tensor
+    return tensor
 
 def _synchronize_dp_ranks(
     num_tokens_unpadded: int,
@@ -115,7 +145,7 @@ def _synchronize_dp_ranks(
     # Coordinate between the DP ranks via an All Reduce
     # to determine the total number of tokens that each rank
     # will run and if we are using ubatching or not.
-    tensor = _run_ar(
+    tensor = get_tensor_cached(
         should_ubatch=should_attempt_ubatching,
         should_dp_pad=should_attempt_dp_padding,
         orig_num_tokens_per_ubatch=num_tokens_unpadded,
