@@ -145,7 +145,7 @@ def _synchronize_dp_ranks(
     # Coordinate between the DP ranks via an All Reduce
     # to determine the total number of tokens that each rank
     # will run and if we are using ubatching or not.
-    tensor = get_tensor_cached(
+    tensor = _run_ar(
         should_ubatch=should_attempt_ubatching,
         should_dp_pad=should_attempt_dp_padding,
         orig_num_tokens_per_ubatch=num_tokens_unpadded,
