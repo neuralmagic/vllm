@@ -49,7 +49,8 @@ def _run_ar(
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = 1 if should_dp_pad else 0
-    dist.all_reduce(tensor, group=group)
+    # NOTE(elvircrn)
+    # dist.all_reduce(tensor, group=group)
     return tensor
 
 
