@@ -128,8 +128,6 @@ def _synchronize_dp_ranks(
     should_dp_pad = bool(torch.all(tensor[3] == 1).item())
 
     # DP ranks should all have the same value for should_attempt_dp_padding.
-    # NOTE(elvircrn):
-    print(f'======== should_attempt_dp_padding should_dp_pad = {should_attempt_dp_padding} {should_dp_pad}')
     assert should_attempt_dp_padding == should_dp_pad
 
     # Check conditions for microbatching
