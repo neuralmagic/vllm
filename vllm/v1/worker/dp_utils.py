@@ -48,8 +48,8 @@ def _run_ar(
              1024, 1024, 1024, 1024],
             [   0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
                 0,    0,    0,    0],
-            [   1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,    1,
-                1,    1,    1,    1]], device=device, dtype=torch.int32)
+            [   0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+                0,    0,    0,    0]], device=device, dtype=torch.int32)
 
 
 def _post_process_ubatch(tensor: torch.Tensor) -> bool:
