@@ -118,7 +118,8 @@ def _synchronize_dp_ranks(
     # will run and if we are using ubatching or not.
     tensor = _run_ar(
         should_ubatch=should_attempt_ubatching,
-        should_dp_pad=should_attempt_dp_padding,
+        # NOTE(elvircrn): This eneded to be added
+        should_dp_pad=True,
         orig_num_tokens_per_ubatch=num_tokens_unpadded,
         padded_num_tokens_per_ubatch=num_tokens_padded,
         parallel_config=parallel_config,
