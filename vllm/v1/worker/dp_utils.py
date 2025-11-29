@@ -48,7 +48,7 @@ def _run_ar(
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
-    tensor[3][dp_rank] = 1 if should_dp_pad else 0
+    tensor[3][dp_rank] = 1
     # NOTE(elvircrn)
     # dist.all_reduce(tensor, group=group)
     return tensor
@@ -125,7 +125,8 @@ def _synchronize_dp_ranks(
         parallel_config=parallel_config,
     )
 
-    should_dp_pad = bool(torch.all(tensor[3] == 1).item())
+    # NOTE(elvircrn):
+    should_dp_pad = True # bool(torch.all(tensor[3] == 1).item())
 
     # DP ranks should all have the same value for should_attempt_dp_padding.
     # NOTE(elvircrn):
