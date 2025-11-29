@@ -42,6 +42,7 @@ def _run_ar(
     parallel_config: ParallelConfig,
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
+    print(f'===== dp_size = {dp_size} ======')
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
     tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
