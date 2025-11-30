@@ -59,7 +59,7 @@ def _run_ar(
     tensor[3][dp_rank] = 1 if should_dp_pad else 0
     dist.all_reduce(tensor, group=group)
 
-    _cache[key] = key
+    _cache[key] = tensor
     return tensor
 
 
