@@ -34,6 +34,8 @@ def _get_device_and_group(parallel_config: ParallelConfig):
     return device, group
 
 
+_cache = {}
+
 def _run_ar(
         should_ubatch: bool,
         should_dp_pad: bool,
@@ -44,12 +46,20 @@ def _run_ar(
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
+
+    key = (dp_size, dp_rank, orig_num_tokens_per_ubatch, padded_num_tokens_per_ubatch, should_ubatch, should_dp_pad)
+
+    if key in _cache:
+        return _cache[key]
+
     tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = 1 if should_dp_pad else 0
     dist.all_reduce(tensor, group=group)
+
+    _cache[key] = key
     return tensor
 
 
@@ -87,36 +97,6 @@ def _post_process_dp_padding(tensor: torch.Tensor, should_dp_pad: bool) -> torch
     else:
         return num_tokens_across_dp.cpu()
 
-_cache = {}
-
-def get_tensor_cached(
-        should_ubatch,
-        should_dp_pad,
-        num_tokens_unpadded,
-        num_tokens_padded,
-        parallel_config,
-):
-    key = (
-        should_ubatch,
-        should_dp_pad,
-        num_tokens_unpadded,
-        num_tokens_padded,
-        parallel_config.to_tuple(),   # ensure hashability
-    )
-
-    if key in _cache:
-        return _cache[key]
-
-    tensor = _run_ar(
-        should_ubatch=should_ubatch,
-        should_dp_pad=should_dp_pad,
-        orig_num_tokens_per_ubatch=num_tokens_unpadded,
-        padded_num_tokens_per_ubatch=num_tokens_padded,
-        parallel_config=parallel_config,
-    )
-
-    _cache[key] = tensor
-    return tensor
 
 def _synchronize_dp_ranks(
     num_tokens_unpadded: int,
