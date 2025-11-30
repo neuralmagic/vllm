@@ -34,7 +34,7 @@ def _get_device_and_group(parallel_config: ParallelConfig):
     return device, group
 
 
-_cache = {}
+# _cache = {}
 
 def _run_ar(
         should_ubatch: bool,
@@ -47,10 +47,10 @@ def _run_ar(
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
 
-    key = (dp_size, dp_rank, orig_num_tokens_per_ubatch, padded_num_tokens_per_ubatch, should_ubatch, should_dp_pad)
+    # key = (dp_size, dp_rank, orig_num_tokens_per_ubatch, padded_num_tokens_per_ubatch, should_ubatch, should_dp_pad)
 
-    if key in _cache:
-        return _cache[key]
+    # if key in _cache:
+    #     return _cache[key]
 
     tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
@@ -59,7 +59,7 @@ def _run_ar(
     tensor[3][dp_rank] = 1 if should_dp_pad else 0
     dist.all_reduce(tensor, group=group)
 
-    _cache[key] = tensor
+    # _cache[key] = tensor
     return tensor
 
 

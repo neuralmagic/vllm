@@ -224,7 +224,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
-    VLLM_USE_NCCL_SYMM_MEM: bool = False
+    VLLM_USE_NCCL_SYMM_MEM: bool = True
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
