@@ -176,7 +176,7 @@ class ParallelConfig:
     threshold, microbatching will be used. Otherwise, the request will be
     processed in a single batch."""
 
-    disable_nccl_for_dp_synchronization: bool = True
+    disable_nccl_for_dp_synchronization: bool = False
     """Forces the dp synchronization logic in vllm/v1/worker/dp_utils.py 
     to use Gloo instead of NCCL for its all reduce"""
 
