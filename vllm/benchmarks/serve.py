@@ -258,6 +258,7 @@ def calculate_metrics_for_embeddings(
             completed += 1
             total_input += outputs[i].prompt_len
         else:
+            print(outputs[i].error)
             failed += 1
 
     if completed == 0:
