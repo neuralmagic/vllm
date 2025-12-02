@@ -382,7 +382,6 @@ def calculate_metrics(
     # Find the time range across all successful requests
     successful_outputs = [output for output in outputs if output.success]
     failed_outputs = [output for output in outputs if not output.success]
-    print(f'===== failed outputs = {failed_outputs[0].error}')
     if successful_outputs:
         min_start_time = min(output.start_time for output in successful_outputs)
         max_end_time = max(
