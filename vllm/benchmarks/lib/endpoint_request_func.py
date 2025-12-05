@@ -30,7 +30,7 @@ class StreamedResponseHandler:
         """Add a chunk of bytes to the buffer and return any complete
         messages."""
         # NOTE(elvircrn): errors='ignore' to avoid UnicodeDecodeError
-        chunk_str = chunk_bytes.decode("utf-8", errors='ignore')
+        chunk_str = chunk_bytes.decode("utf-8", errors='replace')
         self.buffer += chunk_str
 
         messages = []
