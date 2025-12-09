@@ -172,4 +172,4 @@ def _add_shutdown_handlers(app: FastAPI, server: uvicorn.Server) -> None:
             engine=request.app.state.engine_client,
         )
 
-        return Response(status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        return Response(status_code=HTTPStatus.NOT_IMPLEMENTED)
