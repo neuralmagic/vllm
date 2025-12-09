@@ -1,70 +1,6 @@
 #!/usr/bin/env bash
 set -ex
 
-<<<<<<< HEAD
-# usage: ./install_python_libraries.sh [options]
-#   --workspace <dir>    workspace directory (default: ./ep_kernels_workspace)
-#   --mode <mode>        "install" (default) or "wheel"
-#   --pplx-ref <commit>  pplx-kernels commit hash
-#   --deepep-ref <commit> DeepEP commit hash
-
-CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
-PPLX_COMMIT_HASH=${PPLX_COMMIT_HASH:-"12cecfd"}
-DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"73b6ea4"}
-NVSHMEM_VER=3.3.9
-WORKSPACE=${WORKSPACE:-$(pwd)/ep_kernels_workspace}
-MODE=${MODE:-install}
-
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --workspace)
-            if [[ -z "$2" || "$2" =~ ^- ]]; then
-                echo "Error: --workspace requires an argument." >&2
-                exit 1
-            fi
-            WORKSPACE="$2"
-            shift 2
-            ;;
-        --mode)
-            if [[ -z "$2" || "$2" =~ ^- ]]; then
-                echo "Error: --mode requires an argument." >&2
-                exit 1
-            fi
-            MODE="$2"
-            shift 2
-            ;;
-        --pplx-ref)
-            if [[ -z "$2" || "$2" =~ ^- ]]; then
-                echo "Error: --pplx-ref requires an argument." >&2
-                exit 1
-            fi
-            PPLX_COMMIT_HASH="$2"
-            shift 2
-            ;;
-        --deepep-ref)
-            if [[ -z "$2" || "$2" =~ ^- ]]; then
-                echo "Error: --deepep-ref requires an argument." >&2
-                exit 1
-            fi
-            DEEPEP_COMMIT_HASH="$2"
-            shift 2
-            ;;
-        *)
-            echo "Error: Unknown argument '$1'" >&2
-            exit 1
-            ;;
-    esac
-done
-
-mkdir -p "$WORKSPACE"
-
-WHEEL_DIR="$WORKSPACE/dist"
-mkdir -p "$WHEEL_DIR"
-
-pushd "$WORKSPACE"
-
-=======
 # prepare workspace directory
 WORKSPACE=$1
 if [ -z "$WORKSPACE" ]; then
@@ -79,7 +15,6 @@ fi
 PIP_CMD=${PIP_CMD:-pip3}
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 
->>>>>>> 31ad8d5ae (Deepep)
 # install dependencies if not installed
 $PIP_CMD install cmake torch ninja
 
@@ -177,67 +112,12 @@ clone_repo() {
     fi
 }
 
-<<<<<<< HEAD
-deepep_cuda13_patch() {
-    cuda_version_major=$(${CUDA_HOME}/bin/nvcc --version | egrep -o "release [0-9]+" | cut -d ' ' -f 2)
-    if [ ${cuda_version_major} -ge 13 ]; then
-        sed -i "s|f'{nvshmem_dir}/include']|f'{nvshmem_dir}/include', '${CUDA_HOME}/include/cccl']|" "setup.py"
-    fi
-}
-
-do_build() {
-    local repo=$1
-    local name=$2
-    local key=$3
-    local commit=$4
-    local extra_env=$5
-
-    pushd "$WORKSPACE"
-    clone_repo "$repo" "$name" "$key" "$commit"
-    cd "$name"
-
-    if [ "$name" == "DeepEP" ]; then
-        deepep_cuda13_patch
-    fi
-
-    if [ "$MODE" = "install" ]; then
-        echo "Installing $name into environment"
-        eval "$extra_env" uv pip install --no-build-isolation -vvv .
-    else
-        echo "Building $name wheel into $WHEEL_DIR"
-        eval "$extra_env" uv build --wheel --no-build-isolation -vvv --out-dir "$WHEEL_DIR" .
-    fi
-    popd
-}
-
-# build pplx-kernels
-do_build \
-    "https://github.com/ppl-ai/pplx-kernels" \
-    "pplx-kernels" \
-    "setup.py" \
-    "$PPLX_COMMIT_HASH" \
-    ""
-
-# build DeepEP
-do_build \
-    "https://github.com/elvircrn/DeepEP" \
-    "DeepEP" \
-    "setup.py" \
-    "main" \
-    "export NVSHMEM_DIR=$WORKSPACE/nvshmem; "
-
-if [ "$MODE" = "wheel" ]; then
-    echo "All wheels written to $WHEEL_DIR"
-    ls -l "$WHEEL_DIR"
-fi
-=======
 # build and install pplx, require pytorch installed
 pushd $WORKSPACE
 clone_repo "https://github.com/ppl-ai/pplx-kernels" "pplx-kernels" "setup.py" "c336faf"
 cd pplx-kernels
 $PIP_CMD install --no-build-isolation -vvv -e .
 popd
->>>>>>> 31ad8d5ae (Deepep)
 
 # build and install deepep, require pytorch installed
 pushd $WORKSPACE
