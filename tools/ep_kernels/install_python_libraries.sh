@@ -12,7 +12,7 @@ if [ ! -d "$WORKSPACE" ]; then
 fi
 
 # configurable pip command (default: pip3)
-PIP_CMD=${PIP_CMD:-pip3}
+PIP_CMD=${PIP_CMD:-uv pip}
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 
 # install dependencies if not installed
