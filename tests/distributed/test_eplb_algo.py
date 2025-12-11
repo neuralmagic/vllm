@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -312,9 +313,9 @@ if __name__ == "__main__":
     test_basic_rebalance()
 
 
-def _make_phyrank_from_phy2log(phy2log: torch.Tensor) -> torch.Tensor:
-    """Create phyrank from phy2log"""
-    pr = torch.zeros_like(phy2log)
+def _make_phyrank_from_phy2log(phy2log: np.ndarray) -> np.ndarray:
+    """Create phyrank from phy2log (numpy)."""
+    pr = np.zeros_like(phy2log, dtype=np.int64)
     for layer in range(phy2log.shape[0]):
         seen: dict[int, int] = {}
         row = phy2log[layer].tolist()
@@ -326,11 +327,11 @@ def _make_phyrank_from_phy2log(phy2log: torch.Tensor) -> torch.Tensor:
 
 
 def _validate_intragpu_rearrangement(
-    old_global_expert_indices: torch.Tensor,
-    new_phy2log: torch.Tensor,
-    new_phyrank: torch.Tensor,
-    post_phy2log: torch.Tensor,
-    post_phyrank: torch.Tensor,
+    old_global_expert_indices: np.ndarray,
+    new_phy2log: np.ndarray,
+    new_phyrank: np.ndarray,
+    post_phy2log: np.ndarray,
+    post_phyrank: np.ndarray,
     num_ranks: int,
     slots_per_gpu: int,
 ):
@@ -345,7 +346,7 @@ def _validate_intragpu_rearrangement(
         post_rnk = post_phyrank[0, start:end]
 
         # Pairwise equality for (expert, rank) pairs to ensure nothing is lost
-        def sorted_pairs(seg: torch.Tensor, rnk: torch.Tensor):
+        def sorted_pairs(seg, rnk):
             pairs = list(zip(seg.tolist(), rnk.tolist()))
             pairs.sort()
             return pairs
@@ -382,11 +383,11 @@ def test_preserve_intragpu_slots_simple():
     num_ranks = 2
     slots_per_gpu = 4
     # Old mapping: GPU0 -> [0,1,2,3], GPU1 -> [4,5,6,7]
-    old_global_expert_indices = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]])
+    old_global_expert_indices = np.array([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=np.int64)
     # New mapping shuffles within GPU0 and brings 4,5 into GPU0.
     # GPU0 new -> [1,5,0,4] (0 and 1 remain on GPU0 but at different slots)
     # GPU1 new -> [6,2,7,3] (6 and 7 remain on GPU1, 2 and 3 move in)
-    phy2log = torch.tensor([[1, 5, 0, 4, 6, 2, 7, 3]])
+    phy2log = np.array([[1, 5, 0, 4, 6, 2, 7, 3]], dtype=np.int64)
     # Derive phyrank from replica occurrence order per expert
     phyrank = _make_phyrank_from_phy2log(phy2log)
 
@@ -417,12 +418,14 @@ def test_preserve_intragpu_slots_with_duplicates():
     # Old mapping:
     #   GPU0 -> [0, 1, 0, 2, 3]  (expert 0 duplicated)
     #   GPU1 -> [4, 5, 6, 1, 2]
-    old_global_expert_indices = torch.tensor([[0, 1, 0, 2, 3, 4, 5, 6, 1, 2]])
+    old_global_expert_indices = np.array(
+        [[0, 1, 0, 2, 3, 4, 5, 6, 1, 2]], dtype=np.int64
+    )
     # New mapping reorders within GPUs and moves some experts across GPUs,
     # while still including duplicates:
     #   GPU0 new -> [0, 5, 4, 0, 1]  (expert 0 duplicated, 4/5 incoming)
     #   GPU1 new -> [6, 2, 3, 1, 2]  (expert 2 duplicated)
-    phy2log = torch.tensor([[0, 5, 4, 0, 1, 6, 2, 3, 1, 2]])
+    phy2log = np.array([[0, 5, 4, 0, 1, 6, 2, 3, 1, 2]], dtype=np.int64)
     # Derive ranks so duplicates have ranks [0,1,...] by occurrence
     phyrank = _make_phyrank_from_phy2log(phy2log)
 
