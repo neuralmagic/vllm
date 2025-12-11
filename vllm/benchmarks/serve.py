@@ -525,9 +525,9 @@ async def benchmark(
         limit_per_host=max_concurrency or 0,
         ttl_dns_cache=300,
         use_dns_cache=True,
-        keepalive_timeout=60,
+        keepalive_timeout=5,       # shorter than server-side
         enable_cleanup_closed=True,
-        force_close=False,
+        force_close=True,
         ssl=("https://" in api_url),
     )
 
