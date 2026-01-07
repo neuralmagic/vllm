@@ -287,6 +287,7 @@ def split_attn_metadata(
     for ubatch_slice in ubatch_slices:
         results.append(_make_metadata_with_slice(ubatch_slice, common_attn_metadata))
 
+    # logger.info("QSL: %s", results[1].query_start_loc)
     return results
 
 
