@@ -7,7 +7,6 @@ import torch
 import vllm.envs as envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
-from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
     CustomRoutingRouter,
 )
@@ -51,7 +50,6 @@ def create_fused_moe_router(
     # eplb parameters
     enable_eplb: bool = False,
     eplb_state: EplbLayerState = EMPTY_EPLB_STATE,
-    capture: Callable[[torch.tensor], None] | None = None,
 ) -> FusedMoERouter:
     """
     Factory function to create the appropriate FusedMoERouter subclass based on
@@ -92,21 +90,16 @@ def create_fused_moe_router(
     Returns:
         An instance of the appropriate FusedMoERouter subclass
     """
-    router: BaseRouter
 
     routing_strategy = envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
     if routing_strategy != "":
-        router = RoutingSimulatorRouter(
+        return RoutingSimulatorRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
         )
-        # TODO(bnell): this is temporary until select_experts is
-        # separated from apply.
-        router.capture = capture
-        return router
 
     if use_grouped_topk:
         assert custom_routing_function is None
@@ -115,7 +108,7 @@ def create_fused_moe_router(
                 "num_expert_group and topk_group must be provided when "
                 "use_grouped_topk is True"
             )
-        router = GroupedTopKRouter(
+        return GroupedTopKRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
@@ -130,11 +123,9 @@ def create_fused_moe_router(
             indices_type_getter=indices_type_getter,
             routing_method_type=routing_method_type,
         )
-        router.capture = capture
-        return router
 
     if custom_routing_function is not None:
-        router = CustomRoutingRouter(
+        return CustomRoutingRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
@@ -143,8 +134,6 @@ def create_fused_moe_router(
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
         )
-        router.capture = capture
-        return router
 
     if scoring_func != "softmax":
         raise ValueError(
@@ -152,7 +141,7 @@ def create_fused_moe_router(
         )
 
     if e_score_correction_bias is not None:
-        router = FusedTopKBiasRouter(
+        return FusedTopKBiasRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
@@ -162,10 +151,8 @@ def create_fused_moe_router(
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
         )
-        router.capture = capture
-        return router
 
-    router = FusedTopKRouter(
+    return FusedTopKRouter(
         top_k=top_k,
         global_num_experts=global_num_experts,
         eplb_state=eplb_state,
@@ -174,5 +161,3 @@ def create_fused_moe_router(
         enable_eplb=enable_eplb,
         indices_type_getter=indices_type_getter,
     )
-    router.capture = capture
-    return router
