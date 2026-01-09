@@ -103,7 +103,7 @@ function build_deepep() {
     export PATH=$OMPI_DIR/bin:$PATH
     export LD_LIBRARY_PATH=$OMPI_DIR/lib:$LD_LIBRARY_PATH
 
-    clone_repo https://github.com/ROCm/DeepEP DeepEP "" setup.py
+    clone_repo  https://github.com/varun-sundar-rabindranath/ROCm-DeepEP.git  DeepEP "varun/add-hidden-dim" setup.py
  
     pushd DeepEP
     python3 setup.py --variant rocm build develop
