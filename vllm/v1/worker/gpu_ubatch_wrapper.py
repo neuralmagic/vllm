@@ -41,8 +41,22 @@ class UbatchMetadata:
 @dataclass
 class CUDAGraphMetaData:
     cudagraph: torch.cuda.CUDAGraph
-    ubatch_metadata: UbatchMetadata
+    ubatch_metadata: list[UbatchMetadata]
     outputs: Any | None = None
+
+
+def get_qsl(cudagraph_metadata: CUDAGraphMetaData) -> torch.Tensor | None:
+    forward_context = cudagraph_metadata.ubatch_metadata[1].context.forward_context
+    metadata_dict = forward_context.attn_metadata
+    if isinstance(metadata_dict, dict):
+        x = list(metadata_dict.values())[0]
+        if hasattr(x, "query_start_loc"):
+            return x.query_start_loc
+    elif isinstance(metadata_dict, list):
+        x = list(metadata_dict[0].values())[0]
+        if hasattr(x, "query_start_loc"):
+            return x.query_start_loc
+    return None
 
 
 class SMControlContextManager:
@@ -456,6 +470,7 @@ class UBatchWrapper:
             and cudagraph_runtime_mode is CUDAGraphMode.FULL
         ):
             cudagraph_metadata = self.cudagraphs[num_tokens]
+            logger.info("SECOND QSL: %s", get_qsl(cudagraph_metadata))
             cudagraph_metadata.cudagraph.replay()
             return cudagraph_metadata.outputs
         else:

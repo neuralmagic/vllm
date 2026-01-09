@@ -276,6 +276,7 @@ def _make_metadata_with_slice(
 def split_attn_metadata(
     ubatch_slices: list[UBatchSlice],
     common_attn_metadata: CommonAttentionMetadata,
+    second_query_start_loc: torch.Tensor,
 ) -> list[CommonAttentionMetadata]:
     """
     Creates a new CommonAttentionMetadata instance that corresponds to the
@@ -283,11 +284,26 @@ def split_attn_metadata(
 
     Note: This function does not modify common_attn_metadata
     """
-    results = []
+
+    # For the first ubatch we're going to use the query start locs in the common attn
+    # metadata. For the second we are going to use query_start_loc_dbo
+    results: list[CommonAttentionMetadata] = []
     for ubatch_slice in ubatch_slices:
         results.append(_make_metadata_with_slice(ubatch_slice, common_attn_metadata))
 
-    # logger.info("QSL: %s", results[1].query_start_loc)
+    # post process the query start locs for each result
+    # first_request_slice = ubatch_slices[0].request_slice
+    first_request_slice = slice(0, ubatch_slices[0].num_requests + 1)
+    first_query_start_loc = common_attn_metadata.query_start_loc[first_request_slice]
+    first_query_start_loc.copy_(results[0].query_start_loc)
+    results[0].query_start_loc = first_query_start_loc
+
+    second_request_slice = slice(0, ubatch_slices[1].num_requests + 1)
+    second_query_start_loc = second_query_start_loc[second_request_slice]
+    second_query_start_loc.copy_(results[1].query_start_loc)
+    results[1].query_start_loc = second_query_start_loc
+
+    logger.info("QSL: %s", results[1].query_start_loc)
     return results
 
 

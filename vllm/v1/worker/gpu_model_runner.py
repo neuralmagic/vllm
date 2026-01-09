@@ -530,6 +530,15 @@ class GPUModelRunner(
             self.max_num_reqs + 1, dtype=torch.int32
         )
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+
+        # If dbo is enabled, allocate a second buffer for query_start_loc that will be
+        # used by the second ubatch
+        # TODO (Sage) We need to add similar logic for seq_lens
+        if self.parallel_config.use_ubatching:
+            self.query_start_loc_dbo = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int32
+            )
+
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens = self._make_buffer(
@@ -1449,13 +1458,21 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
+        def prepare_query_start_loc(query_start_loc):
+            query_start_loc.np[0] = 0
+            query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+            # Note: pad query_start_loc to be non-decreasing, as kernels
+            # like FlashAttention requires that
+            query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+            query_start_loc.copy_to_gpu()
+
         # Prepare the attention metadata.
-        self.query_start_loc.np[0] = 0
-        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-        # Note: pad query_start_loc to be non-decreasing, as kernels
-        # like FlashAttention requires that
-        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
-        self.query_start_loc.copy_to_gpu()
+        prepare_query_start_loc(self.query_start_loc)
+        # When running with DBO, a second tensor is used to hold the query_start_locs
+        # for the second microbatch
+        if self.parallel_config.use_ubatching:
+            prepare_query_start_loc(self.query_start_loc_dbo)
+
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         self.seq_lens.np[:num_reqs] = (
@@ -1764,7 +1781,12 @@ class GPUModelRunner(
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
-                    for ubid, _cm in enumerate(split_attn_metadata(ubatch_slices, cm)):
+                    second_query_start_loc = self.query_start_loc_dbo.gpu[
+                        : num_reqs_padded + 1
+                    ]
+                    for ubid, _cm in enumerate(
+                        split_attn_metadata(ubatch_slices, cm, second_query_start_loc)
+                    ):
                         _build_attn_group_metadata(kv_cache_gid, attn_gid, _cm, ubid)
 
                 else:

@@ -23,6 +23,10 @@ class UBatchSlice:
     def num_tokens(self) -> int:
         return self.token_slice.stop - self.token_slice.start
 
+    @property
+    def num_requests(self) -> int:
+        return self.request_slice.stop - self.request_slice.start
+
 
 UBatchSlices: TypeAlias = list[UBatchSlice]
 
@@ -107,8 +111,13 @@ def maybe_create_ubatch_slices(
         ubatch_slices, num_tokens_padded, num_reqs_padded
     )
     from vllm.logger import init_logger
+
     logger = init_logger(__name__)
-    logger.info("REQ SLICE: %s PADDED REQ SLICE %s", ubatch_slices[1].request_slice, ubatch_slices_padded[1].request_slice)
+    logger.info(
+        "REQ SLICE: %s PADDED REQ SLICE %s",
+        ubatch_slices[1].request_slice,
+        ubatch_slices_padded[1].request_slice,
+    )
 
     assert sum(s.num_tokens for s in ubatch_slices_padded) == num_tokens_padded
 
