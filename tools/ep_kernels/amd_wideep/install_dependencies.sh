@@ -90,7 +90,8 @@ function build_rocshmem() {
     mkdir build.mnic && cd build.mnic
     MPI_ROOT=$BUILD_DIR/ompi ../../scripts/build_configs/gda_mlx5 --fresh \
       -DUSE_IPC=ON \
-      -DGDA_BNXT=ON
+      -DGDA_BNXT=ON \
+      -DDEBUG=ON
 
     popd # build
     popd # rocSHMEM
