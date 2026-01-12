@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import time
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -43,6 +45,7 @@ def _run_ar(
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
 ) -> torch.Tensor:
+    t0 = time.perf_counter()
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
@@ -53,6 +56,9 @@ def _run_ar(
     tensor[3][dp_rank] = 1 if should_dp_pad else 0
     tensor[4][dp_rank] = cudagraph_mode
     dist.all_reduce(tensor, group=group)
+    duration = time.perf_counter() - t0
+    if duration > 1:
+        print(f"============= duration = {duration} ================")
     return tensor
 
 
