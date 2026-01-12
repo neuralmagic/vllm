@@ -303,7 +303,6 @@ def split_attn_metadata(
     second_query_start_loc.copy_(results[1].query_start_loc)
     results[1].query_start_loc = second_query_start_loc
 
-    logger.info("QSL: %s", results[1].query_start_loc)
     return results
 
 
