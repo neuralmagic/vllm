@@ -602,7 +602,9 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
 
     def enable_chunking(self):
         return (
-            envs.VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING and self.supports_chunking()
+            False
+            and envs.VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING
+            and self.supports_chunking()
         )
 
     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
