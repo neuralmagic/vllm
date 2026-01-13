@@ -443,7 +443,7 @@ def invoke_moe_batched_triton_kernel(
 
     # Avoid error: failed to legalize operation 'tt.fp_to_fp' that was explicitly marked illegal
     # error on ROCm
-    USE_BF16_DOT= A.dtype == current_platform.fp8_dtype() and current_platform.is_rocm()
+    USE_BF16_DOT= current_platform.is_rocm() and (current_platform.fp8_dtype() in [A.dtype, B.dtype])
 
     batched_triton_kernel[grid](
         A,
