@@ -362,8 +362,8 @@ class ModelConfig:
             "interleave_mm_strings",
             "skip_mm_profiling",
         }
-
-        factors = get_compile_factors(self, ignored_factors)
+        print(self, ignored_factors)
+        factors = get_compile_factors(self, set())
         return factors or {}
 
     def _update_nested(

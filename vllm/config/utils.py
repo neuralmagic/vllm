@@ -301,6 +301,7 @@ def get_compile_factors(config: ConfigT, ignored_factors: set[str]) -> CompileFa
     field_names = {f.name for f in fields(config)}
     unknown_ignored = ignored_factors - field_names
     if unknown_ignored:
+        logger.warning_once(f"{config=}")
         raise ValueError(
             f"get_compile_factors: ignored_factors contain unknown fields "
             f"{sorted(unknown_ignored)} for {type(config).__name__}"
