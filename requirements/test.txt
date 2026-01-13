@@ -1293,7 +1293,7 @@ uvicorn==0.35.0
     #   mlflow-skinny
 vector-quantize-pytorch==1.21.2
     # via -r requirements/test.in
-virtualenv==20.31.2
+virtualenv==20.36.1
     # via ray
 vocos==0.1.0
     # via -r requirements/test.in
