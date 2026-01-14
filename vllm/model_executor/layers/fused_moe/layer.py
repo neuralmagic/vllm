@@ -339,8 +339,11 @@ class FusedMoE(CustomOp):
         expert_mapping: list[tuple[str, str, int, str]] | None = None,
         n_shared_experts: int | None = None,
         router_logits_dtype: torch.dtype | None = None,
+        gate: torch.nn.Module | None = None,
     ):
         super().__init__()
+
+        self._gate = gate
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -658,7 +661,7 @@ class FusedMoE(CustomOp):
             layer=self,
             moe_config=self.moe_config,
             router=router,
-            # gate=self.gate,
+            gate=self.gate,
             # shared_experts=self.shared_experts,
             quant_method=quant_method,
             reduce_results=self.reduce_results,
@@ -703,7 +706,7 @@ class FusedMoE(CustomOp):
 
     @property
     def gate(self) -> torch.nn.Module | None:
-        return None
+        return self._gate
 
     @property
     def tp_size(self):
@@ -1570,15 +1573,13 @@ class FusedMoE(CustomOp):
 # TODO
 # make gate, shared_experts into properties instead of methods
 #
-
-
 class DefaultMoERunner(MoERunner):
     def __init__(
         self,
         layer: FusedMoE,  # TODO: turn into generic module/parameter blob
         moe_config: FusedMoEConfig,
         router: FusedMoERouter,
-        # gate: torch.nn.Module | None,
+        gate: torch.nn.Module | None,
         # shared_experts: torch.nn.Module | None,
         quant_method: FusedMoEMethodBase,
         reduce_results: bool,
@@ -1586,10 +1587,10 @@ class DefaultMoERunner(MoERunner):
         capture: Callable[[torch.Tensor], None] | None = None,
     ):
         super().__init__()
-        self.layer = layer
+        self.layer = layer  # TODO: get rid of this
         self.moe_config = moe_config
         self.router = router
-        # self.gate = gate
+        self.gate = gate
         # self.shared_experts = shared_experts
         self.quant_method = quant_method
         self.reduce_results = reduce_results
@@ -1675,11 +1676,6 @@ class DefaultMoERunner(MoERunner):
     @property
     def shared_experts(self) -> torch.nn.Module | None:
         return self.layer.shared_experts
-
-    # TBD
-    @property
-    def gate(self) -> torch.nn.Module | None:
-        return self.layer.gate
 
     def ensure_moe_quant_config_init(self):
         if self.quant_method.moe_quant_config is None:
