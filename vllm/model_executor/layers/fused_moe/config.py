@@ -859,6 +859,7 @@ class FusedMoEParallelConfig:
     pcp_rank: int
     dp_rank: int
     ep_rank: int
+    sp_size: int
 
     use_ep: bool  # whether to use EP or not
     all2all_backend: str  # all2all backend for MoE communication
@@ -866,6 +867,10 @@ class FusedMoEParallelConfig:
     @property
     def use_all2all_kernels(self):
         return self.dp_size > 1 and self.use_ep
+
+    @property
+    def is_sequence_parallel(self):
+        return self.sp_size > 1
 
     @property
     def use_pplx_kernels(self):
@@ -898,6 +903,7 @@ class FusedMoEParallelConfig:
         tp_size_: int,
         pcp_size_: int,
         dp_size_: int,
+        sp_size_: int,
         vllm_parallel_config: ParallelConfig,
     ) -> "FusedMoEParallelConfig":
         """
@@ -997,6 +1003,7 @@ class FusedMoEParallelConfig:
                 dp_rank=dp_rank,
                 ep_size=1,
                 ep_rank=0,
+                sp_size=sp_size_,
                 use_ep=False,
                 all2all_backend=vllm_parallel_config.all2all_backend,
             )
@@ -1015,6 +1022,7 @@ class FusedMoEParallelConfig:
             dp_rank=dp_rank,
             ep_size=ep_size,
             ep_rank=ep_rank,
+            sp_size=sp_size_,
             use_ep=True,
             all2all_backend=vllm_parallel_config.all2all_backend,
         )
@@ -1028,6 +1036,7 @@ class FusedMoEConfig:
     hidden_dim: int
 
     num_local_experts: int
+    num_logical_experts: int
     moe_parallel_config: FusedMoEParallelConfig
 
     # The activation type.
@@ -1072,6 +1081,14 @@ class FusedMoEConfig:
     @property
     def ep_size(self):
         return self.moe_parallel_config.ep_size
+
+    @property
+    def sp_size(self):
+        return self.moe_parallel_config.sp_size
+
+    @property
+    def is_sequence_parallel(self):
+        return self.moe_parallel_config.is_sequence_parallel
 
     @property
     def tp_rank(self):
