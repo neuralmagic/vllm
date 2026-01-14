@@ -575,7 +575,7 @@ class FusedMoE(CustomOp):
 
         def _get_quant_method() -> FusedMoEMethodBase:
             """
-            Helper method to ensure self.quant_method is never None and
+            Helper method to ensure quant_method is never None and
             of the proper type.
             """
             quant_method = None
@@ -588,7 +588,7 @@ class FusedMoE(CustomOp):
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
-        self.quant_method: FusedMoEMethodBase = _get_quant_method()
+        quant_method: FusedMoEMethodBase = _get_quant_method()
 
         if not self.moe_config.is_act_and_mul and not current_platform.is_cuda_alike():
             raise NotImplementedError(
@@ -616,18 +616,41 @@ class FusedMoE(CustomOp):
             "global_num_experts": self.global_num_experts,
         }
         # need full intermediate size pre-sharding for WNA16 act order
-        if self.quant_method.__class__.__name__ in (
+        if quant_method.__class__.__name__ in (
             "GPTQMarlinMoEMethod",
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
         ):
             moe_quant_params["intermediate_size_full"] = intermediate_size
 
-        self.quant_method.create_weights(layer=self, **moe_quant_params)
+        quant_method.create_weights(layer=self, **moe_quant_params)
+
+        if self.enable_eplb and not quant_method.supports_eplb:
+            # TODO: Add support for additional quantization methods.
+            # The implementation for other quantization methods does not
+            # contain essential differences, but the current quant API
+            # design causes duplicated work when extending to new
+            # quantization methods, so I'm leaving it for now.
+            # If you plan to add support for more quantization methods,
+            # please refer to the implementation in `Fp8MoEMethod`.
+            raise NotImplementedError(
+                f"EPLB is not supported {quant_method.__class__.__name__}. "
+                "EPLB is only supported for FP8 quantization for now."
+            )
 
         # Chunked all2all staging tensor
         self.batched_hidden_states: torch.Tensor | None = None
         self.batched_router_logits: torch.Tensor | None = None
+
+        capture: Callable[[torch.Tensor], None] | None = None
+        if (
+            self.vllm_config.model_config is not None
+            and self.vllm_config.model_config.enable_return_routed_experts
+        ):
+            # In dummy runs, the capturer is not initialized.
+            capturer = RoutedExpertsCapturer.get_instance()
+            if capturer is not None:
+                capture = lambda topk_ids: capturer.capture(self.layer_id, topk_ids)
 
         self.runner = DefaultMoERunner(
             layer=self,
@@ -635,8 +658,10 @@ class FusedMoE(CustomOp):
             router=router,
             # gate=self.gate,
             # shared_experts=self.shared_experts,
+            quant_method=quant_method,
             reduce_results=self.reduce_results,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
+            capture=capture,
         )
 
     # Note: maybe_init_modular_kernel should only be called by
@@ -660,13 +685,9 @@ class FusedMoE(CustomOp):
             logger.debug(
                 "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
             )
-            self.quant_method = FusedMoEModularMethod.make(
+            self.runner.quant_method = FusedMoEModularMethod.make(
                 self, self.quant_method, prepare_finalize, self.shared_experts
             )
-
-    @property
-    def shared_experts(self) -> torch.nn.Module | None:
-        return None
 
     @property
     def layer_id(self):
@@ -674,6 +695,14 @@ class FusedMoE(CustomOp):
         from vllm.model_executor.models.utils import extract_layer_index
 
         return extract_layer_index(self.layer_name)
+
+    @property
+    def quant_method(self) -> FusedMoEMethodBase:
+        return self.runner.quant_method
+
+    @property
+    def shared_experts(self) -> torch.nn.Module | None:
+        return None
 
     @property
     def gate(self) -> torch.nn.Module | None:
@@ -684,14 +713,6 @@ class FusedMoE(CustomOp):
         return self.moe_parallel_config.tp_size
 
     @property
-    def dp_size(self):
-        return self.moe_parallel_config.dp_size
-
-    @property
-    def pcp_size(self):
-        return self.moe_parallel_config.pcp_size
-
-    @property
     def ep_size(self):
         return self.moe_parallel_config.ep_size
 
@@ -700,40 +721,12 @@ class FusedMoE(CustomOp):
         return self.moe_parallel_config.tp_rank
 
     @property
-    def dp_rank(self):
-        return self.moe_parallel_config.dp_rank
-
-    @property
-    def pcp_rank(self):
-        return self.moe_parallel_config.pcp_rank
-
-    @property
     def ep_rank(self):
         return self.moe_parallel_config.ep_rank
 
     @property
     def use_ep(self):
         return self.moe_parallel_config.use_ep
-
-    @property
-    def use_pplx_kernels(self):
-        return self.moe_parallel_config.use_pplx_kernels
-
-    @property
-    def use_deepep_ht_kernels(self):
-        return self.moe_parallel_config.use_deepep_ht_kernels
-
-    @property
-    def use_deepep_ll_kernels(self):
-        return self.moe_parallel_config.use_deepep_ll_kernels
-
-    @property
-    def use_marlin_kernels(self):
-        return getattr(self.quant_method, "use_marlin", False)
-
-    @property
-    def use_mori_kernels(self):
-        return self.moe_parallel_config.use_mori_kernels
 
     @property
     def is_internal_router(self) -> bool:
@@ -747,7 +740,7 @@ class FusedMoE(CustomOp):
         # with DeepEP-ll all2all backend.
         if (
             self.expert_placement_strategy != "round_robin"
-            or not self.use_deepep_ll_kernels
+            or not self.moe_parallel_config.use_deepep_ll_kernels
         ):
             return None
 
@@ -1432,17 +1425,11 @@ class FusedMoE(CustomOp):
         self.eplb_state.logical_replica_count = logical_replica_count[moe_layer_idx]
 
     def ensure_moe_quant_config_init(self):
-        if self.quant_method.moe_quant_config is None:
-            # Note: the moe_quant_config can't be constructed until after
-            # weight loading post processing.
-            self.quant_method.moe_quant_config = (
-                self.quant_method.get_fused_moe_quant_config(self)
-            )
+        self.runner.ensure_moe_quant_config_init()
 
     @property
     def moe_quant_config(self) -> FusedMoEQuantConfig | None:
-        self.ensure_moe_quant_config_init()
-        return self.quant_method.moe_quant_config
+        return self.runner.moe_quant_config
 
     def must_reduce_shared_expert_outputs(self) -> bool:
         """
@@ -1591,29 +1578,8 @@ class FusedMoE(CustomOp):
         return s
 
 
-def _moe_forward_fake(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-def _moe_forward_shared_fake(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    shared_out = torch.empty_like(hidden_states)
-    fused_out = torch.empty_like(hidden_states)
-    return shared_out, fused_out
-
-
 # TODO
-# supply self.layer.quant_method
-# move self.layer.ensure_moe_quant_config_init
-#      self.layer.moe_quant_config
 # make gate, shared_experts into properties instead of methods
-#
-# Remove unused methods from FusedMoE
 #
 
 
@@ -1625,8 +1591,10 @@ class DefaultMoERunner(MoERunner):
         router: FusedMoERouter,
         # gate: torch.nn.Module | None,
         # shared_experts: torch.nn.Module | None,
+        quant_method: FusedMoEMethodBase,
         reduce_results: bool,
         enable_dbo: bool,
+        capture: Callable[[torch.Tensor], None] | None = None,
     ):
         super().__init__()
         self.layer = layer
@@ -1634,8 +1602,10 @@ class DefaultMoERunner(MoERunner):
         self.router = router
         # self.gate = gate
         # self.shared_experts = shared_experts
+        self.quant_method = quant_method
         self.reduce_results = reduce_results
         self.enable_dbo = enable_dbo
+        self.capture = capture
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -1659,19 +1629,19 @@ class DefaultMoERunner(MoERunner):
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
         ) -> torch.Tensor:
-            return self.forward_impl(hidden_states, router_logits)
+            return self.forward_impl(layer, hidden_states, router_logits)
 
         def _moe_forward_shared(
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return self.forward_impl(hidden_states, router_logits)
+            return self.forward_impl(layer, hidden_states, router_logits)
 
         direct_register_custom_op(
             op_name=f"moe_forward{lname}",
             op_func=_moe_forward,
             mutates_args=["hidden_states"],
-            fake_impl=_moe_forward_fake,
+            fake_impl=DefaultMoERunner._moe_forward_fake,
             tags=(torch.Tag.needs_fixed_stride_order,),
         )
 
@@ -1679,12 +1649,14 @@ class DefaultMoERunner(MoERunner):
             op_name=f"moe_forward_shared{lname}",
             op_func=_moe_forward_shared,
             mutates_args=["hidden_states"],
-            fake_impl=_moe_forward_shared_fake,
+            fake_impl=DefaultMoERunner._moe_forward_shared_fake,
             tags=(torch.Tag.needs_fixed_stride_order,),
         )
 
-        self.moe_forward = eval(f"torch.ops.vllm.moe_forward{lname}")
-        self.moe_forward_shared = eval(f"torch.ops.vllm.moe_forward_shared{lname}")
+        self.moe_forward = _moe_forward
+        self.moe_forward_shared = _moe_forward_shared
+        self.moe_forward_op = eval(f"torch.ops.vllm.moe_forward{lname}")
+        self.moe_forward_shared_op = eval(f"torch.ops.vllm.moe_forward_shared{lname}")
 
         self.moe_config_use_flashinfer_cutlass_kernels = (
             self.moe_config.use_flashinfer_cutlass_kernels
@@ -1693,6 +1665,22 @@ class DefaultMoERunner(MoERunner):
         # Chunked all2all staging tensor
         self.batched_hidden_states: torch.Tensor | None = None
         self.batched_router_logits: torch.Tensor | None = None
+
+    @staticmethod
+    def _moe_forward_fake(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty_like(hidden_states)
+
+    @staticmethod
+    def _moe_forward_shared_fake(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shared_out = torch.empty_like(hidden_states)
+        fused_out = torch.empty_like(hidden_states)
+        return shared_out, fused_out
 
     # TBD
     @property
@@ -1704,20 +1692,18 @@ class DefaultMoERunner(MoERunner):
     def gate(self) -> torch.nn.Module | None:
         return self.layer.gate
 
-    # TBD
-    @property
-    def quant_method(self) -> FusedMoEMethodBase:
-        return self.layer.quant_method
-
-    # TBD
     def ensure_moe_quant_config_init(self):
-        self.layer.ensure_moe_quant_config_init()
+        if self.quant_method.moe_quant_config is None:
+            # Note: the moe_quant_config can't be constructed until after
+            # weight loading post processing.
+            self.quant_method.moe_quant_config = (
+                self.quant_method.get_fused_moe_quant_config(self)
+            )
 
-    # TBD
     @property
     def moe_quant_config(self) -> FusedMoEQuantConfig | None:
-        self.layer.ensure_moe_quant_config_init()
-        return self.layer.moe_quant_config
+        self.ensure_moe_quant_config_init()
+        return self.quant_method.moe_quant_config
 
     @property
     def use_flashinfer_cutlass_kernels(self):
@@ -1858,21 +1844,21 @@ class DefaultMoERunner(MoERunner):
                 # TODO: Once the OOM issue for the TPU backend is resolved, we
                 # will switch to using the moe_forward custom op.
                 # Note: CPU doesn't require wrapped forward_impl.
-                fused_output = self.forward_impl(hidden_states, router_logits)
+                fused_output = self.moe_forward(hidden_states, router_logits)
                 assert not isinstance(fused_output, tuple)
             else:
-                fused_output = self.moe_forward(hidden_states, router_logits)
+                fused_output = self.moe_forward_op(hidden_states, router_logits)
             return reduce_output(fused_output)[..., :og_hidden_states]
         else:
             if current_platform.is_tpu() or current_platform.is_cpu():
                 # TODO: Once the OOM issue for the TPU backend is resolved, we
                 # will switch to using the moe_forward custom op.
                 # Note: CPU doesn't require wrapped forward_impl.
-                shared_output, fused_output = self.forward_impl(
+                shared_output, fused_output = self.moe_forward_shared(
                     hidden_states, router_logits
                 )
             else:
-                shared_output, fused_output = self.moe_forward_shared(
+                shared_output, fused_output = self.moe_forward_shared_op(
                     hidden_states, router_logits
                 )
             return (
@@ -1882,6 +1868,7 @@ class DefaultMoERunner(MoERunner):
 
     def forward_impl_chunked(
         self,
+        layer: torch.nn.Module,
         full_hidden_states: torch.Tensor,
         full_router_logits: torch.Tensor,
         has_separate_shared_experts: bool,
@@ -1932,7 +1919,7 @@ class DefaultMoERunner(MoERunner):
             # Matrix multiply.
             if self.quant_method.is_monolithic:
                 final_hidden_states = self.quant_method.apply_monolithic(
-                    layer=self.layer,
+                    layer=layer,
                     x=staged_hidden_states,
                     router_logits=staged_router_logits,
                 )
@@ -1946,7 +1933,7 @@ class DefaultMoERunner(MoERunner):
                     self.capture(topk_ids)
 
                 final_hidden_states = self.quant_method.apply(
-                    layer=self,
+                    layer=layer,
                     x=staged_hidden_states,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
@@ -2013,6 +2000,7 @@ class DefaultMoERunner(MoERunner):
 
     def forward_impl(
         self,
+        layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -2041,7 +2029,7 @@ class DefaultMoERunner(MoERunner):
 
         if self.use_dp_chunking:
             return self.forward_impl_chunked(
-                hidden_states, router_logits, has_separate_shared_experts
+                layer, hidden_states, router_logits, has_separate_shared_experts
             )
 
         # NOTE(rob): once we finish migrating all the quant methods to use
@@ -2124,7 +2112,7 @@ class DefaultMoERunner(MoERunner):
 
             if self.quant_method.is_monolithic:
                 final_hidden_states = self.quant_method.apply_monolithic(
-                    layer=self.layer,
+                    layer=layer,
                     x=x,
                     router_logits=router_logits,
                 )
@@ -2138,7 +2126,7 @@ class DefaultMoERunner(MoERunner):
                     self.capture(topk_ids)
 
                 final_hidden_states = self.quant_method.apply(
-                    layer=self,
+                    layer=layer,
                     x=x,  # The type signture of this is wrong due to the hack.
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
