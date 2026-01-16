@@ -33,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
+from vllm.model_executor.layers.fused_moe.moe_runner import MoERunner
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     init_aiter_topK_meta_data,
 )
@@ -625,11 +626,7 @@ class FusedMoE(CustomOp):
                 "EPLB is only supported for FP8 quantization for now."
             )
 
-        # Chunked all2all staging tensor
-        self.batched_hidden_states: torch.Tensor | None = None
-        self.batched_router_logits: torch.Tensor | None = None
-
-        capture: Callable[[torch.Tensor], None] | None = None
+        self.capture: Callable[[torch.Tensor], None] | None = None
         if (
             self.vllm_config.model_config is not None
             and self.vllm_config.model_config.enable_return_routed_experts
@@ -637,30 +634,42 @@ class FusedMoE(CustomOp):
             # In dummy runs, the capturer is not initialized.
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
-                capture = lambda topk_ids: capturer.capture(self.layer_id, topk_ids)
+                self.capture = lambda topk_ids: capturer.capture(
+                    self.layer_id, topk_ids
+                )
 
-        self.runner = DefaultMoERunner(
+        self._quant_method = quant_method
+        self._runner: MoERunner | None = None
+
+    @property
+    def runner(self) -> MoERunner:
+        if self._runner is not None:
+            return self._runner
+
+        # TODO: this is hacky
+        self._runner = DefaultMoERunner(
             layer=self,
             moe_config=self.moe_config,
-            router=router,
+            router=self.router,
             gate=self.gate,
-            # shared_experts=self.shared_experts,
-            quant_method=quant_method,
+            shared_experts=self.shared_experts,
+            quant_method=self._quant_method,
             reduce_results=self.reduce_results,
             enable_dbo=self.vllm_config.parallel_config.enable_dbo,
-            capture=capture,
+            capture=self.capture,
         )
+        return self._runner
 
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
     # This is called after all weight loading and post-processing, so it
     # should be safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
-        self.ensure_moe_quant_config_init()
+        self.runner.ensure_moe_quant_config_init(self)
         # routing_tables only needed for round-robin expert placement with
         # DeepEP all2all backend.
         routing_tables = self._maybe_init_expert_routing_tables()
-        prepare_finalize = self.quant_method.maybe_make_prepare_finalize(
+        prepare_finalize = self.runner.quant_method.maybe_make_prepare_finalize(
             routing_tables=routing_tables
         )
         if prepare_finalize is not None:
@@ -668,7 +677,7 @@ class FusedMoE(CustomOp):
                 "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
             )
             self.runner.quant_method = FusedMoEModularMethod.make(
-                self, self.quant_method, prepare_finalize, self.shared_experts
+                self, self.runner.quant_method, prepare_finalize, self.shared_experts
             )
 
     @property
@@ -1046,12 +1055,12 @@ class FusedMoE(CustomOp):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return True if return_success else None
 
-        quant_method_name = self.quant_method.__class__.__name__
+        quant_method_name = self._quant_method.__class__.__name__
         global_expert_id = expert_id
         expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
 
         use_global_sf = (
-            getattr(self.quant_method, "use_global_sf", False)
+            getattr(self._quant_method, "use_global_sf", False)
             and "input_scale" in weight_name
         )
 
@@ -1063,7 +1072,7 @@ class FusedMoE(CustomOp):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        if self.quant_method.__class__.__name__ in (
+        if quant_method_name in (
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
         ):
@@ -1169,7 +1178,7 @@ class FusedMoE(CustomOp):
         if "ModelOpt" in quant_method_name:
             # Determine per-tensor weight scale patterns based on variant
             # Use the dedicated method instead of brittle string matching
-            uses_weight_scale_2 = self.quant_method.uses_weight_scale_2_pattern()
+            uses_weight_scale_2 = self._quant_method.uses_weight_scale_2_pattern()
 
             # Call _load_per_tensor_weight_scale() to load per-tensor (scalar)
             # weights scales.
@@ -1397,9 +1406,6 @@ class FusedMoE(CustomOp):
         self.eplb_state.expert_load_view = expert_load_view[moe_layer_idx]
         self.eplb_state.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.eplb_state.logical_replica_count = logical_replica_count[moe_layer_idx]
-
-    def ensure_moe_quant_config_init(self):
-        self.runner.ensure_moe_quant_config_init()
 
     @property
     def moe_quant_config(self) -> FusedMoEQuantConfig | None:
