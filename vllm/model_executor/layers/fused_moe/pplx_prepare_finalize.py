@@ -103,7 +103,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-        expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
     ) -> tuple[Callable, mk.ReceiverType]:
@@ -111,16 +110,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         hidden_dim = a1.size(-1)  # K
 
         assert topk_ids.size(0) == num_tokens
-        # expert_map should be None because with expert map, -1 id is used for
-        # non-local token; this causes error when casting ids to the
-        # topk_indices_dtype() int32
-        #
-        if expert_map is not None:
-            logger.warning_once(
-                "The PPLX backend does not support expert mapping. "
-                "The provided `expert_map` will be ignored."
-            )
-        expert_map = None  # noqa: F841
 
         # Is this always going to be a1.device?
         device = a1.device
@@ -271,7 +260,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-        expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
     ) -> mk.PrepareResultType:
@@ -280,7 +268,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             topk_weights,
             topk_ids,
             num_experts,
-            expert_map,
             apply_router_weight_on_input,
             quant_config,
         )

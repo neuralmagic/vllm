@@ -173,7 +173,6 @@ class FusedMoEPrepareAndFinalize(ABC):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-        expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
     ) -> PrepareResultType:
@@ -183,8 +182,6 @@ class FusedMoEPrepareAndFinalize(ABC):
         - topk_ids: The topk ids.
         - topk_weights: The topk weights.
         - num_experts: The total number of experts in the global expert space.
-        - expert_map: A tensor mapping expert indices from the global expert
-          space to the local expert space of the expert parallel shard.
         - apply_router_weight_on_input: When True, apply the weights to the
           activations, before quantization + dispatching.
         - quant_config: Quantization info provided by the fused experts.
@@ -213,7 +210,6 @@ class FusedMoEPrepareAndFinalize(ABC):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
-        expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
     ) -> tuple[Callable, ReceiverType] | ReceiverType:
@@ -227,8 +223,6 @@ class FusedMoEPrepareAndFinalize(ABC):
         - topk_ids: The topk ids.
         - topk_weights: The topk weights.
         - num_experts: The total number of experts in the global expert space.
-        - expert_map: A tensor mapping expert indices from the global expert
-          space to the local expert space of the expert parallel shard.
         - apply_router_weight_on_input: When True, apply the weights to the
           activations, before quantization + dispatching.
 
@@ -925,7 +919,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         global_num_experts: int,
-        expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
     ) -> tuple[
         torch.Tensor,
@@ -955,7 +948,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                 topk_weights,
                 topk_ids,
                 global_num_experts,
-                expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
             )
@@ -967,7 +959,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                 topk_weights,
                 topk_ids,
                 global_num_experts,
-                expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
             )
@@ -1221,7 +1212,6 @@ class FusedMoEModularKernel(torch.nn.Module):
             topk_weights,
             topk_ids,
             global_num_experts,
-            expert_map,
             apply_router_weight_on_input,
         )
 
