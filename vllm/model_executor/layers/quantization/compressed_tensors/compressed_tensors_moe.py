@@ -637,38 +637,13 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         assert (
             self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
             and not layer.enable_eplb
-<<<<<<< HEAD
-        ):
-            return flashinfer_trtllm_fp4_moe(
-                layer=layer,
-                x=x,
-                router_logits=router_logits,
-                top_k=layer.top_k,
-                activation=layer.activation,
-                global_num_experts=layer.global_num_experts,
-                num_expert_group=layer.num_expert_group,
-                topk_group=layer.topk_group,
-                custom_routing_function=layer.custom_routing_function,
-                e_score_correction_bias=layer.e_score_correction_bias,
-            )
-
-        # Hidden_states in select_experts is only used to extract metadata
-        if isinstance(x, tuple):
-            x_routing, _ = x
-        else:
-            x_routing = x
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x_routing,
-            router_logits=router_logits,
-=======
->>>>>>> e6b6fc931 (Call select_experts from FusdMoE when possible)
         )
-
         return flashinfer_trtllm_fp4_moe(
             layer=layer,
             x=x,
             router_logits=router_logits,
             top_k=layer.top_k,
+            activation=layer.activation,
             global_num_experts=layer.global_num_experts,
             num_expert_group=layer.num_expert_group,
             topk_group=layer.topk_group,
@@ -1629,16 +1604,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-<<<<<<< HEAD
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-=======
-        assert layer.activation == "silu", (
-            f"{layer.activation} not supported for Marlin MoE."
->>>>>>> e6b6fc931 (Call select_experts from FusdMoE when possible)
-        )
-
         return fused_marlin_moe(
             x,
             layer.w13_weight_packed,

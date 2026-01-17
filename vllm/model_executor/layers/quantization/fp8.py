@@ -999,28 +999,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def is_monolithic(self) -> bool:
         return self.fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
 
-    def apply(
-        self,
-        layer: FusedMoE,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        assert self.kernel is not None
-        assert not self.is_monolithic
-        return self.kernel(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights,
-            topk_ids,
-            inplace=self.use_inplace,
-            activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-        )
-
     def apply_monolithic(
         self,
         layer: FusedMoE,
@@ -1080,6 +1058,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_group=layer.topk_group,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
             )
+
+    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert self.kernel is not None
+        assert not self.is_monolithic
+        return self.kernel(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            inplace=self.use_inplace,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        )
 
 
 class Fp8OnlineMoEMethod(Fp8MoEMethod):
