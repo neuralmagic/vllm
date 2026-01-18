@@ -18,6 +18,7 @@ def fused_topk_bias(
     e_score_correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
+    indices_type: torch.dtype | None = None,
 ):
     n_routed_experts = gating_output.shape[-1]
     scores = gating_output.softmax(dim=-1)
@@ -31,7 +32,9 @@ def fused_topk_bias(
     topk_weights = scores.gather(1, topk_indices)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    return topk_weights.to(torch.float32), topk_indices.to(torch.int32)
+    return topk_weights.to(torch.float32), topk_indices.to(
+        torch.int32 if indices_type is None else indices_type
+    )
 
 
 class FusedTopKBiasRouter(BaseRouter):
@@ -80,6 +83,7 @@ class FusedTopKBiasRouter(BaseRouter):
             e_score_correction_bias=self.e_score_correction_bias.data,
             topk=self.top_k,
             renormalize=self.renormalize,
+            indices_type=indices_type,
         )
 
         if self.routed_scaling_factor != 1.0:
