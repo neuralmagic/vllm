@@ -209,7 +209,7 @@ class DefaultMoERunner(MoERunner):
 
         return hidden_states_clone
 
-    def apply_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    def _apply_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         has_separate_shared_experts = (
             not isinstance(self.quant_method, FusedMoEModularMethod)
             and self.shared_experts is not None

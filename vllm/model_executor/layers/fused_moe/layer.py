@@ -512,6 +512,8 @@ class FusedMoE(CustomOp):
                     self.layer_id, topk_ids
                 )
 
+        # TODO(bnell): we should not have to create a router if the kernel is
+        # monolithic.
         self.router = create_fused_moe_router(
             top_k=top_k,
             global_num_experts=self.global_num_experts,
