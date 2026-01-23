@@ -10,7 +10,7 @@ set -ex
 
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 PPLX_COMMIT_HASH=${PPLX_COMMIT_HASH:-"12cecfd"}
-DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"73b6ea4"}
+DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"8acd63e13d55935e82504f730622a74815ba1072"}
 NVSHMEM_VER=${NVSHMEM_VER:-"3.3.24"}  # Default supports both CUDA 12 and 13
 WORKSPACE=${WORKSPACE:-$(pwd)/ep_kernels_workspace}
 MODE=${MODE:-install}
@@ -174,9 +174,9 @@ do_build() {
     cd "$name"
 
     # DeepEP CUDA 13 patch
-    #    if [[ "$name" == "DeepEP" && "${CUDA_VERSION_MAJOR}" -ge 13 ]]; then
-    #        sed -i "s|f'{nvshmem_dir}/include']|f'{nvshmem_dir}/include', '${CUDA_HOME}/include/cccl']|" "setup.py"
-    #    fi
+    if [[ "$name" == "DeepEP" && "${CUDA_VERSION_MAJOR}" -ge 13 ]]; then
+        sed -i "s|f'{nvshmem_dir}/include']|f'{nvshmem_dir}/include', '${CUDA_HOME}/include/cccl']|" "setup.py"
+    fi
 
     if [ "$MODE" = "install" ]; then
         echo "Installing $name into environment"
@@ -198,7 +198,7 @@ do_build \
 
 # build DeepEP
 do_build \
-    "https://github.com/deepseek-ai/DeepEP" \
+    "https://github.com/elvircrn/DeepEP" \
     "DeepEP" \
     "setup.py" \
     "$DEEPEP_COMMIT_HASH" \
