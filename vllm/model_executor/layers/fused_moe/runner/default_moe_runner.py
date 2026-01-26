@@ -40,20 +40,6 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 logger = init_logger(__name__)
 
 
-def unpack_pair(
-    y: torch.Tensor | None,
-    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(x, tuple):
-        if y is not None:
-            assert x[0] is None
-            return y, x[1]
-        else:
-            return x
-    else:
-        return y, x
-
-
 class DefaultMoERunner(MoERunner):
     def __init__(
         self,
@@ -80,6 +66,7 @@ class DefaultMoERunner(MoERunner):
         self.capture = capture
 
         # Chunked all2all staging tensor
+        # TODO rename these
         self.batched_hidden_states: torch.Tensor | None = None
         self.batched_router_logits: torch.Tensor | None = None
 
@@ -266,32 +253,6 @@ class DefaultMoERunner(MoERunner):
 
         return shared_output
 
-    def _ensure_dp_chunking_init(self):
-        if not self.use_dp_chunking or self.batched_hidden_states is not None:
-            return
-
-        states_shape: tuple[int, ...]
-        logits_shape: tuple[int, ...]
-
-        moe = self.moe_config
-
-        if self.enable_dbo:
-            states_shape = (2, moe.max_num_tokens, self.moe_config.hidden_dim)
-            logits_shape = (2, moe.max_num_tokens, self.moe_config.num_logical_experts)
-        else:
-            states_shape = (moe.max_num_tokens, self.moe_config.hidden_dim)
-            logits_shape = (moe.max_num_tokens, self.moe_config.num_logical_experts)
-
-        self.batched_hidden_states = torch.zeros(
-            states_shape, dtype=moe.in_dtype, device=torch.cuda.current_device()
-        )
-
-        self.batched_router_logits = torch.zeros(
-            logits_shape,
-            dtype=moe.router_logits_dtype,
-            device=torch.cuda.current_device(),
-        )
-
     def must_reduce_shared_expert_outputs(self) -> bool:
         """
         The shared_experts are typically computed using the RowParallelLinear
@@ -361,17 +322,18 @@ class DefaultMoERunner(MoERunner):
 
     def _apply_quant_method(
         self,
+        shared_output: torch.Tensor,
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         extra_tensor: torch.Tensor | None,
         router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         # TODO(bnell): deal with fp4 flashinfer tuple hidden states hack (#30014).
         # Figure out nicer way to do this.
         x_arg = hidden_states if extra_tensor is None else (hidden_states, extra_tensor)
 
         if self.quant_method.is_monolithic:
-            return self.quant_method.apply_monolithic(
+            result = self.quant_method.apply_monolithic(
                 layer=layer,
                 x=x_arg,
                 router_logits=router_logits,
@@ -385,12 +347,21 @@ class DefaultMoERunner(MoERunner):
             if self.capture is not None:
                 self.capture(topk_ids)
 
-            return self.quant_method.apply(
+            result = self.quant_method.apply(
                 layer=layer,
                 x=x_arg,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
             )
+
+        if isinstance(result, tuple):
+            if shared_output is not None:
+                assert result[0] is None
+                return shared_output, result[1]
+            else:
+                return result
+        else:
+            return shared_output, result
 
     def _sequence_parallel_context(self):
         ctx = get_forward_context()
@@ -399,6 +370,61 @@ class DefaultMoERunner(MoERunner):
             if ctx.dp_metadata
             else nullcontext()
         )
+
+    def _ensure_dp_chunking_init(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        assert self.use_dp_chunking
+
+        if self.batched_hidden_states is None:
+            states_shape: tuple[int, ...]
+            logits_shape: tuple[int, ...]
+
+            moe = self.moe_config
+
+            if self.enable_dbo:
+                states_shape = (2, moe.max_num_tokens, self.moe_config.hidden_dim)
+                logits_shape = (
+                    2,
+                    moe.max_num_tokens,
+                    self.moe_config.num_logical_experts,
+                )
+            else:
+                states_shape = (moe.max_num_tokens, self.moe_config.hidden_dim)
+                logits_shape = (moe.max_num_tokens, self.moe_config.num_logical_experts)
+
+            self.batched_hidden_states = torch.zeros(
+                states_shape, dtype=moe.in_dtype, device=torch.cuda.current_device()
+            )
+
+            self.batched_router_logits = torch.zeros(
+                logits_shape,
+                dtype=moe.router_logits_dtype,
+                device=torch.cuda.current_device(),
+            )
+
+        # Assert the inputs are of the proper type and shape.
+        assert self.batched_hidden_states is not None
+        assert self.batched_router_logits is not None
+        assert self.batched_hidden_states.dtype == hidden_states.dtype, (
+            f"{self.batched_hidden_states.dtype} == {hidden_states.dtype}"
+        )
+        assert self.batched_router_logits.dtype == router_logits.dtype, (
+            f"{self.batched_router_logits.dtype} == {router_logits.dtype}"
+        )
+        # Check size compatibility.
+        assert self.batched_hidden_states.size(-1) == hidden_states.size(-1)
+        assert self.batched_router_logits.size(-1) == router_logits.size(-1)
+
+        final_fused_hidden_states = torch.empty_like(hidden_states)
+        if self.shared_experts is not None:
+            final_shared_hidden_states = torch.empty_like(hidden_states)
+        else:
+            final_shared_hidden_states = None
+
+        return final_shared_hidden_states, final_fused_hidden_states
 
     def _maybe_gate(
         self,
@@ -456,7 +482,8 @@ class DefaultMoERunner(MoERunner):
 
         # NOTE: Similar with DP, PCP also needs dispatch and combine. For
         # simplicity, AgRsAll2All was added separately for PCP here. Maybe
-        # we should modify All2AllManager abstract to better support PCP.
+        # we should modify All2AllManager abstraction to better support PCP.
+        # TODO(bnell): see what we can do here
         if self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().all_gather(
                 hidden_states,
@@ -500,80 +527,83 @@ class DefaultMoERunner(MoERunner):
         fused_output = self.moe_forward(hidden_states, router_logits)
         return self._maybe_reduce_output(fused_output, og_hidden_states)
 
+    # TODO: avoid some of the copying by disabling inplace
+    def _slice_input(
+        self,
+        out_slice: torch.Tensor,
+        orig: torch.Tensor | None,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        assert orig is not None
+        slice_size = end - start
+        orig_slice = orig[start:end, :]
+        if self.enable_dbo:
+            assert out_slice.dim() == 3
+            batch_buffer_idx = dbo_current_ubatch_id()
+            out_slice = out_slice[batch_buffer_idx, :]
+
+        assert out_slice.size(0) >= slice_size
+        out_slice = out_slice[:slice_size, :]
+        out_slice.copy_(orig_slice, non_blocking=True)
+        return out_slice
+
     def forward_impl_chunked(
         self,
         layer: torch.nn.Module,
         full_hidden_states: torch.Tensor,
-        full_router_logits: torch.Tensor,
+        router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        self._ensure_dp_chunking_init()
-
-        assert self.batched_hidden_states is not None
-        assert self.batched_router_logits is not None
-        assert self.batched_hidden_states.dtype == full_hidden_states.dtype, (
-            f"{self.batched_hidden_states.dtype} == {full_hidden_states.dtype}"
+        final_shared_hidden_states, final_fused_hidden_states = (
+            self._ensure_dp_chunking_init(full_hidden_states, router_logits)
         )
-        assert self.batched_router_logits.dtype == full_router_logits.dtype, (
-            f"{self.batched_router_logits.dtype} == {full_router_logits.dtype}"
-        )
-        # Check size compatibility.
-        assert self.batched_hidden_states.size(-1) == full_hidden_states.size(-1)
-        assert self.batched_router_logits.size(-1) == full_router_logits.size(-1)
-
-        full_fused_final_hidden_states = torch.empty_like(full_hidden_states)
-        if self.shared_experts is not None:
-            full_shared_final_hidden_states = torch.empty_like(full_hidden_states)
 
         def process_chunk(chunk_start, chunk_end, skip_result_store=False):
-            chunk_size = chunk_end - chunk_start
-            hidden_states = full_hidden_states[chunk_start:chunk_end, :]
-            router_logits = full_router_logits[chunk_start:chunk_end, :]
-
-            assert self.batched_hidden_states is not None
-            assert self.batched_router_logits is not None
-            # This is only true when DBO has been enabled in the config.
-            # Both tensors will have an outer dimension for the ubatch id
-            if self.batched_hidden_states.dim() == 3:
-                assert self.batched_router_logits.dim() == 3
-                batch_buffer_idx = dbo_current_ubatch_id()
-                batched_hidden_states = self.batched_hidden_states[batch_buffer_idx, :]
-                batched_router_logits = self.batched_router_logits[batch_buffer_idx, :]
-            else:
-                batched_hidden_states = self.batched_hidden_states
-                batched_router_logits = self.batched_router_logits
-
-            assert batched_hidden_states.size(0) >= chunk_size
-            assert batched_router_logits.size(0) >= chunk_size
-            staged_hidden_states = batched_hidden_states[:chunk_size, :]
-            staged_router_logits = batched_router_logits[:chunk_size, :]
-            staged_hidden_states.copy_(hidden_states, non_blocking=True)
-            staged_router_logits.copy_(router_logits, non_blocking=True)
-
-            shared_output, hidden_states = unpack_pair(
-                None,
-                self._apply_quant_method(
-                    layer=layer,
-                    hidden_states=staged_hidden_states,
-                    extra_tensor=None,
-                    router_logits=staged_router_logits,
-                ),
+            hidden_states_chunk = self._slice_input(
+                self.batched_hidden_states,
+                full_hidden_states,
+                chunk_start,
+                chunk_end,
             )
 
+            router_logits_chunk = self._slice_input(
+                self.batched_router_logits,
+                router_logits,
+                chunk_start,
+                chunk_end,
+            )
+
+            ##################################################
+
+            # Run this before quant_method to avoid inplace issues.
             shared_output = self._apply_shared_experts(
-                shared_output, staged_hidden_states
+                None,
+                hidden_states_chunk,
             )
+
+            # Implement this as inplace?
+            shared_output, hidden_states = self._apply_quant_method(
+                shared_output=shared_output,
+                layer=layer,
+                hidden_states=hidden_states_chunk,
+                extra_tensor=None,
+                router_logits=router_logits_chunk,
+            )
+
+            ##################################################
 
             if not skip_result_store:
                 if self.shared_experts is None:
-                    full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
+                    final_fused_hidden_states[chunk_start:chunk_end, :].copy_(
                         hidden_states, non_blocking=True
                     )
                 else:
                     assert shared_output is not None
-                    full_shared_final_hidden_states[chunk_start:chunk_end, :].copy_(
+                    assert final_shared_hidden_states is not None
+                    final_shared_hidden_states[chunk_start:chunk_end, :].copy_(
                         shared_output, non_blocking=True
                     )
-                    full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
+                    final_fused_hidden_states[chunk_start:chunk_end, :].copy_(
                         hidden_states, non_blocking=True
                     )
 
@@ -604,13 +634,15 @@ class DefaultMoERunner(MoERunner):
                 self.moe_config.sp_size, moe_dp_chunk_size_per_rank, chunk_idx
             ):
                 process_chunk(
-                    chunk_start, chunk_end, skip_result_store=chunk_start_ >= num_tokens
+                    chunk_start,
+                    chunk_end,
+                    skip_result_store=chunk_start_ >= num_tokens,
                 )
 
         if self.shared_experts is None:
-            return full_fused_final_hidden_states
+            return final_fused_hidden_states
         else:
-            return (full_shared_final_hidden_states, full_fused_final_hidden_states)
+            return (final_shared_hidden_states, final_fused_hidden_states)
 
     def forward_impl(
         self,
@@ -632,8 +664,9 @@ class DefaultMoERunner(MoERunner):
             self.has_separate_shared_experts and not self.use_shared_experts_stream
         )
 
-        # TODO(bnell): the dispatch/combine steps should go away once
-        # #32567 lands and the remaining kernels are made MKs.
+        # TODO(bnell): parts of the dispatch/combine steps will go away once
+        # #32567 lands and the remaining kernels are made MKs.  The PCP
+        # code will probably remain
         hidden_states, router_logits, extra_tensor = self._maybe_dispatch(
             hidden_states,
             router_logits,
@@ -648,14 +681,12 @@ class DefaultMoERunner(MoERunner):
                 False,  # TODO: why don't we use streaming here?
             )
 
-        shared_output, hidden_states = unpack_pair(
-            shared_output,
-            self._apply_quant_method(
-                layer=layer,
-                hidden_states=hidden_states,
-                extra_tensor=extra_tensor,
-                router_logits=router_logits,
-            ),
+        shared_output, hidden_states = self._apply_quant_method(
+            shared_output=shared_output,
+            layer=layer,
+            hidden_states=hidden_states,
+            extra_tensor=extra_tensor,
+            router_logits=router_logits,
         )
 
         if not run_shared_experts_before:
