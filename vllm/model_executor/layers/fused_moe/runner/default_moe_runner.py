@@ -528,7 +528,7 @@ class DefaultMoERunner(MoERunner):
         return self._maybe_reduce_output(fused_output, og_hidden_states)
 
     # TODO: avoid some of the copying by disabling inplace
-    def _slice_input(
+    def _slice_and_copy_input(
         self,
         out_slice: torch.Tensor,
         orig: torch.Tensor | None,
@@ -551,61 +551,12 @@ class DefaultMoERunner(MoERunner):
     def forward_impl_chunked(
         self,
         layer: torch.nn.Module,
-        full_hidden_states: torch.Tensor,
+        full_hidden_states: torch.Tensor,  # TODO: rename this
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         final_shared_hidden_states, final_fused_hidden_states = (
             self._ensure_dp_chunking_init(full_hidden_states, router_logits)
         )
-
-        def process_chunk(chunk_start, chunk_end, skip_result_store=False):
-            hidden_states_chunk = self._slice_input(
-                self.batched_hidden_states,
-                full_hidden_states,
-                chunk_start,
-                chunk_end,
-            )
-
-            router_logits_chunk = self._slice_input(
-                self.batched_router_logits,
-                router_logits,
-                chunk_start,
-                chunk_end,
-            )
-
-            ##################################################
-
-            # Run this before quant_method to avoid inplace issues.
-            shared_output = self._apply_shared_experts(
-                None,
-                hidden_states_chunk,
-            )
-
-            # Implement this as inplace?
-            shared_output, hidden_states = self._apply_quant_method(
-                shared_output=shared_output,
-                layer=layer,
-                hidden_states=hidden_states_chunk,
-                extra_tensor=None,
-                router_logits=router_logits_chunk,
-            )
-
-            ##################################################
-
-            if not skip_result_store:
-                if self.shared_experts is None:
-                    final_fused_hidden_states[chunk_start:chunk_end, :].copy_(
-                        hidden_states, non_blocking=True
-                    )
-                else:
-                    assert shared_output is not None
-                    assert final_shared_hidden_states is not None
-                    final_shared_hidden_states[chunk_start:chunk_end, :].copy_(
-                        shared_output, non_blocking=True
-                    )
-                    final_fused_hidden_states[chunk_start:chunk_end, :].copy_(
-                        hidden_states, non_blocking=True
-                    )
 
         ctx = get_forward_context()
         # flashinfer_cutlass_kernels can handle: optional DP + TP/EP
@@ -630,14 +581,53 @@ class DefaultMoERunner(MoERunner):
             # clamp start and end
             chunk_start = min(chunk_start, num_tokens - 1)
             chunk_end = min(chunk_end, num_tokens)
-            with ctx.dp_metadata.chunked_sizes(
+            chunk_sizes = ctx.dp_metadata.chunked_sizes(
                 self.moe_config.sp_size, moe_dp_chunk_size_per_rank, chunk_idx
-            ):
-                process_chunk(
+            )
+            with chunk_sizes:
+                hidden_states_chunk = self._slice_and_copy_input(
+                    self.batched_hidden_states,
+                    full_hidden_states,
                     chunk_start,
                     chunk_end,
-                    skip_result_store=chunk_start_ >= num_tokens,
                 )
+
+                router_logits_chunk = self._slice_and_copy_input(
+                    self.batched_router_logits,
+                    router_logits,
+                    chunk_start,
+                    chunk_end,
+                )
+
+                ##################################################
+
+                # Run this before quant_method to avoid inplace issues.
+                shared_output = self._apply_shared_experts(
+                    None,
+                    hidden_states_chunk,
+                )
+
+                shared_output, hidden_states = self._apply_quant_method(
+                    shared_output=shared_output,
+                    layer=layer,
+                    hidden_states=hidden_states_chunk,
+                    extra_tensor=None,
+                    router_logits=router_logits_chunk,
+                )
+
+                ##################################################
+
+                # Store outputs
+                if chunk_start < num_tokens:
+                    final_fused_hidden_states[chunk_start:chunk_end, :].copy_(
+                        hidden_states, non_blocking=True
+                    )
+                    if self.shared_experts is not None:
+                        assert shared_output is not None
+                        assert final_shared_hidden_states is not None
+                        final_shared_hidden_states[chunk_start:chunk_end, :].copy_(
+                            shared_output, non_blocking=True
+                        )
 
         if self.shared_experts is None:
             return final_fused_hidden_states
