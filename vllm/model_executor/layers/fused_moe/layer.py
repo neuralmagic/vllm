@@ -663,6 +663,8 @@ class FusedMoE(CustomOp):
             )
             # force reconstruction of runner
             self.init_runner(reconstruct=True)
+        else:
+            self.init_runner()
 
     @property
     def shared_experts(self) -> torch.nn.Module | None:
