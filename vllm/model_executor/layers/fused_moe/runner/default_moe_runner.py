@@ -359,7 +359,7 @@ class DefaultMoERunner(MoERunner):
             )
         return hidden_states, og_hidden_states
 
-    def quant_method_apply(
+    def _apply_quant_method(
         self,
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
@@ -542,22 +542,16 @@ class DefaultMoERunner(MoERunner):
                 batched_hidden_states = self.batched_hidden_states
                 batched_router_logits = self.batched_router_logits
 
-            assert (
-                batched_hidden_states.size(0)  # type: ignore
-                >= chunk_size
-            )
-            assert (
-                batched_router_logits.size(0)  # type: ignore
-                >= chunk_size
-            )
-            staged_hidden_states = batched_hidden_states[:chunk_size, :]  # type: ignore
-            staged_router_logits = batched_router_logits[:chunk_size, :]  # type: ignore
+            assert batched_hidden_states.size(0) >= chunk_size
+            assert batched_router_logits.size(0) >= chunk_size
+            staged_hidden_states = batched_hidden_states[:chunk_size, :]
+            staged_router_logits = batched_router_logits[:chunk_size, :]
             staged_hidden_states.copy_(hidden_states, non_blocking=True)
             staged_router_logits.copy_(router_logits, non_blocking=True)
 
             shared_output, hidden_states = unpack_pair(
                 None,
-                self.quant_method_apply(
+                self._apply_quant_method(
                     layer=layer,
                     hidden_states=staged_hidden_states,
                     extra_tensor=None,
@@ -645,6 +639,8 @@ class DefaultMoERunner(MoERunner):
             router_logits,
         )
 
+        # TODO(bnell): maybe move _apply_shared_experts calls into
+        # _apply_quant_method
         if run_shared_experts_before:
             shared_output = self._apply_shared_experts(
                 shared_output,
@@ -654,7 +650,7 @@ class DefaultMoERunner(MoERunner):
 
         shared_output, hidden_states = unpack_pair(
             shared_output,
-            self.quant_method_apply(
+            self._apply_quant_method(
                 layer=layer,
                 hidden_states=hidden_states,
                 extra_tensor=extra_tensor,
