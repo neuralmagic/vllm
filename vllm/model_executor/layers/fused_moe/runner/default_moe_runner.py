@@ -104,33 +104,40 @@ class DefaultMoERunner(MoERunner):
             self.moe_config.use_flashinfer_cutlass_kernels
         )
 
-        self.moe_forward = self.select_forward(layer)
+        self.moe_forward = self._select_forward(layer)
 
-    def select_forward(self, layer: torch.nn.Module) -> Callable:
+    def _select_forward(self, layer: torch.nn.Module) -> Callable:
+        # Note: these are local functions so they capture the layer.
         def _moe_forward(
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
         ) -> torch.Tensor:
-            router_logits = self.maybe_gate(hidden_states, router_logits)
-            if self.use_dp_chunking:
-                return self.forward_impl_chunked(layer, hidden_states, router_logits)
-            else:
-                return self.forward_impl(layer, hidden_states, router_logits)
+            router_logits = self._maybe_gate(hidden_states, router_logits)
+            with self._sequence_parallel_context():
+                if self.use_dp_chunking:
+                    return self.forward_impl_chunked(
+                        layer, hidden_states, router_logits
+                    )
+                else:
+                    return self.forward_impl(layer, hidden_states, router_logits)
 
         def _moe_forward_shared(
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            router_logits = self.maybe_gate(hidden_states, router_logits)
-            if self.use_dp_chunking:
-                return self.forward_impl_chunked(layer, hidden_states, router_logits)
-            else:
-                return self.forward_impl(layer, hidden_states, router_logits)
+            router_logits = self._maybe_gate(hidden_states, router_logits)
+            with self._sequence_parallel_context():
+                if self.use_dp_chunking:
+                    return self.forward_impl_chunked(
+                        layer, hidden_states, router_logits
+                    )
+                else:
+                    return self.forward_impl(layer, hidden_states, router_logits)
 
+        # TODO: Once the OOM issue for the TPU backend is resolved, we will
+        # switch to using the moe_forward custom op.
+        # Note: CPU doesn't require wrapped forward_impl.
         if current_platform.is_tpu() or current_platform.is_cpu():
-            # TODO: Once the OOM issue for the TPU backend is resolved, we
-            # will switch to using the moe_forward custom op.
-            # Note: CPU doesn't require wrapped forward_impl.
             return _moe_forward if self.shared_experts is None else _moe_forward_shared
 
         op_name = f"moe_forward{layer.layer_name.replace('.', '_')}"
@@ -177,6 +184,8 @@ class DefaultMoERunner(MoERunner):
             and self._use_flashinfer_cutlass_kernels
         )
 
+    # Note: this needs to be a runtime method because it requires
+    # a moe_quant_config which may not be set up til later.
     @property
     def use_dp_chunking(self) -> bool:
         return (
@@ -257,7 +266,7 @@ class DefaultMoERunner(MoERunner):
 
         return shared_output
 
-    def ensure_dp_chunking_init(self):
+    def _ensure_dp_chunking_init(self):
         if not self.use_dp_chunking or self.batched_hidden_states is not None:
             return
 
@@ -310,7 +319,7 @@ class DefaultMoERunner(MoERunner):
         else:
             return tensor_model_parallel_all_reduce(final_hidden_states)
 
-    def _reduce_output(
+    def _maybe_reduce_output(
         self,
         states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         trunc_dim: int,
@@ -383,7 +392,7 @@ class DefaultMoERunner(MoERunner):
                 topk_ids=topk_ids,
             )
 
-    def sequence_parallel_context(self):
+    def _sequence_parallel_context(self):
         ctx = get_forward_context()
         return (
             ctx.dp_metadata.sp_local_sizes(self.moe_config.sp_size)
@@ -391,7 +400,7 @@ class DefaultMoERunner(MoERunner):
             else nullcontext()
         )
 
-    def maybe_gate(
+    def _maybe_gate(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -410,7 +419,7 @@ class DefaultMoERunner(MoERunner):
             self.quant_method, FusedMoEModularMethod
         )
 
-    def maybe_dispatch(
+    def _maybe_dispatch(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
@@ -460,7 +469,7 @@ class DefaultMoERunner(MoERunner):
 
         return hidden_states, router_logits, extra_tensor
 
-    def maybe_combine(
+    def _maybe_combine(
         self,
         shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
@@ -476,7 +485,8 @@ class DefaultMoERunner(MoERunner):
                 dim=0,
             )
 
-        if shared_output is not None:
+        if self.shared_experts is not None:
+            assert shared_output is not None
             return shared_output, hidden_states
         else:
             return hidden_states
@@ -488,7 +498,7 @@ class DefaultMoERunner(MoERunner):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states, og_hidden_states = self._maybe_pad_hidden_states(hidden_states)
         fused_output = self.moe_forward(hidden_states, router_logits)
-        return self._reduce_output(fused_output, og_hidden_states)
+        return self._maybe_reduce_output(fused_output, og_hidden_states)
 
     def forward_impl_chunked(
         self,
@@ -496,7 +506,7 @@ class DefaultMoERunner(MoERunner):
         full_hidden_states: torch.Tensor,
         full_router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        self.ensure_dp_chunking_init()
+        self._ensure_dp_chunking_init()
 
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
@@ -614,51 +624,53 @@ class DefaultMoERunner(MoERunner):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        with self.sequence_parallel_context():
-            shared_output: torch.Tensor | None = None
+        shared_output: torch.Tensor | None = None
 
-            # TODO: set this up better so that we don't need to clone, i.e.
-            # disable inplace.
-            hidden_states_clone = self._maybe_setup_shared_experts_stream(
-                hidden_states, self.use_dp_chunking
-            )
+        # TODO: set this up better so that we don't need to clone, i.e.
+        # disable inplace?
+        hidden_states_clone = self._maybe_setup_shared_experts_stream(
+            hidden_states, self.use_dp_chunking
+        )
 
-            # Check if we need to run shared experts before matrix multiply because
-            # matrix multiply may modify the hidden_states.
-            run_shared_experts_before = (
-                self.has_separate_shared_experts and not self.use_shared_experts_stream
-            )
+        # Check if we need to run shared experts before matrix multiply because
+        # matrix multiply may modify the hidden_states.
+        run_shared_experts_before = (
+            self.has_separate_shared_experts and not self.use_shared_experts_stream
+        )
 
-            hidden_states, router_logits, extra_tensor = self.maybe_dispatch(
-                hidden_states,
-                router_logits,
-            )
+        # TODO(bnell): the dispatch/combine steps should go away once
+        # #32567 lands and the remaining kernels are made MKs.
+        hidden_states, router_logits, extra_tensor = self._maybe_dispatch(
+            hidden_states,
+            router_logits,
+        )
 
-            if run_shared_experts_before:
-                shared_output = self._apply_shared_experts(
-                    shared_output,
-                    hidden_states,
-                    False,  # TODO: why don't we use streaming here?
-                )
-
-            shared_output, hidden_states = unpack_pair(
-                shared_output,
-                self.quant_method_apply(
-                    layer=layer,
-                    hidden_states=hidden_states,
-                    extra_tensor=extra_tensor,
-                    router_logits=router_logits,
-                ),
-            )
-
-            if not run_shared_experts_before:
-                shared_output = self._apply_shared_experts(
-                    shared_output,
-                    hidden_states_clone,
-                    True,
-                )
-
-            return self.maybe_combine(
+        if run_shared_experts_before:
+            shared_output = self._apply_shared_experts(
                 shared_output,
                 hidden_states,
+                False,  # TODO: why don't we use streaming here?
             )
+
+        shared_output, hidden_states = unpack_pair(
+            shared_output,
+            self.quant_method_apply(
+                layer=layer,
+                hidden_states=hidden_states,
+                extra_tensor=extra_tensor,
+                router_logits=router_logits,
+            ),
+        )
+
+        if not run_shared_experts_before:
+            shared_output = self._apply_shared_experts(
+                shared_output,
+                hidden_states_clone,
+                True,
+            )
+
+        # TODO(bnell): will go away
+        return self._maybe_combine(
+            shared_output,
+            hidden_states,
+        )
