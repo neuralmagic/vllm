@@ -40,6 +40,20 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 logger = init_logger(__name__)
 
 
+def unpack_pair(
+    y: torch.Tensor | None,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(x, tuple):
+        if y is not None:
+            assert x[0] is None
+            return y, x[1]
+        else:
+            return x
+    else:
+        return y, x
+
+
 class DefaultMoERunner(MoERunner):
     def __init__(
         self,
@@ -64,12 +78,16 @@ class DefaultMoERunner(MoERunner):
         self.reduce_results = reduce_results
         self.enable_dbo = enable_dbo
         self.capture = capture
-        self.use_shared_experts_stream = False
+
+        # Chunked all2all staging tensor
+        self.batched_hidden_states: torch.Tensor | None = None
+        self.batched_router_logits: torch.Tensor | None = None
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
+        self.use_shared_experts_stream = False
         if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
             logger.debug_once("Disabling MoE shared_experts cuda stream", scope="local")
             self.shared_experts_stream = None
@@ -82,59 +100,58 @@ class DefaultMoERunner(MoERunner):
                     "Enabled separate cuda stream for MoE shared_experts", scope="local"
                 )
 
-        lname = layer.layer_name.replace(".", "_")
+        self._use_flashinfer_cutlass_kernels = (
+            self.moe_config.use_flashinfer_cutlass_kernels
+        )
 
+        self.moe_forward = self.select_forward(layer)
+
+    def select_forward(self, layer: torch.nn.Module) -> Callable:
         def _moe_forward(
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
         ) -> torch.Tensor:
-            return self.forward_impl(layer, hidden_states, router_logits)
+            router_logits = self.maybe_gate(hidden_states, router_logits)
+            if self.use_dp_chunking:
+                return self.forward_impl_chunked(layer, hidden_states, router_logits)
+            else:
+                return self.forward_impl(layer, hidden_states, router_logits)
 
         def _moe_forward_shared(
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return self.forward_impl(layer, hidden_states, router_logits)
+            router_logits = self.maybe_gate(hidden_states, router_logits)
+            if self.use_dp_chunking:
+                return self.forward_impl_chunked(layer, hidden_states, router_logits)
+            else:
+                return self.forward_impl(layer, hidden_states, router_logits)
 
         if current_platform.is_tpu() or current_platform.is_cpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
             # will switch to using the moe_forward custom op.
             # Note: CPU doesn't require wrapped forward_impl.
-            if self.shared_experts is None:
-                self.moe_forward = _moe_forward
-            else:
-                self.moe_forward = _moe_forward_shared
-        else:
-            if self.shared_experts is None:
-                op_name = f"moe_forward{lname}"
-                if not hasattr(torch.ops.vllm, op_name):
-                    direct_register_custom_op(
-                        op_name=op_name,
-                        op_func=_moe_forward,
-                        mutates_args=["hidden_states"],
-                        fake_impl=DefaultMoERunner._moe_forward_fake,
-                        tags=(torch.Tag.needs_fixed_stride_order,),
-                    )
-                self.moe_forward = getattr(torch.ops.vllm, op_name)
-            else:
-                op_name = f"moe_forward_shared{lname}"
-                if not hasattr(torch.ops.vllm, op_name):
-                    direct_register_custom_op(
-                        op_name=op_name,
-                        op_func=_moe_forward_shared,
-                        mutates_args=["hidden_states"],
-                        fake_impl=DefaultMoERunner._moe_forward_shared_fake,
-                        tags=(torch.Tag.needs_fixed_stride_order,),
-                    )
-                self.moe_forward = getattr(torch.ops.vllm, op_name)
+            return _moe_forward if self.shared_experts is None else _moe_forward_shared
 
-        self.moe_config_use_flashinfer_cutlass_kernels = (
-            self.moe_config.use_flashinfer_cutlass_kernels
-        )
+        op_name = f"moe_forward{layer.layer_name.replace('.', '_')}"
 
-        # Chunked all2all staging tensor
-        self.batched_hidden_states: torch.Tensor | None = None
-        self.batched_router_logits: torch.Tensor | None = None
+        if not hasattr(torch.ops.vllm, op_name):
+            if self.shared_experts is None:
+                fn = _moe_forward
+                fake_fn = DefaultMoERunner._moe_forward_fake
+            else:
+                fn = _moe_forward_shared
+                fake_fn = DefaultMoERunner._moe_forward_shared_fake
+
+            direct_register_custom_op(
+                op_name=op_name,
+                op_func=fn,
+                mutates_args=["hidden_states"],
+                fake_impl=fake_fn,
+                tags=(torch.Tag.needs_fixed_stride_order,),
+            )
+
+        return getattr(torch.ops.vllm, op_name)
 
     @staticmethod
     def _moe_forward_fake(
@@ -157,7 +174,7 @@ class DefaultMoERunner(MoERunner):
         return (
             self.moe_quant_config is not None
             and self.moe_quant_config.quant_dtype == "nvfp4"
-            and self.moe_config_use_flashinfer_cutlass_kernels
+            and self._use_flashinfer_cutlass_kernels
         )
 
     @property
@@ -172,12 +189,11 @@ class DefaultMoERunner(MoERunner):
     def _maybe_setup_shared_experts_stream(
         self,
         hidden_states: torch.Tensor,
-        has_separate_shared_experts: bool,
         use_chunked_impl: bool,
     ) -> torch.Tensor | None:
         self.use_shared_experts_stream = (
             current_platform.is_cuda()
-            and has_separate_shared_experts
+            and self.has_separate_shared_experts
             and not use_chunked_impl
             and self.shared_experts_stream is not None
             and (
@@ -209,18 +225,23 @@ class DefaultMoERunner(MoERunner):
 
         return hidden_states_clone
 
-    def _apply_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        has_separate_shared_experts = (
+    @property
+    def has_separate_shared_experts(self) -> bool:
+        return (
             not isinstance(self.quant_method, FusedMoEModularMethod)
             and self.shared_experts is not None
         )
 
-        shared_output: torch.Tensor | None = None
-
-        if has_separate_shared_experts:
+    def _apply_shared_experts(
+        self,
+        shared_output: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        allow_streaming: bool = False,
+    ) -> torch.Tensor | None:
+        if self.has_separate_shared_experts and shared_output is None:
             assert self.shared_experts is not None
 
-            if self.use_shared_experts_stream:
+            if self.use_shared_experts_stream and allow_streaming:
                 # Run shared experts in parallel on a separate stream
                 # NOTE: We start the separate stream here and mark the
                 # sync end point immediately after it is done. This is
@@ -275,7 +296,6 @@ class DefaultMoERunner(MoERunner):
         Therefore it is required that we reduce the shared_experts output
         early.
         """
-        assert self.quant_method is not None
         return (
             isinstance(self.quant_method, FusedMoEModularMethod)
             and self.quant_method.fused_experts.output_is_reduced()
@@ -316,29 +336,6 @@ class DefaultMoERunner(MoERunner):
         else:
             return func(states)
 
-    def _combine_output(
-        self,
-        all_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        needs_combine: bool,
-    ) -> torch.Tensor:
-        if isinstance(all_states, tuple):
-            shared_states, states = all_states
-        else:
-            states = all_states
-
-        if needs_combine:
-            states = get_ep_group().combine(
-                states, self.moe_config.is_sequence_parallel
-            )
-
-        if self.moe_config.pcp_size > 1:
-            states = get_pcp_group().reduce_scatter(
-                states,
-                dim=0,
-            )
-
-        return shared_states, states if isinstance(all_states, tuple) else states
-
     def _maybe_pad_hidden_states(
         self,
         hidden_states: torch.Tensor,
@@ -352,15 +349,6 @@ class DefaultMoERunner(MoERunner):
                 value=0.0,
             )
         return hidden_states, og_hidden_states
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, og_hidden_states = self._maybe_pad_hidden_states(hidden_states)
-        fused_output = self.moe_forward(hidden_states, router_logits)
-        return self._reduce_output(fused_output, og_hidden_states)
 
     def quant_method_apply(
         self,
@@ -395,13 +383,121 @@ class DefaultMoERunner(MoERunner):
                 topk_ids=topk_ids,
             )
 
+    def sequence_parallel_context(self):
+        ctx = get_forward_context()
+        return (
+            ctx.dp_metadata.sp_local_sizes(self.moe_config.sp_size)
+            if ctx.dp_metadata
+            else nullcontext()
+        )
+
+    def maybe_gate(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        # If router/gate provided, then apply it here.
+        # (Note: This code runs only when "overlapped mode" is on to allow
+        #        parallel execution of shared experts with the FusedMoE via
+        #        separate cuda stream)
+        if self.gate is not None:
+            router_logits, _ = self.gate(hidden_states)
+        return router_logits
+
+    @property
+    def do_naive_dispatch_combine(self) -> bool:
+        return self.moe_config.dp_size > 1 and not isinstance(
+            self.quant_method, FusedMoEModularMethod
+        )
+
+    def maybe_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        extra_tensor: torch.Tensor | None = None
+
+        if self.do_naive_dispatch_combine:
+            post_quant_allgather = (
+                self.moe_config.dp_size > 1
+                and self.moe_config.use_ep
+                and getattr(self.quant_method, "do_post_quant_allgather", False)
+            )
+            if post_quant_allgather:
+                hidden_states_to_dispatch, extra_tensors = (
+                    self.quant_method.prepare_dp_allgather_tensor(
+                        self, hidden_states, router_logits
+                    )
+                )
+            else:
+                hidden_states_to_dispatch = hidden_states
+
+            hidden_states, router_logits, extra_tensors_dispatched = (
+                get_ep_group().dispatch(
+                    hidden_states_to_dispatch,
+                    router_logits,
+                    self.moe_config.is_sequence_parallel,
+                    extra_tensors=extra_tensors,
+                )
+            )
+
+            if extra_tensors_dispatched is not None:
+                assert len(extra_tensors_dispatched) == 1
+                extra_tensor = extra_tensors_dispatched[0]
+
+        # NOTE: Similar with DP, PCP also needs dispatch and combine. For
+        # simplicity, AgRsAll2All was added separately for PCP here. Maybe
+        # we should modify All2AllManager abstract to better support PCP.
+        if self.moe_config.pcp_size > 1:
+            hidden_states = get_pcp_group().all_gather(
+                hidden_states,
+                dim=0,
+            )
+            router_logits = get_pcp_group().all_gather(
+                router_logits,
+                dim=0,
+            )
+
+        return hidden_states, router_logits, extra_tensor
+
+    def maybe_combine(
+        self,
+        shared_output: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        if self.do_naive_dispatch_combine:
+            hidden_states = get_ep_group().combine(
+                hidden_states, self.moe_config.is_sequence_parallel
+            )
+
+        if self.moe_config.pcp_size > 1:
+            hidden_states = get_pcp_group().reduce_scatter(
+                hidden_states,
+                dim=0,
+            )
+
+        if shared_output is not None:
+            return shared_output, hidden_states
+        else:
+            return hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, og_hidden_states = self._maybe_pad_hidden_states(hidden_states)
+        fused_output = self.moe_forward(hidden_states, router_logits)
+        return self._reduce_output(fused_output, og_hidden_states)
+
     def forward_impl_chunked(
         self,
         layer: torch.nn.Module,
         full_hidden_states: torch.Tensor,
         full_router_logits: torch.Tensor,
-        has_separate_shared_experts: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        self.ensure_dp_chunking_init()
+
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
         assert self.batched_hidden_states.dtype == full_hidden_states.dtype, (
@@ -449,35 +545,32 @@ class DefaultMoERunner(MoERunner):
             staged_hidden_states.copy_(hidden_states, non_blocking=True)
             staged_router_logits.copy_(router_logits, non_blocking=True)
 
-            final_hidden_states = self.quant_method_apply(
-                layer=layer,
-                hidden_states=staged_hidden_states,
-                extra_tensor=None,
-                router_logits=staged_router_logits,
+            shared_output, hidden_states = unpack_pair(
+                None,
+                self.quant_method_apply(
+                    layer=layer,
+                    hidden_states=staged_hidden_states,
+                    extra_tensor=None,
+                    router_logits=staged_router_logits,
+                ),
             )
 
-            if has_separate_shared_experts:
-                assert not isinstance(final_hidden_states, tuple)
-                assert self.shared_experts is not None
-
-                shared_output = self.shared_experts(staged_hidden_states)
-
-                final_hidden_states = (
-                    shared_output,
-                    final_hidden_states,
-                )
+            shared_output = self._apply_shared_experts(
+                shared_output, staged_hidden_states
+            )
 
             if not skip_result_store:
                 if self.shared_experts is None:
                     full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                        final_hidden_states, non_blocking=True
+                        hidden_states, non_blocking=True
                     )
                 else:
+                    assert shared_output is not None
                     full_shared_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                        final_hidden_states[0], non_blocking=True
+                        shared_output, non_blocking=True
                     )
                     full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                        final_hidden_states[1], non_blocking=True
+                        hidden_states, non_blocking=True
                     )
 
         ctx = get_forward_context()
@@ -515,131 +608,57 @@ class DefaultMoERunner(MoERunner):
         else:
             return (full_shared_final_hidden_states, full_fused_final_hidden_states)
 
-    def sequence_parallel_context(self):
-        ctx = get_forward_context()
-        return (
-            ctx.dp_metadata.sp_local_sizes(self.moe_config.sp_size)
-            if ctx.dp_metadata
-            else nullcontext()
-        )
-
     def forward_impl(
         self,
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        assert self.quant_method is not None
-
-        self.ensure_dp_chunking_init()
-
-        has_separate_shared_experts = (
-            not isinstance(self.quant_method, FusedMoEModularMethod)
-            and self.shared_experts is not None
-        )
-
-        use_chunked_impl = self.use_dp_chunking
-
-        hidden_states_clone = self._maybe_setup_shared_experts_stream(
-            hidden_states, has_separate_shared_experts, use_chunked_impl
-        )
-
-        # If router/gate provided, then apply it here.
-        # (Note: This code runs only when "overlapped mode" is on to allow
-        #        parallel execution of shared experts with the FusedMoE via
-        #        separate cuda stream)
-        if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
-
-        if use_chunked_impl:
-            return self.forward_impl_chunked(
-                layer, hidden_states, router_logits, has_separate_shared_experts
-            )
-
-        do_naive_dispatch_combine: bool = (
-            self.moe_config.dp_size > 1
-            and not isinstance(self.quant_method, FusedMoEModularMethod)
-        )
-
         with self.sequence_parallel_context():
-            extra_tensor: torch.Tensor | None = None
+            shared_output: torch.Tensor | None = None
 
-            if do_naive_dispatch_combine:
-                post_quant_allgather = (
-                    self.quant_method is not None
-                    and self.moe_config.dp_size > 1
-                    and self.moe_config.use_ep
-                    and getattr(self.quant_method, "do_post_quant_allgather", False)
-                )
-                if post_quant_allgather:
-                    hidden_states_to_dispatch, extra_tensors = (
-                        self.quant_method.prepare_dp_allgather_tensor(
-                            self, hidden_states, router_logits
-                        )
-                    )
-                else:
-                    hidden_states_to_dispatch = hidden_states
-
-                hidden_states, router_logits, extra_tensors_dispatched = (
-                    get_ep_group().dispatch(
-                        hidden_states_to_dispatch,
-                        router_logits,
-                        self.moe_config.is_sequence_parallel,
-                        extra_tensors=extra_tensors,
-                    )
-                )
-
-                if extra_tensors_dispatched is not None:
-                    assert len(extra_tensors_dispatched) == 1
-                    extra_tensor = extra_tensors_dispatched[0]
-
-            # Run shared experts before matrix multiply.
-            # because matrix multiply maybe modify the hidden_states.
-            if has_separate_shared_experts and not self.use_shared_experts_stream:
-                assert self.shared_experts is not None
-                shared_output = self.shared_experts(hidden_states)
-
-            # NOTE: Similar with DP, PCP also needs dispatch and combine. For
-            # simplicity, AgRsAll2All was added separately for PCP here. Maybe
-            # we should modify All2AllManager abstract to better support PCP.
-            if self.moe_config.pcp_size > 1:
-                hidden_states = get_pcp_group().all_gather(
-                    hidden_states,
-                    dim=0,
-                )
-                router_logits = get_pcp_group().all_gather(
-                    router_logits,
-                    dim=0,
-                )
-
-            final_hidden_states = self.quant_method_apply(
-                layer=layer,
-                hidden_states=hidden_states,
-                extra_tensor=extra_tensor,
-                router_logits=router_logits,
+            # TODO: set this up better so that we don't need to clone, i.e.
+            # disable inplace.
+            hidden_states_clone = self._maybe_setup_shared_experts_stream(
+                hidden_states, self.use_dp_chunking
             )
 
-            if has_separate_shared_experts:
-                assert self.shared_experts is not None
+            # Check if we need to run shared experts before matrix multiply because
+            # matrix multiply may modify the hidden_states.
+            run_shared_experts_before = (
+                self.has_separate_shared_experts and not self.use_shared_experts_stream
+            )
 
-                if self.use_shared_experts_stream:
-                    # Run shared experts in parallel on a separate stream
-                    # NOTE: We start the separate stream here and mark the
-                    # sync end point immediately after it is done. This is
-                    # important to avoid excessive stream allocations by the cuda
-                    # graph replay later.
-                    with torch.cuda.stream(self.shared_experts_stream):
-                        # Note that hidden_states clone() is necessary here to avoid
-                        # conflict with the main stream
-                        shared_output = self.shared_experts(hidden_states_clone)
-                    current_stream().wait_stream(self.shared_experts_stream)
+            hidden_states, router_logits, extra_tensor = self.maybe_dispatch(
+                hidden_states,
+                router_logits,
+            )
 
-                final_hidden_states = (
+            if run_shared_experts_before:
+                shared_output = self._apply_shared_experts(
                     shared_output,
-                    final_hidden_states,
+                    hidden_states,
+                    False,  # TODO: why don't we use streaming here?
                 )
 
-            return self._combine_output(
-                final_hidden_states,
-                do_naive_dispatch_combine,
+            shared_output, hidden_states = unpack_pair(
+                shared_output,
+                self.quant_method_apply(
+                    layer=layer,
+                    hidden_states=hidden_states,
+                    extra_tensor=extra_tensor,
+                    router_logits=router_logits,
+                ),
+            )
+
+            if not run_shared_experts_before:
+                shared_output = self._apply_shared_experts(
+                    shared_output,
+                    hidden_states_clone,
+                    True,
+                )
+
+            return self.maybe_combine(
+                shared_output,
+                hidden_states,
             )
