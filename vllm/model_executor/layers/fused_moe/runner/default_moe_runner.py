@@ -185,19 +185,7 @@ class DefaultMoERunner(MoERunner):
     def _maybe_setup_shared_experts_stream(
         self,
         hidden_states: torch.Tensor,
-        use_chunked_impl: bool,
     ) -> torch.Tensor | None:
-        self.use_shared_experts_stream = (
-            current_platform.is_cuda()
-            and self.has_separate_shared_experts
-            and not use_chunked_impl
-            and self.shared_experts_stream is not None
-            and (
-                hidden_states.shape[0]
-                <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
-            )
-        )
-
         hidden_states_clone: torch.Tensor | None = None
         if self.use_shared_experts_stream:
             assert self.shared_experts_stream is not None
@@ -230,11 +218,11 @@ class DefaultMoERunner(MoERunner):
 
     def _apply_shared_experts(
         self,
-        shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
         allow_streaming: bool = False,
     ) -> torch.Tensor | None:
-        if self.has_separate_shared_experts and shared_output is None:
+        shared_output: torch.Tensor | None = None
+        if self.has_separate_shared_experts:
             assert self.shared_experts is not None
 
             if self.use_shared_experts_stream and allow_streaming:
@@ -322,12 +310,27 @@ class DefaultMoERunner(MoERunner):
 
     def _apply_quant_method(
         self,
-        shared_output: torch.Tensor,
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         extra_tensor: torch.Tensor | None,
         router_logits: torch.Tensor,
+        run_shared_experts_before: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        shared_output: torch.Tensor | None = None
+
+        # Run this before quant_method to avoid inplace issues.
+        if run_shared_experts_before:
+            shared_output = self._apply_shared_experts(
+                hidden_states,
+                False,
+            )
+        else:
+            # TODO: set this up better so that we don't need to clone, i.e.
+            # disable inplace?
+            hidden_states_clone = self._maybe_setup_shared_experts_stream(
+                hidden_states,
+            )
+
         # TODO(bnell): deal with fp4 flashinfer tuple hidden states hack (#30014).
         # Figure out nicer way to do this.
         x_arg = hidden_states if extra_tensor is None else (hidden_states, extra_tensor)
@@ -355,13 +358,19 @@ class DefaultMoERunner(MoERunner):
             )
 
         if isinstance(result, tuple):
-            if shared_output is not None:
-                assert result[0] is None
-                return shared_output, result[1]
-            else:
-                return result
+            assert shared_output is None
+            shared_output, hidden_states = result
         else:
-            return shared_output, result
+            hidden_states = result
+
+        if not run_shared_experts_before:
+            assert shared_output is None
+            shared_output = self._apply_shared_experts(
+                hidden_states_clone,
+                True,
+            )
+
+        return shared_output, hidden_states
 
     def _sequence_parallel_context(self):
         ctx = get_forward_context()
@@ -466,19 +475,21 @@ class DefaultMoERunner(MoERunner):
                 )
             else:
                 hidden_states_to_dispatch = hidden_states
+                extra_tensors = None
 
-            hidden_states, router_logits, extra_tensors_dispatched = (
-                get_ep_group().dispatch(
-                    hidden_states_to_dispatch,
-                    router_logits,
-                    self.moe_config.is_sequence_parallel,
-                    extra_tensors=extra_tensors,
-                )
+            result = get_ep_group().dispatch(
+                hidden_states_to_dispatch,
+                router_logits,
+                self.moe_config.is_sequence_parallel,
+                extra_tensors=extra_tensors,
             )
 
-            if extra_tensors_dispatched is not None:
-                assert len(extra_tensors_dispatched) == 1
-                extra_tensor = extra_tensors_dispatched[0]
+            if len(result) == 3:
+                hidden_states, router_logits, extra_tensors = result
+                assert len(extra_tensors) == 1
+                extra_tensor = extra_tensors[0]
+            else:
+                hidden_states, router_logits = result
 
         # NOTE: Similar with DP, PCP also needs dispatch and combine. For
         # simplicity, AgRsAll2All was added separately for PCP here. Maybe
@@ -505,12 +516,18 @@ class DefaultMoERunner(MoERunner):
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel
             )
+            if shared_output is not None:
+                shared_output = get_ep_group().combine(
+                    shared_output, self.moe_config.is_sequence_parallel
+                )
 
         if self.moe_config.pcp_size > 1:
+            print("TAKING PCP")
             hidden_states = get_pcp_group().reduce_scatter(
                 hidden_states,
                 dim=0,
             )
+            # need RS for shared_output?
 
         if self.shared_experts is not None:
             assert shared_output is not None
@@ -599,23 +616,12 @@ class DefaultMoERunner(MoERunner):
                     chunk_end,
                 )
 
-                ##################################################
-
-                # Run this before quant_method to avoid inplace issues.
-                shared_output = self._apply_shared_experts(
-                    None,
-                    hidden_states_chunk,
-                )
-
                 shared_output, hidden_states = self._apply_quant_method(
-                    shared_output=shared_output,
                     layer=layer,
                     hidden_states=hidden_states_chunk,
                     extra_tensor=None,
                     router_logits=router_logits_chunk,
                 )
-
-                ##################################################
 
                 # Store outputs
                 if chunk_start < num_tokens:
@@ -640,12 +646,21 @@ class DefaultMoERunner(MoERunner):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        shared_output: torch.Tensor | None = None
-
         # TODO: set this up better so that we don't need to clone, i.e.
         # disable inplace?
-        hidden_states_clone = self._maybe_setup_shared_experts_stream(
-            hidden_states, self.use_dp_chunking
+        # hidden_states_clone = self._maybe_setup_shared_experts_stream(
+        #    hidden_states, self.use_dp_chunking
+        # )
+
+        self.use_shared_experts_stream = (
+            current_platform.is_cuda()
+            and self.has_separate_shared_experts
+            and not self.use_dp_chunking
+            and self.shared_experts_stream is not None
+            and (
+                hidden_states.shape[0]
+                <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            )
         )
 
         # Check if we need to run shared experts before matrix multiply because
@@ -662,31 +677,15 @@ class DefaultMoERunner(MoERunner):
             router_logits,
         )
 
-        # TODO(bnell): maybe move _apply_shared_experts calls into
-        # _apply_quant_method
-        if run_shared_experts_before:
-            shared_output = self._apply_shared_experts(
-                shared_output,
-                hidden_states,
-                False,  # TODO: why don't we use streaming here?
-            )
-
         shared_output, hidden_states = self._apply_quant_method(
-            shared_output=shared_output,
             layer=layer,
             hidden_states=hidden_states,
             extra_tensor=extra_tensor,
             router_logits=router_logits,
+            run_shared_experts_before=run_shared_experts_before,
         )
 
-        if not run_shared_experts_before:
-            shared_output = self._apply_shared_experts(
-                shared_output,
-                hidden_states_clone,
-                True,
-            )
-
-        # TODO(bnell): will go away
+        # TODO(bnell): should go away?
         return self._maybe_combine(
             shared_output,
             hidden_states,
