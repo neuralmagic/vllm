@@ -363,7 +363,7 @@ class DefaultMoERunner(MoERunner):
         else:
             hidden_states = result
 
-        if not run_shared_experts_before:
+        if not run_shared_experts_before and self.has_separate_shared_experts:
             assert shared_output is None
             shared_output = self._apply_shared_experts(
                 hidden_states_clone,
