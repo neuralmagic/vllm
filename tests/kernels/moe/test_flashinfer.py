@@ -299,6 +299,7 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
                 moe_config=moe_config,
                 quant_config=quant_config,
             ),
+            inplace=False,
         )
 
         flashinfer_cutlass_output = kernel(
@@ -307,7 +308,6 @@ def test_flashinfer_cutlass_moe_fp8_no_graph(
             td.layer.w2_weight,
             topk_weights,
             topk_ids,
-            inplace=False,
             activation=activation,
             global_num_experts=e,
             expert_map=None,
