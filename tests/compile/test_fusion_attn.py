@@ -21,7 +21,7 @@ from tests.compile.fusion_test_utils import (
 from tests.utils import flat_product
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
-from vllm.compilation.passes.fusion.fusion_attn import ATTN_OP, AttnFusionPass
+from vllm.compilation.passes.fusion.attn_quant_fusion import ATTN_OP, AttnFusionPass
 from vllm.compilation.passes.fusion.matcher_utils import QUANT_OPS
 from vllm.compilation.passes.fx_utils import find_op_nodes
 from vllm.compilation.passes.utility.noop_elimination import NoOpEliminationPass
@@ -581,7 +581,7 @@ def test_attn_quant(
         run_model(compilation_config, model_name, **model_kwargs)
 
     log_matches = re.findall(
-        r"fusion_attn.py:\d+] Fused quant onto (\d+) attention nodes",
+        r"attn_quant_fusion.py:\d+] Fused quant onto (\d+) attention nodes",
         log_holder.text,
     )
     assert len(log_matches) == 1, log_holder.text
