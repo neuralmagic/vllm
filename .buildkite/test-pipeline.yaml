@@ -510,6 +510,7 @@ steps:
   # However, find does not normally propagate error codes, so we combine it with xargs
   # (using -0 for proper path handling)
   - "find compile/ -maxdepth 1 -name 'test_*.py' -print0 | xargs -0 -n1 -I{} pytest -s -v '{}'"
+  - pytest -s -v compile/passes --ignore compile/passes/distributed
 
 - label: PyTorch Fullgraph Smoke Test # 15min
   timeout_in_minutes: 30

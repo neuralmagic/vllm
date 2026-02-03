@@ -22,13 +22,12 @@ from tests.compile.fusion_test_utils import (
     is_blackwell,
     run_model,
 )
+from tests.utils import flat_product, multi_gpu_test
 from tests.v1.attention.utils import AttentionBackendEnum
 from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode, PassConfig
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.torch_utils import is_torch_equal_or_newer
-
-from ...utils import flat_product, multi_gpu_test
 
 
 @multi_gpu_test(num_gpus=2)
