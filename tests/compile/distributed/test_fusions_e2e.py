@@ -124,7 +124,7 @@ def test_tp2_attn_quant_allreduce_rmsnorm(
     assert all(int(log_match) == matches.attention_fusion for log_match in log_matches)
 
     log_matches = re.findall(
-        r"collective_fusion.py:\d+] Replaced (\d+) patterns",
+        r"allreduce_rms_fusion.py:\d+] Replaced (\d+) patterns",
         log_holder.text,
     )
     assert len(log_matches) == 2, log_holder.text
