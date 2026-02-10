@@ -114,7 +114,7 @@ __global__ void act_and_mul_quant_kernel(
 }
 
 __device__ __forceinline__ float silu(float x) {
-  return __fdividef(x, (1.f + expf(-x)));
+  return __fdividef(x, (1.f + __expf(-x)));
 }
 
 __device__ __forceinline__ float2 silu2(float2 x) {
