@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from vllm.model_executor.offloader.base import BaseOffloader
 from vllm.utils.platform_utils import is_pin_memory_available, is_uva_available
-from vllm.utils.torch_utils import get_cuda_view_from_cpu_tensor
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 
 class UVAOffloader(BaseOffloader):
@@ -77,7 +77,7 @@ class UVAOffloader(BaseOffloader):
             cpu_data.copy_(p.data)
             # keep the cpu data alive
             p._vllm_offloaded_cpu_data = cpu_data
-            p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+            p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
             self.cpu_offload_bytes += p.data.numel() * p.data.element_size()
 
         return module
