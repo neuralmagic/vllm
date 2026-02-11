@@ -485,12 +485,23 @@ class DefaultMoERunner(MoERunner):
                     router_logits=staged_router_logits,
                 )
 
+                # TODO(elvircrn): Verify this fix - shared_input must be chunked
+                # to match staged_hidden_states size. Without this, the MK's
+                # shared_experts operates on full batch (e.g. 8192 tokens) while
+                # routed experts operate on chunk (e.g. 256 tokens), causing
+                # tensor size mismatch in result storage. Bug was in upstream
+                # PR #32344.
+                chunked_shared_input = (
+                    shared_input[chunk_start:chunk_end, :]
+                    if shared_input is not None
+                    else None
+                )
                 final_hidden_states = self.quant_method.apply(
                     layer=layer,
                     x=staged_hidden_states,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
-                    shared_experts_input=shared_input,
+                    shared_experts_input=chunked_shared_input,
                 )
 
             if has_separate_shared_experts:
