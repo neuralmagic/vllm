@@ -67,6 +67,13 @@ class EplbCommunicator(ABC):
     Implementations provide P2P send/recv and execution semantics.
     """
 
+    def __init__(self, communication_config: EPLBCommunicationConfig) -> None:
+        self._communication_config = communication_config
+
+    @property
+    def communication_config(self) -> EPLBCommunicationConfig:
+        return self._communication_config
+
     @abstractmethod
     def add_send(self, tensor: torch.Tensor, dst_rank: int) -> None:
         pass
@@ -89,8 +96,10 @@ class TorchDistributedEplbCommunicator(EplbCommunicator):
     def __init__(
         self,
         ep_group: ProcessGroup,
+        communication_config: EPLBCommunicationConfig,
         cuda_stream: torch.cuda.Stream | None = None,
     ) -> None:
+        super().__init__(communication_config)
         self._ep_group = ep_group
         self._cuda_stream = cuda_stream
         self._p2p_ops: list[P2POp] = []
@@ -139,8 +148,10 @@ class PyNcclEplbCommunicator(EplbCommunicator):
     def __init__(
         self,
         pynccl_comm: PyNcclCommunicator,
+        communication_config: EPLBCommunicationConfig,
         cuda_stream: torch.cuda.Stream | None = None,
     ) -> None:
+        super().__init__(communication_config)
         self._pynccl_comm = pynccl_comm
         self._cuda_stream = cuda_stream
         # Track if group has been started
@@ -168,9 +179,10 @@ class PyNcclEplbCommunicator(EplbCommunicator):
 
 def create_eplb_communicator(
     ep_group: ProcessGroup,
-    backend: str,
+    communication_config: EPLBCommunicationConfig,
     expert_weights: Sequence[torch.Tensor],
 ) -> EplbCommunicator:
+    backend = communication_config.backend
     if backend == "pynccl":
         # Check if expert weights have dtypes supported by PyNccl
         try:
@@ -183,7 +195,9 @@ def create_eplb_communicator(
                 "unsupported dtype; falling back to torch.distributed. Error: %s",
                 str(e),
             )
-            return TorchDistributedEplbCommunicator(ep_group=ep_group)
+            return TorchDistributedEplbCommunicator(
+                ep_group=ep_group, communication_config=communication_config
+            )
 
         group_coordinator = get_ep_group()
         device_comm = group_coordinator.device_communicator
@@ -199,14 +213,19 @@ def create_eplb_communicator(
             )
         else:
             try:
-                return PyNcclEplbCommunicator(pynccl_comm=pynccl_comm)
+                return PyNcclEplbCommunicator(
+                    pynccl_comm=pynccl_comm,
+                    communication_config=communication_config,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to initialize PyNcclEplbCommunicator (%s); "
                     "falling back to torch.distributed.",
                     exc,
                 )
-    return TorchDistributedEplbCommunicator(ep_group=ep_group)
+    return TorchDistributedEplbCommunicator(
+        ep_group=ep_group, communication_config=communication_config
+    )
 
 
 # Type alias for the result of move_to_buffer or transfer_layer
@@ -575,7 +594,6 @@ def move_to_buffer(
     expert_weights_buffers: Sequence[torch.Tensor],
     cuda_stream: torch.cuda.Stream | None,
     ep_group: ProcessGroup,
-    communication_config: EPLBCommunicationConfig,
     communicator: EplbCommunicator,
 ) -> MoveToBufferResult:
     """
@@ -591,7 +609,6 @@ def move_to_buffer(
         expert_weights_buffers: Intermediate buffers (one per tensor).
         cuda_stream: CUDA stream for async copies (can be None for sync mode).
         ep_group: Distributed process group for expert parallel comms.
-        communication_config: Communication configuration for P2P operations.
         communicator: EplbCommunicator instance for P2P communication.
 
     Returns:
@@ -671,6 +688,7 @@ def move_to_buffer(
                     b[dst].copy_(w[src_local], non_blocking=True)
 
     # 2. Build communication plan (routing)
+    communication_config = communicator.communication_config
     comm_plan = _build_communication_plan(
         num_local_experts=num_local_experts,
         old_indices=old_indices,
@@ -812,7 +830,6 @@ async def transfer_layer(
     expert_weights: Sequence[torch.Tensor],
     expert_weights_buffer: Sequence[torch.Tensor],
     ep_group: ProcessGroup,
-    communication_config: EPLBCommunicationConfig,
     communicator: EplbCommunicator,
     is_profile: bool = False,
     cuda_stream: torch.cuda.Stream | None = None,
@@ -887,7 +904,6 @@ async def transfer_layer(
         expert_weights_buffers=expert_weights_buffer,
         cuda_stream=cuda_stream,
         ep_group=ep_group,
-        communication_config=communication_config,
         communicator=communicator,
     )
     return is_unchanged, is_received_locally, recv_metadata
@@ -898,7 +914,6 @@ def rearrange_expert_weights_inplace(
     new_global_expert_indices: torch.Tensor,
     expert_weights: Sequence[Sequence[torch.Tensor]],
     ep_group: ProcessGroup,
-    communication_config: EPLBCommunicationConfig,
     communicator: EplbCommunicator,
     is_profile: bool = False,
     rank_mapping: dict[int, int] | None = None,
@@ -922,7 +937,6 @@ def rearrange_expert_weights_inplace(
             This is used during profile run, where we only perform dummy
             communications to reserve enough memory for the buffers.
         rank_mapping: A dictionary mapping old rank to new rank.
-        communication_config: Communication configuration for P2P operations.
     """
     if rank_mapping is not None:
         if len(rank_mapping) == ep_group.size():
@@ -986,7 +1000,6 @@ def rearrange_expert_weights_inplace(
             expert_weights_buffers=weights_buffer,
             cuda_stream=None,
             ep_group=ep_group,
-            communication_config=communication_config,
             communicator=communicator,
         )
 

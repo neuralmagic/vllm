@@ -166,11 +166,6 @@ async def transfer_run_periodically(
                             cuda_stream.wait_event(model_state.buffer_consumed_event)
                             model_state.buffer_consumed_event = None
 
-                        comm_config = (
-                            state.parallel_config.eplb_config.get_communication_config(
-                                eplb_group.size()
-                            )
-                        )
                         (
                             model_state.is_unchanged,
                             model_state.is_received_locally,
@@ -181,7 +176,6 @@ async def transfer_run_periodically(
                             expert_weights=model_state.model.expert_weights[layer_idx],
                             expert_weights_buffer=model_state.expert_buffer,
                             ep_group=eplb_group,
-                            communication_config=comm_config,
                             communicator=model_state.communicator,
                             is_profile=is_profile,
                             cuda_stream=cuda_stream,

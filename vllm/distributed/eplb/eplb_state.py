@@ -528,25 +528,25 @@ class EplbState:
             logical_replica_count,
         )
 
+        # Get communication config based on EP size
+        comm_config = self.parallel_config.eplb_config.get_communication_config(
+            ep_group.size()
+        )
+
         # Create the communicator for this model
         communicator = create_eplb_communicator(
             ep_group=ep_group,
-            backend=self.parallel_config.eplb_config.communicator,
+            communication_config=comm_config,
             expert_weights=model.expert_weights[0],
         )
 
         if global_expert_load is not None:
-            # Get communication config based on EP size
-            comm_config = self.parallel_config.eplb_config.get_communication_config(
-                ep_group.size()
-            )
             rearrange_expert_weights_inplace(
                 old_global_expert_indices,
                 new_physical_to_logical_map,
                 model.expert_weights,
                 ep_group,
                 communicator,
-                comm_config,
                 is_profile=False,
                 rank_mapping=rank_mapping,
             )
@@ -864,10 +864,6 @@ class EplbState:
                     eplb_model_state.physical_to_logical_map,
                 )
 
-                # Get eplb communication config
-                comm_config = self.parallel_config.eplb_config.get_communication_config(
-                    ep_group.size()
-                )
                 # Update expert weights
                 rearrange_expert_weights_inplace(
                     eplb_model_state.physical_to_logical_map,
@@ -875,7 +871,6 @@ class EplbState:
                     eplb_model_state.model.expert_weights,
                     ep_group,
                     eplb_model_state.communicator,
-                    comm_config,
                     is_profile=is_profile,
                     rank_mapping=rank_mapping,
                 )

@@ -298,11 +298,12 @@ def _test_async_transfer_layer_without_mtp_worker(
     comm_config = EPLBCommunicationConfig(
         num_groups=1,
         experts_batch_size=None,
+        backend=eplb_communicator,
     )
 
     communicator = create_eplb_communicator(
         ep_group=ep_group,
-        backend=eplb_communicator,
+        communication_config=comm_config,
         expert_weights=expert_weights[0],
     )
     communicator.set_stream(cuda_stream)
@@ -315,7 +316,6 @@ def _test_async_transfer_layer_without_mtp_worker(
                 expert_weights=expert_weights[layer_idx],
                 expert_weights_buffer=expert_buffer,
                 ep_group=ep_group,
-                communication_config=comm_config,
                 communicator=communicator,
                 cuda_stream=cuda_stream,
             )
@@ -402,11 +402,12 @@ def _test_rearrange_expert_weights_with_redundancy(
     comm_config = EPLBCommunicationConfig(
         num_groups=1,
         experts_batch_size=None,
+        backend=eplb_communicator,
     )
 
     communicator = create_eplb_communicator(
         ep_group=ep_group,
-        backend=eplb_communicator,
+        communication_config=comm_config,
         expert_weights=expert_weights[0],
     )
 
@@ -416,7 +417,6 @@ def _test_rearrange_expert_weights_with_redundancy(
         new_indices,
         expert_weights,
         ep_group,
-        comm_config,
         communicator,
         is_profile=False,
     )
@@ -537,11 +537,12 @@ def _test_rearrange_with_communication_config(
     comm_config = EPLBCommunicationConfig(
         num_groups=num_communication_groups,
         experts_batch_size=communication_experts_batch_size,
+        backend=eplb_communicator,
     )
 
     communicator = create_eplb_communicator(
         ep_group=ep_group,
-        backend=eplb_communicator,
+        communication_config=comm_config,
         expert_weights=expert_weights[0],
     )
 
@@ -551,7 +552,6 @@ def _test_rearrange_with_communication_config(
         new_indices,
         expert_weights,
         ep_group,
-        comm_config,
         communicator,
         is_profile=False,
         rank_mapping=None,
@@ -660,16 +660,17 @@ def _test_rearrange_expert_weights_no_change(
             layer_copy.append(weight.clone())
         original_weights.append(layer_copy)
 
-    communicator = create_eplb_communicator(
-        ep_group=ep_group,
-        backend=eplb_communicator,
-        expert_weights=expert_weights[0],
-    )
-
     # Create default communication config
     comm_config = EPLBCommunicationConfig(
         num_groups=1,
         experts_batch_size=None,
+        backend=eplb_communicator,
+    )
+
+    communicator = create_eplb_communicator(
+        ep_group=ep_group,
+        communication_config=comm_config,
+        expert_weights=expert_weights[0],
     )
 
     # Execute rearrangement (should be no change)
@@ -678,7 +679,6 @@ def _test_rearrange_expert_weights_no_change(
         indices,  # Same indices
         expert_weights,
         ep_group,
-        comm_config,
         communicator,
         is_profile=False,
     )
@@ -787,11 +787,12 @@ def _test_rearrange_expert_weights_profile_mode(env, world_size) -> None:
     comm_config = EPLBCommunicationConfig(
         num_groups=1,
         experts_batch_size=None,
+        backend="torch",
     )
 
     communicator = create_eplb_communicator(
         ep_group=ep_group,
-        backend="torch",
+        communication_config=comm_config,
         expert_weights=expert_weights[0],
     )
 
@@ -801,7 +802,6 @@ def _test_rearrange_expert_weights_profile_mode(env, world_size) -> None:
         new_indices,
         expert_weights,
         ep_group,
-        comm_config,
         communicator,
         is_profile=True,  # Profile mode
     )

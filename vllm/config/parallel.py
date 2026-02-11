@@ -64,6 +64,13 @@ class EPLBCommunicationConfig:
     The actual number of P2P operations will be experts_batch_size * num_weight_tensors.
     """
 
+    backend: "EPLBCommunicatorBackend"
+    """
+    Backend for EPLB expert weight communication:
+    - "torch": Use torch.distributed
+    - "pynccl": Use PyNccl send/recv
+    """
+
 
 @config
 class EPLBConfig:
@@ -183,6 +190,7 @@ class EPLBConfig:
         return EPLBCommunicationConfig(
             num_groups=num_groups,
             experts_batch_size=experts_batch_size,
+            backend=self.communicator,
         )
 
 
