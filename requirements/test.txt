@@ -501,7 +501,7 @@ mdurl==0.1.2
     # via markdown-it-py
 mistral-common==1.9.0
     # via -r requirements/test.in
-mlflow==2.22.0
+mlflow==3.5.0
     # via terratorch
 mlflow-skinny==2.22.0
     # via mlflow
