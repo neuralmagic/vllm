@@ -6,6 +6,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.offloader.base import get_offloader
 from vllm.v1.attention.backend import AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -76,8 +77,17 @@ class EagleCudaGraphManager:
         # Capture the graph.
         assert num_tokens not in self.graphs
         graph = torch.cuda.CUDAGraph()
+
+        # Sync offloader's copy stream before capture.
+        # Ensure any pre-capture prefetches from offloader are complete.
+        get_offloader().sync_prev_onload()
+
         with torch.cuda.graph(graph, self.pool):
-            generate_fn(num_tokens, attn_metadata, slot_mappings, num_tokens_across_dp)
+            generate_fn(num_tokens, attn_metadata, num_tokens_across_dp)
+            # Join offloader's copy stream after forward to avoid unjoined
+            # stream error. The last layer's start_prefetch forks copy_stream,
+            # but wait_prefetch only happens in the next forward pass.
+            get_offloader().join_after_forward()
         self.graphs[num_tokens] = graph
 
     @torch.inference_mode()
@@ -102,4 +112,7 @@ class EagleCudaGraphManager:
 
     def run(self, num_tokens: int) -> None:
         assert num_tokens in self.graphs
+        # Sync offloader before replay - ensures any external dependencies
+        # from pre-capture prefetches are satisfied.
+        get_offloader().sync_prev_onload()
         self.graphs[num_tokens].replay()
