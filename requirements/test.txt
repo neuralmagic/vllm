@@ -941,7 +941,7 @@ rasterio==1.4.3
     #   rioxarray
     #   terratorch
     #   torchgeo
-ray==2.48.0
+ray==2.52.0
     # via -r requirements/test.in
 redis==5.2.0
     # via tensorizer
