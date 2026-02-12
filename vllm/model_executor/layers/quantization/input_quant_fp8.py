@@ -19,6 +19,10 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
+from vllm.logger import init_logger
+
+
+logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 _FP8_MIN, _FP8_MAX = get_fp8_min_max()
@@ -94,6 +98,7 @@ class QuantFP8(CustomOp):
             and self.use_deep_gemm_supported
             and (DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0)
         ):
+            logger.info("ASDFASDFASDF per_token_group_quant_fp8_packed_for_deepgemm")
             return fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
                 x,
                 group_size=self.group_size,
@@ -103,6 +108,7 @@ class QuantFP8(CustomOp):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
 
+            logger.info("ASDFASDFASDF per_token_group_quant_fp8")
             return fp8_utils.per_token_group_quant_fp8(
                 x,
                 group_size=self.group_size,
@@ -119,6 +125,7 @@ class QuantFP8(CustomOp):
             and scale_ub.numel() == 1
         )
 
+        logger.info("ASDFASDFASDF scaled_fp8_quant")
         return ops.scaled_fp8_quant(
             x,
             scale,

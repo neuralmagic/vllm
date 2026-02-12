@@ -802,6 +802,28 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return True
         return False
 
+    @property
+    def weight_block_size(self) -> list[int] | None:
+        """
+        Extract the weight block size from the quantization schemes.
+        This property is needed for the _maybe_allow_fp8_block_shape_mismatch()
+        method in linear.py to properly handle non-divisible block sizes.
+
+        Returns:
+            The block structure [block_n, block_k] if any scheme uses block
+            quantization, otherwise None.
+        """
+        for scheme in self.target_scheme_map.values():
+            weight_quant = scheme.get("weights")
+            if (
+                weight_quant is not None
+                and weight_quant.strategy == QuantizationStrategy.BLOCK
+                and hasattr(weight_quant, "block_structure")
+                and weight_quant.block_structure is not None
+            ):
+                return weight_quant.block_structure
+        return None
+
     @staticmethod
     def supports_cutlass_24(
         weight_quant: QuantizationArgs | None,
