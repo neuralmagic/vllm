@@ -956,7 +956,7 @@ regex==2024.9.11
     #   sacrebleu
     #   tiktoken
     #   transformers
-requests==2.32.3
+requests==2.32.4
     # via
     #   buildkite-test-collector
     #   databricks-sdk
