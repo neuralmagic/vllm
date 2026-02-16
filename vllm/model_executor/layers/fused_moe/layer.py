@@ -1379,8 +1379,18 @@ class FusedMoE(CustomOp):
         weights = list(self.named_parameters())
         weights = [(name, _maybe_make_contiguous(name, p)) for name, p in weights]
 
+        # Weaker than is_contiguous(): accepts any tensor whose data lies
+        # within a contiguous range of storage (allows broadcast views,
+        # sliced first dims, permutations).  Mirrors the check in
+        # csrc/custom_all_reduce.cu::_is_weak_contiguous.
+        def _is_weak_contiguous(t: torch.Tensor) -> bool:
+            return t.is_contiguous() or (
+                t.storage().nbytes() - t.storage_offset() * t.element_size()
+                == t.numel() * t.element_size()
+            )
+
         assert all(
-            weight.is_contiguous()
+            _is_weak_contiguous(weight)
             for name, weight in weights
             if not (name.startswith("_shared_experts.") or name.startswith("_gate."))
         )
@@ -1393,7 +1403,7 @@ class FusedMoE(CustomOp):
         }
 
         return [
-            weight.view(self.local_num_experts, -1)
+            weight.contiguous().view(self.local_num_experts, -1)
             for name, weight in weights
             if name not in NON_EXPERT_WEIGHTS
             and weight.shape != torch.Size([])
