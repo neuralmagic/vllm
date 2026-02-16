@@ -505,10 +505,13 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         w13, w13_scale = reorder_w1w3_to_w3w1(w13, w13_scale)
 
     # For some FI kernels, the input scales are shared by all experts.
+    # .contiguous() is needed because .expand() creates a stride-0 broadcast
+    # view, which fails the contiguity assertion in EPLB's get_expert_weights().
+    # EPLB transfers raw memory between ranks, so tensors must be contiguous.
     if is_global_sf_supported_for_nvfp4_backend(backend):
         num_experts = w13.shape[0]
-        a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
-        a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
+        a13_scale = a13_scale.max().to(torch.float32).expand(num_experts).contiguous()
+        a2_scale = a2_scale.max().to(torch.float32).expand(num_experts).contiguous()
     else:
         a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
 
