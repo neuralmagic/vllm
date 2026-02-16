@@ -1380,17 +1380,24 @@ class FusedMoE(CustomOp):
         weights = [(name, _maybe_make_contiguous(name, p)) for name, p in weights]
 
         # Weaker than is_contiguous(): accepts any tensor whose data lies
-        # within a contiguous range of storage (allows broadcast views,
-        # sliced first dims, permutations).  Mirrors the check in
-        # csrc/custom_all_reduce.cu::_is_weak_contiguous.
+        # within a contiguous range of storage (allows sliced first dims,
+        # permutations).  Mirrors csrc/custom_all_reduce.cu.
         def _is_weak_contiguous(t: torch.Tensor) -> bool:
             return t.is_contiguous() or (
-                t.storage().nbytes() - t.storage_offset() * t.element_size()
+                t.untyped_storage().nbytes()
+                - t.storage_offset() * t.element_size()
                 == t.numel() * t.element_size()
             )
 
+        # Broadcast views (stride 0) are created by .expand() for global
+        # per-tensor scales shared across all experts (e.g. NVFP4 activation
+        # scales). These are safe for EPLB: the same scalar is replicated to
+        # every expert, so raw memory transfer produces correct results.
+        def _is_broadcast(t: torch.Tensor) -> bool:
+            return sum(t.stride()) == 0
+
         assert all(
-            _is_weak_contiguous(weight)
+            _is_weak_contiguous(weight) or _is_broadcast(weight)
             for name, weight in weights
             if not (name.startswith("_shared_experts.") or name.startswith("_gate."))
         )
