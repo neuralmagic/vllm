@@ -1595,7 +1595,7 @@ class SpecDecodeBaseProposer:
                 kv_cache_spec = group.kv_cache_spec
                 break
 
-        attention_groups: dict[str, AttentionGroup] = {}
+        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
         if kv_cache_spec is not None:
             for layer_name in self._draft_attn_layer_names:
                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
