@@ -44,7 +44,7 @@ COLUMN_MAJOR_SCALES = [True, False]
 TMA_ALIGNED_SCALES = [True, False]
 M = [1, 7, 8, 83, 84, 4096]
 N = [128, 512, 7168, 7748, 13824]
-K = [10994]
+K = [256, 3884, 4096, 13824, 16384]
 # Deepseek-V3's intermediate size 18432, so N is 18432*2/8=4608 at TP8
 # and its hidden size is 7168.
 BLOCK_SIZE = [[128, 128]]
@@ -142,7 +142,7 @@ def test_w8a8_block_fp8_cutlass_matmul():
     # like in DSV3 kv_a_proj_with_mqa
     M = 32
     N = 576
-    K = 10944
+    K = 7168
     block_size = [128, 128]
     out_dtype = torch.bfloat16
     seed = 0
@@ -174,11 +174,6 @@ def test_w8a8_block_fp8_cutlass_matmul():
     )
 
     ref_out = native_w8a8_block_matmul(A_fp8, B_fp8, As, Bs, block_size, out_dtype)
-    print(f"qx {A_fp8_cutlass.shape}")
-    print(f"weight {B_fp8.shape}")
-    print(f"x_scale {As_cutlass.shape}")
-    print(f"weight_scale {Bs_cutlass.shape}")
-    print(f"block_size {block_size}")
     out = cutlass_scaled_mm(
         A_fp8_cutlass, B_fp8, As_cutlass, Bs_cutlass, block_size, out_dtype
     )
@@ -225,9 +220,10 @@ def test_w8a8_block_fp8_deep_gemm_matmul(M, N, K, block_size, out_dtype, seed):
 
     out = torch.zeros((M, N), device="cuda", dtype=out_dtype)
 
-    assert As_fp8.shape == (M, (K + 127) // 128), (
-        f"{As_fp8.shape} != {(M, (K + 127) // 128)}"
-    )
+    assert As_fp8.shape == (
+        M,
+        (K + 127) // 128,
+    ), f"{As_fp8.shape} != {(M, (K + 127) // 128)}"
 
     fp8_gemm_nt((A_fp8, As_fp8), (B_fp8, Bs_fp8), out)
 

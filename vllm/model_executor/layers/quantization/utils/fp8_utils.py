@@ -559,22 +559,22 @@ class W8A8BlockFp8LinearOp:
         ],
         QuantFP8,
     ]:
-        # if use_cutlass:
-        #     return self._run_cutlass, (
-        #         QuantFP8(
-        #             False,
-        #             self.act_quant_group_shape,
-        #             column_major_scales=True,
-        #             use_ue8m0=False,
-        #         )
-        #     )
-        # if use_aiter_and_is_supported:
-        #     return self._run_aiter, QuantFP8(
-        #         False,
-        #         self.act_quant_group_shape,
-        #         column_major_scales=False,
-        #         use_ue8m0=False,
-        #     )
+        if use_cutlass:
+            return self._run_cutlass, (
+                QuantFP8(
+                    False,
+                    self.act_quant_group_shape,
+                    column_major_scales=True,
+                    use_ue8m0=False,
+                )
+            )
+        if use_aiter_and_is_supported:
+            return self._run_aiter, QuantFP8(
+                False,
+                self.act_quant_group_shape,
+                column_major_scales=False,
+                use_ue8m0=False,
+            )
         return self._run_triton, (
             QuantFP8(
                 False,
@@ -883,10 +883,10 @@ def per_token_group_quant_fp8(
     if use_ue8m0 is None:
         use_ue8m0 = is_deep_gemm_e8m0_used()
     dtype = current_platform.fp8_dtype() if dtype is None else dtype
-    # assert x.shape[-1] % group_size == 0, (
-    #     f"the last dimension of `x` {x.shape[-1]} must be divisible "
-    #     f"by `group_size` {group_size}"
-    # )
+    assert x.shape[-1] % group_size == 0, (
+        f"the last dimension of `x` {x.shape[-1]} must be divisible "
+        f"by `group_size` {group_size}"
+    )
     assert x.stride(-1) == 1, "`x` groups must be contiguous"
 
     fp8_min, fp8_max = get_fp8_min_max()
@@ -1198,7 +1198,7 @@ def w8a8_triton_block_scaled_mm(
 
     assert A.shape[-1] == B.shape[-1]
     assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
-    # assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     M = A.numel() // A.shape[-1]
 
     assert B.ndim == 2 and Bs.ndim == 2

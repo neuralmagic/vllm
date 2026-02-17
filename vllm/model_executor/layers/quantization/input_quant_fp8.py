@@ -6,7 +6,6 @@ import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -20,8 +19,6 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
-
-logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 _FP8_MIN, _FP8_MAX = get_fp8_min_max()
@@ -128,9 +125,9 @@ class QuantFP8(CustomOp):
             num_token_padding=self.num_token_padding,
             scale_ub=scale_ub,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
-            group_shape=(
-                (self.group_shape.row, self.group_shape.col) if self.static else None
-            ),
+            group_shape=(self.group_shape.row, self.group_shape.col)
+            if self.static
+            else None,
         )
 
     def forward_hip(
