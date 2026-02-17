@@ -1613,18 +1613,18 @@ class SpecDecodeBaseProposer:
                         and self.kv_cache_gid < len(kernel_block_sizes)
                         else None
                     )
-                    group = AttentionGroup(
+                    attn_group = AttentionGroup(
                         backend=attn_backend,
                         layer_names=[layer_name],
                         kv_cache_spec=layer_kv_cache_spec,
                         kv_cache_group_id=self.kv_cache_gid,
                     )
-                    group.create_metadata_builders(
+                    attn_group.create_metadata_builders(
                         self.vllm_config,
                         self.device,
                         kernel_block_size=kernel_block_size,
                     )
-                    attention_groups[backend_key] = group
+                    attention_groups[backend_key] = attn_group
                 else:
                     attention_groups[backend_key].layer_names.append(layer_name)
 
