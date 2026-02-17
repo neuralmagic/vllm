@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -19,8 +20,6 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
-from vllm.logger import init_logger
-
 
 logger = init_logger(__name__)
 
@@ -98,7 +97,6 @@ class QuantFP8(CustomOp):
             and self.use_deep_gemm_supported
             and (DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0)
         ):
-            logger.info("ASDFASDFASDF per_token_group_quant_fp8_packed_for_deepgemm")
             return fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
                 x,
                 group_size=self.group_size,
@@ -108,7 +106,6 @@ class QuantFP8(CustomOp):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
 
-            logger.info("ASDFASDFASDF per_token_group_quant_fp8")
             return fp8_utils.per_token_group_quant_fp8(
                 x,
                 group_size=self.group_size,
@@ -125,16 +122,15 @@ class QuantFP8(CustomOp):
             and scale_ub.numel() == 1
         )
 
-        logger.info("ASDFASDFASDF scaled_fp8_quant")
         return ops.scaled_fp8_quant(
             x,
             scale,
             num_token_padding=self.num_token_padding,
             scale_ub=scale_ub,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
-            group_shape=(self.group_shape.row, self.group_shape.col)
-            if self.static
-            else None,
+            group_shape=(
+                (self.group_shape.row, self.group_shape.col) if self.static else None
+            ),
         )
 
     def forward_hip(

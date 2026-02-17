@@ -143,16 +143,6 @@ def _padded_cutlass(
         )
         return output[0 : qx.shape[0], ...]
     else:
-        # if x_scale.shape[1] != weight_scale.shape[1]:
-        #     x_scale = torch.nn.functional.pad(
-        #         x_scale, 
-        #         (0, weight_scale.shape[1]-x_scale.shape[1])
-        #     )
-        logger.info(f"qx {qx.shape}")
-        logger.info(f"weight {weight.shape}")
-        logger.info(f"x_scale {x_scale.shape}")
-        logger.info(f"weight_scale {weight_scale.shape}")
-        logger.info(f"block_size {block_size}")
         return cutlass_scaled_mm(
             qx, weight, x_scale, weight_scale, block_size, output_dtype
         )
@@ -394,7 +384,6 @@ class W8A8BlockFp8LinearOp:
             if self.is_deep_gemm_supported
             else None
         )
-        logger.info(f"AAAAA DEEPGEMMM INPUT QUANT OP {self.deepgemm_input_quant_op}")
 
     def apply(
         self,
@@ -457,7 +446,6 @@ class W8A8BlockFp8LinearOp:
     ) -> torch.Tensor:
         assert input_scale is None
         assert self.input_quant_op is not None
-        logger.warning(f"ASDFASDFASDF ishopper {self.is_hopper}")
         q_input, input_scale = self.input_quant_op(input_2d)
         if self.is_hopper:
             return torch.ops.vllm.padded_cutlass(
