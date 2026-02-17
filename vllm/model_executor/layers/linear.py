@@ -77,10 +77,10 @@ def adjust_marlin_shard(param, shard_size, shard_offset):
 def adjust_block_scale_shard(weight_block_size, shard_size, shard_offset):
     assert weight_block_size is not None
     block_n = weight_block_size[0]
-    scale_offset = (shard_offset + block_n - 1) // block_n
-    scale_end = (shard_offset + shard_size + block_n - 1) // block_n
-    scale_size = scale_end - scale_offset
-    return scale_size, scale_offset
+    shard_offset = (shard_offset + block_n - 1) // block_n
+    shard_end = (shard_offset + shard_size + block_n - 1) // block_n
+    shard_size = shard_end - shard_offset
+    return shard_size, shard_offset
 
 
 def adjust_bitsandbytes_4bit_shard(
