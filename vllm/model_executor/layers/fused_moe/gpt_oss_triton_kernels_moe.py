@@ -191,14 +191,26 @@ def triton_kernel_moe_forward(
         logits = gating_output
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
-        sparse_logits = topk_fn(logits, topk, apply_softmax=not sm_first)
-        # sparse_logits.indx contains global expert IDs – remap to local.
-        topk_ids = expert_map[sparse_logits.indx.to(torch.long)]
-        topk_weights = sparse_logits.vals
-        local_num_experts = w1.size(0)
-        routing_data, gather_idx, scatter_idx = make_routing_data(
-            topk_ids, topk_weights, local_num_experts
-        )
+        
+
+        local_num_experts = w1.shape[0]
+        if not current_platform.is_rocm():
+            sparse_logits = topk_fn(logits, topk, apply_softmax=not sm_first)
+            # sparse_logits.indx contains global expert IDs – remap to local.
+            topk_ids = expert_map[sparse_logits.indx.to(torch.long)]
+            topk_weights = sparse_logits.vals
+            routing_data, gather_idx, scatter_idx = make_routing_data(
+                topk_ids, topk_weights, local_num_experts)
+        else:
+            # rocm
+            topk_ids, topk_weights, bitmatrix = topk_fn(logits, topk, apply_softmax=not sm_first)
+            topk_ids = expert_map[topk_ids.to(torch.long)]
+            # matmul_ogs expects invalid topk_weights to be -1s
+            topk_weights = torch.where(topk_ids == -1, -1.0, topk_weights)
+            routing_data, gather_idx, scatter_idx = legacy_routing_from_bitmatrix(
+                bitmatrix, topk_weights, topk_ids, local_num_experts, topk
+            )
+
         # expert_map already applied; pass None downstream.
         effective_expert_map = None
         effective_global_num_experts = local_num_experts
