@@ -220,10 +220,9 @@ def test_w8a8_block_fp8_deep_gemm_matmul(M, N, K, block_size, out_dtype, seed):
 
     out = torch.zeros((M, N), device="cuda", dtype=out_dtype)
 
-    assert As_fp8.shape == (
-        M,
-        (K + 127) // 128,
-    ), f"{As_fp8.shape} != {(M, (K + 127) // 128)}"
+    assert As_fp8.shape == (M, (K + 127) // 128), (
+        f"{As_fp8.shape} != {(M, (K + 127) // 128)}"
+    )
 
     fp8_gemm_nt((A_fp8, As_fp8), (B_fp8, Bs_fp8), out)
 
