@@ -5440,7 +5440,7 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
-            self.drafter.initialize_attn_backend(kv_cache_config)
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def _check_and_update_cudagraph_mode(
         self,
