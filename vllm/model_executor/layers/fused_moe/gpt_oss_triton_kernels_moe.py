@@ -194,7 +194,7 @@ def triton_kernel_moe_forward(
         
 
         local_num_experts = w1.shape[0]
-        if not current_platform.is_rocm():
+        if not current_platform.is_rocm() and False:
             sparse_logits = topk_fn(logits, topk, apply_softmax=not sm_first)
             # sparse_logits.indx contains global expert IDs – remap to local.
             topk_ids = expert_map[sparse_logits.indx.to(torch.long)]
