@@ -212,15 +212,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if self.vllm_config.speculative_config
             else 0
         )
-        # Now deepgemm fp8_paged_mqa_logits does not support next_n > 2
-        self.reorder_batch_threshold += min(self.num_speculative_tokens, 1)
+        self.reorder_batch_threshold += self.num_speculative_tokens
 
         props = torch.cuda.get_device_properties(self.device)
         sm_count = props.multi_processor_count
         self.num_sms = sm_count
 
         self.decode_lens_buffer = torch.empty(
-            (scheduler_config.max_num_seqs,), dtype=torch.int32, device=self.device
+            (scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=self.device,
         )
 
         # See: DeepGMM/csrc/apis/attention.hpp
@@ -322,29 +323,65 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # Use CPU to avoid GPU sync; breaking async scheduling
             requires_padding = (decode_lens_cpu.max() > decode_lens_cpu.min()).item()
 
-            # Decide which top-k kernel to use based on batch size and sequence length
-            batch_size = num_decodes
-            _is_large_context = common_attn_metadata.max_seq_len > 8192
-
-            # Decision logic based on micro-benchmark results:
-            # - large_context_topk wins for batch <= 128 and seq_len > 8K
-            # - top_k_per_row_decode wins for batch > 128 or seq_len <= 8K
-            use_large_context_topk = batch_size <= 128 and _is_large_context
-
-            next_n = 1 + self.num_speculative_tokens
-            if next_n > 1:
-                offsets = torch.arange(next_n, device=self.device, dtype=torch.int32)
-            else:
-                offsets = None
-
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+            block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+
+            max_decode_len = int(decode_lens_cpu.max().item())
+            if max_decode_len > 2:
+                # fp8_paged_mqa_logits does not support next_n > 2.
+                # Flatten multi-token decode requests into single-token
+                # batch entries, expanding seq_lens and block tables so
+                # the kernel always sees next_n=1.
+                #
+                # For request i with seq_len=S, decode_len=L, create L
+                # entries with seqlens [S-L+1, S-L+2, ..., S].
+                expanded_base = torch.repeat_interleave(
+                    seq_lens - decode_lens, decode_lens
+                )
+                cumsum = torch.cumsum(decode_lens, dim=0, dtype=torch.int32)
+                starts = torch.zeros_like(cumsum)
+                starts[1:] = cumsum[:-1]
+                expanded_starts = torch.repeat_interleave(starts, decode_lens)
+                positions_within = (
+                    torch.arange(
+                        num_decode_tokens,
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                    - expanded_starts
+                )
+                seq_lens = expanded_base + positions_within + 1
+
+                block_table = torch.repeat_interleave(block_table, decode_lens, dim=0)
+
+                self.decode_lens_buffer[:num_decode_tokens] = 1
+                decode_lens = self.decode_lens_buffer[:num_decode_tokens]
+                requires_padding = False
+                offsets = None
+                batch_size = num_decode_tokens
+            else:
+                next_n = 1 + self.num_speculative_tokens
+                if next_n > 1:
+                    offsets = torch.arange(
+                        next_n, device=self.device, dtype=torch.int32
+                    )
+                else:
+                    offsets = None
+                batch_size = num_decodes
+
             if is_deep_gemm_supported():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
-                    seq_lens, self.kv_cache_spec.block_size, self.num_sms
+                    seq_lens,
+                    self.kv_cache_spec.block_size,
+                    self.num_sms,
                 )
+
+            _is_large_context = common_attn_metadata.max_seq_len > 8192
+            use_large_context_topk = batch_size <= 128 and _is_large_context
+
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
-                block_table=common_attn_metadata.block_table_tensor[:num_decodes, ...],
-                seq_lens=common_attn_metadata.seq_lens[:num_decodes],
+                block_table=block_table,
+                seq_lens=seq_lens,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
