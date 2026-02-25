@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:7.1.1-complete
+ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:7.2-complete
 ARG TRITON_BRANCH="v3.6.0"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG PYTORCH_BRANCH="v2.10.0"
@@ -21,10 +21,10 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
 ARG SCCACHE_REGION_NAME=us-west-2
 ARG SCCACHE_S3_NO_CREDENTIALS=0
-ARG ROCM_VERSION=7.1
+ARG ROCM_VERSION=7.2
 
 FROM ${BASE_IMAGE} AS base
-ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/test/rocm7.1
+ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/test/rocm7.2
 ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV ROCM_PATH=/opt/rocm
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
@@ -111,7 +111,7 @@ ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ####
 FROM base AS build_triton
 RUN mkdir -p /app/install
-RUN pip wheel triton==3.6.0 triton-rocm==3.6.0  --wheel-dir=/app/install --extra-index-url https://download.pytorch.org/whl/test/rocm7.1
+RUN pip wheel triton==3.6.0 triton-rocm==3.6.0  --wheel-dir=/app/install --extra-index-url https://download.pytorch.org/whl/test/rocm7.2
 
 
 #ARG TRITON_BRANCH
@@ -147,7 +147,7 @@ ARG PYTORCH_VISION_REPO
 ARG PYTORCH_AUDIO_REPO
 ARG USE_SCCACHE
 RUN mkdir -p /app/install
-RUN pip wheel torch==2.10.0+rocm7.1 torchvision==0.25.0+rocm7.1 torchaudio==2.10.0+rocm7.1 --index-url https://download.pytorch.org/whl/test/rocm7.1  --wheel-dir=/app/install 
+RUN pip wheel torch==2.10.0+rocm7.2 torchvision==0.25.0+rocm7.2 torchaudio==2.10.0+rocm7.2 --index-url https://download.pytorch.org/whl/test/rocm7.2  --wheel-dir=/app/install 
 
 #RUN git clone ${PYTORCH_REPO} pytorch
 #RUN cd pytorch && git checkout ${PYTORCH_BRANCH} \
