@@ -492,22 +492,9 @@ def maybe_override_with_speculators(
     vllm_speculative_config: dict[str, Any] | None = None,
     **kwargs,
 ) -> tuple[str, str | None, dict[str, Any] | None]:
-    """
-    Resolve model configuration when speculators are detected.
-
-    Checks if the provided model is a speculators model and if so, extracts
-    the target model configuration and builds the speculative config.
-
-    Args:
-        model: Model name or path
-        tokenizer: Tokenizer name or path
-        trust_remote_code: Whether to trust remote code
-        revision: Model revision
-        vllm_speculative_config: Existing vLLM speculative config
-
-    Returns:
-        Tuple of (resolved_model, resolved_tokenizer, speculative_config)
-    """
+    """If `model` is a speculators checkpoint, swap in the verifier as the
+    main model and return a populated speculative_config. Otherwise returns
+    the arguments unchanged."""
     if check_gguf_file(model):
         kwargs["gguf_file"] = Path(model).name
         gguf_model_repo = Path(model).parent
@@ -526,20 +513,15 @@ def maybe_override_with_speculators(
     speculators_config = config_dict.get("speculators_config")
 
     if speculators_config is None:
-        # No speculators config found, return original values
         return model, tokenizer, vllm_speculative_config
 
-    # Speculators format detected - process overrides
     from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 
     speculative_config = SpeculatorsConfig.extract_vllm_speculative_config(
         config_dict=config_dict
     )
-
-    # Set the draft model to the speculators model
     speculative_config["model"] = model
 
-    # Override model and tokenizer with the verifier model from config
     verifier_model = speculators_config["verifier"]["name_or_path"]
     model = tokenizer = verifier_model
 
