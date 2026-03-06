@@ -501,6 +501,9 @@ class SpeculativeConfig:
                         )
                 elif self.method == "draft_model":
                     pass
+                elif self.method == "mtp":
+                    # Method was set explicitly or via speculators config; trust it.
+                    pass
                 else:
                     raise NotImplementedError(
                         f"Unsupported speculative method: '{self.method}'"

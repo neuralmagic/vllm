@@ -39,3 +39,41 @@ def update_eagle3(config_dict: dict, pre_trained_config: dict) -> None:
         pre_trained_config["eagle_aux_hidden_state_layer_ids"] = config_dict[
             "eagle_aux_hidden_state_layer_ids"
         ]
+
+
+@register_speculator("mtp")
+def update_mtp(config_dict: dict, pre_trained_config: dict) -> None:
+    """Apply MTP-specific config fields for standalone speculators MTP checkpoints.
+
+    hf_config_override() uses architectures[0] (MiMo) or model_type (Qwen3-Next)
+    to remap to the vLLM MTP model type, so both must be correctly populated.
+    n_predict is consumed by SpeculativeConfig to set num_speculative_tokens.
+    num_nextn_predict_layers is consumed by the MTP model constructors.
+    """
+    # Set architectures from verifier so hf_config_override detects the right MTP type:
+    #   "MiMoForCausalLM"     → mimo_mtp (num_hidden_layers also set to 0)
+    #   "Qwen3MoeForCausalLM" → model_type="qwen3_next" (already in pre_trained_config)
+    #                           → qwen3_next_mtp
+    verifier_archs = (
+        config_dict.get("speculators_config", {})
+        .get("verifier", {})
+        .get("architectures", [])
+    )
+    if verifier_archs:
+        pre_trained_config["architectures"] = verifier_archs
+
+    # Number of MTP layers — consumed by MiMoMultiTokenPredictor
+    # and Qwen3NextMultiTokenPredictor.
+    pre_trained_config.setdefault(
+        "num_nextn_predict_layers", config_dict.get("num_nextn_predict_layers", 1)
+    )
+
+    # n_predict — consumed by SpeculativeConfig to derive num_speculative_tokens
+    # when not explicitly provided.
+    proposal_methods = config_dict.get("speculators_config", {}).get(
+        "proposal_methods", []
+    )
+    if proposal_methods:
+        pre_trained_config["n_predict"] = proposal_methods[0].get(
+            "speculative_tokens", pre_trained_config.get("num_nextn_predict_layers", 1)
+        )

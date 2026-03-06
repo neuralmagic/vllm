@@ -72,8 +72,8 @@ class MiMoMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         spec_step_index: int = 0,
     ) -> torch.Tensor:
-        assert inputs_embeds is not None
-        # masking inputs at position 0, as not needed by MTP
+        # Position 0 tokens are not used by MTP; zero them out to avoid
+        # leaking information across unrelated sequences in the batch.
         inputs_embeds[positions == 0] = 0
         inputs_embeds = self.token_layernorm(inputs_embeds)
         previous_hidden_states = self.hidden_layernorm(previous_hidden_states)
@@ -146,9 +146,7 @@ class MiMoMultiTokenPredictor(nn.Module):
         lm_head: ParallelLMHead,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        self.mtp_layers[str(self.mtp_start_layer_idx + spec_step_idx)]
-        logits = self.logits_processor(lm_head, hidden_states)
-        return logits
+        return self.logits_processor(lm_head, hidden_states)
 
 
 class MiMoMTP(nn.Module):
@@ -206,17 +204,10 @@ class MiMoMTP(nn.Module):
             name = self.map_model_name_to_mtp_param_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
                 if "mtp_layers" not in name:
                     break
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -240,55 +231,42 @@ class MiMoMTP(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        # embed_tokens and lm_head are shared from the verifier at load time;
+        # mark them as loaded so the strict weight check in default_loader does
+        # not raise. eagle.py replaces these modules with the verifier's copies.
+        for param_name in params_dict:
+            if "embed_tokens" in param_name or "lm_head" in param_name:
+                loaded_params.add(param_name)
         return loaded_params
 
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import regex as re
 
-        # append mtp_start_layer_idx
+        # The checkpoint stores MTP layer indices starting at 0; our module
+        # keys them from num_hidden_layers onward to avoid colliding with the
+        # verifier's layer indices.
         pattern = r"(model\.mtp_layers\.)(\d+)(\.)"
         match = re.match(pattern, name)
         if match:
             original_num = int(match.group(2))
             new_num = original_num + self.config.num_hidden_layers
             name = name.replace(match.group(), f"{match.group(1)}{new_num}.")
-        # check for early turn
-        name_without_prefix = [
+
+        # These weights are direct attributes of the MTP layer, not inside
+        # the inner transformer block, so no further renaming is needed.
+        direct_mtp_weights = [
             "token_layernorm",
             "hidden_layernorm",
             "input_proj",
             "final_layernorm",
         ]
-        for sub_name in name_without_prefix:
-            if sub_name in name:
-                return name
-        # add mtp_block
+        if any(w in name for w in direct_mtp_weights):
+            return name
+
+        # All other weights belong to the inner Qwen2DecoderLayer, which is
+        # stored under the .mtp_block attribute.
         pattern = r"(model\.mtp_layers\.\d+\.)"
         match = re.match(pattern, name)
         if match:
             name = name.replace(match.group(), match.group() + "mtp_block.")
-        return name
-
-    def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
-        """
-        Rewrite the weight name to match the format of the original model.
-        Add .mtp_block for modules in transformer layer block for spec layer
-        """
-        spec_layer_weight_names = [
-            "embed_tokens",
-            "enorm",
-            "hnorm",
-            "eh_proj",
-            "shared_head",
-        ]
-        spec_layer_weight = False
-        for weight_name in spec_layer_weight_names:
-            if weight_name in name:
-                spec_layer_weight = True
-                break
-        if not spec_layer_weight:
-            # treat rest weights as weights for transformer layer block
-            name = name.replace(
-                f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
-            )
         return name
