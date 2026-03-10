@@ -1510,19 +1510,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 cur_data_parallel_size, new_data_parallel_size
             )
 
-    async def _eep_wait_for_setup_switch_complete(self) -> None:
+    def _eep_wait_for_setup_switch_complete(self) -> asyncio.Future:
         """
-        Wait for core engines to switch to the new setup.
+        Returns a future that will wait for the core engine processes to switch over to
+        the new DP sizes. This future will be resolved in _process_utility_output after
+        the RECONFIGURE_FINISHED notification is received from engine 0.
 
-        In eep_process_engine_core_notification(), a dummy UtilityOutput with
-        EEP_NOTIFICATION_CALL_ID will be set when RECONFIGURE_FINISHED
-        notification is received from engine 0. We create a future with
-        that call_id and wait for it to be resolved.
+        The caller is responsible for waiting on the future
         """
         future = asyncio.get_running_loop().create_future()
         self.utility_results[EEP_NOTIFICATION_CALL_ID] = future
         self._ensure_output_queue_task()
-        await future
+        return future
 
     async def _scale_up_elastic_ep(
         self, cur_data_parallel_size: int, new_data_parallel_size: int
@@ -1568,11 +1567,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             self.vllm_config,
             new_data_parallel_size,
         )
-        wait_future = self._eep_wait_for_setup_switch_complete()
+
+        future = self._eep_wait_for_setup_switch_complete()
 
         # Phase 3: Wait for new engines to be created
         # and reconfig messages to be received
         await asyncio.gather(start_new_worker_future, *reconfig_futures)
+        await future
         logger.info("[Elastic EP] Successfully started new engines")
 
         # Create new CoreEngine objects for the new engines
@@ -1601,9 +1602,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             identity, _ = sync_input_socket.recv_multipart()
             new_engine_identities.discard(identity)
 
-        # NOTE(yongji): Before we schedule any requests on the new workers,
-        # we should wait for them to switch to the new setup.
-        await wait_future
         # Update the parallel config
         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         # Notify coordinator about scale up through existing
@@ -1658,12 +1656,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             )
             reconfig_futures.append(asyncio.create_task(coro))
 
-        # NOTE(yongji): Immediately stop sending requests to the removing engines.
+        # Immediately stop sending requests to the engines that are being
+        # removed.
         self.core_engines = self.core_engines[:new_data_parallel_size]
         self.lb_engines = self.lb_engines[:new_data_parallel_size]
-        wait_future = self._eep_wait_for_setup_switch_complete()
+
+        # Wait for _process_utility_output
+        future = self._eep_wait_for_setup_switch_complete()
 
         await asyncio.gather(*reconfig_futures)
+        await future
 
         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         self._ensure_stats_update_task()
@@ -1672,10 +1674,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         )
         await self.first_req_send_socket.send(scale_down_marker)
 
-        # NOTE(yongji): Unlike scaling up,
-        # here we don't actually need to wait for the setup switch to complete.
-        # We may want to remove it in the future.
-        await wait_future
         logger.info(
             "[Elastic EP] Scale down completed, new data parallel size: %s",
             new_data_parallel_size,
