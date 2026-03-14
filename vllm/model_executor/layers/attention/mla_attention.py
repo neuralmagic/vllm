@@ -255,6 +255,13 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.utils.nan_check import (
+    NanCheckRegistry,
+    nan_check_copy,
+    nan_check_detect,
+    nan_check_enabled,
+    nan_check_kv_written,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -418,6 +425,51 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             compile_native=True,
         )
 
+        self._nc_fmqa_group = None
+        if nan_check_enabled():
+            vllm_config = get_current_vllm_config()
+            max_tokens = min(
+                vllm_config.scheduler_config.max_num_batched_tokens, 2048)
+            group_name = f"{prefix}.fmqa_detail"
+            self._nc_fmqa_group = NanCheckRegistry.get().new_group(
+                group_name)
+            self.register_buffer(
+                "_nc_fmqa_out_flag",
+                torch.zeros(max_tokens, dtype=torch.int8,
+                            device="cuda"),
+                persistent=False)
+            self._nc_fmqa_group.add(
+                "after_fmqa_kernel", self._nc_fmqa_out_flag, is_flag=True)
+            self.register_buffer(
+                "_nc_v_up_flag",
+                torch.zeros(max_tokens, dtype=torch.int8,
+                            device="cuda"),
+                persistent=False)
+            self._nc_fmqa_group.add(
+                "after_v_up_proj", self._nc_v_up_flag, is_flag=True)
+            self.register_buffer(
+                "_nc_kv_write_flag",
+                torch.zeros(max_tokens, dtype=torch.int8,
+                            device="cuda"),
+                persistent=False)
+            self._nc_fmqa_group.add(
+                "kv_cache_just_written", self._nc_kv_write_flag,
+                is_flag=True)
+            self.register_buffer(
+                "_nc_slot_map",
+                torch.zeros(max_tokens, dtype=torch.int64,
+                            device="cuda"),
+                persistent=False)
+            self._nc_fmqa_group.add_metadata(
+                "slot_mapping", self._nc_slot_map)
+            self.register_buffer(
+                "_nc_seq_lens",
+                torch.zeros(max_tokens, dtype=torch.int32,
+                            device="cuda"),
+                persistent=False)
+            self._nc_fmqa_group.add_metadata(
+                "seq_lens", self._nc_seq_lens)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -521,15 +573,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe = k_pe[:num_actual_toks, ...]
 
         # write the latent and rope to kv cache
+        slot_mapping_flat = attn_metadata.slot_mapping.flatten()
         if kv_cache.numel() > 0:
             ops.concat_and_cache_mla(
                 k_c_normed,
                 k_pe.squeeze(1),
                 kv_cache,
-                attn_metadata.slot_mapping.flatten(),
+                slot_mapping_flat,
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=self._k_scale,
             )
+
+        if self._nc_fmqa_group is not None:
+            nan_check_copy(self._nc_slot_map, slot_mapping_flat)
+            if (attn_metadata.decode is not None
+                    and attn_metadata.decode.seq_lens is not None):
+                nan_check_copy(self._nc_seq_lens,
+                               attn_metadata.decode.seq_lens)
+            if kv_cache.numel() > 0:
+                nan_check_kv_written(
+                    self._nc_kv_write_flag, kv_cache, slot_mapping_flat)
 
         if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
@@ -635,6 +698,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
 
+            if self._nc_fmqa_group is not None:
+                nan_check_detect(self._nc_fmqa_out_flag, attn_out)
+
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
                 attn_out = cp_lse_ag_out_rs(
@@ -646,6 +712,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
+
+            if self._nc_fmqa_group is not None:
+                nan_check_detect(self._nc_v_up_flag, mqa_output_slice)
         return output_padded
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):

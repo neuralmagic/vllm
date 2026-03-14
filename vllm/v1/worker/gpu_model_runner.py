@@ -51,6 +51,7 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.utils.nan_check import NanCheckRegistry, nan_check_enabled
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -3524,6 +3525,45 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+
+        if nan_check_enabled():
+            from vllm.utils.nan_check import (check_kv_caches_for_sequences,
+                                               check_batch_sanity)
+            _nc_rank = (torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else 0)
+            _nc_bt = self.input_batch.block_table[0]
+            _nc_bt_gpu = _nc_bt.get_device_tensor(num_reqs)
+            _nc_bs = _nc_bt.block_size
+            _nc_sm = (slot_mappings_by_group.get(0)
+                      if slot_mappings_by_group else None)
+            _nc_npt = self.input_batch.num_prompt_tokens[:num_reqs]
+            _nc_req_ids = list(self.input_batch.req_ids[:num_reqs])
+            check_batch_sanity(
+                seq_lens=self.seq_lens.np,
+                num_computed_tokens=(
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]),
+                num_scheduled_tokens=num_scheduled_tokens_np,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_unpadded=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded,
+                rank=_nc_rank,
+                req_ids=_nc_req_ids,
+            )
+            check_kv_caches_for_sequences(
+                kv_caches=self.kv_caches,
+                block_table_tensor=_nc_bt_gpu,
+                num_tokens_per_seq=(
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]),
+                num_prompt_tokens_per_seq=_nc_npt,
+                num_reqs=num_reqs,
+                block_size=_nc_bs,
+                slot_mapping=_nc_sm,
+                rank=_nc_rank,
+                phase="PRE_FORWARD",
+                req_ids=_nc_req_ids,
+            )
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -3555,6 +3595,30 @@ class GPUModelRunner(
                 # Common case.
                 hidden_states = model_output
                 aux_hidden_states = None
+
+            if nan_check_enabled():
+                from vllm.utils.nan_check import (check_final_output,
+                                                   check_kv_caches_for_sequences,
+                                                   check_and_reset_fp4_pad_flag)
+                check_final_output(hidden_states, num_tokens_unpadded,
+                                   num_tokens_padded)
+                check_and_reset_fp4_pad_flag()
+                NanCheckRegistry.get().run_checks(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                )
+                check_kv_caches_for_sequences(
+                    kv_caches=self.kv_caches,
+                    block_table_tensor=_nc_bt_gpu,
+                    num_tokens_per_seq=self.seq_lens.np[:num_reqs],
+                    num_prompt_tokens_per_seq=_nc_npt,
+                    num_reqs=num_reqs,
+                    block_size=_nc_bs,
+                    slot_mapping=_nc_sm,
+                    rank=_nc_rank,
+                    phase="POST_FORWARD",
+                    req_ids=list(self.input_batch.req_ids[:num_reqs]),
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.

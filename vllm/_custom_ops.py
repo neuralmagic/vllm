@@ -1612,6 +1612,15 @@ def scaled_fp4_quant(
             output, input, output_scale, input_global_scale, is_sf_swizzled_layout
         )
 
+        if is_sf_swizzled_layout and rounded_m > m:
+            output_scale[m:rounded_m].zero_()
+            from vllm.utils.nan_check import nan_check_enabled
+            if nan_check_enabled():
+                from vllm.utils.nan_check import (fp4_pad_nan_check,
+                                                   get_fp4_pad_flag)
+                flag = get_fp4_pad_flag(device)
+                fp4_pad_nan_check(flag, output_scale, m, rounded_m)
+
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
 

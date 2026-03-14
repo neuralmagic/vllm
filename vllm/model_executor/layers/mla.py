@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.nan_check import nan_check_enabled
 
 
 @dataclass
@@ -110,6 +111,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.prefix = prefix
 
+        self._nc_group = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -174,4 +177,6 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
 
-        return self.o_proj(attn_out)[0]
+        output = self.o_proj(attn_out)[0]
+
+        return output

@@ -75,6 +75,11 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.nan_check import (
+    NanCheckRegistry,
+    nan_check_copy,
+    nan_check_enabled,
+)
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
@@ -1037,6 +1042,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
+        self._nc_group = None
+        if nan_check_enabled():
+            max_tokens = (vllm_config.scheduler_config
+                          .max_num_batched_tokens)
+            device = torch.device("cuda")
+            dtype = torch.get_default_dtype()
+            reg = NanCheckRegistry.get()
+            g = reg.new_group(prefix)
+            self._nc_group = g
+
+            def _mk_buf(name: str, label: str):
+                buf = torch.zeros(max_tokens, config.hidden_size,
+                                  dtype=dtype, device=device)
+                self.register_buffer(name, buf, persistent=False)
+                g.add(label, getattr(self, name))
+
+            _mk_buf("_nc_attn_in", "before_attention")
+            _mk_buf("_nc_attn_out", "after_attention")
+            _mk_buf("_nc_moe_in", "before_mlp")
+            _mk_buf("_nc_moe_out", "after_mlp")
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1057,7 +1083,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         }
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
+
+        if self._nc_group is not None:
+            nan_check_copy(self._nc_attn_in, hidden_states)
+
         hidden_states = self.self_attn(**attn_kwargs)
+
+        if self._nc_group is not None:
+            nan_check_copy(self._nc_attn_out, hidden_states)
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1074,7 +1107,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        if self._nc_group is not None:
+            nan_check_copy(self._nc_moe_in, hidden_states)
+
         hidden_states = self.mlp(hidden_states)
+
+        if self._nc_group is not None:
+            nan_check_copy(self._nc_moe_out, hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
