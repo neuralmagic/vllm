@@ -384,6 +384,8 @@ class FusedMoE(CustomOp):
 
         assert self.moe_parallel_config.is_sequence_parallel == is_sequence_parallel
 
+        logger.debug("FusedMoEParallelConfig = %s", str(self.moe_parallel_config))
+
         self.global_num_experts = num_experts + num_redundant_experts
         self.logical_num_experts = num_experts
 
@@ -596,6 +598,8 @@ class FusedMoE(CustomOp):
             )
 
         self.quant_config = quant_config
+
+        logger.debug("FusedMoEConfig = %s", self.moe_config)
 
         def _get_quant_method() -> FusedMoEMethodBase:
             """
@@ -1453,8 +1457,12 @@ class FusedMoE(CustomOp):
         assert all(
             weight.is_contiguous()
             for name, weight in weights
-            if not (name.startswith("_shared_experts.") or name.startswith("_gate."))
-            and name not in NON_EXPERT_WEIGHTS
+            if not (
+                name.startswith("_shared_experts.")
+                or name.startswith("_gate.")
+                or name.startswith("_routed_input_transform.")
+                or name.startswith("_routed_output_transform.")
+            ) and name not in NON_EXPERT_WEIGHTS
         )
 
         return [
@@ -1463,8 +1471,11 @@ class FusedMoE(CustomOp):
             if name not in NON_EXPERT_WEIGHTS
             and weight.shape != torch.Size([])
             and not name.startswith("_shared_experts.")
-            # exclude parameters from non-expert submodules (e.g. gate/shared)
+            # exclude parameters from non-expert submodules,
+            # e.g. gate/shared/transforms.
             and not name.startswith("_gate.")
+            and not name.startswith("_routed_input_transform.")
+            and not name.startswith("_routed_output_transform.")
         ]
 
     def set_eplb_state(
