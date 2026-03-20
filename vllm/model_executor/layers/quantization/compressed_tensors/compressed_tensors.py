@@ -49,8 +49,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Mxfp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Mxfp8,
     CompressedTensorsW8A16Fp8,
-    CompressedTensorsW8A16Mxfp8,
     CompressedTensorsWNA16,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.transform.linear import (  # noqa: E501
@@ -592,7 +592,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             return CompressedTensorsW4A16Mxfp4()
 
         if self._is_mxfp(weight_quant, num_bits=8):
-            return CompressedTensorsW8A16Mxfp8()
+            return CompressedTensorsW8A8Mxfp8()
 
         if self._is_fp8_w4a8_sm90(weight_quant, input_quant):
             return CompressedTensorsW4A8Fp8(

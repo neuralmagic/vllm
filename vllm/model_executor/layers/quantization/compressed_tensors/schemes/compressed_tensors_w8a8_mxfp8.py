@@ -19,18 +19,17 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
 )
 
-__all__ = ["CompressedTensorsW8A16Mxfp8"]
+__all__ = ["CompressedTensorsW8A8Mxfp8"]
 
 
-class CompressedTensorsW8A16Mxfp8(CompressedTensorsScheme):
+class CompressedTensorsW8A8Mxfp8(CompressedTensorsScheme):
     """
-    Compressed-tensors scheme for MXFP8 weight-only quantization.
+    Compressed-tensors scheme for MXFP8 quantization.
 
-    Supports checkpoints quantized with the compressed-tensors mxfp8 block
+    Supports checkpoints quantized with the compressed-tensors mxfp8
     format:
       - 8-bit float weights (E4M3) stored as float8_e4m3fn
       - Per-group E8M0 scales (uint8) with group_size=32
-      - BF16 activations (weight-only quantization)
     """
 
     def __init__(self):

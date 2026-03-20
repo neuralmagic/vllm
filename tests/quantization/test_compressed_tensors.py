@@ -19,8 +19,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Mxfp8,
     CompressedTensorsW8A16Fp8,
-    CompressedTensorsW8A16Mxfp8,
     CompressedTensorsWNA16,
 )
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
@@ -849,7 +849,7 @@ def test_compressed_tensors_mxfp8(vllm_runner, model_path):
 
             for proj in (qkv_proj, o_proj, gate_up_proj, down_proj):
                 assert isinstance(proj.quant_method, CompressedTensorsLinearMethod)
-                assert isinstance(proj.scheme, CompressedTensorsW8A16Mxfp8)
+                assert isinstance(proj.scheme, CompressedTensorsW8A8Mxfp8)
 
                 if backend == Mxfp8LinearBackend.MARLIN:
                     # should be repacked post weight loading
