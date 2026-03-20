@@ -285,6 +285,8 @@ class DefaultMoERunner(MoERunner):
         """
         Some combine kernels reduce across GPU ranks by default.
         """
+        # If self.must_reduce_shared_expert_outputs(), FusedMoE kernel
+        # already reduced the output.
         if self.must_reduce_shared_expert_outputs():
             return final_hidden_states
         else:
@@ -599,13 +601,19 @@ class DefaultMoERunner(MoERunner):
             hidden_states,
         )
 
-        fused_output = self.forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            self._encode_layer_name(),
+        # This is the boundary of the custom op.
+        # custom op cannot handle union outputs, so we have separate
+        # entrypoint for _moe_forward and _moe_forward_shared.
+        fused_output: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = (
+            self.forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                self._encode_layer_name(),
+            )
         )
 
+        # All reduce happens outside the custom op to enable fusion.
         return self._maybe_reduce_output(fused_output, og_hidden_dims)
 
     def forward_dispatch(

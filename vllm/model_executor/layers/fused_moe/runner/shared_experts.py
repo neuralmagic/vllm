@@ -97,14 +97,6 @@ class SharedExperts:
             or self._moe_config.moe_parallel_config.use_fi_nvl_two_sided_kernels
         )
 
-    @property
-    def _must_reduce_shared_expert_outputs(self) -> bool:
-        return (
-            self._reduce_results
-            and self._quant_method.moe_kernel is not None
-            and self._quant_method.moe_kernel.output_is_reduced()
-        )
-
     def _determine_shared_experts_order(
         self,
         hidden_states: torch.Tensor,
@@ -178,7 +170,9 @@ class SharedExperts:
         # Reduce shared expert outputs if necessary, since the MLP
         # should have been created with reduce_results=False.
         if (
-            self._must_reduce_shared_expert_outputs
+            self._reduce_results
+            and self._quant_method.moe_kernel is not None
+            and self._quant_method.moe_kernel.output_is_reduced()
             and get_tensor_model_parallel_world_size() > 1
         ):
             shared_out = tensor_model_parallel_all_reduce(shared_out)
@@ -211,10 +205,5 @@ class SharedExperts:
         else:
             self._output = self._layer(shared_experts_input)
 
-        if order == SharedExpertsOrder.EXTERNAL:
-            # TODO: figure out how to combine this with maybe_reduce_output?
-            # or get rid of it completely.
-            assert self._output is not None
-            self._output = self._maybe_reduce_shared_out(self._output)
-
-        # TODO(bnell): potentially do AFTER reduce here instead of in runner.
+        # R
+        self._output = self._maybe_reduce_shared_out(self._output)
