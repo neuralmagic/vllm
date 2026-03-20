@@ -844,6 +844,7 @@ def test_compressed_tensors_mxfp8(vllm_runner, model_path):
                 Mxfp8LinearBackend,
                 select_mxfp8_linear_backend,
             )
+
             backend = select_mxfp8_linear_backend()
 
             for proj in (qkv_proj, o_proj, gate_up_proj, down_proj):
@@ -855,7 +856,6 @@ def test_compressed_tensors_mxfp8(vllm_runner, model_path):
                     assert proj.weight.dtype is torch.int32
                     assert proj.weight_scale.dtype is torch.float8_e8m0fnu
 
-                # weight: [N, K], weight_scale: [N, K // 32] (group_size=32)
                 assert len(proj.weight.shape) == 2
                 assert len(proj.weight_scale.shape) == 2
 
