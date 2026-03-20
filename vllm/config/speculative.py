@@ -501,6 +501,24 @@ class SpeculativeConfig:
                             "multiple times of forward on same MTP layer"
                             ",which may result in lower acceptance rate"
                         )
+                    if self.model != self.target_model_config.model:
+                        self.draft_model_config.hf_config.mtp_standalone_checkpoint = (
+                            True
+                        )
+                elif getattr(
+                    self.draft_model_config.hf_config, "speculators_model_type", None
+                ) == "mtp":
+                    self.method = "mtp"
+                    self.draft_model_config.hf_config.mtp_standalone_checkpoint = True
+                    if (
+                        self.num_speculative_tokens is not None
+                        and self.num_speculative_tokens > 1
+                    ):
+                        logger.warning(
+                            "Enabling num_speculative_tokens > 1 will run "
+                            "multiple times of forward on same MTP layer"
+                            ",which may result in lower acceptance rate"
+                        )
                 elif self.draft_model_config.hf_config.model_type in (
                     "longcat_flash_mtp"
                 ):

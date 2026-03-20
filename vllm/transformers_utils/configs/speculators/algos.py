@@ -12,6 +12,24 @@ def register_speculator(name):
     return decorator
 
 
+@register_speculator("mtp")
+def update_mtp(config_dict: dict, pre_trained_config: dict) -> None:
+    """Configure vLLM to load a speculators FastMTP checkpoint.
+
+    Extracts num_nextn_predict_layers from the top-level config (not
+    transformer_layer_config) and sets the architecture to Qwen3NextMTP
+    for qwen3_next base models.
+    """
+    tl_cfg = config_dict.get("transformer_layer_config", {})
+    if tl_cfg.get("model_type") == "qwen3_next":
+        pre_trained_config["architectures"] = ["Qwen3NextMTP"]
+    pre_trained_config["speculators_model_type"] = "mtp"
+    pre_trained_config["num_nextn_predict_layers"] = config_dict.get(
+        "num_nextn_predict_layers", 1
+    )
+    pre_trained_config["n_predict"] = pre_trained_config["num_nextn_predict_layers"]
+
+
 @register_speculator("eagle3")
 def update_eagle3(config_dict: dict, pre_trained_config: dict) -> None:
     """

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next MTP model."""
 
+import itertools
 from collections.abc import Iterable
 
 import torch
@@ -37,6 +38,38 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+# Speculators FastMTP → Qwen3NextMultiTokenPredictor weight name mapping.
+# Keys are suffixes after "mtp_layers.0.", values are full vLLM param names
+# relative to Qwen3NextMultiTokenPredictor (without the outer "model." prefix).
+_SPECULATORS_LAYER_REMAP: dict[str, str] = {
+    "hidden_layernorm.": "pre_fc_norm_hidden.",
+    "token_layernorm.": "pre_fc_norm_embedding.",
+    "input_proj.": "fc.",
+    "final_layernorm.": "norm.",
+    "input_layernorm.": "layers.0.input_layernorm.",
+    "post_attention_layernorm.": "layers.0.post_attention_layernorm.",
+    "self_attn.": "layers.0.self_attn.",
+    "mlp.": "layers.0.mlp.",
+}
+
+
+def _remap_speculators_weight(name: str) -> tuple[str, str] | None:
+    """Map a speculators FastMTP weight name to a (target, inner_name) pair.
+
+    Returns ("model", inner_name) for weights belonging to
+    Qwen3NextMultiTokenPredictor, ("lm_head", name) for lm_head, or None to skip.
+    """
+    if name == "lm_head.weight":
+        return "lm_head", name
+    if name == "embed_tokens.weight":
+        return "model", name
+    if name.startswith("mtp_layers.0."):
+        inner = name[len("mtp_layers.0."):]
+        for prefix, mapped in _SPECULATORS_LAYER_REMAP.items():
+            if inner.startswith(prefix):
+                return "model", mapped + inner[len(prefix):]
+    return None
 
 
 @support_torch_compile
@@ -281,15 +314,59 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        shared_weight_names = ["embed_tokens", "lm_head"]
+        # Auto-detect checkpoint format from weight key names.
+        # Standalone speculators checkpoints use "mtp_layers.N.*" keys;
+        # base-model-embedded checkpoints use "mtp.*" keys.
+        # Peek at the first few keys — standalone format always has an
+        # "mtp_layers." key within the first handful of entries.
+        it = iter(weights)
+        peek = list(itertools.islice(it, 10))
+        weights = itertools.chain(peek, it)
+        # Base-model checkpoints always have "model.*"-prefixed keys for the
+        # transformer layers (e.g. "model.embed_tokens.weight" is key #1).
+        # Standalone speculators checkpoints never have "model.*" keys.
+        is_standalone = not any(n.startswith("model.") for n, _ in peek)
 
-        def remap_weight_names(weights):
-            for name, weight in weights:
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif not any(key in name for key in shared_weight_names):
-                    continue
-                yield name, weight
+        if not is_standalone:
+            # Base-model-embedded format: MTP weights carry the "mtp." prefix.
+            shared_weight_names = ["embed_tokens", "lm_head"]
 
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+            def remap_weight_names(w):
+                for name, weight in w:
+                    if name.startswith("mtp."):
+                        name = name.replace("mtp.", "model.")
+                    elif not any(key in name for key in shared_weight_names):
+                        continue
+                    yield name, weight
+
+            loader = AutoWeightsLoader(self)
+            return loader.load_weights(remap_weight_names(weights))
+
+        # Standalone speculators checkpoint: "mtp_layers.0.*" naming.
+        # embed_tokens and lm_head are identical to the verifier's — skip them.
+        # Only remap "mtp_layers.0.*" keys into Qwen3NextMultiTokenPredictor
+        # namespace and delegate to its load_weights(), which correctly handles
+        # QKV fusion and FusedMoE experts via stacked/expert_params_mapping.
+        model_weights: list[tuple[str, torch.Tensor]] = []
+        for name, weight in weights:
+            if not name.startswith("mtp_layers."):
+                continue
+            remapped = _remap_speculators_weight(name)
+            if remapped is None:
+                continue
+            _, inner_name = remapped
+            model_weights.append((inner_name, weight))
+
+        # self.model.load_weights() returns names relative to
+        # Qwen3NextMultiTokenPredictor; prefix with "model." to match
+        # Qwen3NextMTP.named_parameters() which default_loader checks against.
+        loaded = {
+            f"model.{name}"
+            for name in self.model.load_weights(iter(model_weights))
+        }
+        # embed_tokens and lm_head are skipped above; eagle.py's
+        # _maybe_share_embeddings/_maybe_share_lm_head will assign them from
+        # the verifier. Mark them as loaded so default_loader doesn't error.
+        loaded.add("model.embed_tokens.weight")
+        loaded.add("lm_head.weight")
+        return loaded
