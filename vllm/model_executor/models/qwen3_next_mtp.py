@@ -65,10 +65,10 @@ def _remap_speculators_weight(name: str) -> tuple[str, str] | None:
     if name == "embed_tokens.weight":
         return "model", name
     if name.startswith("mtp_layers.0."):
-        inner = name[len("mtp_layers.0."):]
+        inner = name[len("mtp_layers.0.") :]
         for prefix, mapped in _SPECULATORS_LAYER_REMAP.items():
             if inner.startswith(prefix):
-                return "model", mapped + inner[len(prefix):]
+                return "model", mapped + inner[len(prefix) :]
     return None
 
 
@@ -361,8 +361,7 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
         # Qwen3NextMultiTokenPredictor; prefix with "model." to match
         # Qwen3NextMTP.named_parameters() which default_loader checks against.
         loaded = {
-            f"model.{name}"
-            for name in self.model.load_weights(iter(model_weights))
+            f"model.{name}" for name in self.model.load_weights(iter(model_weights))
         }
         # embed_tokens and lm_head are skipped above; eagle.py's
         # _maybe_share_embeddings/_maybe_share_lm_head will assign them from

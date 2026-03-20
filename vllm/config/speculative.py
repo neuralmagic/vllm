@@ -505,9 +505,14 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config.mtp_standalone_checkpoint = (
                             True
                         )
-                elif getattr(
-                    self.draft_model_config.hf_config, "speculators_model_type", None
-                ) == "mtp":
+                elif (
+                    getattr(
+                        self.draft_model_config.hf_config,
+                        "speculators_model_type",
+                        None,
+                    )
+                    == "mtp"
+                ):
                     self.method = "mtp"
                     self.draft_model_config.hf_config.mtp_standalone_checkpoint = True
                     if (

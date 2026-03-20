@@ -59,11 +59,7 @@ def main(args):
 
     prompts = get_samples(args, tokenizer)
     llm_prompts = [
-        {
-            "prompt_token_ids": tokenizer.encode(
-                p.prompt, add_special_tokens=False
-            )
-        }
+        {"prompt_token_ids": tokenizer.encode(p.prompt, add_special_tokens=False)}
         for p in prompts
     ]
 
@@ -97,9 +93,7 @@ def main(args):
 
     metrics = llm.get_metrics()
 
-    total_output_tokens = sum(
-        len(o.outputs[0].token_ids) for o in outputs
-    )
+    total_output_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
     num_drafts = 0
     num_draft_tokens = 0
     num_accepted_tokens = 0
