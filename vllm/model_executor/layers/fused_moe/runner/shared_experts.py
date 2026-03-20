@@ -204,6 +204,3 @@ class SharedExperts:
             self._output = self._run_in_aux_stream(shared_experts_input)
         else:
             self._output = self._layer(shared_experts_input)
-
-        # R
-        self._output = self._maybe_reduce_shared_out(self._output)
