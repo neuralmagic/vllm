@@ -1081,7 +1081,7 @@ class FusedMoEKernelModularImpl:
             assert shared_experts_input is not None
             self.shared_experts.apply(
                 shared_experts_input,
-                SharedExpertsOrder.INTERNAL,
+                SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
             )
 
     def _prepare(

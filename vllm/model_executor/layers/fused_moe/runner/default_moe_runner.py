@@ -405,7 +405,7 @@ class DefaultMoERunner(MoERunner):
         # Run this before quant_method to avoid inplace issues.
         self._maybe_apply_shared_experts(
             shared_experts_input,
-            SharedExpertsOrder.BEFORE_QUANT_METHOD,
+            SharedExpertsOrder.NO_OVERLAP,
         )
 
         if self.quant_method.is_monolithic:
@@ -430,7 +430,7 @@ class DefaultMoERunner(MoERunner):
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
-            SharedExpertsOrder.AFTER_QUANT_METHOD,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
         )
 
         return (
