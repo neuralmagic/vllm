@@ -207,9 +207,8 @@ def _pydantic_dataclass_replace(obj, **changes):
 def create_chunked_local_attention_backend(
     underlying_attn_backend: AttentionBackend,
     attention_chunk_size: int,
-    block_size: int,
 ) -> type[AttentionBackend]:
-    prefix = f"ChunkedLocalAttention_{attention_chunk_size}_{block_size}_"
+    prefix = f"ChunkedLocalAttention_{attention_chunk_size}_"
 
     underlying_builder = underlying_attn_backend.get_builder_cls()
     assert issubclass(underlying_builder, AttentionMetadataBuilder)
@@ -224,6 +223,8 @@ def create_chunked_local_attention_backend(
             vllm_config: VllmConfig,
             device: torch.device,
         ):
+            self.block_size = kv_cache_spec.block_size
+
             # Compute loose, upper bound on number of virtual batches
             # for persistent buffer allocation
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -235,7 +236,7 @@ def create_chunked_local_attention_backend(
                 // attention_chunk_size
             )
             num_vb_ub = max_num_seqs * max_vb_per_req
-            pages_per_virtual_batch = attention_chunk_size // block_size
+            pages_per_virtual_batch = attention_chunk_size // self.block_size
 
             # Create modified config with num_vb_ub as max_num_seqs so the
             # underlying builder allocates buffers large enough for virtual
@@ -358,7 +359,7 @@ def create_chunked_local_attention_backend(
                 bs,
                 max_blocks_per_seq,
                 ATTN_CHUNK_SIZE=chunk,
-                BLOCK_SIZE=block_size,
+                BLOCK_SIZE=self.block_size,
                 PAGES_PER_VIRTUAL_BATCH=pages_per_vb,
                 MAX_VIRTUAL_BATCHES=max_vb_per_req,
             )
@@ -469,16 +470,12 @@ class ChunkedLocalAttention(Attention):
         dtype = torch.get_default_dtype()
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
-            block_size = cache_config.block_size
         else:
             kv_cache_dtype = "auto"
-            block_size = 16
 
-        underlying_attn_backend = get_attn_backend(
-            head_size, dtype, kv_cache_dtype, block_size
-        )
+        underlying_attn_backend = get_attn_backend(head_size, dtype, kv_cache_dtype)
         attn_backend = create_chunked_local_attention_backend(
-            underlying_attn_backend, attention_chunk_size, block_size
+            underlying_attn_backend, attention_chunk_size
         )
 
         super().__init__(
