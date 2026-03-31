@@ -137,9 +137,8 @@ class SharedExperts:
             # because we synch the streams before using shared_output.
             shared_experts_input.record_stream(self._stream)
 
-            # Mark sync start point for the separate shared experts
-            # stream here since we want to run in parallel with the
-            # router/gate (next op below)
+            # Mark sync start point for the aux stream since we will
+            # run in parallel with router/gate.
             self._stream.wait_stream(current_stream())
 
     def _run_in_aux_stream(
