@@ -19,3 +19,25 @@ def rms_norm(
     if weight is not None:
         x = x.to(weight.dtype) * weight
     return x.to(orig_dtype)
+
+
+@register_op(has_reduction=True, allow_inplace=True)
+def fused_add_rms_norm(
+    x: Tensor,
+    x_residual: Tensor,
+    weight: Tensor | None,
+    epsilon: float,
+    variance_size: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Fused add and weighted root-mean-square layer normalization"""
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    x = x + x_residual.to(torch.float32)
+    x_residual = x.to(orig_dtype)
+
+    x_var = x if variance_size is None else x[..., :variance_size]
+    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + epsilon)
+    if weight is not None:
+        x = x.to(weight.dtype) * weight
+    return x.to(orig_dtype), x_residual
