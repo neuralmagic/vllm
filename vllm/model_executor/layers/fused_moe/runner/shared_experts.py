@@ -147,14 +147,8 @@ class SharedExperts:
     ) -> torch.Tensor:
         # TODO: assert that maybe_setup_shared_experts_stream has been called.
 
-        # Run shared experts in parallel on a separate stream
-        # NOTE: We start the separate stream here and mark the
-        # sync end point immediately after it is done. This is
-        # important to avoid excessive stream allocations by the cuda
-        # graph replay later.
+        # Run shared experts in parallel on a separate stream.
         with torch.cuda.stream(self._stream):
-            # Note that hidden_states clone() is necessary here to avoid
-            # conflict with the main stream
             output = self._layer(shared_experts_input)
         current_stream().wait_stream(self._stream)
 
