@@ -25,6 +25,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8Mxfp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
@@ -542,6 +543,52 @@ def test_compressed_tensors_moe_ignore_with_model(vllm_runner):
 
         # Verify the model can generate output
         output = llm.generate_greedy("Hello, my name is", max_tokens=4)
+        assert output
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
+)
+@pytest.mark.parametrize(
+    "model_path",
+    [
+        "nm-testing/Qwen3-0.6B-MXFP8",
+        "nm-testing/TinyLlama-1.1B-Chat-v1.0-MXFP8",
+    ],
+)
+def test_compressed_tensors_mxfp8(vllm_runner, model_path):
+    with vllm_runner(model_path) as llm:
+
+        def check_model(model):
+            layer = model.model.layers[0]
+
+            qkv_proj = layer.self_attn.qkv_proj
+            o_proj = layer.self_attn.o_proj
+            gate_up_proj = layer.mlp.gate_up_proj
+            down_proj = layer.mlp.down_proj
+
+            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+                Mxfp8LinearBackend,
+                select_mxfp8_linear_backend,
+            )
+
+            backend = select_mxfp8_linear_backend()
+
+            for proj in (qkv_proj, o_proj, gate_up_proj, down_proj):
+                assert isinstance(proj.quant_method, CompressedTensorsLinearMethod)
+                assert isinstance(proj.scheme, CompressedTensorsW8A8Mxfp8)
+
+                if backend == Mxfp8LinearBackend.MARLIN:
+                    # should be repacked post weight loading
+                    assert proj.weight.dtype is torch.int32
+                    assert proj.weight_scale.dtype is torch.float8_e8m0fnu
+
+                assert len(proj.weight.shape) == 2
+                assert len(proj.weight_scale.shape) == 2
+
+        llm.apply_model(check_model)
+
+        output = llm.generate_greedy("Hello my name is", max_tokens=10)
         assert output
 
 
