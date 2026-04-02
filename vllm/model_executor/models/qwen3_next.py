@@ -60,6 +60,7 @@ from .interfaces import (
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
 )
@@ -691,6 +692,7 @@ class Qwen3NextForCausalLM(
     HasInnerState,
     SupportsLoRA,
     SupportsPP,
+    SupportsEagle3,
     QwenNextMixtureOfExperts,
     IsHybrid,
 ):
