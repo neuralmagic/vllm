@@ -1949,7 +1949,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         from flashinfer.fused_moe.core import (
             ActivationType,
             Fp8QuantizationType,
@@ -2034,7 +2034,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         assert not self.is_monolithic
         raise NotImplementedError(
             "Non-monolithic MXFP8 MoE path is not yet implemented."

@@ -50,7 +50,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
 
     @staticmethod
     def make(
-        moe_layer: torch.nn.Module,
+        routed_experts: "RoutedExperts",
         old_quant_method: FusedMoEMethodBase,
         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
         shared_experts: SharedExperts | None,
@@ -60,7 +60,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             old_quant_method,
             FusedMoEKernel(
                 prepare_finalize,
-                old_quant_method.select_gemm_impl(prepare_finalize, moe_layer),
+                old_quant_method.select_gemm_impl(prepare_finalize, routed_experts),
                 shared_experts=shared_experts,
                 inplace=inplace,
             ),

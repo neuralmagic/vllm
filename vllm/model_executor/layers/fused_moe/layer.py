@@ -20,7 +20,6 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
-    RoutingMethodType,
 )
 from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
@@ -32,9 +31,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
-from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-    init_aiter_topK_meta_data,
-)
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
@@ -45,21 +41,17 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner_factory import (
     create_moe_runner,
 )
-from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
-    SharedExperts,
-)
 from vllm.model_executor.layers.fused_moe.utils import (
     disable_inplace,
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
-from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
 
-# Should be method?  only used in layer
+# TODO: merge with class method
 def determine_expert_placement_strategy(
     expert_placement_strategy: ExpertPlacementStrategy,
     moe_parallel_config: FusedMoEParallelConfig,
@@ -213,11 +205,11 @@ class FusedMoE(CustomOp):
         super().__init__()
 
         # IMPORTANT: RoutedExperts must have same layer_name/prefix as FusedMoE for now
+        # This is still needed
         self.layer_name = prefix
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
 
         vllm_config = get_current_vllm_config()
 
@@ -237,31 +229,28 @@ class FusedMoE(CustomOp):
         dp_size_ = dp_size if dp_size is not None else get_dp_group().world_size
         pcp_size_ = pcp_size if pcp_size is not None else get_pcp_group().world_size
 
-        self.is_sequence_parallel = is_sequence_parallel
-        self.sp_size = tp_size_ if is_sequence_parallel else 1
+        is_sequence_parallel = is_sequence_parallel
+        sp_size = tp_size_ if is_sequence_parallel else 1
 
-        self.moe_parallel_config: FusedMoEParallelConfig = FusedMoEParallelConfig.make(
+        moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size_=tp_size_,
             pcp_size_=pcp_size_,
             dp_size_=dp_size_,
-            sp_size_=self.sp_size,
+            sp_size_=sp_size,
             vllm_parallel_config=vllm_config.parallel_config,
         )
 
-        assert self.moe_parallel_config.is_sequence_parallel == is_sequence_parallel
+        assert moe_parallel_config.is_sequence_parallel == is_sequence_parallel
 
-        logger.debug("FusedMoEParallelConfig = %s", str(self.moe_parallel_config))
+        logger.debug("FusedMoEParallelConfig = %s", str(moe_parallel_config))
 
-        self.global_num_experts = num_experts + num_redundant_experts
-        self.logical_num_experts = num_experts
+        global_num_experts = num_experts + num_redundant_experts
+        logical_num_experts = num_experts
 
         # Initialize EPLB manager (or None?)
         eplb_manager: EplbManager | None = None
         if enable_eplb:
             eplb_manager = EplbManager(num_redundant_experts=num_redundant_experts)
-
-        # Expert mapping used in self.load_weights
-        self.expert_mapping = expert_mapping
 
         expert_placement_strategy: ExpertPlacementStrategy = (
             vllm_config.parallel_config.expert_placement_strategy
@@ -270,34 +259,29 @@ class FusedMoE(CustomOp):
         # ROCm aiter shared experts fusion
         # AITER only supports gated activations (silu/gelu), so disable it
         # for non-gated MoE (is_act_and_mul=False)
-        self.rocm_aiter_fmoe_enabled = (
+        rocm_aiter_fmoe_enabled = (
             rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul
         )
-        self.aiter_fmoe_shared_expert_enabled = (
+        aiter_fmoe_shared_expert_enabled = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and is_act_and_mul
         )
 
-        self.num_fused_shared_experts = (
+        num_fused_shared_experts = (
             n_shared_experts
-            if n_shared_experts is not None and self.aiter_fmoe_shared_expert_enabled
+            if n_shared_experts is not None and aiter_fmoe_shared_expert_enabled
             else 0
         )
-        if (
-            not self.aiter_fmoe_shared_expert_enabled
-            and self.num_fused_shared_experts != 0
-        ):
+        if not aiter_fmoe_shared_expert_enabled and num_fused_shared_experts != 0:
             raise ValueError(
                 "n_shared_experts is only supported on ROCm aiter when "
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled"
             )
 
         # Determine expert maps
-        if self.use_ep:
+        if moe_parallel_config.use_ep:
             if eplb_manager is not None:
                 # Validate EPLB configuration
-                eplb_manager.validate_configuration(
-                    self.global_num_experts, self.ep_size
-                )
+                eplb_manager.validate_configuration(global_num_experts, ep_size)
             else:
                 assert num_redundant_experts == 0, (
                     "Redundant experts are only supported with EPLB."
@@ -306,7 +290,7 @@ class FusedMoE(CustomOp):
             # Determine expert placement strategy before creating manager
             expert_placement_strategy_effective = determine_expert_placement_strategy(
                 expert_placement_strategy=expert_placement_strategy,
-                moe_parallel_config=self.moe_parallel_config,
+                moe_parallel_config=moe_parallel_config,
                 num_expert_group=num_expert_group,
                 num_redundant_experts=num_redundant_experts,
                 enable_eplb=eplb_manager is not None,
@@ -316,71 +300,20 @@ class FusedMoE(CustomOp):
 
         # Create expert map manager
         self.expert_map_manager = ExpertMapManager(
-            global_num_experts=self.global_num_experts,
-            logical_num_experts=self.logical_num_experts,
-            moe_parallel_config=self.moe_parallel_config,
+            max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+            top_k=top_k,
+            global_num_experts=global_num_experts,
+            logical_num_experts=logical_num_experts,
+            moe_parallel_config=moe_parallel_config,
             placement_strategy=expert_placement_strategy_effective,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            rocm_aiter_enabled=self.rocm_aiter_fmoe_enabled,
+            num_fused_shared_experts=num_fused_shared_experts,
+            rocm_aiter_enabled=rocm_aiter_fmoe_enabled,
             device=vllm_config.device_config.device,
         )
 
-        # Register buffers for state_dict compatibility
-        # if self.expert_map_manager.expert_map is not None:
-        #    self.register_buffer("_expert_map", self.expert_map_manager.expert_map)
-        #
-        # if self.expert_map_manager.expert_mask is not None:
-        #    self.register_buffer("expert_mask", self.expert_map_manager.expert_mask)
-
-        # Log EP configuration (move into EMM?)
-        if self.use_ep:
-            logger.info_once(
-                "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
-                "placement strategy: %s. Local/global"
-                " number of experts: %s/%s. Experts local to global index map:"
-                " %s.",
-                self.ep_rank,
-                self.ep_size,
-                self.expert_map_manager.placement_strategy,
-                self.expert_map_manager.local_num_experts,
-                self.expert_map_manager.global_num_experts,
-                self.expert_map_manager.get_compressed_map_string(),
-            )
-
-        self.top_k = top_k
-
-        # move into EMM?
-        self._init_aiter_shared_experts_topK_buffer(
-            vllm_config=vllm_config, dp_size=dp_size_
-        )
-
-        # XXXXX move into EMM (this is just an assert)
-        if self.use_ep and self.rocm_aiter_fmoe_enabled:
-            expert_mask = self.expert_map_manager.expert_mask
-            assert expert_mask is None or torch.all(
-                (expert_mask == 0) | (expert_mask == 1)
-            ), "Aiter Fused MoE kernel only supports expert_map with 0 and 1s."
-
-        assert intermediate_size % self.tp_size == 0
-        self.intermediate_size_per_partition = intermediate_size // self.tp_size
-        self.renormalize = renormalize
-
-        # TODO(bnell): these attributes are only used by monolithic kernels.
-        # Put them in a MoERouterConfig dataclass?
-        self.use_grouped_topk = use_grouped_topk
-        if self.use_grouped_topk:
-            assert num_expert_group is not None and topk_group is not None
-        self.num_expert_group = num_expert_group
-        self.topk_group = topk_group
-        self.custom_routing_function = custom_routing_function
-        self.scoring_func = scoring_func
-        self.routed_scaling_factor = routed_scaling_factor
-        self.e_score_correction_bias = e_score_correction_bias
-        # TODO(bnell): end attributes
-
-        # Store in runner?
-        self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.activation = MoEActivation.from_str(activation)
+        tp_size = moe_parallel_config.tp_size
+        assert intermediate_size % tp_size == 0
+        intermediate_size_per_partition = intermediate_size // tp_size
 
         self._runner: MoERunner
 
@@ -388,7 +321,7 @@ class FusedMoE(CustomOp):
         # monolithic.
         router = create_fused_moe_router(
             top_k=top_k,
-            global_num_experts=self.global_num_experts,
+            global_num_experts=global_num_experts,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,
@@ -399,29 +332,25 @@ class FusedMoE(CustomOp):
             if not apply_scale_to_output
             else 1.0,
             e_score_correction_bias=e_score_correction_bias,
-            num_fused_shared_experts=self.num_fused_shared_experts,
+            num_fused_shared_experts=num_fused_shared_experts,
             eplb_manager=eplb_manager,
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
             indices_type_getter=lambda: self._runner.routed_experts.quant_method.topk_indices_dtype,  # noqa: E501
             zero_expert_type=zero_expert_type,
-            num_logical_experts=self.logical_num_experts,
+            num_logical_experts=logical_num_experts,
         )
-        self.routing_method_type: RoutingMethodType = router.routing_method_type
 
-        # TODO(bnell): is this redundant now?
         # When using zero experts, slice e_score_correction_bias to cover
         # only real experts, for compatibility with monolithic kernels that
         # read it directly.
         if zero_expert_type is not None and e_score_correction_bias is not None:
-            self.e_score_correction_bias = e_score_correction_bias[
-                : self.logical_num_experts
-            ]
+            self.e_score_correction_bias = e_score_correction_bias[logical_num_experts]
 
         # Round up hidden size before creating moe_config.
         # This way moe_config is created with the correct hidden_size from the start.
         unpadded_hidden_size = hidden_size
-        self.model_type = (
+        model_type = (
             vllm_config.model_config.hf_config.model_type
             if vllm_config.model_config is not None
             else None
@@ -429,20 +358,21 @@ class FusedMoE(CustomOp):
         hidden_size = maybe_roundup_hidden_size(
             hidden_size=hidden_size,
             act_dtype=moe_in_dtype,
-            moe_parallel_config=self.moe_parallel_config,
+            moe_parallel_config=moe_parallel_config,
             is_lora_enabled=vllm_config.lora_config is not None,
-            model_type=self.model_type,
+            model_type=model_type,
         )
-        self.hidden_size = hidden_size
 
-        self.moe_config = FusedMoEConfig(
-            num_experts=self.global_num_experts,
+        moe_activation = MoEActivation.from_str(activation)
+
+        moe_config = FusedMoEConfig(
+            num_experts=global_num_experts,
             experts_per_token=top_k,
             hidden_dim=hidden_size,
-            intermediate_size_per_partition=self.intermediate_size_per_partition,
-            num_local_experts=self.local_num_experts,
-            num_logical_experts=self.logical_num_experts,
-            moe_parallel_config=self.moe_parallel_config,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            num_local_experts=self.expert_map_manager.local_num_experts,
+            num_logical_experts=logical_num_experts,
+            moe_parallel_config=moe_parallel_config,
             in_dtype=moe_in_dtype,
             moe_backend=vllm_config.kernel_config.moe_backend,
             router_logits_dtype=router_logits_dtype,
@@ -450,32 +380,16 @@ class FusedMoE(CustomOp):
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
-            activation=self.activation,
+            activation=moe_activation,
             device=vllm_config.device_config.device,
-            routing_method=self.routing_method_type,
+            routing_method=router.routing_method_type,
             # TODO: in_dtype == out_dtype?
             disable_inplace=disable_inplace() or shared_experts is not None,
         )
 
-        # Move XXXXXXXXXXXXX
-        if self.moe_config.use_mori_kernels:
-            assert self.rocm_aiter_fmoe_enabled, (
-                "Mori needs to be used with aiter fused_moe for now."
-            )
-            assert not self.aiter_fmoe_shared_expert_enabled, (
-                "Mori does not support fusion shared expert now. "
-                "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"
-            )
+        quant_config = quant_config
 
-        self.quant_config = quant_config
-
-        logger.debug("FusedMoEConfig = %s", self.moe_config)
-
-        # Move XXXXXXXXXXXXX
-        if not self.moe_config.is_act_and_mul and not current_platform.is_cuda_alike():
-            raise NotImplementedError(
-                "is_act_and_mul=False is supported only for CUDA and ROCm for now"
-            )
+        logger.debug("FusedMoEConfig = %s", moe_config)
 
         # Create RoutedExperts instance BEFORE create_weights()
         # This will hold all expert weight parameters
@@ -484,11 +398,11 @@ class FusedMoE(CustomOp):
             params_dtype,
             unpadded_hidden_size,
             intermediate_size,
-            self.moe_config,
-            self.quant_config,
+            moe_config,
+            quant_config,
             expert_map_manager=self.expert_map_manager,
             # Extra params that are needed by quant_methods, pass along for now
-            rocm_aiter_fmoe_enabled=self.rocm_aiter_fmoe_enabled,
+            rocm_aiter_fmoe_enabled=rocm_aiter_fmoe_enabled,  # get from moe config
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,
@@ -496,17 +410,18 @@ class FusedMoE(CustomOp):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
+            e_score_correction_bias=e_score_correction_bias,  # get from router?
             apply_router_weight_on_input=apply_router_weight_on_input,
-            activation=MoEActivation.from_str(activation),
+            activation=moe_activation,
         )
 
         # TODO(bnell): this needs to be stored as a parameter for weight loading.
         # ditch this eventually.
         self.routed_experts = routed_experts
 
-        # Move XXXXXXXXXXXXX
-        if eplb_manager is not None and not routed_experts.quant_method.supports_eplb:
+        # Where to move this?
+        quant_method = routed_experts.quant_method
+        if enable_eplb and not quant_method.supports_eplb:
             # TODO: Add support for additional quantization methods.
             # The implementation for other quantization methods does not
             # contain essential differences, but the current quant API
@@ -515,7 +430,7 @@ class FusedMoE(CustomOp):
             # If you plan to add support for more quantization methods,
             # please refer to the implementation in `Fp8MoEMethod`.
             raise NotImplementedError(
-                f"EPLB is not supported {self.quant_method.__class__.__name__}."
+                f"EPLB is not supported {quant_method.__class__.__name__}."
             )
 
         # Storing the runner in the FusedMoE is an intermediate state, eventually
@@ -523,7 +438,7 @@ class FusedMoE(CustomOp):
         # for MoE ops.
         self._runner = create_moe_runner(
             layer_name=self.layer_name,
-            moe_config=self.moe_config,
+            moe_config=moe_config,
             router=router,
             routed_input_transform=routed_input_transform,
             routed_output_transform=routed_output_transform,
@@ -541,32 +456,12 @@ class FusedMoE(CustomOp):
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(vllm_config, self)
 
-    def extra_repr(self) -> str:
-        s = (
-            f"global_num_experts={self.global_num_experts}, "
-            f"local_num_experts={self.local_num_experts}, "
-            f"top_k={self.top_k}, "
-            f"intermediate_size_per_partition={self.intermediate_size_per_partition}, "  # noqa: E501
-            f"tp_size={self.tp_size},\n"
-            f"ep_size={self.ep_size}, "
-        )
-
-        return s
-
     # TODO(bnell): This method is provided as a hook so vllm/lora/layers/fused_moe.py
     # and vllm/distributed/elastic_ep/elastic_execute.py
     # can safely swap out the quant_method. We should figure out a less
     # intrusive way to do this.
     def _replace_quant_method(self, mk: FusedMoEMethodBase):
         self._runner._replace_quant_method(mk)
-
-    # def _ensure_moe_quant_config_init(self):
-    #    if self._runner.quant_method.moe_quant_config is None:
-    #        # Note: the moe_quant_config can't be constructed until after
-    #        # weight loading post processing.
-    #        self._runner.quant_method.moe_quant_config = (
-    #            self._runner.quant_method.get_fused_moe_quant_config(self)
-    #        )
 
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
@@ -605,8 +500,8 @@ class FusedMoE(CustomOp):
                     self,
                     base_quant_method,
                     prepare_finalize,
-                    self.shared_experts,
-                    inplace=not self.moe_config.disable_inplace,
+                    self._runner.shared_experts,
+                    inplace=not base_quant_method.moe.disable_inplace,
                 )
             )
 
@@ -621,40 +516,33 @@ class FusedMoE(CustomOp):
 
         return extract_layer_index(self.layer_name)
 
-    @property
-    def tp_size(self):
-        return self.moe_parallel_config.tp_size
+    #
+    # Attributes still needed by models
+    #
 
     @property
-    def ep_size(self):
-        return self.moe_parallel_config.ep_size
+    def is_monolithic(self) -> bool:
+        return self._runner.routed_experts.quant_method.is_monolithic
 
     @property
-    def tp_rank(self):
-        return self.moe_parallel_config.tp_rank
+    def activation(self) -> MoEActivation:
+        return self._runner.routed_experts.activation
 
     @property
-    def ep_rank(self):
-        return self.moe_parallel_config.ep_rank
+    def is_internal_router(self) -> bool:
+        # By default, router/gate is called before FusedMoE forward pass
+        return self._runner.is_internal_router
 
-    @property
-    def use_ep(self):
-        return self.moe_parallel_config.use_ep
-
-    # XXXXXXXXX keep this separate
-    @property
-    def local_num_experts(self) -> int:
-        """Number of experts assigned to this rank."""
-        return self.expert_map_manager.local_num_experts
+    #
+    # Expert maps
+    #
 
     @property
     def expert_placement_strategy(self) -> ExpertPlacementStrategy:
-        """Expert placement strategy ('linear' or 'round_robin')."""
         return self.expert_map_manager.placement_strategy
 
     @property
     def expert_global_to_physical(self) -> torch.Tensor | None:
-        """Routing table: global expert ID to physical expert ID."""
         tables = self.expert_map_manager.routing_tables
         return tables[0] if tables else None
 
@@ -669,23 +557,6 @@ class FusedMoE(CustomOp):
         """Routing table: local expert ID to global expert ID."""
         tables = self.expert_map_manager.routing_tables
         return tables[2] if tables else None
-
-    @property
-    def is_internal_router(self) -> bool:
-        # By default, router/gate is called before FusedMoE forward pass
-        return self._runner.is_internal_router
-
-    @property
-    def is_monolithic(self) -> bool:
-        return self._runner.routed_experts.quant_method.is_monolithic
-
-    @property
-    def shared_experts(self) -> SharedExperts | None:
-        return self._runner.shared_experts
-
-    #
-    # Expert maps
-    #
 
     @property
     def expert_map(self) -> torch.Tensor | None:
@@ -708,24 +579,6 @@ class FusedMoE(CustomOp):
     #
     # EPLB
     #
-
-    def _init_aiter_shared_experts_topK_buffer(
-        self, vllm_config: VllmConfig, dp_size: int
-    ):
-        if self.num_fused_shared_experts > 0:
-            init_aiter_topK_meta_data(
-                n_routed_experts=self.global_num_experts,
-                n_shared_experts=self.num_fused_shared_experts,
-                top_k=self.top_k,
-                tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
-                tp_size=self.ep_size if self.use_ep else self.tp_size,
-                shared_experts_score=1.0,
-                max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens
-                * dp_size,
-                is_EP=self.use_ep,
-            )
-        # HACK
-        self.expert_map_manager._local_num_experts += self.num_fused_shared_experts
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         """Delegate to EPLB manager."""

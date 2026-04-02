@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
@@ -212,7 +211,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     def _setup_kernel(
         self,
-        layer: Module,
+        layer: "RoutedExperts",
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> None:

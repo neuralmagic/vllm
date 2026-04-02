@@ -12,6 +12,9 @@ import torch
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+    init_aiter_topK_meta_data,
+)
 
 logger = init_logger(__name__)
 
@@ -123,6 +126,8 @@ class ExpertMapManager:
 
     def __init__(
         self,
+        max_num_batched_tokens: int,
+        top_k: int,
         global_num_experts: int,
         logical_num_experts: int,
         moe_parallel_config: FusedMoEParallelConfig,
@@ -162,19 +167,74 @@ class ExpertMapManager:
         # Initialize routing tables if needed
         self._maybe_init_routing_tables()
 
+        self._init_aiter_shared_experts_topK_buffer(
+            dp_size=self.moe_parallel_config.dp_size,
+            top_k=top_k,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+
+        if self.use_ep and self.rocm_aiter_enabled:
+            expert_mask = self.expert_mask
+            assert expert_mask is None or torch.all(
+                (expert_mask == 0) | (expert_mask == 1)
+            ), "Aiter Fused MoE kernel only supports expert_map with 0 and 1s."
+
+        # Log EP configuration (move into EMM?)
+        if self.use_ep:
+            logger.info_once(
+                "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
+                "placement strategy: %s. Local/global"
+                " number of experts: %s/%s. Experts local to global index map:"
+                " %s.",
+                self.ep_rank,
+                self.ep_size,
+                self.placement_strategy,
+                self.local_num_experts,
+                self.global_num_experts,
+                self.get_compressed_map_string(),
+            )
+
+    def _init_aiter_shared_experts_topK_buffer(
+        self,
+        dp_size: int,
+        top_k: int,
+        max_num_batched_tokens: int,
+    ):
+        if self.num_fused_shared_experts > 0:
+            init_aiter_topK_meta_data(
+                n_routed_experts=self.global_num_experts,
+                n_shared_experts=self.num_fused_shared_experts,
+                top_k=top_k,
+                tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
+                tp_size=self.ep_size if self.use_ep else self.tp_size,
+                shared_experts_score=1.0,
+                max_num_tokens=max_num_batched_tokens * dp_size,
+                is_EP=self.use_ep,
+            )
+        self._local_num_experts += self.num_fused_shared_experts
+
+    @property
+    def use_ep(self) -> int:
+        return self.moe_parallel_config.use_ep
+
     @property
     def ep_size(self) -> int:
-        """Expert parallelism world size."""
         return self.moe_parallel_config.ep_size
 
     @property
     def ep_rank(self) -> int:
-        """Expert parallelism rank."""
         return self.moe_parallel_config.ep_rank
 
     @property
+    def tp_size(self) -> int:
+        return self.moe_parallel_config.tp_size
+
+    @property
+    def tp_rank(self) -> int:
+        return self.moe_parallel_config.tp_rank
+
+    @property
     def local_num_experts(self) -> int:
-        """Number of experts assigned to this rank."""
         return self._local_num_experts
 
     @property

@@ -1178,8 +1178,7 @@ class QuarkOCP_MX_MoEMethod_OSS(QuarkOCP_MX_MoEMethod):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        expert_map: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if layer.enable_eplb:
             raise NotImplementedError(
                 "EPLB not supported for `QuarkW4MXFp4MoEMethod_OSS` yet."
@@ -1197,7 +1196,7 @@ class QuarkOCP_MX_MoEMethod_OSS(QuarkOCP_MX_MoEMethod):
             topk=layer.top_k,
             renormalize=layer.renormalize,
             global_num_experts=layer.global_num_experts,
-            expert_map=expert_map,
+            expert_map=layer.expert_map,
             quant_config=self.moe_quant_config,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             unpadded_N_w1=self.intermediate_size_per_partition * 2,

@@ -18,7 +18,7 @@ class SharedFusedMoE(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         return super().forward(
             hidden_states=hidden_states,
             router_logits=router_logits,

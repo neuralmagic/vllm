@@ -1190,7 +1190,13 @@ class FusedMoEConfig:
     # kernel is free to use inplace or not.
     disable_inplace: bool = True
 
+    # Set by __post_init__
+    rocm_aiter_fmoe_enabled: bool = False
+    aiter_fmoe_shared_expert_enabled: bool = False
+
     def __post_init__(self):
+        from vllm._aiter_ops import rocm_aiter_ops
+
         if self.dp_size > 1:
             logger.debug_once(
                 "Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens
@@ -1200,6 +1206,26 @@ class FusedMoEConfig:
 
         if self.router_logits_dtype is None:
             self.router_logits_dtype = self.in_dtype
+
+        if self.is_act_and_mul:
+            self.rocm_aiter_fmoe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
+            self.aiter_fmoe_shared_expert_enabled = (
+                rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+            )
+
+        if self.use_mori_kernels:
+            assert self.rocm_aiter_fmoe_enabled, (
+                "Mori needs to be used with aiter fused_moe for now."
+            )
+            assert not self.aiter_fmoe_shared_expert_enabled, (
+                "Mori does not support fusion shared expert now. "
+                "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"
+            )
+
+        if not self.is_act_and_mul and not current_platform.is_cuda_alike():
+            raise NotImplementedError(
+                "is_act_and_mul=False is supported only for CUDA and ROCm for now"
+            )
 
     @property
     def tp_size(self):
