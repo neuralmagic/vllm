@@ -322,11 +322,17 @@ class CacheOnlyAttentionLayer(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # Note: we use MLAAttentionSpec here to because it will
+        # Note: we use MLAAttentionSpec here because it will
         # produce page sizes of (block_size * num_kv_heads * head_size * dtype_size)
-        # whereas FullAttentionSpec will add an additional factor of 2
+        # whereas FullAttentionSpec will add an additional factor of 2.
+        #
+        # Use vllm_config.cache_config.block_size (not self.block_size) so that
+        # we always reflect the value after Platform.update_block_size_for_backend()
+        # has run. For hybrid models (e.g. Qwen3Next), that function adjusts
+        # block_size to make attention and recurrent-state page sizes compatible;
+        # self.block_size is captured at model-load time (before the adjustment).
         return MLAAttentionSpec(
-            block_size=self.block_size,
+            block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_heads,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,
