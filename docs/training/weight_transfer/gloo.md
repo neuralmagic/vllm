@@ -59,8 +59,8 @@ group = GLOOWeightTransferEngine.trainer_init(
 !!! note
     `trainer_init` always assigns the trainer to rank 0. Inference workers start at `rank_offset` (typically 1).
 
-!!! important
-    GLOO weight transfer requires `torch.distributed` to be uninitialized before calling `trainer_init` or `init_transfer_engine`. If your application uses `torch.distributed` for other purposes, consider using the **IPC** backend instead.
+!!! note
+    GLOO weight transfer creates an independent process group that does not interfere with existing `torch.distributed` groups. It uses a dedicated TCPStore similar to how NCCL uses `StatelessProcessGroup`.
 
 ## Sending Weights
 
@@ -115,11 +115,22 @@ The `names`, `dtype_names`, and `shapes` lists describe each parameter. These mu
 
 See [`examples/weight_transfer_gloo_example.py`](https://github.com/vllm-project/vllm/blob/main/examples/weight_transfer_gloo_example.py) for a complete working example demonstrating GLOO-based weight transfer between a trainer and multiple worker processes.
 
+## Unsupported Options
+
+The following options from the NCCL backend are **not supported** by GLOO and will trigger warnings if specified:
+
+- **`packed`**: Packed tensor broadcasting is not available. Weights are always transferred one-by-one.
+- **`packed_buffer_size_bytes`**: Only applicable to packed mode, ignored by GLOO.
+- **`packed_num_buffers`**: Only applicable to packed mode, ignored by GLOO.
+- **`layerwise_cpu_buffer=False`**: GLOO always uses CPU buffers, so this option has no effect.
+
+If you attempt to use these options, GLOO will issue a warning and ignore the unsupported parameters while continuing with standard one-by-one weight transfer.
+
 ## Limitations
 
 - **No packed tensor broadcasting**: Weights are transferred one-by-one, which can be slower for models with many small tensors.
 - **CPU-bound**: GLOO is optimized for CPU communication and will be significantly slower than NCCL for GPU workloads.
-- **Requires uninitialized torch.distributed**: Cannot be used if `torch.distributed.init_process_group()` has already been called.
 - **No CUDA stream overlap**: Unlike NCCL, GLOO does not support overlapping communication with computation on GPU streams.
+- **Network overhead**: Each weight is broadcast separately, which can increase network round-trips compared to NCCL's packed mode.
 
 For production GPU-based workloads, prefer the **NCCL** backend for optimal performance.

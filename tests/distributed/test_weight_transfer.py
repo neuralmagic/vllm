@@ -257,6 +257,53 @@ class TestGLOOEngineParsing:
         assert update_info.dtype_names == ["float32", "bfloat16"]
         assert update_info.shapes == [[100, 100], [50]]
 
+    def test_parse_update_info_packed_warns(self):
+        """Test that packed=True triggers a warning."""
+        config = WeightTransferConfig(backend="gloo")
+        parallel_config = create_mock_parallel_config()
+        engine = GLOOWeightTransferEngine(config, parallel_config)
+
+        with pytest.warns(UserWarning, match="does not support packed tensor"):
+            update_info = engine.parse_update_info(
+                {
+                    "names": ["w1"],
+                    "dtype_names": ["float32"],
+                    "shapes": [[100, 100]],
+                    "packed": True,
+                }
+            )
+
+        # Should still create valid update info, just without packed
+        assert isinstance(update_info, GLOOWeightTransferUpdateInfo)
+        assert update_info.names == ["w1"]
+
+    def test_parse_update_info_packed_options_warn(self):
+        """Test that packed options trigger warnings."""
+        config = WeightTransferConfig(backend="gloo")
+        parallel_config = create_mock_parallel_config()
+        engine = GLOOWeightTransferEngine(config, parallel_config)
+
+        with pytest.warns(UserWarning):
+            engine.parse_update_info(
+                {
+                    "names": ["w1"],
+                    "dtype_names": ["float32"],
+                    "shapes": [[100]],
+                    "packed_buffer_size_bytes": 1024,
+                    "packed_num_buffers": 2,
+                }
+            )
+
+    def test_layerwise_cpu_buffer_false_warns(self):
+        """Test that layerwise_cpu_buffer=False triggers a warning."""
+        with pytest.warns(UserWarning, match="always uses CPU buffers"):
+            GLOOWeightTransferUpdateInfo(
+                names=["w1"],
+                dtype_names=["float32"],
+                shapes=[[100]],
+                layerwise_cpu_buffer=False,
+            )
+
 
 # --- Unit Tests: Engine Registry ---
 

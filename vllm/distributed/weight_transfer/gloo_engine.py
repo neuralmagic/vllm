@@ -50,7 +50,9 @@ class GLOOWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     shapes: list[list[int]]
 
     def __post_init__(self):
-        """Validate that all lists have the same length."""
+        """Validate that all lists have the same length and warn about unsupported options."""
+        import warnings
+
         num_params = len(self.names)
         if len(self.dtype_names) != num_params:
             raise ValueError(
@@ -61,6 +63,15 @@ class GLOOWeightTransferUpdateInfo(WeightTransferUpdateInfo):
             raise ValueError(
                 f"`shapes` should be of the same size as `names`: "
                 f"got {len(self.shapes)} and {len(self.names)}"
+            )
+
+        # Warn about unsupported options
+        if not self.layerwise_cpu_buffer:
+            warnings.warn(
+                "GLOO weight transfer always uses CPU buffers. "
+                "Setting layerwise_cpu_buffer=False has no effect and will be ignored.",
+                UserWarning,
+                stacklevel=2,
             )
 
 
@@ -91,6 +102,62 @@ class GLOOWeightTransferEngine(
         """
         super().__init__(config, parallel_config)
         self.model_update_group: dist.ProcessGroup | None = None
+
+    def parse_update_info(
+        self, update_dict: dict[str, Any]
+    ) -> GLOOWeightTransferUpdateInfo:
+        """
+        Construct typed update info from dict with validation.
+
+        Warns if packed tensor options are specified (not supported by GLOO).
+
+        Args:
+            update_dict: Dictionary containing backend-specific update parameters
+
+        Returns:
+            Typed backend-specific update info dataclass
+
+        Raises:
+            ValueError: If update_dict is invalid for this backend
+        """
+        import warnings
+
+        # Warn if packed tensor options are specified
+        if update_dict.get("packed", False):
+            warnings.warn(
+                "GLOO weight transfer does not support packed tensor broadcasting. "
+                "The 'packed' option will be ignored. Weights will be transferred "
+                "one-by-one. For packed transfer, use the NCCL backend instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+            # Remove from dict to avoid TypeError
+            update_dict = {k: v for k, v in update_dict.items() if k != "packed"}
+
+        if "packed_buffer_size_bytes" in update_dict:
+            warnings.warn(
+                "GLOO weight transfer does not support packed tensor broadcasting. "
+                "The 'packed_buffer_size_bytes' option will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+            update_dict = {
+                k: v for k, v in update_dict.items() if k != "packed_buffer_size_bytes"
+            }
+
+        if "packed_num_buffers" in update_dict:
+            warnings.warn(
+                "GLOO weight transfer does not support packed tensor broadcasting. "
+                "The 'packed_num_buffers' option will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
+            update_dict = {
+                k: v for k, v in update_dict.items() if k != "packed_num_buffers"
+            }
+
+        # Call parent implementation
+        return super().parse_update_info(update_dict)
 
     def init_transfer_engine(self, init_info: GLOOWeightTransferInitInfo) -> None:
         """
@@ -252,45 +319,45 @@ class GLOOWeightTransferEngine(
         """
         Initialize a GLOO process group for CPU-based communication.
 
-        This creates a process group using torch.distributed's standard
-        initialization. Unlike NCCL which uses PyNcclCommunicator for stateless
-        groups, GLOO uses the standard torch.distributed process group mechanism.
+        This creates an independent process group using a dedicated TCPStore,
+        similar to how NCCL uses StatelessProcessGroup. The group does not
+        interfere with any existing torch.distributed groups.
 
         Args:
             master_address: Master node address
             master_port: Master node port
-            rank: Rank of this process
-            world_size: Total number of processes
+            rank: Rank of this process in the weight transfer group
+            world_size: Total number of processes in the weight transfer group
 
         Returns:
             ProcessGroup for GLOO communication
         """
-        import os
+        from datetime import timedelta
 
-        # Set environment variables for process group initialization
-        os.environ["MASTER_ADDR"] = master_address
-        os.environ["MASTER_PORT"] = str(master_port)
+        from torch.distributed import PrefixStore, ProcessGroupGloo, TCPStore
 
-        # Initialize process group with gloo backend
-        # If torch.distributed is not initialized, create the global group
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend="gloo",
-                init_method=f"tcp://{master_address}:{master_port}",
-                rank=rank,
-                world_size=world_size,
-            )
-            return dist.group.WORLD
-        else:
-            # If already initialized, we need to create a new group
-            # However, this requires coordination with all ranks in the original group
-            # For simplicity, we'll create a subgroup with the specified ranks
-            # NOTE: This approach assumes the ranks [0, world_size) exist in the
-            # initialized process group
-            raise RuntimeError(
-                "GLOO weight transfer currently requires torch.distributed to be "
-                "uninitialized. Please initialize the GLOO weight transfer engine "
-                "before calling torch.distributed.init_process_group(), or use a "
-                "different weight transfer backend (e.g., 'nccl' for GPU, 'ipc' for "
-                "shared memory)."
-            )
+        # Create a TCPStore for this specific weight transfer group
+        # This is independent of any existing torch.distributed state
+        is_master = rank == 0
+        store = TCPStore(
+            host_name=master_address,
+            port=master_port,
+            world_size=world_size,
+            is_master=is_master,
+            timeout=timedelta(seconds=300),
+        )
+
+        # Use a prefix to isolate this group's data in the store
+        prefix = f"gloo_weight_transfer_{master_port}"
+        prefix_store = PrefixStore(prefix, store)
+
+        # Create ProcessGroupGloo directly with the store
+        # This bypasses the global torch.distributed state
+        pg = ProcessGroupGloo(
+            prefix_store,
+            rank,
+            world_size,
+            timeout=timedelta(seconds=300),
+        )
+
+        return pg
