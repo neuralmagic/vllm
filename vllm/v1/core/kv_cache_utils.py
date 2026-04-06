@@ -946,6 +946,20 @@ def unify_kv_cache_spec_page_size(
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
             new_spec = replace(layer_spec, block_size=new_block_size)
+            # Some specs (e.g. MambaSpec) have page_size_bytes that does not
+            # depend on block_size (it depends on shapes/dtypes). Scaling
+            # block_size alone won't bring them to max_page_size. Use the
+            # page_size_padded field (present on both KVCacheSpec subclasses)
+            # to record the unified page size when block_size scaling is not
+            # sufficient.
+            if new_spec.page_size_bytes != max_page_size:
+                if not hasattr(new_spec, "page_size_padded"):
+                    raise NotImplementedError(
+                        f"Cannot unify page size for {type(new_spec).__name__}: "
+                        "page_size_bytes does not change with block_size and "
+                        "the spec has no page_size_padded field."
+                    )
+                new_spec = replace(new_spec, page_size_padded=max_page_size)  # type: ignore[call-arg]
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
