@@ -43,7 +43,6 @@ def start_async_worker(
                     state=state,
                     eplb_group=eplb_group,
                     cuda_stream=cuda_stream,
-                    is_profile=is_profile,
                 )
             )
         except Exception as exc:  # pragma: no cover - diagnostic path
@@ -90,7 +89,6 @@ async def transfer_run_periodically(
     state: "EplbState",
     eplb_group: ProcessGroup,
     cuda_stream: torch.cuda.Stream,
-    is_profile: bool = False,
 ) -> None:
     while True:
         await asyncio.to_thread(state.rearrange_event.wait)
@@ -137,6 +135,21 @@ async def transfer_run_periodically(
                         assert model_state.new_physical_to_logical_map is not None
                         assert physical_to_logical_map_cpu is not None
 
+                        # assert that the number of physical experts hasn't changed.
+                        # Sync EPLB is used for scale up/down even when async EPLB is
+                        # enabled.
+                        assert (
+                            physical_to_logical_map_cpu.shape
+                            == model_state.new_physical_to_logical_map.shape
+                        )
+
+                        # assert num_physical_experts == num_logical_experts * ep_size
+                        assert (
+                            physical_to_logical_map_cpu.shape[1]
+                            == model_state.model.expert_weights[0][0].shape[0]
+                            * eplb_group.size()
+                        )
+
                         layer_idx = model_state.layer_to_transfer
                         old_layer_indices = physical_to_logical_map_cpu[layer_idx]
                         new_layer_indices = model_state.new_physical_to_logical_map[
@@ -158,9 +171,8 @@ async def transfer_run_periodically(
                             new_layer_indices=new_layer_indices,
                             expert_weights=model_state.model.expert_weights[layer_idx],
                             expert_weights_buffer=model_state.expert_buffer,
-                            ep_group=eplb_group,
+                            ep_rank=eplb_group.rank(),
                             communicator=model_state.communicator,
-                            is_profile=is_profile,
                             cuda_stream=cuda_stream,
                         )
                         # block the async thread until the transfer to
