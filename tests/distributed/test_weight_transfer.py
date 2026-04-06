@@ -18,6 +18,11 @@ from torch.multiprocessing.reductions import reduce_tensor
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+from vllm.distributed.weight_transfer.gloo_engine import (
+    GLOOWeightTransferEngine,
+    GLOOWeightTransferInitInfo,
+    GLOOWeightTransferUpdateInfo,
+)
 from vllm.distributed.weight_transfer.ipc_engine import (
     IPCWeightTransferEngine,
     IPCWeightTransferInitInfo,
@@ -89,6 +94,51 @@ class TestNCCLWeightTransferUpdateInfoValidation:
         assert len(info.names) == 0
 
 
+# --- Unit Tests: GLOOWeightTransferUpdateInfo Validation ---
+
+
+class TestGLOOWeightTransferUpdateInfoValidation:
+    """Test GLOOWeightTransferUpdateInfo dataclass validation."""
+
+    def test_valid_update_info(self):
+        """Test creating valid GLOOWeightTransferUpdateInfo."""
+        info = GLOOWeightTransferUpdateInfo(
+            names=["layer.weight", "layer.bias"],
+            dtype_names=["float32", "float32"],
+            shapes=[[10, 10], [10]],
+        )
+        assert info.names == ["layer.weight", "layer.bias"]
+        assert info.dtype_names == ["float32", "float32"]
+        assert info.shapes == [[10, 10], [10]]
+
+    def test_mismatched_dtype_names_raises(self):
+        """Test that mismatched dtype_names length raises ValueError."""
+        with pytest.raises(ValueError, match="dtype_names"):
+            GLOOWeightTransferUpdateInfo(
+                names=["layer.weight", "layer.bias"],
+                dtype_names=["float32"],  # Only one dtype
+                shapes=[[10, 10], [10]],
+            )
+
+    def test_mismatched_shapes_raises(self):
+        """Test that mismatched shapes length raises ValueError."""
+        with pytest.raises(ValueError, match="shapes"):
+            GLOOWeightTransferUpdateInfo(
+                names=["layer.weight", "layer.bias"],
+                dtype_names=["float32", "float32"],
+                shapes=[[10, 10]],  # Only one shape
+            )
+
+    def test_empty_lists_valid(self):
+        """Test that empty lists are valid."""
+        info = GLOOWeightTransferUpdateInfo(
+            names=[],
+            dtype_names=[],
+            shapes=[],
+        )
+        assert len(info.names) == 0
+
+
 # --- Unit Tests: Engine Parsing ---
 
 
@@ -150,6 +200,64 @@ class TestNCCLEngineParsing:
         assert update_info.shapes == [[100, 100], [50]]
 
 
+class TestGLOOEngineParsing:
+    """Test GLOOWeightTransferEngine parsing methods."""
+
+    def test_parse_init_info_valid(self):
+        """Test parsing valid init info dict."""
+        config = WeightTransferConfig(backend="gloo")
+        parallel_config = create_mock_parallel_config()
+        engine = GLOOWeightTransferEngine(config, parallel_config)
+
+        init_info = engine.parse_init_info(
+            {
+                "master_address": "127.0.0.1",
+                "master_port": 12345,
+                "rank_offset": 1,
+                "world_size": 3,
+            }
+        )
+
+        assert isinstance(init_info, GLOOWeightTransferInitInfo)
+        assert init_info.master_address == "127.0.0.1"
+        assert init_info.master_port == 12345
+        assert init_info.rank_offset == 1
+        assert init_info.world_size == 3
+
+    def test_parse_init_info_missing_field_raises(self):
+        """Test parsing init info with missing required field."""
+        config = WeightTransferConfig(backend="gloo")
+        parallel_config = create_mock_parallel_config()
+        engine = GLOOWeightTransferEngine(config, parallel_config)
+
+        with pytest.raises(ValueError, match="Invalid init_info"):
+            engine.parse_init_info(
+                {
+                    "master_address": "127.0.0.1",
+                    # Missing master_port, rank_offset, world_size
+                }
+            )
+
+    def test_parse_update_info_valid(self):
+        """Test parsing valid update info dict."""
+        config = WeightTransferConfig(backend="gloo")
+        parallel_config = create_mock_parallel_config()
+        engine = GLOOWeightTransferEngine(config, parallel_config)
+
+        update_info = engine.parse_update_info(
+            {
+                "names": ["w1", "w2"],
+                "dtype_names": ["float32", "bfloat16"],
+                "shapes": [[100, 100], [50]],
+            }
+        )
+
+        assert isinstance(update_info, GLOOWeightTransferUpdateInfo)
+        assert update_info.names == ["w1", "w2"]
+        assert update_info.dtype_names == ["float32", "bfloat16"]
+        assert update_info.shapes == [[100, 100], [50]]
+
+
 # --- Unit Tests: Engine Registry ---
 
 
@@ -169,6 +277,13 @@ class TestEngineRegistry:
         parallel_config = create_mock_parallel_config()
         engine = WeightTransferEngineFactory.create_engine(config, parallel_config)
         assert isinstance(engine, IPCWeightTransferEngine)
+
+    def test_create_engine_gloo(self):
+        """Test factory creates GLOO engine."""
+        config = WeightTransferConfig(backend="gloo")
+        parallel_config = create_mock_parallel_config()
+        engine = WeightTransferEngineFactory.create_engine(config, parallel_config)
+        assert isinstance(engine, GLOOWeightTransferEngine)
 
     def test_create_engine_invalid_backend(self):
         """Test factory raises for invalid backend."""

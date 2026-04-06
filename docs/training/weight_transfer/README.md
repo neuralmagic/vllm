@@ -13,8 +13,9 @@ The weight transfer system follows a **two-phase protocol** with a pluggable bac
 
 | Backend | Transport | Use Case |
 | ------- | --------- | -------- |
-| [NCCL](nccl.md) | NCCL broadcast | Separate GPUs for training and inference |
+| [NCCL](nccl.md) | NCCL broadcast | Separate GPUs for training and inference (recommended for GPU workloads) |
 | [IPC](ipc.md) | CUDA IPC handles | Colocated training and inference on same GPU |
+| [GLOO](gloo.md) | GLOO broadcast | CPU-only environments, development/testing |
 
 ## Configuration
 
@@ -28,7 +29,7 @@ from vllm.config import WeightTransferConfig
 
 llm = LLM(
     model="my-model",
-    weight_transfer_config=WeightTransferConfig(backend="nccl"),  # or "ipc"
+    weight_transfer_config=WeightTransferConfig(backend="nccl"),  # or "ipc", "gloo"
 )
 ```
 
@@ -39,7 +40,7 @@ vllm serve my-model \
     --weight-transfer-config '{"backend": "nccl"}'
 ```
 
-The `backend` field accepts `"nccl"` (default) or `"ipc"`.
+The `backend` field accepts `"nccl"` (default), `"ipc"`, or `"gloo"`.
 
 ## API Endpoints
 
@@ -71,7 +72,7 @@ EngineClass.trainer_send_weights(
 )
 ```
 
-See the [NCCL](nccl.md) and [IPC](ipc.md) pages for backend-specific trainer APIs and full examples.
+See the [NCCL](nccl.md), [IPC](ipc.md), and [GLOO](gloo.md) pages for backend-specific trainer APIs and full examples.
 
 ## Extending the System
 
