@@ -53,10 +53,6 @@ class MultipleOf:
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    # For some attention backends, we allocate an output tensor before
-    # calling the custom op. When piecewise cudagraph is enabled, this
-    # makes sure the output tensor is allocated inside the cudagraph.
-    accept_output_buffer: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list["CacheDType"]] = [
         "auto",
