@@ -38,6 +38,10 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+)
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -969,31 +973,30 @@ class Worker(WorkerBase):
         model = self.model_runner.model
 
         if typed_update_info.is_checkpoint_format:
-            from vllm.model_executor.model_loader.reload import (
-                finalize_layerwise_reload,
-                initialize_layerwise_reload,
-            )
+            # Maybe move weights to cpu for reduced gpu memory usage
+            def load_weights_fn(weights: list[tuple[str, torch.Tensor]]):
+                if typed_update_info.layerwise_cpu_buffer:
+                    weights = [(name, weight.to("cpu")) for name, weight in weights]
+
+                model.load_weights(weights)
 
             # Use layerwise reload pattern for checkpoint format weights
-            with torch.device(self.device):
-                initialize_layerwise_reload(model)
-                self.weight_transfer_engine.receive_weights(
-                    typed_update_info,
-                    load_weights=model.load_weights,
-                )
-                finalize_layerwise_reload(model, self.model_config)
+            initialize_layerwise_reload(model)
+            self.weight_transfer_engine.receive_weights(
+                typed_update_info,
+                load_weights=load_weights_fn,
+            )
+            finalize_layerwise_reload(model, self.model_config)
         else:
             # Weights are already in kernel format, copy directly
-            def load_weights_direct(
-                weights: list[tuple[str, torch.Tensor]],
-            ) -> None:
+            def load_weights_fn(weights: list[tuple[str, torch.Tensor]]):
                 for name, weight in weights:
                     param = model.get_parameter(name)
                     param.copy_(weight)
 
             self.weight_transfer_engine.receive_weights(
                 typed_update_info,
-                load_weights=load_weights_direct,
+                load_weights=load_weights_fn,
             )
 
         # NCCL broadcast/packed path are asynchronous.

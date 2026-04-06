@@ -33,6 +33,11 @@ class WeightTransferUpdateInfo(ABC):  # noqa: B024
     """Set to True if weights are in checkpoint/original model format and need
     layerwise processing. Set to False if weights have already been processed
     into kernel format (repacking, renaming, etc.)."""
+    layerwise_cpu_buffer: bool = True
+    """Set to true to move weights to cpu after transfer. Doing this significantly
+    reduces device memory usage when weights are provided out of order and
+    `is_checkpoint_format`. Set to `False` to reduce reload latency, only recommend if
+    weights are provided in order. Default is True."""
 
 
 # API-level request classes (accept dicts for backend-agnostic serialization)
