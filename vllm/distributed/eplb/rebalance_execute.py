@@ -49,7 +49,7 @@ class AsyncEplbLayerResult:
     new_physical_to_logical_map: torch.Tensor
     """
     New physical→logical mapping for all layers, on CPU.
-    Shape: (num_moe_layers, num_physical_experts)
+    Shape: (num_physical_experts)
     """
     is_unchanged: np.ndarray
     """Per-physical-expert flag: weight was not moved during transfer."""

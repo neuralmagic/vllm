@@ -100,7 +100,8 @@ async def transfer_run_periodically(
             model_state.communicator.set_stream(cuda_stream)
             current_num_layers = model_state.model.num_moe_layers
 
-            # Snapshot the physical_to_logical_map and copy it to CPU
+            # Snapshot the physical_to_logical_map (synchronized with
+            # rearrange_event) and copy it to CPU
             with torch.cuda.stream(cuda_stream):
                 physical_to_logical_map_cpu = model_state.physical_to_logical_map.cpu()
 
@@ -150,8 +151,8 @@ async def transfer_run_periodically(
                     consumed_event=consumed_event,
                 )
 
-                # Block the this thread until the main thread finishes copying
-                # model_state.expert_buffer into
+                # Block this thread until the main thread and main stream
+                # finish copying model_state.expert_buffer into
                 # model_state.model.expert_weights[layer_idx]
                 consumed_event.wait(stream=cuda_stream)
                 assert model_state.pending_result is None
