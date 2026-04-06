@@ -65,7 +65,7 @@ class ChunkingMoERunner(MoERunnerBase):
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         self.routed_experts.quant_method = quant_method
         self._inner._replace_quant_method(quant_method)
-        assert self._shared_experts == self._inner._shared_experts
+        assert self.shared_experts == self._inner.shared_experts
 
     def _init_dp_chunking(self) -> list[torch.Tensor]:
         states_shape: tuple[int, ...]

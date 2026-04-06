@@ -112,6 +112,43 @@ def determine_expert_map(
     return (local_num_experts, expert_map, expert_mask)
 
 
+def determine_expert_placement_strategy(
+    expert_placement_strategy: ExpertPlacementStrategy,
+    moe_parallel_config: FusedMoEParallelConfig,
+    num_expert_group: int | None,
+    num_redundant_experts: int,
+    enable_eplb: bool,
+) -> ExpertPlacementStrategy:
+    if expert_placement_strategy == "round_robin":
+        round_robin_supported = (
+            (num_expert_group is not None and num_expert_group > 1)
+            and num_redundant_experts == 0
+            and not enable_eplb
+        )
+
+        if not round_robin_supported:
+            logger.warning(
+                "Round-robin expert placement is only supported for "
+                "models with multiple expert groups and no redundant "
+                "experts. Falling back to linear expert placement."
+            )
+            return "linear"
+        if (
+            moe_parallel_config.use_all2all_kernels
+            and not moe_parallel_config.use_deepep_ll_kernels
+            and not moe_parallel_config.use_nixl_ep_kernels
+        ):
+            logger.warning(
+                "Round-robin expert placement currently only supports "
+                "the DeepEP low-latency or NIXL EP backend, but '%s' was configured. "
+                "Falling back to linear expert placement.",
+                moe_parallel_config.all2all_backend,
+            )
+            return "linear"
+
+    return expert_placement_strategy
+
+
 class ExpertMapManager:
     """
     Manages expert ID mappings and placement for Expert Parallelism.
@@ -130,8 +167,11 @@ class ExpertMapManager:
         top_k: int,
         global_num_experts: int,
         logical_num_experts: int,
+        num_redundant_experts: int,
+        num_expert_group: int | None,
         moe_parallel_config: FusedMoEParallelConfig,
         placement_strategy: ExpertPlacementStrategy,
+        enable_eplb: bool,
         num_fused_shared_experts: int = 0,
         rocm_aiter_enabled: bool = False,
         device: torch.device | None = None,
@@ -155,6 +195,17 @@ class ExpertMapManager:
         self.num_fused_shared_experts = num_fused_shared_experts
         self.rocm_aiter_enabled = rocm_aiter_enabled
         self.device = device
+
+        if moe_parallel_config.use_ep:
+            # Determine expert placement strategy before creating manager
+            # TODO move into EMM
+            placement_strategy = determine_expert_placement_strategy(
+                expert_placement_strategy=placement_strategy,
+                moe_parallel_config=moe_parallel_config,
+                num_expert_group=num_expert_group,
+                num_redundant_experts=num_redundant_experts,
+                enable_eplb=enable_eplb,
+            )
 
         # Determine effective placement strategy
         self._placement_strategy = self._determine_placement_strategy(

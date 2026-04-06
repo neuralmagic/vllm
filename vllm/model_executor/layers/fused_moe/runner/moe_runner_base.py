@@ -240,8 +240,8 @@ class MoERunnerBase(MoERunner):
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         self.routed_experts.quant_method = quant_method
-        if self._shared_experts is not None:
-            self._shared_experts._mk_owns_shared_expert = (
+        if self.shared_experts is not None:
+            self.shared_experts._mk_owns_shared_expert = (
                 quant_method.mk_owns_shared_expert
             )
 
@@ -250,11 +250,11 @@ class MoERunnerBase(MoERunner):
             # TODO: Once the OOM issue for the TPU backend is resolved, we
             # will switch to using the moe_forward custom op.
             # Note: CPU doesn't require wrapped _forward_impl.
-            return _moe_forward if self._shared_experts is None else _moe_forward_shared
+            return _moe_forward if self.shared_experts is None else _moe_forward_shared
 
         return (
             torch.ops.vllm.moe_forward
-            if self._shared_experts is None
+            if self.shared_experts is None
             else torch.ops.vllm.moe_forward_shared
         )
 
@@ -280,7 +280,7 @@ class MoERunnerBase(MoERunner):
 
         return (
             hidden_states,
-            hidden_states if self._shared_experts is not None else None,
+            hidden_states if self.shared_experts is not None else None,
         )
 
     def apply_routed_output_transform(
@@ -332,7 +332,7 @@ class MoERunnerBase(MoERunner):
         early.
         """
         return (
-            self._shared_experts is not None
+            self.shared_experts is not None
             and self.routed_experts.quant_method.moe_kernel is not None
             and self.routed_experts.quant_method.moe_kernel.output_is_reduced()
         )
@@ -441,9 +441,9 @@ class MoERunnerBase(MoERunner):
         model's overlap strategy. Only fires if shared experts are configured
         and the order matches the shared experts' configured execution point.
         """
-        if self._shared_experts is not None:
+        if self.shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts(shared_experts_input, order)
+            self.shared_experts(shared_experts_input, order)
 
     def _apply_quant_method(
         self,
@@ -489,7 +489,7 @@ class MoERunnerBase(MoERunner):
         )
 
         return (
-            self._shared_experts.output if self._shared_experts is not None else None,
+            self.shared_experts.output if self.shared_experts is not None else None,
             fused_out,
         )
 

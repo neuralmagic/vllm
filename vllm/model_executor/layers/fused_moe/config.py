@@ -1164,7 +1164,7 @@ class FusedMoEConfig:
     num_experts: int
     experts_per_token: int
     hidden_dim: int
-    intermediate_size_per_partition: int
+    intermediate_size: int
     num_local_experts: int
     num_logical_experts: int
     activation: MoEActivation
@@ -1181,7 +1181,6 @@ class FusedMoEConfig:
     moe_backend: str = "auto"
     max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
     has_bias: bool = False
-    is_act_and_mul: bool = True
     is_lora_enabled: bool = False
 
     # This flag is used to disable the inplace optimization
@@ -1191,11 +1190,16 @@ class FusedMoEConfig:
     disable_inplace: bool = True
 
     # Set by __post_init__
+    intermediate_size_per_partition: int = -1
     rocm_aiter_fmoe_enabled: bool = False
     aiter_fmoe_shared_expert_enabled: bool = False
 
     def __post_init__(self):
         from vllm._aiter_ops import rocm_aiter_ops
+
+        tp_size = self.moe_parallel_config.tp_size
+        assert self.intermediate_size % tp_size == 0
+        self.intermediate_size_per_partition = self.intermediate_size // tp_size
 
         if self.dp_size > 1:
             logger.debug_once(
@@ -1226,6 +1230,10 @@ class FusedMoEConfig:
             raise NotImplementedError(
                 "is_act_and_mul=False is supported only for CUDA and ROCm for now"
             )
+
+    @property
+    def is_act_and_mul(self) -> bool:
+        return self.activation.is_gated
 
     @property
     def tp_size(self):

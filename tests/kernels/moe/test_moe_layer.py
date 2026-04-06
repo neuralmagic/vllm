@@ -857,7 +857,7 @@ def make_fused_moe_layer(
         topk_group=topk_group,
         quant_config=quant_config,
         tp_size=tp_size,
-        ep_size=ep_size,
+        # ep_size=ep_size,
         dp_size=dp_size,
         pcp_size=pcp_size,
         prefix="from_forward_context",

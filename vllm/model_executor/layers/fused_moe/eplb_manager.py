@@ -29,12 +29,22 @@ class EplbManager:
 
     def __init__(
         self,
+        ep_size: int,
+        global_num_experts: int,
         num_redundant_experts: int = 0,
     ):
         self.num_redundant_experts = num_redundant_experts
 
         # Runtime EPLB state
         self.state = EplbLayerState()
+
+        # Validate EPLB configuration
+        # EPLB currently only supports even distribution of experts across ranks
+        assert global_num_experts % ep_size == 0, (
+            f"EPLB currently only supports even distribution of "
+            f"experts across ranks. Got {global_num_experts} experts "
+            f"and {ep_size} EP ranks."
+        )
 
     def set_state(
         self,
@@ -131,13 +141,7 @@ class EplbManager:
         assert all(
             weight.is_contiguous()
             for name, weight in weights
-            if not (
-                name.startswith("_runner._shared_experts._layer")
-                or name.startswith("routed_experts.shared_experts._layer")
-                or name.startswith("_runner.gate.")
-                or name.startswith("_runner.routed_input_transform.")
-                or name.startswith("_runner.routed_output_transform.")
-            )
+            if not name.startswith("shared_experts._layer")
             and name not in NON_EXPERT_WEIGHTS
         )
 
@@ -146,34 +150,5 @@ class EplbManager:
             for name, weight in weights
             if name not in NON_EXPERT_WEIGHTS
             and weight.shape != torch.Size([])
-            and not name.startswith("_runner._shared_experts._layer")
-            and not name.startswith("routed_experts.shared_experts._layer")
-            # exclude parameters from non-expert submodules,
-            # e.g. gate/shared/transforms.
-            and not name.startswith("_runner.gate.")
-            and not name.startswith("_runner.routed_input_transform.")
-            and not name.startswith("_runner.routed_output_transform.")
+            and not name.startswith("shared_experts._layer")
         ]
-
-    @staticmethod
-    def validate_configuration(
-        global_num_experts: int,
-        ep_size: int,
-    ) -> None:
-        """
-        Validate EPLB configuration.
-
-        Args:
-            global_num_experts: Total number of experts (including redundant)
-            ep_size: Expert parallelism size
-
-        Raises:
-            AssertionError: If configuration is invalid
-        """
-
-        # EPLB currently only supports even distribution of experts across ranks
-        assert global_num_experts % ep_size == 0, (
-            f"EPLB currently only supports even distribution of "
-            f"experts across ranks. Got {global_num_experts} experts "
-            f"and {ep_size} EP ranks."
-        )

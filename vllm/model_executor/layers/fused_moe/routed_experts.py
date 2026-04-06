@@ -16,6 +16,7 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+    FusedMoEParallelConfig,
 )
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
@@ -31,6 +32,42 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 
 logger = init_logger(__name__)
+
+
+# TODO(rob): move this down to the kernel.
+def maybe_roundup_hidden_size(
+    hidden_size: int,
+    act_dtype: torch.dtype,
+    moe_parallel_config: FusedMoEParallelConfig,
+    is_lora_enabled: bool,
+    model_type: str | None,
+) -> int:
+    """
+    Given layer hidden size and MoE configurations, round up hidden_size
+    if necessary.
+
+    Args:
+        hidden_size: Layer hidden-size
+        act_dtype: Data type of the layer activations.
+        moe_parallel_config: Fused MoE parallelization strategy configuration.
+        is_lora_enabled: True if the engine is enabled with LoRA. This
+            is used in the case of mxfp4 quantization in selecting the
+            MxFP4Backend.
+        model_type: for checking if gpt-oss
+
+    Return:
+        Rounded up hidden_size if rounding up is required based on the configs.
+        Original hidden size otherwise.
+    """
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_roundup_layer_hidden_size,
+    )
+
+    hidden_size = maybe_roundup_layer_hidden_size(
+        hidden_size, act_dtype, moe_parallel_config
+    )
+
+    return hidden_size
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -53,7 +90,7 @@ class RoutedExperts(torch.nn.Module):
     def __init__(
         self,
         layer_name: str,
-        params_dtype: torch.dtype,
+        params_dtype: torch.dtype | None,
         unpadded_hidden_size: int,  # put in moe_config?
         intermediate_size: int,
         moe_config: FusedMoEConfig,
@@ -67,9 +104,6 @@ class RoutedExperts(torch.nn.Module):
         self.quant_config = quant_config
         self.expert_map_manager = expert_map_manager
         self.hidden_size = moe_config.hidden_dim
-        self.intermediate_size_per_partition = (
-            moe_config.intermediate_size_per_partition
-        )
         self.global_num_experts = moe_config.num_experts
         self.local_num_experts = moe_config.num_local_experts
 
@@ -80,6 +114,8 @@ class RoutedExperts(torch.nn.Module):
         if self.expert_map_manager.expert_mask is not None:
             self.register_buffer("expert_mask", self.expert_map_manager.expert_mask)
 
+        self.rocm_aiter_fmoe_enabled = moe_config.rocm_aiter_fmoe_enabled
+
         # Bit of hack until things are settled
         self.__dict__.update(kwargs)
 
@@ -88,6 +124,69 @@ class RoutedExperts(torch.nn.Module):
             self.quant_config,
             self.moe_config,
         )
+
+        #
+        # TODO: this will be replaced by method on quant_method.
+        #
+
+        vllm_config = get_current_vllm_config()
+
+        # Round up hidden size before creating moe_config.
+        # This way moe_config is created with the correct hidden_size from the start.
+        unpadded_hidden_size = self.moe_config.hidden_dim
+        model_type = (
+            vllm_config.model_config.hf_config.model_type
+            if vllm_config.model_config is not None
+            else None
+        )
+
+        # FIXME (varun): We should have a better way of inferring the activation
+        # datatype. This works for now as the tensor datatype entering the MoE
+        # operation is typically unquantized (i.e. float16/bfloat16).
+        if vllm_config.model_config is not None:
+            moe_in_dtype = vllm_config.model_config.dtype
+        elif params_dtype is not None:
+            # TODO (bnell): This is a hack to get test_mixtral_moe to work
+            # since model_config is not set in the pytest test.
+            moe_in_dtype = params_dtype
+        else:
+            params_dtype = torch.get_default_dtype()
+            moe_in_dtype = params_dtype
+
+        hidden_size = maybe_roundup_hidden_size(
+            hidden_size=self.moe_config.hidden_dim,
+            act_dtype=moe_in_dtype,
+            moe_parallel_config=self.moe_config.moe_parallel_config,
+            is_lora_enabled=vllm_config.lora_config is not None,
+            model_type=model_type,
+        )
+
+        self.moe_config.hidden_dim = hidden_size
+        # self.moe_config.intermediate_size_per_partition = (
+        #    intermediate_size_per_partition
+        # )
+        self.intermediate_size_per_partition = (
+            moe_config.intermediate_size_per_partition
+        )
+
+        #
+        # END TODO: this will be replaced by method on quant_method.
+        #
+
+        if (
+            self.moe_config.moe_parallel_config.enable_eplb
+            and not self.quant_method.supports_eplb
+        ):
+            # TODO: Add support for additional quantization methods.
+            # The implementation for other quantization methods does not
+            # contain essential differences, but the current quant API
+            # design causes duplicated work when extending to new
+            # quantization methods, so I'm leaving it for now.
+            # If you plan to add support for more quantization methods,
+            # please refer to the implementation in `Fp8MoEMethod`.
+            raise NotImplementedError(
+                f"EPLB is not supported {self.quant_method.__class__.__name__}."
+            )
 
         moe_quant_params = {
             "num_experts": moe_config.num_local_experts,
