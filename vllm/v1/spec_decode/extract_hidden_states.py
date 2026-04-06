@@ -93,8 +93,9 @@ class ExtractHiddenStatesProposer:
             target_hidden_states: List of hidden state tensors from target model
                                 (one per aux hidden state layer)
             common_attn_metadata: Attention metadata
-            slot_mappings: Slot mappings for KV cache (unused, provided for
-                          interface compatibility)
+            slot_mappings: Slot mappings for KV cache. Used to get the
+                          CacheOnly layer's slot_mapping from its own KV cache
+                          group (which may differ from the FullAttention group).
 
         Returns:
             Tuple of:
@@ -129,6 +130,19 @@ class ExtractHiddenStatesProposer:
         if num_tokens_across_dp is not None:
             num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
+        # Use the CacheOnly layer's own slot_mapping (from its KV cache group)
+        # rather than common_attn_metadata.slot_mapping (which belongs to the
+        # first FullAttentionSpec group and uses a different block_size). Using
+        # the wrong slot_mapping causes out-of-bounds writes into the CacheOnly
+        # KV cache tensor.
+        cache_only_slot_mapping = common_attn_metadata.slot_mapping
+        if (
+            isinstance(slot_mappings, dict)
+            and self.attn_layer_names
+            and self.attn_layer_names[0] in slot_mappings
+        ):
+            cache_only_slot_mapping = slot_mappings[self.attn_layer_names[0]]
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -136,7 +150,7 @@ class ExtractHiddenStatesProposer:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=self._get_slot_mapping(
-                num_input_tokens, common_attn_metadata.slot_mapping
+                num_input_tokens, cache_only_slot_mapping
             ),
         ):
             self.model(
