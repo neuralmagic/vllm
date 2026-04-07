@@ -10,14 +10,10 @@ Available backends:
 - FlashInfer (optimized for Blackwell)
 - cuDNN (optimized for Blackwell, requires NVIDIA artifactory)
 - TRT-LLM Ragged (optimized for Blackwell, DeepSeek-specific)
-
-Metadata classes (FlashInferPrefillMetadata, CudnnPrefillMetadata) are available
-through their respective backend modules to avoid circular imports.
 """
 
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLAPrefillBackend,
-    MLAPrefillBuilderState,
     MLAPrefillImpl,
 )
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
@@ -25,7 +21,6 @@ from vllm.v1.attention.backends.mla.prefill.selector import get_mla_prefill_back
 
 __all__ = [
     "MLAPrefillBackend",
-    "MLAPrefillBuilderState",
     "MLAPrefillImpl",
     "MLAPrefillBackendEnum",
     "get_mla_prefill_backend",

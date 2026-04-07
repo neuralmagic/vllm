@@ -6,10 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm import envs
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLAPrefillBackend,
-    MLAPrefillBuilderState,
     MLAPrefillImpl,
 )
 
@@ -19,7 +17,6 @@ if TYPE_CHECKING:
         MLACommonPrefillMetadata,
     )
     from vllm.platforms.interface import DeviceCapability
-    from vllm.v1.kv_cache_interface import AttentionSpec
 
 
 class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
@@ -41,7 +38,6 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
 
     @classmethod
     def supports_compute_capability(cls, device_capability: "DeviceCapability") -> bool:
-        # TRT-LLM ragged prefill is optimized for Blackwell
         return device_capability.major == 10
 
     @classmethod
@@ -54,38 +50,6 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             return True
         except ImportError:
             return False
-
-    @classmethod
-    def create_builder_state(
-        cls,
-        vllm_config: "VllmConfig",
-        kv_cache_spec: "AttentionSpec",
-        layer_names: list[str],
-        device: torch.device,
-    ) -> MLAPrefillBuilderState:
-        """Create TRT-LLM Ragged-specific builder state."""
-        workspace_buffer = torch.empty(
-            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
-            dtype=torch.uint8,
-            device=device,
-        )
-
-        return MLAPrefillBuilderState(
-            workspace_buffer=workspace_buffer,
-        )
-
-    @classmethod
-    def post_process_prefill_metadata(
-        cls,
-        prefill_metadata: "MLACommonPrefillMetadata",
-        builder_state: MLAPrefillBuilderState,
-        prefill_query_start_loc: torch.Tensor,
-    ) -> None:
-        """Set TRT-LLM Ragged-specific fields on the prefill metadata."""
-        prefill_metadata.query_seq_lens = (
-            prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
-        )
-        prefill_metadata.workspace_buffer = builder_state.workspace_buffer
 
 
 class TrtllmRaggedPrefillImpl(MLAPrefillImpl):

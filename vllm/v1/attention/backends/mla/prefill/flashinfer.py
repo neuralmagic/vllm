@@ -3,14 +3,12 @@
 """FlashInfer backend for MLA prefill."""
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
-from vllm import envs
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLAPrefillBackend,
-    MLAPrefillBuilderState,
     MLAPrefillImpl,
 )
 
@@ -20,7 +18,6 @@ if TYPE_CHECKING:
         MLACommonPrefillMetadata,
     )
     from vllm.platforms.interface import DeviceCapability
-    from vllm.v1.kv_cache_interface import AttentionSpec
 
 try:
     from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
@@ -69,7 +66,6 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
 
     @classmethod
     def supports_compute_capability(cls, device_capability: "DeviceCapability") -> bool:
-        # FlashInfer prefill is optimized for Blackwell
         return device_capability.major == 10
 
     @classmethod
@@ -82,134 +78,6 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
             return True
         except ImportError:
             return False
-
-    @classmethod
-    def create_builder_state(
-        cls,
-        vllm_config: "VllmConfig",
-        kv_cache_spec: "AttentionSpec",
-        layer_names: list[str],
-        device: torch.device,
-    ) -> MLAPrefillBuilderState:
-        """Create FlashInfer-specific builder state."""
-        # Import here to avoid circular dependency
-        from vllm.model_executor.layers.attention.mla_attention import MLACommonImpl
-        from vllm.v1.attention.backends.utils import (
-            get_per_layer_parameters,
-            infer_global_hyperparameters,
-        )
-
-        workspace_buffer = torch.empty(
-            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
-            dtype=torch.uint8,
-            device=device,
-        )
-
-        global_hyperparameters = infer_global_hyperparameters(
-            get_per_layer_parameters(vllm_config, layer_names, MLACommonImpl)  # type: ignore[type-abstract]
-        )
-
-        return MLAPrefillBuilderState(
-            workspace_buffer=workspace_buffer,
-            backend_state={
-                "prefill_main": None,
-                "prefill_chunks": [],
-                "global_hyperparameters": global_hyperparameters,
-            },
-        )
-
-    @classmethod
-    def finalize_attention_metadata(
-        cls,
-        attn_metadata: Any,
-        builder_state: MLAPrefillBuilderState,
-        num_prefills: int,
-        num_heads: int,
-        kv_cache_spec: "AttentionSpec",
-        mla_dims: Any,
-        model_config: Any,
-    ) -> None:
-        """Build FlashInfer prefill wrappers."""
-        if num_prefills == 0:
-            return
-
-        prefill = attn_metadata.prefill
-        if prefill is None:
-            return
-
-        assert isinstance(prefill, FlashInferPrefillMetadata)
-
-        qo_indptr = prefill.query_start_loc
-        has_context = prefill.chunked_context is not None
-
-        prefill_main = builder_state.backend_state.get("prefill_main")
-        prefill_chunks = builder_state.backend_state.get("prefill_chunks", [])
-        workspace_buffer = builder_state.workspace_buffer
-        global_hyperparameters = builder_state.backend_state["global_hyperparameters"]
-
-        if prefill_main is None:
-            prefill_main = BatchPrefillWithRaggedKVCacheWrapper(
-                workspace_buffer, "NHD", backend="cutlass"
-            )
-            builder_state.backend_state["prefill_main"] = prefill_main
-
-        if has_context:
-            chunked_context = prefill.chunked_context
-            num_chunks = chunked_context.cu_seq_lens.shape[0]
-            if len(prefill_chunks) < num_chunks:
-                for _ in range(len(prefill_chunks), num_chunks):
-                    prefill_chunks.append(
-                        BatchPrefillWithRaggedKVCacheWrapper(
-                            workspace_buffer, "NHD", backend="cutlass"
-                        )
-                    )
-                builder_state.backend_state["prefill_chunks"] = prefill_chunks
-            assert num_chunks <= len(prefill_chunks)
-
-        num_qo_heads = num_heads
-        num_kv_heads = num_qo_heads
-        assert kv_cache_spec.num_kv_heads == 1
-
-        head_dim_qk = mla_dims.qk_nope_head_dim + mla_dims.qk_rope_head_dim
-        head_dim_vo = mla_dims.v_head_dim
-        kv_indptr = qo_indptr.clone()
-
-        prefill_main.plan(
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            causal=True,
-            sm_scale=global_hyperparameters.sm_scale,
-            window_left=global_hyperparameters.window_left,
-            logits_soft_cap=global_hyperparameters.logits_soft_cap,
-            q_data_type=prefill.q_data_type,
-            o_data_type=prefill.output_dtype,
-        )
-
-        if has_context:
-            for i in range(num_chunks):
-                kv_indptr_chunk = chunked_context.cu_seq_lens[i]
-
-                prefill_chunks[i].plan(
-                    qo_indptr=qo_indptr,
-                    kv_indptr=kv_indptr_chunk,
-                    num_qo_heads=num_qo_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
-                    causal=False,
-                    sm_scale=global_hyperparameters.sm_scale,
-                    window_left=global_hyperparameters.window_left,
-                    logits_soft_cap=global_hyperparameters.logits_soft_cap,
-                    q_data_type=prefill.q_data_type,
-                    o_data_type=prefill.output_dtype,
-                )
-
-        prefill.prefill_main = prefill_main
-        prefill.prefill_chunks = prefill_chunks
 
 
 class FlashInferPrefillImpl(MLAPrefillImpl):

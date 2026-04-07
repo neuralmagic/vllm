@@ -9,7 +9,6 @@ import torch
 
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLAPrefillBackend,
-    MLAPrefillBuilderState,
     MLAPrefillImpl,
 )
 
@@ -19,7 +18,6 @@ if TYPE_CHECKING:
         MLACommonPrefillMetadata,
     )
     from vllm.platforms.interface import DeviceCapability
-    from vllm.v1.kv_cache_interface import AttentionSpec
 
 CUDNN_WORKSPACE_SIZE = 12800
 
@@ -66,9 +64,12 @@ class CudnnPrefillBackend(MLAPrefillBackend):
     def get_prefill_metadata_cls() -> type["CudnnPrefillMetadata"]:
         return CudnnPrefillMetadata
 
+    @staticmethod
+    def get_chunked_context_metadata_cls() -> type:
+        return CudnnPrefillMetadata.ChunkedContextMetadata
+
     @classmethod
     def supports_compute_capability(cls, device_capability: "DeviceCapability") -> bool:
-        # cuDNN prefill is optimized for Blackwell
         return device_capability.major == 10
 
     @classmethod
@@ -83,49 +84,6 @@ class CudnnPrefillBackend(MLAPrefillBackend):
         from vllm.utils.flashinfer import has_nvidia_artifactory
 
         return has_nvidia_artifactory()
-
-    @classmethod
-    def create_builder_state(
-        cls,
-        vllm_config: "VllmConfig",
-        kv_cache_spec: "AttentionSpec",
-        layer_names: list[str],
-        device: torch.device,
-    ) -> MLAPrefillBuilderState:
-        """Create cuDNN-specific builder state."""
-        scheduler_config = vllm_config.scheduler_config
-
-        cudnn_workspace = torch.empty(
-            CUDNN_WORKSPACE_SIZE * scheduler_config.max_num_seqs,
-            dtype=torch.int8,
-            device=device,
-        )
-
-        return MLAPrefillBuilderState(
-            backend_state={"cudnn_workspace": cudnn_workspace},
-        )
-
-    @staticmethod
-    def get_chunked_context_metadata_cls() -> type:
-        """Return the cuDNN-specific ChunkedContextMetadata class."""
-        return CudnnPrefillMetadata.ChunkedContextMetadata
-
-    @classmethod
-    def post_process_prefill_metadata(
-        cls,
-        prefill_metadata: "MLACommonPrefillMetadata",
-        builder_state: MLAPrefillBuilderState,
-        prefill_query_start_loc: torch.Tensor,
-    ) -> None:
-        """Set cuDNN-specific fields on the prefill metadata."""
-        assert isinstance(prefill_metadata, CudnnPrefillMetadata)
-
-        prefill_metadata.query_seq_lens = (
-            prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
-        )
-        prefill_metadata.cudnn_workspace = builder_state.backend_state[
-            "cudnn_workspace"
-        ]
 
 
 class CudnnPrefillImpl(MLAPrefillImpl):
