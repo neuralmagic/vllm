@@ -51,6 +51,19 @@ from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
     XPUW4A8IntLinearKernel,
     XPUwNa16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8 import (
+    Mxfp8LinearKernel,
+    Mxfp8LinearLayerConfig,
+)
+from vllm.model_executor.kernels.linear.mxfp8.emulation import (
+    EmulationMxfp8LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+    FlashInferCutlassMxfp8LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+    MarlinMxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
@@ -149,6 +162,18 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CPU: [
         Dynamic4bitLinearKernel,
         CPUWNA16LinearKernel,
+    ],
+}
+
+# in priority/performance order (when available)
+_POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
+    PlatformEnum.CUDA: [
+        FlashInferCutlassMxfp8LinearKernel,
+        MarlinMxfp8LinearKernel,
+        EmulationMxfp8LinearKernel,
+    ],
+    PlatformEnum.ROCM: [
+        EmulationMxfp8LinearKernel,
     ],
 }
 
@@ -367,6 +392,41 @@ def choose_mp_linear_kernel(
     )
 
 
+def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
+    """Select and instantiate the best MXFP8 linear kernel for the
+    current platform."""
+    config = Mxfp8LinearLayerConfig()
+
+    platform = current_platform._enum
+    possible = _POSSIBLE_MXFP8_KERNELS.get(platform, [])
+
+    failure_reasons = []
+    for kernel_cls in possible:
+        if kernel_cls.__name__ in envs.VLLM_DISABLED_KERNELS:
+            failure_reasons.append(
+                f" {kernel_cls.__name__} disabled by environment variable"
+            )
+            continue
+
+        is_supported, reason = kernel_cls.is_supported()
+        if not is_supported:
+            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
+            continue
+
+        can_implement, reason = kernel_cls.can_implement(config)
+        if not can_implement:
+            failure_reasons.append(f"{kernel_cls.__name__}: {reason}")
+            continue
+
+        logger.info_once("Using %s for MXFP8 GEMM", kernel_cls.__name__)
+        return kernel_cls(config)
+
+    raise ValueError(
+        "Failed to find a kernel that can implement the "
+        "MXFP8 linear layer. Reasons: \n" + "\n".join(failure_reasons)
+    )
+
+
 def register_linear_kernel(
     kernel_class: type,
     platform: PlatformEnum,
@@ -396,6 +456,10 @@ def register_linear_kernel(
         if platform not in _POSSIBLE_FP8_KERNELS:
             _POSSIBLE_FP8_KERNELS[platform] = []
         _POSSIBLE_FP8_KERNELS[platform].append(kernel_class)
+    elif kernel_type == "mxfp8":
+        if platform not in _POSSIBLE_MXFP8_KERNELS:
+            _POSSIBLE_MXFP8_KERNELS[platform] = []
+        _POSSIBLE_MXFP8_KERNELS[platform].append(kernel_class)
     else:
         raise ValueError(f"Unrecognized kernel type: {kernel_type}")
 
@@ -433,4 +497,10 @@ __all__ = [
     "MarlinLinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
+    "init_mxfp8_linear_kernel",
+    "Mxfp8LinearKernel",
+    "Mxfp8LinearLayerConfig",
+    "FlashInferCutlassMxfp8LinearKernel",
+    "MarlinMxfp8LinearKernel",
+    "EmulationMxfp8LinearKernel",
 ]

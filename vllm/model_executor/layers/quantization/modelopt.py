@@ -9,7 +9,10 @@ from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
+from vllm.model_executor.kernels.linear import (
+    init_fp8_linear_kernel,
+    init_mxfp8_linear_kernel,
+)
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -67,7 +70,6 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
-    Mxfp8LinearOp,
     mxfp8_e4m3_quantize,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
@@ -1572,7 +1574,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
                 "Dynamic quantization is not supported."
             )
 
-        self.mxfp8_linear_op = Mxfp8LinearOp()
+        self.kernel = init_mxfp8_linear_kernel()
 
     def create_weights(
         self,
@@ -1654,7 +1656,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
             f" got {layer.weight_scale.dtype}"
         )
 
-        self.mxfp8_linear_op.process_weights(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -1662,16 +1664,7 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.mxfp8_linear_op.apply(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            out_dtype=x.dtype,
-            bias=bias,
-            workspace=getattr(layer, "workspace", None),
-            size_n=layer.output_size_per_partition,
-            size_k=layer.input_size_per_partition,
-        )
+        return self.kernel.apply_weights(layer, x, bias)
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
