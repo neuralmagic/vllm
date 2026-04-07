@@ -530,12 +530,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe: torch.Tensor,  # value in unified attn
         kv_cache: torch.Tensor,
         attn_metadata: "MLACommonMetadata",
-        output: torch.Tensor | None = None,
+        output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert output is not None, "Output tensor must be provided."
-
         use_quant = output_scale is not None or output_block_scale is not None
         if use_quant:
             # The fusion pass has allocated output with quantized dtype
