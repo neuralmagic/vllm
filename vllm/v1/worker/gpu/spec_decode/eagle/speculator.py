@@ -80,6 +80,12 @@ class EagleSpeculator:
             device=device,
         )
 
+        self._eplb_num_unpadded_tensor: torch.Tensor | None = (
+            torch.tensor(0, dtype=torch.int32, device=device)
+            if vllm_config.parallel_config.enable_eplb
+            else None
+        )
+
         self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
             self.draft_model_config
         )
@@ -162,6 +168,7 @@ class EagleSpeculator:
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
             num_unpadded_tokens=num_unpadded_tokens,
+            num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
         ):
             inputs_embeds = None
             if self.supports_mm_inputs:
@@ -374,6 +381,8 @@ class EagleSpeculator:
 
         # Prefill: Run the eagle speculator with eager mode.
         # TODO(woosuk): Support CUDA graph for prefill.
+        if self._eplb_num_unpadded_tensor is not None:
+            self._eplb_num_unpadded_tensor.fill_(input_batch.num_tokens)
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
             attn_metadata,
@@ -463,6 +472,9 @@ class EagleSpeculator:
                 num_tokens_padded=decode_batch_desc.num_tokens,
                 max_query_len=1,
             )
+
+        if self._eplb_num_unpadded_tensor is not None:
+            self._eplb_num_unpadded_tensor.fill_(num_reqs)
 
         if decode_batch_desc.cg_mode == CUDAGraphMode.FULL:
             self.cudagraph_manager.run_fullgraph(decode_batch_desc)

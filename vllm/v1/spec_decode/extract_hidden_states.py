@@ -38,6 +38,12 @@ class ExtractHiddenStatesProposer:
         self.dtype = vllm_config.model_config.dtype
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
+        self._eplb_num_unpadded_tensor: torch.Tensor | None = (
+            torch.tensor(0, dtype=torch.int32, device=device)
+            if vllm_config.parallel_config.enable_eplb
+            else None
+        )
+
         # Model and attention layer tracking (initialized in load_model)
         self.model: nn.Module | None = None
         self.attn_layer_names: list[str] = []
@@ -129,6 +135,8 @@ class ExtractHiddenStatesProposer:
         if num_tokens_across_dp is not None:
             num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
+        if self._eplb_num_unpadded_tensor is not None:
+            self._eplb_num_unpadded_tensor.fill_(num_tokens)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -139,6 +147,7 @@ class ExtractHiddenStatesProposer:
                 num_input_tokens, common_attn_metadata.slot_mapping
             ),
             num_unpadded_tokens=num_tokens,
+            num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
         ):
             self.model(
                 hidden_states=self.hidden_states[:num_input_tokens],
@@ -266,6 +275,7 @@ class ExtractHiddenStatesProposer:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=slot_mapping_dict,
             num_unpadded_tokens=num_tokens,
+            num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
         ):
             self.model(
                 hidden_states=self.hidden_states[:num_input_tokens],

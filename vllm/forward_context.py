@@ -261,10 +261,6 @@ class ForwardContext:
 
 _forward_context: ForwardContext | None = None
 
-# Persistent across forward passes so its device-pointer stays constant
-# inside CUDA-graph replays.  Filled by create_forward_context().
-_num_unpadded_tokens_tensor: torch.Tensor | None = None
-
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
@@ -290,22 +286,12 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     num_unpadded_tokens: int | None = None,
+    num_unpadded_tokens_tensor: torch.Tensor | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
     else:
         all_moe_layers = None
-
-    global _num_unpadded_tokens_tensor
-    num_unpadded_tensor: torch.Tensor | None = None
-    if num_unpadded_tokens is not None:
-        if _num_unpadded_tokens_tensor is None:
-            _num_unpadded_tokens_tensor = torch.tensor(
-                num_unpadded_tokens, dtype=torch.int32, device="cuda"
-            )
-        else:
-            _num_unpadded_tokens_tensor.fill_(num_unpadded_tokens)
-        num_unpadded_tensor = _num_unpadded_tokens_tensor
 
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -318,7 +304,7 @@ def create_forward_context(
         ubatch_slices=ubatch_slices,
         skip_compiled=skip_compiled,
         num_unpadded_tokens=num_unpadded_tokens,
-        num_unpadded_tokens_tensor=num_unpadded_tensor,
+        num_unpadded_tokens_tensor=num_unpadded_tokens_tensor,
         additional_kwargs=additional_kwargs or {},
     )
 
@@ -350,6 +336,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     num_unpadded_tokens: int | None = None,
+    num_unpadded_tokens_tensor: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -410,6 +397,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         num_unpadded_tokens,
+        num_unpadded_tokens_tensor,
     )
 
     try:
