@@ -132,6 +132,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CacheOnlySpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -2130,7 +2131,7 @@ class GPUModelRunner(
         def _get_block_table(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
-            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+            if isinstance(kv_cache_spec, (EncoderOnlyAttentionSpec, CacheOnlySpec)):
                 blk_table_tensor = torch.zeros(
                     (num_reqs_padded, 1),
                     dtype=torch.int32,
@@ -3723,6 +3724,14 @@ class GPUModelRunner(
                     dtype=torch.int64,
                     device=self.device,
                 )
+            elif isinstance(kv_cache_spec, CacheOnlySpec):
+                # Use real slot mapping so hidden states land in the correct
+                # paged blocks.  Fill padding with 0 (not -1): basic_cache uses
+                # plain tensor indexing and cannot handle negative slot IDs.
+                blk_table = self.input_batch.block_table[kv_cache_gid]
+                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded].clone()
+                slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(0)
+                return slot_mapping
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
@@ -6485,27 +6494,38 @@ class GPUModelRunner(
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
         block_sizes = []
+        kernel_block_sizes_for_table = []
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
+        # prepare_kernel_block_sizes skips CacheOnly groups, so kernel_block_sizes
+        # has no entry for them; insert block_size directly for CacheOnly instead
+        # of consuming from the iterator.
+        kernel_block_sizes_iter = iter(kernel_block_sizes)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
-            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+            spec = kv_cache_group.kv_cache_spec
+            if isinstance(spec, EncoderOnlyAttentionSpec):
                 continue
-            block_size = kv_cache_group.kv_cache_spec.block_size
+            block_size = spec.block_size
             block_sizes.append(block_size)
             max_num_blocks_per_req = cdiv(
                 max_model_len, block_size * get_total_cp_world_size()
             )
-            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+            if isinstance(spec, MambaSpec):
                 max_num_blocks_per_req = (
                     max_num_blocks_per_req
                     if self.cache_config.enable_prefix_caching
                     else 1
-                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                ) + spec.num_speculative_blocks
             max_num_blocks.append(max_num_blocks_per_req)
+            kernel_block_sizes_for_table.append(
+                block_size
+                if isinstance(spec, CacheOnlySpec)
+                else next(kernel_block_sizes_iter)
+            )
 
         if (
             block_sizes != self._init_block_sizes
-            or kernel_block_sizes != self._init_kernel_block_sizes
+            or kernel_block_sizes_for_table != self._init_kernel_block_sizes
         ):
             assert self.offload_config.uva.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
@@ -6513,7 +6533,7 @@ class GPUModelRunner(
                 "for more details."
             )
             self._init_block_sizes = block_sizes
-            self._init_kernel_block_sizes = kernel_block_sizes
+            self._init_kernel_block_sizes = kernel_block_sizes_for_table
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -6522,7 +6542,7 @@ class GPUModelRunner(
                 pin_memory=self.pin_memory,
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
-                kernel_block_sizes=kernel_block_sizes,
+                kernel_block_sizes=kernel_block_sizes_for_table,
                 max_num_blocks_per_req=max_num_blocks,
                 is_spec_decode=bool(self.vllm_config.speculative_config),
                 logitsprocs=self.input_batch.logitsprocs,
@@ -6534,9 +6554,9 @@ class GPUModelRunner(
             f"InputBatch block_sizes {self._init_block_sizes} != "
             f"kv_cache block_sizes {block_sizes}"
         )
-        assert self._init_kernel_block_sizes == kernel_block_sizes, (
+        assert self._init_kernel_block_sizes == kernel_block_sizes_for_table, (
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
-            f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
+            f"!= kv_cache kernel_block_sizes {kernel_block_sizes_for_table}"
         )
 
     def _allocate_kv_cache_tensors(
@@ -6603,17 +6623,27 @@ class GPUModelRunner(
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
-            if group.kv_cache_group_id == len(kernel_block_sizes):
-                # There may be a last group for layers without kv cache.
+            is_cache_only = isinstance(kv_cache_spec, CacheOnlySpec)
+            if group.kv_cache_group_id == len(kernel_block_sizes) and not is_cache_only:
+                # Group without kv cache (e.g. encoder-only on some workers)
                 continue
-            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            kernel_block_size = (
+                None if is_cache_only else kernel_block_sizes[group.kv_cache_group_id]
+            )
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-                if isinstance(kv_cache_spec, AttentionSpec):
+                if is_cache_only:
+                    kv_caches[layer_name] = raw_tensor.view(kv_cache_spec.dtype).view(
+                        num_blocks,
+                        kv_cache_spec.block_size,
+                        kv_cache_spec.num_hidden_states,
+                        kv_cache_spec.hidden_size,
+                    )
+                elif isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size

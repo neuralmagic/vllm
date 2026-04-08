@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CacheOnlySpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -350,7 +351,7 @@ def prepare_kernel_block_sizes(
             # All layers in the UniformTypeKVCacheSpecs have the same type,
             # pick an arbitrary one to dispatch.
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
-        if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+        if isinstance(kv_cache_spec, (EncoderOnlyAttentionSpec, CacheOnlySpec)):
             continue
         if isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
