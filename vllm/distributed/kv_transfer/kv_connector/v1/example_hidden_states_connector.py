@@ -12,10 +12,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.kv_cache_interface import CacheOnlySpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -99,7 +101,7 @@ class ExampleHiddenStatesConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class ExampleHiddenStatesConnector(KVConnectorBase_V1):
+class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     """
     Simple debug implementation of a HiddenStatesConnector.
 
@@ -147,6 +149,16 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         self._request_filenames: dict[str, str] = {}
         self._active_requests: dict[str, NewRequestData] = {}
         self._req_blocks: dict[str, list[int]] = {}
+
+        groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else []
+        self._cache_group_idx = next(
+            (
+                i
+                for i, g in enumerate(groups)
+                if isinstance(g.kv_cache_spec, CacheOnlySpec)
+            ),
+            0,
+        )
 
     # ==============================
     # Worker-side methods
@@ -269,12 +281,14 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
                 new_req.req_id,
                 filename=filename,
                 token_ids=token_ids,
-                block_ids=new_req.block_ids[0],
+                block_ids=new_req.block_ids[self._cache_group_idx],
                 block_size=self._block_size,
             )
             self._request_filenames[new_req.req_id] = filename
             self._active_requests[new_req.req_id] = new_req
-            self._req_blocks[new_req.req_id] = list(new_req.block_ids[0])
+            self._req_blocks[new_req.req_id] = list(
+                new_req.block_ids[self._cache_group_idx]
+            )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -289,7 +303,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
             if new_block_ids is None:
                 continue
 
-            block_ids = new_block_ids[0]
+            block_ids = new_block_ids[self._cache_group_idx]
 
             req_block_ids.extend(block_ids)
             filename = os.path.join(self._storage_path, f"{req_id}.safetensors")
@@ -330,6 +344,13 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         _ = self._req_blocks.pop(req_id, None)
 
         return False, {"hidden_states_path": req_filename}
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        return self.request_finished(request, block_ids[self._cache_group_idx])
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
