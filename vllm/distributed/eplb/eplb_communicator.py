@@ -34,7 +34,7 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 try:
-    if not current_platform.is_rocm():
+    if current_platform.is_cuda():
         from nixl._api import (
             nixl_agent as NixlWrapper,  # type: ignore[reportMissingImports]
         )
