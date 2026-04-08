@@ -93,8 +93,9 @@ class ExtractHiddenStatesProposer:
             target_hidden_states: List of hidden state tensors from target model
                                 (one per aux hidden state layer)
             common_attn_metadata: Attention metadata
-            slot_mappings: Slot mappings for KV cache (unused, provided for
-                          interface compatibility)
+            slot_mappings: Per-layer slot mappings for KV cache; the entry
+                          for the CacheOnly layer is used to fill the hidden
+                          states into the correct paged block slots
 
         Returns:
             Tuple of:
@@ -129,6 +130,10 @@ class ExtractHiddenStatesProposer:
         if num_tokens_across_dp is not None:
             num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
+        cache_only_slot_mapping = None
+        if isinstance(slot_mappings, dict) and self.attn_layer_names:
+            cache_only_slot_mapping = slot_mappings.get(self.attn_layer_names[0])
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -136,7 +141,7 @@ class ExtractHiddenStatesProposer:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=self._get_slot_mapping(
-                num_input_tokens, common_attn_metadata.slot_mapping
+                num_input_tokens, cache_only_slot_mapping
             ),
         ):
             self.model(
