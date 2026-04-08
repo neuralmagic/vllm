@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLAPrefillBackend,
     MLAPrefillImpl,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -67,6 +69,7 @@ class TrtllmRaggedPrefillImpl(MLAPrefillImpl):
         v_head_dim: int,
         vllm_config: "VllmConfig",
         device: torch.device,
+        **kwargs,
     ) -> None:
         super().__init__(
             num_heads=num_heads,
@@ -77,6 +80,22 @@ class TrtllmRaggedPrefillImpl(MLAPrefillImpl):
             v_head_dim=v_head_dim,
             vllm_config=vllm_config,
             device=device,
+        )
+
+    def prepare_metadata(
+        self,
+        prefill_metadata: "MLACommonPrefillMetadata",
+    ) -> None:
+        prefill_metadata.query_seq_lens = (
+            prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
+        )
+        (prefill_metadata.workspace_buffer,) = (
+            current_workspace_manager().get_simultaneous(
+                (
+                    (envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,),
+                    torch.uint8,
+                ),
+            )
         )
 
     def run_prefill_new_tokens(

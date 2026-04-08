@@ -62,6 +62,7 @@ class FlashAttnPrefillImpl(MLAPrefillImpl):
         v_head_dim: int,
         vllm_config: "VllmConfig",
         device: torch.device,
+        **kwargs,
     ) -> None:
         super().__init__(
             num_heads=num_heads,

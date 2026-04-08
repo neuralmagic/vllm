@@ -1430,20 +1430,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 
         self._prefill_backend = get_mla_prefill_backend(vllm_config)
-        self._prefill_backend_name = self._prefill_backend.get_name()
         self.prefill_metadata_cls = self._prefill_backend.get_prefill_metadata_cls()
 
-        if self._prefill_backend_name == "FLASHINFER_PREFILL":
-            from vllm.v1.attention.backends.utils import (
-                get_per_layer_parameters,
-                infer_global_hyperparameters,
-            )
-
-            self._fi_prefill_main = None
-            self._fi_prefill_chunks: list = []
-            self._global_hyperparameters = infer_global_hyperparameters(
-                get_per_layer_parameters(vllm_config, layer_names, MLACommonImpl)  # type: ignore[type-abstract]
-            )
+        prefill_impl_cls = self._prefill_backend.get_prefill_impl_cls()
+        self._prefill_impl = prefill_impl_cls(
+            num_heads=self.num_heads,
+            scale=self.model_config.get_head_size() ** -0.5,
+            kv_lora_rank=self.mla_dims.kv_lora_rank,
+            qk_nope_head_dim=self.mla_dims.qk_nope_head_dim,
+            qk_rope_head_dim=self.mla_dims.qk_rope_head_dim,
+            v_head_dim=self.mla_dims.v_head_dim,
+            vllm_config=vllm_config,
+            device=device,
+            layer_names=layer_names,
+        )
 
         supports_spec_decode = self.query_len_support != QueryLenSupport.SINGLE_ONLY
         self._init_reorder_batch_threshold(
@@ -1455,93 +1455,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 f"reorder_batch_threshold must be 1 when query_len_support is "
                 f"SINGLE_ONLY, got {self.reorder_batch_threshold}"
             )
-
-    def _get_fi_workspace_buffer(self):
-        if not hasattr(self, "_fi_workspace_buffer"):
-            self._fi_workspace_buffer = torch.empty(
-                envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-        return self._fi_workspace_buffer
-
-    def _build_fi_prefill_wrappers(self, prefill):
-        from vllm.v1.attention.backends.mla.prefill.flashinfer import (
-            FlashInferPrefillMetadata,
-        )
-
-        assert isinstance(prefill, FlashInferPrefillMetadata)
-
-        qo_indptr = prefill.query_start_loc
-        has_context = prefill.chunked_context is not None
-        workspace_buffer = self._get_fi_workspace_buffer()
-
-        if self._fi_prefill_main is None:
-            from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
-
-            self._fi_prefill_main = BatchPrefillWithRaggedKVCacheWrapper(
-                workspace_buffer, "NHD", backend="cutlass"
-            )
-
-        if has_context:
-            chunked_context = prefill.chunked_context
-            num_chunks = chunked_context.cu_seq_lens.shape[0]
-            if len(self._fi_prefill_chunks) < num_chunks:
-                from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
-
-                for _ in range(len(self._fi_prefill_chunks), num_chunks):
-                    self._fi_prefill_chunks.append(
-                        BatchPrefillWithRaggedKVCacheWrapper(
-                            workspace_buffer, "NHD", backend="cutlass"
-                        )
-                    )
-            assert num_chunks <= len(self._fi_prefill_chunks)
-
-        num_qo_heads = self.num_heads
-        num_kv_heads = num_qo_heads
-        assert self.kv_cache_spec.num_kv_heads == 1
-
-        head_dim_qk = self.mla_dims.qk_nope_head_dim + self.mla_dims.qk_rope_head_dim
-        head_dim_vo = self.mla_dims.v_head_dim
-        kv_indptr = qo_indptr.clone()
-
-        assert self._fi_prefill_main is not None
-        self._fi_prefill_main.plan(
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            causal=True,
-            sm_scale=self._global_hyperparameters.sm_scale,
-            window_left=self._global_hyperparameters.window_left,
-            logits_soft_cap=self._global_hyperparameters.logits_soft_cap,
-            q_data_type=prefill.q_data_type,
-            o_data_type=prefill.output_dtype,
-        )
-
-        if has_context:
-            for i in range(num_chunks):
-                kv_indptr_chunk = chunked_context.cu_seq_lens[i]
-
-                self._fi_prefill_chunks[i].plan(
-                    qo_indptr=qo_indptr,
-                    kv_indptr=kv_indptr_chunk,
-                    num_qo_heads=num_qo_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
-                    causal=False,
-                    sm_scale=self._global_hyperparameters.sm_scale,
-                    window_left=self._global_hyperparameters.window_left,
-                    logits_soft_cap=self._global_hyperparameters.logits_soft_cap,
-                    q_data_type=prefill.q_data_type,
-                    o_data_type=prefill.output_dtype,
-                )
-
-        prefill.prefill_main = self._fi_prefill_main
-        prefill.prefill_chunks = self._fi_prefill_chunks
 
     def _build_decode(
         self,
@@ -1801,39 +1714,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 q_data_type=self.q_data_type,
             )
 
-            if self._prefill_backend_name in (
-                "CUDNN_PREFILL",
-                "TRTLLM_RAGGED_PREFILL",
-            ):
-                prefill_metadata.query_seq_lens = (
-                    prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
-                )
-
-            if self._prefill_backend_name == "CUDNN_PREFILL":
-                from vllm.v1.attention.backends.mla.prefill.cudnn import (
-                    CUDNN_WORKSPACE_SIZE,
-                    CudnnPrefillMetadata,
-                )
-                from vllm.v1.worker.workspace import current_workspace_manager
-
-                assert isinstance(prefill_metadata, CudnnPrefillMetadata)
-                num_seqs = prefill_metadata.query_seq_lens.shape[0]
-                (prefill_metadata.cudnn_workspace,) = (
-                    current_workspace_manager().get_simultaneous(
-                        ((CUDNN_WORKSPACE_SIZE * num_seqs,), torch.int8),
-                    )
-                )
-            elif self._prefill_backend_name == "TRTLLM_RAGGED_PREFILL":
-                from vllm.v1.worker.workspace import current_workspace_manager
-
-                (prefill_metadata.workspace_buffer,) = (
-                    current_workspace_manager().get_simultaneous(
-                        (
-                            (envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,),
-                            torch.uint8,
-                        ),
-                    )
-                )
+            self._prefill_impl.prepare_metadata(prefill_metadata)
 
         decode_metadata = None
         if num_decodes > 0:
@@ -1877,9 +1758,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             prefill=prefill_metadata,
             decode=decode_metadata,
         )
-
-        if num_prefills > 0 and self._prefill_backend_name == "FLASHINFER_PREFILL":
-            self._build_fi_prefill_wrappers(attn_metadata.prefill)
 
         return attn_metadata
 

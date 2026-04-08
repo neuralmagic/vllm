@@ -127,6 +127,7 @@ class MLAPrefillImpl(ABC):
         v_head_dim: int,
         vllm_config: "VllmConfig",
         device: torch.device,
+        layer_names: list[str] | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.scale = scale
@@ -136,6 +137,16 @@ class MLAPrefillImpl(ABC):
         self.v_head_dim = v_head_dim
         self.vllm_config = vllm_config
         self.device = device
+
+    def prepare_metadata(  # noqa: B027
+        self,
+        prefill_metadata: "MLACommonPrefillMetadata",
+    ) -> None:
+        """Prepare backend-specific metadata before the forward pass.
+
+        Called by the metadata builder after constructing the prefill metadata.
+        Backends can override this to allocate workspaces, build wrappers, etc.
+        """
 
     @abstractmethod
     def run_prefill_new_tokens(

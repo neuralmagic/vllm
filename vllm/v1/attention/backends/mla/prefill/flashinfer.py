@@ -7,10 +7,16 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLAPrefillBackend,
     MLAPrefillImpl,
 )
+from vllm.v1.attention.backends.utils import (
+    get_per_layer_parameters,
+    infer_global_hyperparameters,
+)
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -95,6 +101,7 @@ class FlashInferPrefillImpl(MLAPrefillImpl):
         v_head_dim: int,
         vllm_config: "VllmConfig",
         device: torch.device,
+        layer_names: list[str] | None = None,
     ) -> None:
         super().__init__(
             num_heads=num_heads,
@@ -105,7 +112,94 @@ class FlashInferPrefillImpl(MLAPrefillImpl):
             v_head_dim=v_head_dim,
             vllm_config=vllm_config,
             device=device,
+            layer_names=layer_names,
         )
+
+        self._prefill_main: BatchPrefillWithRaggedKVCacheWrapper | None = None
+        self._prefill_chunks: list[BatchPrefillWithRaggedKVCacheWrapper] = []
+
+        if layer_names is not None:
+            from vllm.model_executor.layers.attention.mla_attention import (
+                MLACommonImpl,
+            )
+
+            self._global_hyperparameters = infer_global_hyperparameters(
+                get_per_layer_parameters(vllm_config, layer_names, MLACommonImpl)  # type: ignore[type-abstract]
+            )
+
+    def prepare_metadata(
+        self,
+        prefill_metadata: "MLACommonPrefillMetadata",
+    ) -> None:
+        assert isinstance(prefill_metadata, FlashInferPrefillMetadata)
+
+        qo_indptr = prefill_metadata.query_start_loc
+        has_context = prefill_metadata.chunked_context is not None
+        (workspace_buffer,) = current_workspace_manager().get_simultaneous(
+            ((envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,), torch.uint8),
+        )
+
+        if self._prefill_main is None:
+            self._prefill_main = BatchPrefillWithRaggedKVCacheWrapper(
+                workspace_buffer, "NHD", backend="cutlass"
+            )
+
+        if has_context:
+            chunked_context = prefill_metadata.chunked_context
+            num_chunks = chunked_context.cu_seq_lens.shape[0]
+            if len(self._prefill_chunks) < num_chunks:
+                for _ in range(len(self._prefill_chunks), num_chunks):
+                    self._prefill_chunks.append(
+                        BatchPrefillWithRaggedKVCacheWrapper(
+                            workspace_buffer, "NHD", backend="cutlass"
+                        )
+                    )
+            assert num_chunks <= len(self._prefill_chunks)
+
+        num_qo_heads = self.num_heads
+        num_kv_heads = num_qo_heads
+
+        head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
+        head_dim_vo = self.v_head_dim
+        kv_indptr = qo_indptr.clone()
+
+        assert self._prefill_main is not None
+        self._prefill_main.plan(
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            causal=True,
+            sm_scale=self._global_hyperparameters.sm_scale,
+            window_left=self._global_hyperparameters.window_left,
+            logits_soft_cap=self._global_hyperparameters.logits_soft_cap,
+            q_data_type=prefill_metadata.q_data_type,
+            o_data_type=prefill_metadata.output_dtype,
+        )
+
+        if has_context:
+            for i in range(num_chunks):
+                kv_indptr_chunk = chunked_context.cu_seq_lens[i]
+
+                self._prefill_chunks[i].plan(
+                    qo_indptr=qo_indptr,
+                    kv_indptr=kv_indptr_chunk,
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
+                    causal=False,
+                    sm_scale=self._global_hyperparameters.sm_scale,
+                    window_left=self._global_hyperparameters.window_left,
+                    logits_soft_cap=self._global_hyperparameters.logits_soft_cap,
+                    q_data_type=prefill_metadata.q_data_type,
+                    o_data_type=prefill_metadata.output_dtype,
+                )
+
+        prefill_metadata.prefill_main = self._prefill_main
+        prefill_metadata.prefill_chunks = self._prefill_chunks
 
     def run_prefill_new_tokens(
         self,
