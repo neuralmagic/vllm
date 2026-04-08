@@ -28,6 +28,7 @@ physical experts.
 
 import threading
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 
 import torch
@@ -256,6 +257,12 @@ class EplbState:
         self.async_worker: threading.Thread | None = None
         """
         Background thread handling async transfers.
+        """
+        self.stop_requested: bool = False
+        """
+        Flag to signal the async worker thread to stop. Set by
+        shutdown_async_worker() and stop_async_worker(); checked by the
+        async thread after each blocking wait in transfer_run_periodically.
         """
         self.cuda_device_index: int | None = None
         """
@@ -809,6 +816,29 @@ class EplbState:
                 self,
                 is_profile=is_profile,
             )
+
+    def stop_async_worker(self) -> None:
+        """ """
+        if self.async_worker is None:
+            return
+        self.stop_requested = True
+
+        # Unblock the outer rearrange_event.wait() if the worker is idle there.
+        with suppress(AssertionError):
+            self.rearrange_event.record()
+
+        # Unblock consumed_event.wait() if the worker is blocked there.
+        for model_state in self.model_states.values():
+            if model_state.pending_result is not None:
+                model_state.pending_result.consumed_event.record()
+            model_state.rebalanced = False
+            model_state.pending_result = None
+
+        # Terminate the async_worker thread
+        self.async_worker.join(timeout=5.0)
+        self.async_worker = None
+
+        self.stop_requested = False
 
     def _all_ranks_result_ready(self, model_state: EplbModelState) -> bool:
         parallel_state = get_ep_group()
