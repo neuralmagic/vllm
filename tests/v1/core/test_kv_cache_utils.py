@@ -27,7 +27,9 @@ from vllm.v1.core.kv_cache_utils import (
     estimate_max_model_len,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
+    get_kv_cache_config_from_groups,
     get_kv_cache_configs,
+    get_kv_cache_groups,
     get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     hash_block_tokens,
@@ -37,6 +39,7 @@ from vllm.v1.core.kv_cache_utils import (
     tensor_data,
 )
 from vllm.v1.kv_cache_interface import (
+    CacheOnlySpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -2137,3 +2140,114 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def new_cache_only_spec(
+    block_size=16,
+    num_hidden_states=3,
+    hidden_size=64,
+    dtype=torch.float32,
+):
+    return CacheOnlySpec(
+        block_size=block_size,
+        num_hidden_states=num_hidden_states,
+        hidden_size=hidden_size,
+        dtype=dtype,
+    )
+
+
+def test_cache_only_spec_page_size():
+    spec = new_cache_only_spec(
+        block_size=16, num_hidden_states=3, hidden_size=64, dtype=torch.float32
+    )
+    # float32 = 4 bytes; page = 16 * 3 * 64 * 4
+    assert spec.page_size_bytes == 16 * 3 * 64 * 4
+
+    spec_bf16 = new_cache_only_spec(
+        block_size=8, num_hidden_states=2, hidden_size=128, dtype=torch.bfloat16
+    )
+    # bfloat16 = 2 bytes; page = 8 * 2 * 128 * 2
+    assert spec_bf16.page_size_bytes == 8 * 2 * 128 * 2
+
+
+def test_get_kv_cache_groups_cache_only_pure_attention():
+    """CacheOnly pre-extracted before routing; appended as last group."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    kv_cache_spec = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_kv_cache_spec(),
+        "cache_only_0": new_cache_only_spec(),
+    }
+    groups = get_kv_cache_groups(vllm_config, kv_cache_spec)
+    assert len(groups) == 2
+    # Last group must be the CacheOnly group
+    assert isinstance(groups[-1].kv_cache_spec, CacheOnlySpec)
+    assert groups[-1].layer_names == ["cache_only_0"]
+    # First group must be the two attention layers
+    assert isinstance(groups[0].kv_cache_spec, FullAttentionSpec)
+    assert set(groups[0].layer_names) == {"layer_1", "layer_2"}
+
+
+def test_get_kv_cache_groups_cache_only_hybrid():
+    """HMA path (FullAttention + Mamba) + CacheOnly: last group is CacheOnly."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+
+    attn_spec = new_kv_cache_spec(block_size=16, num_kv_heads=2, head_size=64)
+    mamba_page_size = attn_spec.page_size_bytes  # pad mamba to same page size
+    mamba_spec = new_mamba_spec(block_size=16, page_size_padded=mamba_page_size)
+    cache_only_spec = new_cache_only_spec()
+
+    kv_cache_spec = {
+        "attn_0": attn_spec,
+        "mamba_0": mamba_spec,
+        "cache_only_0": cache_only_spec,
+    }
+    groups = get_kv_cache_groups(vllm_config, kv_cache_spec)
+    assert isinstance(groups[-1].kv_cache_spec, CacheOnlySpec)
+    assert groups[-1].layer_names == ["cache_only_0"]
+    # Remaining groups come from the HMA path; neither is CacheOnly
+    for g in groups[:-1]:
+        assert not isinstance(g.kv_cache_spec, CacheOnlySpec)
+
+
+def test_get_kv_cache_groups_cache_only_excluded_from_unify():
+    """CacheOnly must be pre-extracted before unify_hybrid_kv_cache_specs runs."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = True
+
+    kv_cache_spec = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_sliding_window_spec(sliding_window=1),
+        "cache_only_0": new_cache_only_spec(),
+    }
+    # Should not raise even though CacheOnlySpec can't be unified
+    groups = get_kv_cache_groups(vllm_config, kv_cache_spec)
+    assert isinstance(groups[-1].kv_cache_spec, CacheOnlySpec)
+
+
+def test_get_kv_cache_config_from_groups_budget():
+    """Memory budget includes CacheOnly cost per block."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+
+    attn_spec = new_kv_cache_spec()  # page_size = 16 * 2 * 64 * 4 * 2
+    cache_only_spec = new_cache_only_spec()  # page_size = 16 * 3 * 64 * 4
+
+    attn_page = attn_spec.page_size_bytes
+    co_page = cache_only_spec.page_size_bytes
+    target_blocks = 32
+    # 2 attn layers + 1 cache_only layer
+    available_memory = target_blocks * (2 * attn_page + co_page)
+
+    groups = [
+        KVCacheGroupSpec(["layer_1", "layer_2"], attn_spec),
+        KVCacheGroupSpec(["cache_only_0"], cache_only_spec),
+    ]
+    config = get_kv_cache_config_from_groups(vllm_config, groups, available_memory)
+
+    assert config.num_blocks == target_blocks
+    assert sum(t.size for t in config.kv_cache_tensors) == available_memory
+
+    # Verify the CacheOnly tensor is sized correctly
+    co_tensors = [t for t in config.kv_cache_tensors if t.shared_by == ["cache_only_0"]]
+    assert len(co_tensors) == 1
+    assert co_tensors[0].size == co_page * target_blocks
