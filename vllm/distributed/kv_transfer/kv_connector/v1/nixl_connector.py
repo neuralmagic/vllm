@@ -5,7 +5,6 @@ import copy
 import logging
 import os
 import queue
-import sys
 import threading
 import time
 import uuid
@@ -53,6 +52,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     compute_mamba_phys_ratio,
     derive_mamba_conv_split,
 )
+from vllm.distributed.nixl_utils import import_nixl_module
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -105,42 +105,25 @@ GET_META_MSG = b"get_meta_msg"
 logger = init_logger(__name__)
 
 # Lazy import nixl_wrapper to avoid loading nixl_bindings if nixl is not used
+nixl_api = None
 try:
-    if "UCX_RCACHE_MAX_UNRELEASED" not in os.environ:
-        # avoid a memory leak in UCX when using NIXL on some models
-        # see: https://github.com/vllm-project/vllm/issues/24264
-        if "nixl" in sys.modules or "rixl" in sys.modules:
-            logger.warning(
-                "NIXL was already imported, we can't reset UCX_RCACHE_MAX_UNRELEASED. "
-                "Please set it to '1024' manually."
-            )
-        else:
-            logger.info(
-                "Setting UCX_RCACHE_MAX_UNRELEASED to '1024' to avoid a rare "
-                "memory leak in UCX when using NIXL."
-            )
-            os.environ["UCX_RCACHE_MAX_UNRELEASED"] = "1024"
-
-    if not current_platform.is_rocm():
-        from nixl._api import nixl_agent as NixlWrapper
-        from nixl._bindings import nixlXferTelemetry
-    else:
-        from rixl._api import nixl_agent as NixlWrapper
-        from rixl._bindings import nixlXferTelemetry
+    nixl_api = import_nixl_module("_api", logger)
+    nixl_bindings = import_nixl_module("_bindings", logger)
+    NixlWrapper = nixl_api.nixl_agent
+    nixlXferTelemetry = nixl_bindings.nixlXferTelemetry
 
     logger.info("NIXL is available")
-except ImportError:
+except (ImportError, AttributeError):
     logger.warning("NIXL is not available")
     NixlWrapper = None
     nixlXferTelemetry = None
 
 
 try:
-    if not current_platform.is_rocm():
-        from nixl._api import nixl_agent_config
-    else:
-        from rixl._api import nixl_agent_config
-except ImportError:
+    if nixl_api is None:
+        nixl_api = import_nixl_module("_api", logger)
+    nixl_agent_config = nixl_api.nixl_agent_config
+except (ImportError, AttributeError):
     nixl_agent_config = None
     logger.warning("NIXL agent config is not available")
 
@@ -3275,7 +3258,8 @@ class NixlKVConnectorStats(KVConnectorStats):
             "num_kv_expired_reqs": [],
         }
 
-    def record_transfer(self, res: nixlXferTelemetry):
+    # nixlXferTelemetry is imported dynamically, so keep this as Any for mypy.
+    def record_transfer(self, res: Any):
         # Keep metrics units consistent with rest of the code: time us->s
         self.data["transfer_duration"].append(res.xferDuration / 1e6)
         self.data["post_duration"].append(res.postDuration / 1e6)
