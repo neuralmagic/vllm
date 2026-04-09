@@ -230,19 +230,17 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._peer_partition_bytes: int = 0
         self._dtype_max_bytes: dict[torch.dtype, int] = {}
         self._cuda_device_id = int(self._device.index or 0)
-        try:
-            self._init_registered_buffers(expert_weights)
-        except Exception as exc:
-            raise RuntimeError("NIXL EPLB init failed: buffers") from exc
-        try:
-            self._init_remote_agents()
-        except Exception as exc:
-            raise RuntimeError("NIXL EPLB init failed: agents") from exc
-        try:
-            self._exchange_remote_send_meta()
-        except Exception as exc:
-            raise RuntimeError("NIXL EPLB init failed: send meta") from exc
+        self._init_step("buffers", self._init_registered_buffers, expert_weights)
+        self._init_step("agents", self._init_remote_agents)
+        self._init_step("send meta", self._exchange_remote_send_meta)
         self._log_initialized()
+
+    @staticmethod
+    def _init_step(name: str, fn: object, *args: object, **kwargs: object) -> None:
+        try:
+            fn(*args, **kwargs)  # type: ignore[operator]
+        except Exception as exc:
+            raise RuntimeError(f"NIXL EPLB init failed: {name}") from exc
 
     def _make_agent_name(self) -> str:
         """Build a deployment-unique nixl agent name."""
