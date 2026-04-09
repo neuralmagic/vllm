@@ -167,3 +167,9 @@ direct_register_custom_op(
     op_func=_mxfp8_e4m3_quantize_impl,
     fake_impl=mxfp8_e4m3_quantize_fake,
 )
+
+
+def xpu_mxfp8_quantize(
+    x: torch.Tensor, dtype: torch.dtype | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.vllm.xpu_mxfp8_quantize(x, dtype)
