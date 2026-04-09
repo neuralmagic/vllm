@@ -320,7 +320,7 @@ class IrOp:
                     continue
 
                 if batch_invariant_only and not impl.batch_invariant:
-                    # Skip batch invariant implementations
+                    # Skip non-batch-invariant implementations
                     continue
 
                 filtered_impls.append(impl)

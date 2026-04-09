@@ -563,6 +563,8 @@ class CudaPlatformBase(Platform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
+        # triton_batch_invariant available even when VLLM_BATCH_INVARIANT=0,
+        # but it won't be selected. vllm_c is skipped when VLLM_BATCH_INVARIANT=1.
         rms_norm = (
             ["native"]
             if using_inductor
