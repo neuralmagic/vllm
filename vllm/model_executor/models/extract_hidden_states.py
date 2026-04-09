@@ -34,8 +34,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CacheOnlySpec,
     KVCacheSpec,
-    MLAAttentionSpec,
 )
 
 ########## Custom Ops ########
@@ -322,10 +322,7 @@ class CacheOnlyAttentionLayer(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # Note: we use MLAAttentionSpec here to because it will
-        # produce page sizes of (block_size * num_kv_heads * head_size * dtype_size)
-        # whereas FullAttentionSpec will add an additional factor of 2
-        return MLAAttentionSpec(
+        return CacheOnlySpec(
             block_size=self.block_size,
             num_kv_heads=self.num_heads,
             head_size=self.head_size,
