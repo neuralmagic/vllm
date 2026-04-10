@@ -15,7 +15,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.utils import divide
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.lora.ops.triton_ops.utils import get_lora_op_configs
-from vllm.model_executor.layers.fused_moe import FusedMoE, RoutedExperts
+from vllm.model_executor.layers.fused_moe import FusedMoE, MoERunner, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     _get_config_dtype_str,
 )
@@ -43,12 +43,11 @@ from .utils import _get_lora_device, try_get_optimal_moe_lora_config
 
 # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 class FusedMoEWithLoRA(BaseLayerWithLoRA):
-    def __init__(self, base_layer: FusedMoE) -> None:
+    def __init__(self, base_layer: MoERunner) -> None:
         super().__init__()
         self.base_layer = base_layer
-        self._runner = base_layer._runner
 
-        assert not self.routed_experts.use_ep, (
+        assert not self.base_layer.routed_experts.use_ep, (
             "EP support for Fused MoE LoRA is not implemented yet."
         )
         self.tp_size = get_tensor_model_parallel_world_size()

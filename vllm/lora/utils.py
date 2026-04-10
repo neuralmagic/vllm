@@ -35,7 +35,7 @@ from vllm.lora.layers import (
     RowParallelLinearWithShardedLoRA,
     VocabParallelEmbeddingWithLoRA,
 )
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE, MoERunner
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.utils import get_moe_expert_mapping, get_packed_modules_mapping
 
@@ -98,7 +98,8 @@ _all_lora_classes: set[type[BaseLayerWithLoRA]] = {
 # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 def is_moe_model(model: nn.Module) -> bool:
     """Checks if the model contains FusedMoE layers and warns the user."""
-    if any(isinstance(module, FusedMoE) for module in model.modules()):
+    # Use MoERunner or RoutedExperts?
+    if any(isinstance(module, MoERunner) for module in model.modules()):
         logger.info_once("MoE model detected. Using fused MoE LoRA implementation.")
         return True
     return False
