@@ -18,6 +18,7 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.kv_cache_interface import (
+    CacheOnlySpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -837,7 +838,11 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
 
 
 def get_num_blocks(
-    vllm_config: VllmConfig, num_layers: int, available_memory: int, page_size: int
+    vllm_config: VllmConfig,
+    num_layers: int,
+    available_memory: int,
+    page_size: int,
+    extra_bytes_per_block: int = 0,
 ) -> int:
     """
     Get the number of kv cache blocks.
@@ -847,8 +852,11 @@ def get_num_blocks(
         num_layers: The number of layers
         available_memory: Memory available for KV cache in bytes.
         page_size: The page size of the KV cache.
+        extra_bytes_per_block: Additional per-block overhead (e.g. CacheOnly
+            groups) to include in the budget denominator.
     """
-    num_blocks = int(available_memory // page_size // num_layers)
+    bytes_per_block = page_size * num_layers + extra_bytes_per_block
+    num_blocks = int(available_memory // bytes_per_block)
     num_blocks = max(num_blocks, 0)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     return num_blocks
@@ -1103,52 +1111,77 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    # Separate CacheOnly groups — they have a different page_size and
+    # must not participate in get_uniform_page_size / UniformTypeKVCacheSpecs.
+    cache_only_groups = [
+        group
+        for group in kv_cache_groups
+        if isinstance(group.kv_cache_spec, CacheOnlySpec)
+    ]
+    main_groups = [
+        group
+        for group in kv_cache_groups
+        if not isinstance(group.kv_cache_spec, CacheOnlySpec)
+    ]
+    cache_only_bytes_per_block = sum(
+        group.kv_cache_spec.page_size_bytes for group in cache_only_groups
+    )
+
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
-        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    # The num_blocks calculation includes cache_only_bytes_per_block so that
+    # CacheOnly tensors share the same block pool as main tensors.
+    if len(main_groups) == 1 and isinstance(
+        main_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
-        # Special case: all layers have the same type of KV cache but with
-        # different hidden size. Allocate different amount of memory for each
-        # layer based on its hidden size.
-        num_blocks = (
-            available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        )
+        # Special case: all main layers have the same type of KV cache but
+        # with different hidden size. Allocate different amount of memory for
+        # each layer based on its hidden size.
+        main_bytes = main_groups[0].kv_cache_spec.page_size_bytes
+        num_blocks = int(available_memory // (main_bytes + cache_only_bytes_per_block))
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-        per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+        per_layer_specs = main_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(
                 size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
                 shared_by=[layer_name],
             )
-            for layer_name in kv_cache_groups[0].layer_names
+            for layer_name in main_groups[0].layer_names
         ]
     else:
         # General case:
-        # We will have group_size memory pools, each is shared by one layer from
-        # each group. As layers of different groups have different block table,
-        # they will use different parts of the shared Tensor.
-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
-        # (sw.1, padding) will be: (group_size = 2)
-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
-        # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
-
+        # We will have group_size memory pools, each is shared by one layer
+        # from each group. As layers of different groups have different block
+        # table, they will use different parts of the shared Tensor.
+        group_size = max(len(group.layer_names) for group in main_groups)
         page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
+            [group.kv_cache_spec for group in main_groups]
         )
         assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
+            vllm_config,
+            group_size,
+            available_memory,
+            page_size,
+            extra_bytes_per_block=cache_only_bytes_per_block,
         )
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+            for j in range(len(main_groups)):
+                if i < len(main_groups[j].layer_names):
+                    shared_by.append(main_groups[j].layer_names[i])
             kv_cache_tensors.append(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
+
+    # Add CacheOnly tensors (each gets its own tensor with its own page_size).
+    for group in cache_only_groups:
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=group.kv_cache_spec.page_size_bytes * num_blocks,
+                shared_by=group.layer_names,
+            )
+        )
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -1232,34 +1265,47 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
-    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
-        unify_hybrid_kv_cache_specs(kv_cache_spec)
+    cache_only = {
+        k: v for k, v in kv_cache_spec.items() if isinstance(v, CacheOnlySpec)
+    }
+    regular = {
+        k: v for k, v in kv_cache_spec.items() if not isinstance(v, CacheOnlySpec)
+    }
 
-    if is_kv_cache_type_attention_free(kv_cache_spec):
+    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        unify_hybrid_kv_cache_specs(regular)
+
+    if is_kv_cache_type_attention_free(regular):
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
-        return []
-
-    if is_kv_cache_spec_uniform(kv_cache_spec):
+        groups: list[KVCacheGroupSpec] = []
+    elif is_kv_cache_spec_uniform(regular):
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
-        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
-    elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
+        groups = _get_kv_cache_groups_uniform_spec(regular)
+    elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(regular):
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
-        return _get_kv_cache_groups_uniform_type(uniform_spec)
+        groups = _get_kv_cache_groups_uniform_type(uniform_spec)
+    else:
+        # As KVCacheManager can only allocate memory of one size, we need to
+        # unify the page size of the layers. For cases cannot be unified, this
+        # function will raise an error.
+        regular = unify_kv_cache_spec_page_size(regular)
+        # Model contains multiple attention types, but KV cache of all layers
+        # have the same physical memory per block per layer. Split the layers
+        # into groups with the same number of layers, and thus same total page
+        # size.
+        groups = _get_kv_cache_groups_uniform_page_size(regular)
 
-    # As KVCacheManager can only allocate memory of one size, we need to unify
-    # the page size of the layers. For cases cannot be unified, this function
-    # will raise an error.
-    kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-    # Model contains multiple attention types, but KV cache of all layers
-    # have the same physical memory per block per layer. Split the layers
-    # into groups with the same number of layers, and thus same total page
-    # size.
-    return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+    if cache_only:
+        groups.append(
+            KVCacheGroupSpec(list(cache_only.keys()), next(iter(cache_only.values())))
+        )
+
+    return groups
 
 
 def generate_scheduler_kv_cache_config(
@@ -1343,28 +1389,44 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    cache_only_groups = [
+        g for g in kv_cache_groups if isinstance(g.kv_cache_spec, CacheOnlySpec)
+    ]
+    main_groups = [
+        g for g in kv_cache_groups if not isinstance(g.kv_cache_spec, CacheOnlySpec)
+    ]
+
     # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
-    if len(kv_cache_groups) == 1 and isinstance(
-        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    if len(main_groups) == 1 and isinstance(
+        main_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
-        per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-        return sum(
+        per_layer_specs = main_groups[0].kv_cache_spec.kv_cache_specs
+        main_memory = sum(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    else:
+        # General case: group_size pools, each shared by one layer per group
+        # Memory = group_size * page_size * blocks_for_max_len
+        group_size = max(len(group.layer_names) for group in main_groups)
+        page_size = get_uniform_page_size(
+            [group.kv_cache_spec for group in main_groups]
+        )
+        blocks_needed = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                page_size,
+            )
+            for group in main_groups
+        )
+        main_memory = group_size * page_size * blocks_needed
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
-    group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
-    )
-    blocks_needed = sum(
-        cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
-        for group in kv_cache_groups
+    # Add CacheOnly memory (shares the same block pool as main).
+    cache_only_memory = sum(
+        g.kv_cache_spec.max_memory_usage_bytes(vllm_config) for g in cache_only_groups
     )
 
-    return group_size * page_size * blocks_needed
+    return main_memory + cache_only_memory
 
 
 def _estimate_max_model_len_from_groups(
