@@ -360,6 +360,34 @@ class MambaSpec(KVCacheSpec):
 
 
 @dataclass(frozen=True)
+class CacheOnlySpec(KVCacheSpec):
+    """
+    KV cache spec for CacheOnlyAttentionLayer used by extract_hidden_states
+    speculative decoding.
+
+    Semantically distinct from AttentionSpec: there is no key/value factor of 2,
+    and the dimensions describe hidden state slots rather than attention heads.
+    """
+
+    num_hidden_states: int
+    hidden_size: int
+    dtype: torch.dtype
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_hidden_states
+            * self.hidden_size
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+
+@dataclass(frozen=True)
 class EncoderOnlyAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # Encoder-only layers do not need KV cache
@@ -489,6 +517,8 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
                 for spec in kv_cache_specs.values()
             )
+        elif isinstance(one_spec, CacheOnlySpec):
+            return False
         else:
             # NOTE(Chen): Please add new branches for new KV cache spec types.
             raise NotImplementedError(
