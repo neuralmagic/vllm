@@ -1282,6 +1282,7 @@ class SpecDecodeBaseProposer:
                 "Qwen2_5_VLForConditionalGeneration",
                 "Qwen3VLForConditionalGeneration",
                 "Qwen3VLMoeForConditionalGeneration",
+                "Gemma4ForConditionalGeneration",
                 "HunYuanVLForConditionalGeneration",
                 "GlmOcrForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
