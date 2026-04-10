@@ -15,7 +15,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.utils import divide
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.lora.ops.triton_ops.utils import get_lora_op_configs
-from vllm.model_executor.layers.fused_moe import FusedMoE, MoERunner, RoutedExperts
+from vllm.model_executor.layers.fused_moe import MoERunner, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     _get_config_dtype_str,
 )
@@ -62,6 +62,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def routed_experts(self) -> RoutedExperts:
         return self.base_layer.routed_experts
 
+    @property
+    def _shared_experts(self):  # return type
+        return self.base_layer.shared_experts  # ?
+
     def _normalize_keys(self, config: dict[str, int | None]) -> dict[str, int | None]:
         normalized_config = {}
         for key, value in config.items():
@@ -82,7 +86,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         rank: int,
         num_slices: int,
         M: int,
-        layer: FusedMoE,
+        layer: RoutedExperts,
         top_k: int,
         config_dtype: str,
     ):
@@ -114,13 +118,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:  # fall back to the default config
             get_config_func = functools.partial(
                 try_get_optimal_moe_lora_config,
-                w1_shape=layer.routed_experts.w13_weight.size(),
-                w2_shape=layer.routed_experts.w2_weight.size(),
+                w1_shape=layer.w13_weight.size(),
+                w2_shape=layer.w2_weight.size(),
                 rank=rank,
                 top_k=top_k,
                 dtype=config_dtype,
                 M=M,
-                block_shape=layer.routed_experts.quant_method.moe_quant_config.block_shape,
+                block_shape=layer.quant_method.moe_quant_config.block_shape,
             )
             shrink_config = get_config_func(
                 op_type=f"fused_moe_lora_{op_prefix}_shrink"
@@ -206,7 +210,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     rank=max_lora_rank,
                     num_slices=self._w13_slices,
                     M=M,
-                    layer=layer,
+                    layer=layer.routed_experts,
                     top_k=top_k,
                     config_dtype=config_dtype,
                 )
@@ -296,7 +300,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                     rank=max_lora_rank,
                     num_slices=1,
                     M=M,
-                    layer=layer,
+                    layer=layer.routed_experts,
                     top_k=top_k,
                     config_dtype=config_dtype,
                 )
@@ -616,7 +620,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """Returns True if the layer can be replaced by this LoRA layer."""
 
         # source_layer is FusedMoE or SharedFusedMoE
-        return isinstance(source_layer, FusedMoE) and len(packed_modules_list) == 2
+        return isinstance(source_layer, MoERunner) and len(packed_modules_list) == 2
 
 
 class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
@@ -778,4 +782,4 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
     ) -> bool:
         """Returns True if the layer can be replaced by this LoRA layer."""
         # source_layer is FusedMoE or SharedFusedMoE
-        return isinstance(source_layer, FusedMoE) and len(packed_modules_list) == 1
+        return isinstance(source_layer, MoERunner) and len(packed_modules_list) == 1
