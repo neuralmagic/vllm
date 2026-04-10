@@ -126,7 +126,7 @@ class Mxfp8OnlineLinearMethod(Fp8OnlineLinearMethod):
 
     def __init__(self, quant_config: "Mxfp8Config"):
         self.quant_config = quant_config
-        self.mxfp8_linear = init_mxfp8_linear_kernel()
+        self.kernel = init_mxfp8_linear_kernel()
 
     def create_weights(
         self,
@@ -165,7 +165,7 @@ class Mxfp8OnlineLinearMethod(Fp8OnlineLinearMethod):
         replace_parameter(layer, "weight", weight_fp8.data)
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
-        self.mxfp8_linear.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
         layer._already_called_process_weights_after_loading = True
 
@@ -175,7 +175,7 @@ class Mxfp8OnlineLinearMethod(Fp8OnlineLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.mxfp8_linear.apply_weights(layer, x, bias)
+        return self.kernel.apply_weights(layer, x, bias)
 
 
 class Mxfp8OnlineMoEMethod(Fp8OnlineMoEMethod):
