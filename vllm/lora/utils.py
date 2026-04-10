@@ -95,6 +95,7 @@ _all_lora_classes: set[type[BaseLayerWithLoRA]] = {
 }
 
 
+# XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 def is_moe_model(model: nn.Module) -> bool:
     """Checks if the model contains FusedMoE layers and warns the user."""
     if any(isinstance(module, FusedMoE) for module in model.modules()):

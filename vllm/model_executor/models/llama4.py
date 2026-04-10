@@ -36,7 +36,10 @@ from vllm.model_executor.layers.attention import (
     Attention,
     ChunkedLocalAttention,
 )
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    SharedFusedMoE,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
@@ -554,7 +557,7 @@ class Llama4Model(LlamaModel):
         fused_experts_params = False
         # Expert parameter mapping for the case where the expert weights are
         # not fused into a single weight tensor.
-        expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -564,7 +567,7 @@ class Llama4Model(LlamaModel):
         )
         # Expert parameter mapping for the case where the expert weights are
         # fused into a single weight tensor.
-        expert_params_mapping_fused = SharedFusedMoE.make_expert_params_mapping(
+        expert_params_mapping_fused = fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_up_proj",
             ckpt_down_proj_name="down_proj",

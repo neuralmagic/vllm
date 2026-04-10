@@ -951,9 +951,6 @@ def make_fake_moe_layer(
         e_score_correction_bias=e_score_correction_bias,
         num_fused_shared_experts=0,  # TODO
         eplb_manager=eplb_manager,
-        # TODO(bnell): once we can construct the MK at init time, we
-        # can make this a value.
-        indices_type_getter=lambda: indices_type,
     )
 
     if quant_dtype is not None:
@@ -993,6 +990,7 @@ def make_fake_moe_layer(
         topk_weights, topk_ids = router.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
+            topk_indices_dtype=indices_type,
         )
 
         # Shared experts use original (untransformed) hidden_states

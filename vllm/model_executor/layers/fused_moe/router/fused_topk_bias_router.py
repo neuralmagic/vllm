@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
-from collections.abc import Callable
 
 import torch
 
@@ -182,13 +181,11 @@ class FusedTopKBiasRouter(BaseRouter):
         renormalize: bool = True,
         routed_scaling_factor: float = 1.0,
         eplb_manager: EplbManager | None = None,
-        indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_manager=eplb_manager,
-            indices_type_getter=indices_type_getter,
         )
         self.e_score_correction_bias = e_score_correction_bias
         self.renormalize = renormalize

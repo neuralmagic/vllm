@@ -12,6 +12,10 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -19,10 +23,6 @@ from vllm.model_executor.layers.fused_moe.activation import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
-)
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoEMethodBase,
-    RoutedExperts,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,

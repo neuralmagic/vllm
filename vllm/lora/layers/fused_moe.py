@@ -41,6 +41,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
 from .utils import _get_lora_device, try_get_optimal_moe_lora_config
 
 
+# XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def __init__(self, base_layer: FusedMoE) -> None:
         super().__init__()

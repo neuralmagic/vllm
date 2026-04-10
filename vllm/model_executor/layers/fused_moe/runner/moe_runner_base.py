@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
+from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
@@ -17,11 +18,15 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
+)
+from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
+    FusedMoEModularMethod,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
@@ -45,7 +50,7 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
-def get_layer_from_name(layer_name: str) -> torch.nn.Module:  # FusedMoE
+def get_layer_from_name(layer_name: str) -> MoERunner:
     forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
         all_moe_layers = forward_context.all_moe_layers
@@ -60,7 +65,7 @@ def get_layer_from_name(layer_name: str) -> torch.nn.Module:  # FusedMoE
         layer_name = all_moe_layers[moe_layer_index]
         forward_context.moe_layer_index += 1
     layer = forward_context.no_compile_layers[layer_name]
-    # assert isinstance(layer, FusedMoE)
+    assert isinstance(layer, MoERunner)
     return layer
 
 
@@ -90,7 +95,7 @@ def _moe_forward(
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer._runner._forward_dispatch(
+    return layer._forward_dispatch(
         hidden_states,
         router_logits,
         shared_experts_input,
@@ -113,7 +118,7 @@ def _moe_forward_shared(
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer._runner._forward_dispatch(
+    return layer._forward_dispatch(
         hidden_states,
         router_logits,
         shared_experts_input,
@@ -220,7 +225,7 @@ class MoERunnerBase(MoERunner):
         )
         self.routed_scaling_factor = routed_scaling_factor
 
-        # Needed for string -> FusedMoE layer lookup in custom ops.
+        # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
 
         self._forward_entry = self._select_forward()
@@ -474,6 +479,7 @@ class MoERunnerBase(MoERunner):
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
+                topk_indices_dtype=self.routed_experts.quant_method.topk_indices_dtype,
             )
 
             fused_out = self.routed_experts.forward(
@@ -678,3 +684,145 @@ class MoERunnerBase(MoERunner):
         are present.
         """
         raise NotImplementedError
+
+    # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+    #
+    # Old methods from FusedMoE layer
+    #
+    # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+    # Note: maybe_init_modular_kernel should only be called by
+    # prepare_communication_buffer_for_model.
+    # This is called after all weight loading and post-processing, so it
+    # should be safe to swap out the quant_method.
+    def maybe_init_modular_kernel(self) -> None:
+        # NOTE(rob): WIP refactor. For quant methods that own the MK
+        # we create the MK during process_weights_after_loading.
+        if (
+            self.routed_experts.quant_method.supports_internal_mk
+            or self.routed_experts.quant_method.is_monolithic
+        ):
+            return None
+
+        self.routed_experts._ensure_moe_quant_config_init()
+        # routing_tables only needed for round-robin expert placement with
+        # DeepEP all2all backend.
+        routing_tables = self._maybe_init_expert_routing_tables()
+
+        if isinstance(self.routed_experts.quant_method, FusedMoEModularMethod):
+            base_quant_method = self.routed_experts.quant_method.old_quant_method
+        else:
+            base_quant_method = self.routed_experts.quant_method
+
+        prepare_finalize = base_quant_method.maybe_make_prepare_finalize(
+            routing_tables=routing_tables
+        )
+        if prepare_finalize is not None:
+            logger.debug(
+                "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
+            )
+            self._replace_quant_method(
+                FusedMoEModularMethod.make(
+                    self,
+                    base_quant_method,
+                    prepare_finalize,
+                    self.shared_experts,
+                    inplace=not base_quant_method.moe.disable_inplace,
+                )
+            )
+
+    #
+    # Properties
+    #
+
+    @property
+    def layer_id(self):
+        # Delayed import to avoid circular dependency
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        return extract_layer_index(self.layer_name)
+
+    #
+    # Attributes still needed by models
+    #
+
+    @property
+    def is_monolithic(self) -> bool:
+        return self.routed_experts.quant_method.is_monolithic
+
+    @property
+    def activation(self) -> MoEActivation:
+        return self.routed_experts.activation
+
+    #
+    # Expert maps
+    #
+
+    @property
+    def expert_placement_strategy(self) -> ExpertPlacementStrategy:
+        return self.expert_map_manager.placement_strategy
+
+    @property
+    def expert_global_to_physical(self) -> torch.Tensor | None:
+        tables = self.expert_map_manager.routing_tables
+        return tables[0] if tables else None
+
+    @property
+    def expert_physical_to_global(self) -> torch.Tensor | None:
+        """Routing table: physical expert ID to global expert ID."""
+        tables = self.expert_map_manager.routing_tables
+        return tables[1] if tables else None
+
+    @property
+    def expert_local_to_global(self) -> torch.Tensor | None:
+        """Routing table: local expert ID to global expert ID."""
+        tables = self.expert_map_manager.routing_tables
+        return tables[2] if tables else None
+
+    @property
+    def expert_map(self) -> torch.Tensor | None:
+        return self.routed_experts.expert_map
+
+    def _maybe_init_expert_routing_tables(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        return self.routed_experts._maybe_init_expert_routing_tables()
+
+    def update_expert_map(self):
+        self.routed_experts.update_expert_map()
+
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        """Map global expert ID to local expert ID."""
+        return self.routed_experts._map_global_expert_id_to_local_expert_id(expert_id)
+
+    #
+    # EPLB
+    #
+
+    def get_expert_weights(self) -> Iterable[torch.Tensor]:
+        """Delegate to EPLB manager."""
+        if self.router.eplb_manager is not None:
+            return self.router.eplb_manager.get_expert_weights(self.routed_experts)
+        else:
+            return []
+
+    def set_eplb_state(
+        self,
+        moe_layer_idx: int,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ) -> None:
+        """
+        Register the EPLB state in this layer.
+
+        This is used later in forward pass, where we get the expert mapping
+        and record the load metrics in `expert_load_view`.
+        """
+        if self.router.eplb_manager is not None:
+            self.router.eplb_manager.set_state(
+                moe_layer_idx,
+                expert_load_view,
+                logical_to_physical_map,
+                logical_replica_count,
+            )

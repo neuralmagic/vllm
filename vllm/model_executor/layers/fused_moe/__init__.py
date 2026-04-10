@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
+    fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat,
@@ -32,6 +33,12 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    MoERunner,
+)
+from vllm.model_executor.layers.fused_moe.runner.moe_runner_factory import (
+    create_moe_runner,
+)
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
@@ -56,23 +63,26 @@ def get_config() -> dict[str, Any] | None:
 
 __all__ = [
     "FusedMoE",
-    "FusedMoERouter",
-    "FusedMoEConfig",
-    "FusedMoEMethodBase",
-    "MoEActivation",
-    "UnquantizedFusedMoEMethod",
-    "FusedMoeWeightScaleSupported",
-    "FusedMoEExpertsModular",
     "FusedMoEActivationFormat",
+    "FusedMoEConfig",
+    "FusedMoEExpertsModular",
+    "FusedMoEMethodBase",
     "FusedMoEPrepareAndFinalizeModular",
+    "FusedMoERouter",
+    "FusedMoeWeightScaleSupported",
     "GateLinear",
+    "MoEActivation",
+    "MoERunner",
     "RoutedExperts",
     "RoutingMethodType",
     "SharedFusedMoE",
+    "UnquantizedFusedMoEMethod",
     "activation_without_mul",
     "apply_moe_activation",
-    "override_config",
+    "create_moe_runner",
+    "fused_moe_make_expert_params_mapping",
     "get_config",
+    "override_config",
 ]
 
 if HAS_TRITON:

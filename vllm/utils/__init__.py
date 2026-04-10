@@ -34,3 +34,16 @@ def length_from_prompt_token_ids_or_embeds(
                 f" prompt_embeds={prompt_embeds_len}"
             )
         return prompt_token_len
+
+
+def is_moe_layer(module: torch.nn.Module) -> bool:
+    # TODO(bnell): Should use isinstance but can't.  Maybe search for
+    # presence of quant_method.maybe_init_modular_kernel?
+    # return (hasattr(module, "quant_method")
+    #         and hasattr(module.quant_method, "moe_kernel"))
+    return (
+        module.__class__.__name__ == "FusedMoE"
+        or module.__class__.__name__ == "SharedFusedMoE"
+        or module.__class__.__name__ == "DefaultMoERunner"
+        or module.__class__.__name__ == "ChunkingMoERunner"
+    )

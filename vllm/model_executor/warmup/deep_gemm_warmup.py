@@ -11,9 +11,12 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_dp_group, is_global_first_rank
+from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.model_executor.layers.fused_moe.deep_gemm_moe import DeepGemmExperts
 from vllm.model_executor.layers.fused_moe.deep_gemm_utils import compute_aligned_M
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE, FusedMoEModularMethod
+from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
+    FusedMoEModularMethod,
+)
 from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
     TritonOrDeepGemmExperts,
 )
@@ -104,7 +107,7 @@ def _extract_data_from_fused_moe_module(
     """
     Extract weights, weight scales and num_topk from FusedMoE module.
     """
-    assert isinstance(m_, FusedMoE)
+    assert isinstance(m_, MoERunner)
     m = m_.routed_experts
     w13 = m.w13_weight
     w13_s = (
@@ -157,7 +160,7 @@ def _fused_moe_grouped_gemm_may_use_deep_gemm(module: torch.nn.Module) -> bool:
     if not (envs.VLLM_USE_DEEP_GEMM and envs.VLLM_MOE_USE_DEEP_GEMM):
         return False
 
-    if not isinstance(module, FusedMoE):
+    if not isinstance(module, MoERunner):
         return False
 
     quant_method = module.routed_experts.quant_method

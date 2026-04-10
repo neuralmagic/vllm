@@ -393,6 +393,7 @@ class LoRAModelManager:
 
             parts = module_name.split(".")[-1]
             packed_moduled_lst = self.packed_modules_mapping.get(parts, [])
+            # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
             if isinstance(module, FusedMoE):
                 # packed_moduled_lst is used here to just determine whether to
                 # instantiate FusedMoE3DWithLoRA or FusedMoEWithLoRA, and the

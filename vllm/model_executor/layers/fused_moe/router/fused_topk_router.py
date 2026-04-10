@@ -123,13 +123,11 @@ class FusedTopKRouter(BaseRouter):
         scoring_func: str = "softmax",
         renormalize: bool = True,
         eplb_manager: EplbManager | None = None,
-        indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_manager=eplb_manager,
-            indices_type_getter=indices_type_getter,
         )
         self.renormalize = renormalize
         self.scoring_func = scoring_func
