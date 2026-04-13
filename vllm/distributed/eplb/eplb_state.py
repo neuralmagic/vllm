@@ -26,9 +26,13 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import json
+import os
+import tempfile
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -278,6 +282,11 @@ class EplbState:
         Interval for expert rearrangement steps.
         This is a constant and is taken from the config.
         """
+        self.global_step: int = 0
+        """
+        Monotonically increasing step counter across rearrangement cycles.
+        Used for logging and expert load dumps.
+        """
         self.should_record_tensor: torch.Tensor | None = None
         """
         Shared scalar bool tensor for all layers.  Every
@@ -459,11 +468,7 @@ class EplbState:
             device=self.device,
         )
 
-        # Set the initial progress of rearrangement to 3/4
         eplb_step_interval = self.parallel_config.eplb_config.step_interval
-        self.expert_rearrangement_step = max(
-            0, eplb_step_interval - eplb_step_interval // 4
-        )
         self.expert_rearrangement_step_interval = eplb_step_interval
 
         policy_type = self.parallel_config.eplb_config.policy
@@ -553,7 +558,8 @@ class EplbState:
 
         if (
             log_stats
-            and self.expert_rearrangement_step
+            and self.global_step > 0
+            and self.global_step
             % self.parallel_config.eplb_config.log_balancedness_interval
             == 0
         ):
@@ -591,7 +597,7 @@ class EplbState:
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
                         "max_tokens=%d, balancedness=%.4f, "
                         "steps until the next rearrangement: %d",
-                        self.expert_rearrangement_step,
+                        self.global_step,
                         eplb_model_state.model_name,
                         avg_tokens,
                         max_tokens,
@@ -599,6 +605,10 @@ class EplbState:
                         self.expert_rearrangement_step_interval
                         - self.expert_rearrangement_step,
                     )
+
+            window_load_list = self._sync_load_window()
+            if ep_group.rank() == 0:
+                self._dump_expert_load(window_load_list, ep_group.size())
 
         # Update the expert load sliding window
         if not is_dummy:
@@ -620,6 +630,7 @@ class EplbState:
         # rearrangement step and perform rearrangement to ensure all ranks are
         # performing collective communication.
         self.expert_rearrangement_step += 1
+        self.global_step += 1
 
         if self.is_async:
             for eplb_model_state in self.model_states.values():
@@ -667,7 +678,7 @@ class EplbState:
 
         log_interval = self.parallel_config.eplb_config.log_balancedness_interval
         steps_until_next_log = (
-            log_interval - (self.expert_rearrangement_step % log_interval)
+            log_interval - (self.global_step % log_interval)
         ) % log_interval
         should_record_for_log = steps_until_next_log <= self.expert_load_window_size
         return should_record_for_rearrange or should_record_for_log
@@ -1024,6 +1035,78 @@ class EplbState:
         for eplb_model_state in self.model_states.values():
             load_pass_list.append(eplb_model_state.expert_load_pass.clone())
         return self._allreduce_list(load_pass_list)
+
+    def _sync_load_window(self) -> list[torch.Tensor]:
+        """Sum the sliding window across all ranks.
+
+        Returns one tensor per model with shape
+        ``(num_moe_layers, num_physical_experts)`` containing the
+        accumulated load over the entire window, all-reduced across ranks.
+        """
+        window_sum_list = []
+        for eplb_model_state in self.model_states.values():
+            window_sum_list.append(eplb_model_state.expert_load_window.sum(dim=0))
+        return self._allreduce_list(window_sum_list)
+
+    def _dump_expert_load(
+        self,
+        expert_load_pass_list: list[torch.Tensor],
+        ep_size: int,
+    ) -> None:
+        """Append expert-load snapshots to per-model JSON files.
+
+        Only called from rank 0. Each model gets its own file in
+        ``expert_load_dump_dir``.  The file is rewritten atomically on
+        every call so a crash never leaves a corrupt file.
+        """
+        dump_dir = self.parallel_config.eplb_config.expert_load_dump_dir
+        if dump_dir is None:
+            return
+
+        dump_path = Path(dump_dir)
+        dump_path.mkdir(parents=True, exist_ok=True)
+
+        for expert_load_pass, eplb_model_state in zip(
+            expert_load_pass_list, self.model_states.values()
+        ):
+            model = eplb_model_state.model
+            safe_name = eplb_model_state.model_name.replace("/", "_")
+            file_path = dump_path / f"{safe_name}_expert_load.json"
+
+            if file_path.exists():
+                with open(file_path) as f:
+                    data = json.load(f)
+            else:
+                data = {
+                    "model_name": eplb_model_state.model_name,
+                    "world_size": ep_size,
+                    "num_moe_layers": model.num_moe_layers,
+                    "num_physical_experts": model.num_physical_experts,
+                    "num_logical_experts": model.num_logical_experts,
+                    "num_redundant_experts": model.num_redundant_experts,
+                    "window_size": self.expert_load_window_size,
+                    "snapshots": [],
+                }
+
+            snapshot = {
+                "step": self.global_step,
+                "expert_load": expert_load_pass.cpu().tolist(),
+                "physical_to_logical_map": (
+                    eplb_model_state.physical_to_logical_map.cpu().tolist()
+                ),
+            }
+            data["snapshots"].append(snapshot)
+
+            fd, tmp_path = tempfile.mkstemp(
+                dir=dump_dir, suffix=".tmp", prefix=".expert_load_"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp_path, file_path)
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
 
     @classmethod
     def from_mapping(

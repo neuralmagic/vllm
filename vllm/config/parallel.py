@@ -94,6 +94,13 @@ class EPLBConfig:
     - None: Auto-select backend ("torch_gloo" for async, "torch_nccl" for sync)
     """
 
+    expert_load_dump_dir: str | None = None
+    """
+    Directory to dump per-step expert load snapshots as JSON files.
+    When set, rank 0 writes one JSON file per model into this directory
+    at the same cadence as log_balancedness_interval.
+    """
+
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
         if self.use_async and self.policy != "default":
