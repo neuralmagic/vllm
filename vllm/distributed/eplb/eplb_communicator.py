@@ -22,7 +22,10 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclDataTypeEnum,
 )
-from vllm.distributed.nixl_utils import import_nixl_module
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    NixlWrapper,
+    nixl_agent_config,
+)
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     get_pp_group,
@@ -34,15 +37,7 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-try:
-    nixl_api = import_nixl_module("_api", logger)
-    NixlWrapper = nixl_api.nixl_agent  # type: ignore[attr-defined]
-    nixl_agent_config = nixl_api.nixl_agent_config  # type: ignore[attr-defined]
-    nixl_available = True
-except (ImportError, AttributeError):
-    NixlWrapper = None
-    nixl_agent_config = None
-    nixl_available = False
+nixl_available = NixlWrapper is not None
 
 
 class EplbCommunicator(ABC):
