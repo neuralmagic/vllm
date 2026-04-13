@@ -230,6 +230,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._peer_partition_bytes: int = 0
         self._dtype_max_bytes: dict[torch.dtype, int] = {}
         self._cuda_device_id = int(self._device.index or 0)
+        self._xfer_cache: dict[tuple[int, int], tuple[int, int, int]] = {}
         self._init_step("buffers", self._init_registered_buffers, expert_weights)
         self._init_step("agents", self._init_remote_agents)
         self._init_step("send meta", self._exchange_remote_send_meta)
@@ -374,18 +375,17 @@ class NixlEplbCommunicator(EplbCommunicator):
             byte_offset += num_bytes
         return byte_offset
 
-    def _release_nixl_handles(
-        self,
-        xfer_handles: list[int],
-        dlist_handles: list[int],
-    ) -> None:
-        """Best-effort cleanup of NIXL handles on exception paths."""
-        for h in xfer_handles:
-            with contextlib.suppress(Exception):
-                self._nixl_wrapper.release_xfer_handle(h)
-        for h in dlist_handles:
-            with contextlib.suppress(Exception):
-                self._nixl_wrapper.release_dlist_handle(h)
+    def _release_all_cached_handles(self) -> None:
+        """Best-effort release of every cached dlist and xfer handle."""
+        for local_dlist, remote_dlist, xfer in self._xfer_cache.values():
+            for release_fn, handle in (
+                (self._nixl_wrapper.release_xfer_handle, xfer),
+                (self._nixl_wrapper.release_dlist_handle, local_dlist),
+                (self._nixl_wrapper.release_dlist_handle, remote_dlist),
+            ):
+                with contextlib.suppress(Exception):
+                    release_fn(handle)
+        self._xfer_cache.clear()
 
     def _wait_for_all_transfers(self, handles: list[int]) -> None:
         pending = set(handles)
@@ -399,14 +399,62 @@ class NixlEplbCommunicator(EplbCommunicator):
                 if state != "PROC":
                     raise RuntimeError(f"NIXL transfer failed with state={state}")
             for handle in completed:
-                self._nixl_wrapper.release_xfer_handle(handle)
                 pending.remove(handle)
             if pending:
                 time.sleep(0.0005)
 
+    def _get_or_create_xfer(self, src: int, total_bytes: int) -> int:
+        """Return a cached xfer handle or create and cache a new one."""
+        key = (src, total_bytes)
+        cached = self._xfer_cache.get(key)
+        if cached is not None:
+            return cached[2]
+
+        recv_base = self._recv_buffer.data_ptr()
+        local_desc = self._nixl_wrapper.get_xfer_descs(
+            [
+                (
+                    recv_base + src * self._peer_partition_bytes,
+                    total_bytes,
+                    self._cuda_device_id,
+                )
+            ],
+            self._nixl_memory_type,
+        )
+        local_handle = self._nixl_wrapper.prep_xfer_dlist(
+            "NIXL_INIT_AGENT",
+            local_desc,
+        )
+
+        remote_base, remote_part_bytes, remote_dev = self._remote_send_meta[src]
+        agent_name = self._remote_agents[src]
+        remote_desc = self._nixl_wrapper.get_xfer_descs(
+            [
+                (
+                    remote_base + self._rank * remote_part_bytes,
+                    total_bytes,
+                    remote_dev,
+                )
+            ],
+            self._nixl_memory_type,
+        )
+        remote_handle = self._nixl_wrapper.prep_xfer_dlist(
+            agent_name,
+            remote_desc,
+        )
+
+        xfer_handle = self._nixl_wrapper.make_prepped_xfer(
+            "READ",
+            local_handle,
+            [0],
+            remote_handle,
+            [0],
+        )
+        self._xfer_cache[key] = (local_handle, remote_handle, xfer_handle)
+        return xfer_handle
+
     def execute(self) -> None:
         xfer_handles: list[int] = []
-        dlist_handles: list[int] = []
         try:
             # Phase 1: pack send buffers.
             with torch.cuda.stream(self._cuda_stream):
@@ -445,8 +493,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                 timeout=timedelta(minutes=5),
             )
 
-            # Phase 2: create descriptors and issue all READs.
-            recv_base = self._recv_buffer.data_ptr()
+            # Phase 2: look up or create descriptors and issue all READs.
             for src in range(self._world_size):
                 if src == self._rank:
                     continue
@@ -461,57 +508,12 @@ class NixlEplbCommunicator(EplbCommunicator):
                 if actual_total_bytes == 0:
                     continue
 
-                local_desc = self._nixl_wrapper.get_xfer_descs(
-                    [
-                        (
-                            recv_base + src * self._peer_partition_bytes,
-                            actual_total_bytes,
-                            self._cuda_device_id,
-                        )
-                    ],
-                    self._nixl_memory_type,
-                )
-                local_handle = self._nixl_wrapper.prep_xfer_dlist(
-                    "NIXL_INIT_AGENT",
-                    local_desc,
-                )
-                dlist_handles.append(local_handle)
-
-                remote_base, remote_part_bytes, remote_dev = self._remote_send_meta[src]
-                agent_name = self._remote_agents[src]
-                remote_desc = self._nixl_wrapper.get_xfer_descs(
-                    [
-                        (
-                            remote_base + self._rank * remote_part_bytes,
-                            actual_total_bytes,
-                            remote_dev,
-                        )
-                    ],
-                    self._nixl_memory_type,
-                )
-                remote_handle = self._nixl_wrapper.prep_xfer_dlist(
-                    agent_name,
-                    remote_desc,
-                )
-                dlist_handles.append(remote_handle)
-
-                xfer_handle = self._nixl_wrapper.make_prepped_xfer(
-                    "READ",
-                    local_handle,
-                    [0],
-                    remote_handle,
-                    [0],
-                )
+                xfer_handle = self._get_or_create_xfer(src, actual_total_bytes)
                 self._nixl_wrapper.transfer(xfer_handle)
                 xfer_handles.append(xfer_handle)
 
             # Phase 3: single wait for all in-flight transfers, then unpack.
             self._wait_for_all_transfers(xfer_handles)
-            xfer_handles.clear()
-
-            for h in dlist_handles:
-                self._nixl_wrapper.release_dlist_handle(h)
-            dlist_handles.clear()
 
             with torch.cuda.stream(self._cuda_stream):
                 for src in range(self._world_size):
@@ -525,13 +527,16 @@ class NixlEplbCommunicator(EplbCommunicator):
                             peer_tensors,
                             byte_offset,
                         )
+        except Exception:
+            self._release_all_cached_handles()
+            raise
         finally:
-            self._release_nixl_handles(xfer_handles, dlist_handles)
             self._send_tensors.clear()
             self._recv_tensors.clear()
 
     def __del__(self) -> None:
         try:
+            self._release_all_cached_handles()
             if self._registered_desc is not None:
                 self._nixl_wrapper.deregister_memory(self._registered_desc)
             for agent_name in self._remote_agents.values():
