@@ -608,7 +608,11 @@ class EplbState:
 
             window_load_list = self._sync_load_window()
             if ep_group.rank() == 0:
-                self._dump_expert_load(window_load_list, ep_group.size())
+                self._dump_expert_load(
+                    window_load_list,
+                    expert_load_pass_list,
+                    ep_group.size(),
+                )
 
         # Update the expert load sliding window
         if not is_dummy:
@@ -1050,7 +1054,8 @@ class EplbState:
 
     def _dump_expert_load(
         self,
-        expert_load_pass_list: list[torch.Tensor],
+        window_load_list: list[torch.Tensor],
+        latest_load_list: list[torch.Tensor],
         ep_size: int,
     ) -> None:
         """Append expert-load snapshots to per-model JSON files.
@@ -1066,8 +1071,8 @@ class EplbState:
         dump_path = Path(dump_dir)
         dump_path.mkdir(parents=True, exist_ok=True)
 
-        for expert_load_pass, eplb_model_state in zip(
-            expert_load_pass_list, self.model_states.values()
+        for window_load, latest_load, eplb_model_state in zip(
+            window_load_list, latest_load_list, self.model_states.values()
         ):
             model = eplb_model_state.model
             safe_name = eplb_model_state.model_name.replace("/", "_")
@@ -1090,7 +1095,8 @@ class EplbState:
 
             snapshot = {
                 "step": self.global_step,
-                "expert_load": expert_load_pass.cpu().tolist(),
+                "window_expert_load": window_load.cpu().tolist(),
+                "latest_expert_load": latest_load.cpu().tolist(),
                 "physical_to_logical_map": (
                     eplb_model_state.physical_to_logical_map.cpu().tolist()
                 ),
