@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -289,8 +289,11 @@ class CacheOnlySpec(MLAAttentionSpec):
     """KV cache spec for hidden-state-only storage (no attention computation).
 
     Inherits from MLAAttentionSpec so that gpu_model_runner.py handles it
-    via existing AttentionSpec code paths. Pre-filtered by get_kv_cache_groups()
-    before any type-unification routing.
+    via existing AttentionSpec code paths (reshape, bind, etc.).
+
+    CacheOnly layers are treated as *supplementary tensors*: they share block
+    IDs with the primary attention group (group 0) and are invisible to the
+    KV cache coordinator.  They are never placed into a KVCacheGroupSpec.
     """
 
     pass
@@ -560,6 +563,13 @@ class KVCacheConfig:
     contains all layers.
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
+    """
+    supplementary_specs: dict[str, KVCacheSpec] = field(default_factory=dict)
+    """
+    Layers that piggyback on the block pool but do not participate in block
+    management (e.g. CacheOnly layers for hidden-state extraction).  They
+    share block IDs with the primary attention group and are invisible to
+    the KV cache coordinator.
     """
 
     @property

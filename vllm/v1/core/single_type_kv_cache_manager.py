@@ -13,7 +13,6 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.kv_cache_interface import (
-    CacheOnlySpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -1110,7 +1109,6 @@ class SinkFullAttentionManager(FullAttentionManager):
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
-    CacheOnlySpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
