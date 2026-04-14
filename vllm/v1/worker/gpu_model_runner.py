@@ -4803,6 +4803,7 @@ class GPUModelRunner(
                             self.drafter.model,
                             spec_config.draft_model_config,
                         )
+                        assert hasattr(self.drafter, "set_eplb_state")
                         self.drafter.set_eplb_state(self.eplb_state)
                         eplb_models += 1
 

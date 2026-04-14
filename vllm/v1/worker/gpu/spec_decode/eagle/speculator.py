@@ -550,6 +550,8 @@ class EagleSpeculator:
             )
 
         if self.eplb_state is not None:
+            # Decode generates exactly 1 token per request, so
+            # num_reqs == the actual unpadded token count.
             self.eplb_state.prepare_forward(self.draft_model_config, num_reqs)
 
         if decode_batch_desc.cg_mode == CUDAGraphMode.FULL:

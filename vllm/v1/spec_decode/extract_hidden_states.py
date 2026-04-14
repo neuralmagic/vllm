@@ -137,6 +137,7 @@ class ExtractHiddenStatesProposer:
             num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
         if self.eplb_state is not None:
+            assert self.vllm_config.speculative_config is not None
             self.eplb_state.prepare_forward(
                 self.vllm_config.speculative_config.draft_model_config,
                 num_tokens,

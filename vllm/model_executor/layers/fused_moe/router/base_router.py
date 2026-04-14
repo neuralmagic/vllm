@@ -208,6 +208,10 @@ class BaseRouter(FusedMoERouter):
                 raise ValueError(
                     "enable_eplb=True requires should_record_tensor != None"
                 )
+            if self.eplb_state.num_unpadded_tokens_tensors is None:
+                raise ValueError(
+                    "enable_eplb=True requires num_unpadded_tokens_tensors != None"
+                )
 
     def _get_indices_type(self) -> torch.dtype | None:
         """Get the desired indices dtype from the getter function."""
