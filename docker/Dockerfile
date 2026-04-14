@@ -539,7 +539,7 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         cuda-cuobjdump-${CUDA_VERSION_DASH} \
         libcurand-dev-${CUDA_VERSION_DASH} \
         libcublas-${CUDA_VERSION_DASH} \
-        # libcublas-dev-${CUDA_VERSION_DASH} \
+        # libcublas-dev-${CUDA_VERSION_DASH}
         # Required by fastsafetensors (fixes #20384)
         libnuma-dev && \
     # Fixes nccl_allocator requiring nccl.h at runtime
