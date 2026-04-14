@@ -239,14 +239,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
 
-        # Persistent CUDA tensor whose device-pointer stays stable across
-        # CUDA-graph replays so the EPLB Triton kernel can read it.
-        self._eplb_num_unpadded_tensor: torch.Tensor | None = (
-            torch.tensor(0, dtype=torch.int32, device=self.device)
-            if self.parallel_config.enable_eplb
-            else None
-        )
-
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
@@ -592,7 +584,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                eplb_num_unpadded_tensor=self._eplb_num_unpadded_tensor,
             )
             if self.speculator is not None:
                 self.speculator.capture_model()
@@ -1066,12 +1057,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             del intermediate_tensors
 
-        # Update the EPLB tensor with the unpadded token count.
-        # Done here (not inside set_forward_context) because
-        # set_forward_context can be captured (in FULL mode),
-        # which would bake in a static value.
-        if self._eplb_num_unpadded_tensor is not None:
-            self._eplb_num_unpadded_tensor.fill_(input_batch.num_tokens)
+        # Update the EPLB meta.
+        self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -1097,8 +1084,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
-                num_unpadded_tokens=input_batch.num_tokens,
-                num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)

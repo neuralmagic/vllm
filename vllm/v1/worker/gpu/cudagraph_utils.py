@@ -289,7 +289,6 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         progress_bar_desc: str = "Capturing CUDA graphs",
-        eplb_num_unpadded_tensor: torch.Tensor | None = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -341,8 +340,6 @@ class ModelCudaGraphManager(CudaGraphManager):
                     num_tokens_across_dp=num_tokens_across_dp,
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
-                    num_unpadded_tokens=num_tokens,
-                    num_unpadded_tokens_tensor=eplb_num_unpadded_tensor,
                 ):
                     model_output = model(**model_inputs)
 

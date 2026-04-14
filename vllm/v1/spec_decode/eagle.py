@@ -14,6 +14,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
@@ -78,11 +79,7 @@ class SpecDecodeBaseProposer:
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
-        self._eplb_num_unpadded_tensor: torch.Tensor | None = (
-            torch.tensor(0, dtype=torch.int32, device=device)
-            if vllm_config.parallel_config.enable_eplb
-            else None
-        )
+        self.eplb_state: EplbState | None = None
 
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -298,6 +295,10 @@ class SpecDecodeBaseProposer:
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(self.max_batch_size, 1)
 
+    def set_eplb_state(self, eplb_state: EplbState) -> None:
+        """Inject EPLB state after construction."""
+        self.eplb_state = eplb_state
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -466,8 +467,8 @@ class SpecDecodeBaseProposer:
             num_tokens, num_input_tokens, mm_embed_inputs
         )
 
-        if self._eplb_num_unpadded_tensor is not None:
-            self._eplb_num_unpadded_tensor.fill_(num_tokens)
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(self.draft_model_config, num_tokens)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -477,8 +478,6 @@ class SpecDecodeBaseProposer:
             slot_mapping=self._get_slot_mapping(
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
-            num_unpadded_tokens=num_tokens,
-            num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
         ):
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -533,8 +532,8 @@ class SpecDecodeBaseProposer:
             self._determine_batch_execution_and_padding(batch_size)
         )
 
-        if self._eplb_num_unpadded_tensor is not None:
-            self._eplb_num_unpadded_tensor.fill_(batch_size)
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(self.draft_model_config, batch_size)
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -640,8 +639,6 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
-                num_unpadded_tokens=batch_size,
-                num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
             ):
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
@@ -1117,8 +1114,8 @@ class SpecDecodeBaseProposer:
                 num_tokens
             )
             num_input_tokens = batch_desc.num_tokens
-            if self._eplb_num_unpadded_tensor is not None:
-                self._eplb_num_unpadded_tensor.fill_(num_tokens)
+            if self.eplb_state is not None:
+                self.eplb_state.prepare_forward(self.draft_model_config, num_tokens)
 
             # Run the model.
             with set_forward_context(
@@ -1129,8 +1126,6 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping(
                     num_input_tokens, attn_metadata.slot_mapping
                 ),
-                num_unpadded_tokens=num_tokens,
-                num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
             ):
                 last_hidden_states, hidden_states = self.model(
                     input_ids=self.input_ids[:num_input_tokens],
@@ -1589,8 +1584,6 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=slot_mapping_dict,
-                num_unpadded_tokens=num_tokens,
-                num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
             ):
                 if self.supports_mm_inputs:
                     input_ids = None

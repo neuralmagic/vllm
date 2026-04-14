@@ -488,15 +488,6 @@ class GPUModelRunner(
         Will be lazily initialized when the model is loaded.
         """
 
-        # Persistent CUDA tensor whose device-pointer stays stable across
-        # CUDA-graph replays so the EPLB Triton kernel can read it.
-        # Callers fill_() this tensor before entering set_forward_context().
-        self._eplb_num_unpadded_tensor: torch.Tensor | None = (
-            torch.tensor(0, dtype=torch.int32, device=self.device)
-            if self.parallel_config.enable_eplb
-            else None
-        )
-
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
@@ -4026,11 +4017,13 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        if (
-            self._eplb_num_unpadded_tensor is not None
-            and num_tokens_unpadded is not None
-        ):
-            self._eplb_num_unpadded_tensor.fill_(num_tokens_unpadded)
+        # Update the EPLB meta.
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(
+                self.model_config,
+                num_tokens_unpadded,
+                ubatch_slices_padded,
+            )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4042,8 +4035,6 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
-                num_unpadded_tokens=num_tokens_unpadded,
-                num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -4812,6 +4803,7 @@ class GPUModelRunner(
                             self.drafter.model,
                             spec_config.draft_model_config,
                         )
+                        self.drafter.set_eplb_state(self.eplb_state)
                         eplb_models += 1
 
                 if self.use_aux_hidden_state_outputs:
@@ -5512,8 +5504,6 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
-                    num_unpadded_tokens=num_tokens_unpadded,
-                    num_unpadded_tokens_tensor=self._eplb_num_unpadded_tensor,
                 ),
             ):
                 outputs = self.model(

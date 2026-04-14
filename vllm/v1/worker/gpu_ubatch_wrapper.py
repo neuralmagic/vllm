@@ -123,15 +123,6 @@ class UBatchWrapper:
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
-        self._eplb_ubatch_tensors: list[torch.Tensor] | None = (
-            [
-                torch.tensor(0, dtype=torch.int32, device=device)
-                for _ in range(vllm_config.parallel_config.num_ubatches)
-            ]
-            if vllm_config.parallel_config.enable_eplb
-            else None
-        )
-
     @property
     def graph_pool(self):
         if self.cudagraph_wrapper is not None:
@@ -335,7 +326,6 @@ class UBatchWrapper:
         dp_metadata,
         batch_descriptor,
         cudagraph_runtime_mode,
-        num_unpadded_tokens: int | None = None,
     ) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         forward_contexts = []
@@ -343,16 +333,6 @@ class UBatchWrapper:
         # converting None to {}), or a list of dicts (one per ubatch)
         has_slot_mapping = slot_mapping and isinstance(slot_mapping, list)
         for i, ubatch_slice in enumerate(ubatch_slices):
-            ubatch_num_unpadded: int | None = None
-            ubatch_tensor: torch.Tensor | None = None
-            if num_unpadded_tokens is not None:
-                ts = ubatch_slice.token_slice
-                ubatch_num_unpadded = max(
-                    0, min(num_unpadded_tokens, ts.stop) - ts.start
-                )
-                if self._eplb_ubatch_tensors is not None:
-                    ubatch_tensor = self._eplb_ubatch_tensors[i]
-                    ubatch_tensor.fill_(ubatch_num_unpadded)
             forward_contexts.append(
                 create_forward_context(
                     attn_metadata[i] if attn_metadata is not None else None,
@@ -361,8 +341,6 @@ class UBatchWrapper:
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     slot_mapping=slot_mapping[i] if has_slot_mapping else None,
-                    num_unpadded_tokens=ubatch_num_unpadded,
-                    num_unpadded_tokens_tensor=ubatch_tensor,
                 )
             )
 
@@ -485,8 +463,6 @@ class UBatchWrapper:
                 )
             )
 
-        num_unpadded_tokens = forward_context.num_unpadded_tokens
-
         if (
             num_tokens not in self.cudagraphs
             and cudagraph_runtime_mode is CUDAGraphMode.FULL
@@ -503,7 +479,6 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                num_unpadded_tokens=num_unpadded_tokens,
             )
             with self.sm_control:
                 return self._capture_ubatches(ubatch_metadata, self.runnable)
@@ -512,15 +487,6 @@ class UBatchWrapper:
             and cudagraph_runtime_mode is CUDAGraphMode.FULL
         ):
             cudagraph_metadata = self.cudagraphs[num_tokens]
-            # Fill per-ubatch EPLB tensors with current values before replay.
-            if num_unpadded_tokens is not None:
-                offset = 0
-                for meta in cudagraph_metadata.ubatch_metadata:
-                    val = max(0, min(num_unpadded_tokens - offset, meta.num_tokens))
-                    t = meta.context.forward_context.num_unpadded_tokens_tensor
-                    if t is not None:
-                        t.fill_(val)
-                    offset += meta.num_tokens
             # Sync offloader before replay - ensures any external dependencies
             # from pre-capture prefetches are satisfied.
             get_offloader().sync_prev_onload()
@@ -539,7 +505,6 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                num_unpadded_tokens=num_unpadded_tokens,
             )
             with self.sm_control:
                 return self._run_ubatches(ubatch_metadata, self.runnable)

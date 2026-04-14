@@ -6,12 +6,12 @@ from collections.abc import Callable
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 if current_platform.is_cuda_alike():
 
@@ -222,12 +222,7 @@ class BaseRouter(FusedMoERouter):
             assert self.eplb_state.logical_to_physical_map is not None
             assert self.eplb_state.logical_replica_count is not None
             assert self.eplb_state.should_record_tensor is not None
-
-            num_unpadded_tokens_tensor = (
-                get_forward_context().num_unpadded_tokens_tensor
-                if is_forward_context_available()
-                else None
-            )
+            assert self.eplb_state.num_unpadded_tokens_tensors is not None
 
             return eplb_map_to_physical_and_record(
                 topk_ids=topk_ids,
@@ -235,7 +230,10 @@ class BaseRouter(FusedMoERouter):
                 logical_replica_count=self.eplb_state.logical_replica_count,
                 expert_load_view=self.eplb_state.expert_load_view,
                 record_enabled=self.eplb_state.should_record_tensor,
-                num_unpadded_tokens=num_unpadded_tokens_tensor,
+                # Pick the tensor for the current micro-batch
+                num_unpadded_tokens=self.eplb_state.num_unpadded_tokens_tensors[
+                    dbo_current_ubatch_id()
+                ],
             )
         return topk_ids
 
