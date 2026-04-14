@@ -650,7 +650,7 @@ def create_eplb_communicator(
         if backend not in ("torch_nccl", "pynccl"):
             raise ValueError(
                 f"Elastic EP requires 'torch_nccl' or 'pynccl' EPLB communicator "
-                f"(got '{backend}'). torch_gloo is not supported with stateless groups."
+                f"(got '{backend}')."
             )
         if backend == "torch_nccl":
             logger.warning(
