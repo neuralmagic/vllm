@@ -24,34 +24,23 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     TpKVTopology,
     get_current_attn_backend,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1 import nixl
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-    metadata as nixl_metadata,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl import (
-    worker as nixl_worker,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
-    NixlConnector,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
+    NixlConnector,
     NixlConnectorMetadata,
-    NixlHandshakePayload,
-    compute_nixl_compatibility_hash,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.scheduler import (
     NixlConnectorScheduler,
-)
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
+    NixlConnectorWorker,
+    NixlHandshakePayload,
     NixlKVConnectorStats,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
-    NixlConnectorWorker,
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    compute_nixl_compatibility_hash,
 )
 from vllm.distributed.kv_transfer.kv_transfer_state import (
     ensure_kv_transfer_shutdown,
@@ -2340,7 +2329,7 @@ def test_compatibility_hash_validation(
         elif "connector_version" in version_override:
             stack.enter_context(
                 patch.object(
-                    nixl_metadata,
+                    nixl.metadata,
                     "NIXL_CONNECTOR_VERSION",
                     version_override["connector_version"],
                 )
@@ -2377,7 +2366,7 @@ def test_compatibility_hash_validation(
     # Patch zmq_ctx to return our mock socket
     with (
         patch.object(decode_worker, "add_remote_agent", return_value="fake_agent"),
-        patch.object(nixl_worker, "zmq_ctx") as mock_zmq_ctx,
+        patch.object(nixl.worker, "zmq_ctx") as mock_zmq_ctx,
     ):
         mock_zmq_ctx.return_value.__enter__.return_value = mock_socket
 
@@ -2476,7 +2465,7 @@ def test_handshake_decode_errors(default_vllm_config, dist_init, error_scenario)
     mock_socket.recv.return_value = msg_bytes
     with (
         patch.object(decode_worker, "add_remote_agent", return_value="fake_agent"),
-        patch.object(nixl_worker, "zmq_ctx") as mock_zmq_ctx,
+        patch.object(nixl.worker, "zmq_ctx") as mock_zmq_ctx,
     ):
         mock_zmq_ctx.return_value.__enter__.return_value = mock_socket
 

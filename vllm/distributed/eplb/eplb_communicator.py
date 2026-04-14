@@ -22,7 +22,7 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclDataTypeEnum,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+from vllm.distributed.nixl_utils import (
     NixlWrapper,
     nixl_agent_config,
 )
@@ -37,7 +37,10 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-nixl_available = NixlWrapper is not None
+
+def has_nixl() -> bool:
+    """Whether the optional NIXL / RIXL package is available."""
+    return NixlWrapper is not None
 
 
 class EplbCommunicator(ABC):
@@ -658,7 +661,7 @@ def create_eplb_communicator(
         return _create_pynccl()
 
     if backend == "nixl":
-        if not nixl_available:
+        if not has_nixl():
             raise RuntimeError(
                 "EPLB communicator 'nixl' requested but NIXL is unavailable."
             )

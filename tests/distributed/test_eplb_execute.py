@@ -11,7 +11,7 @@ import torch.distributed
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.eplb.eplb_communicator import (
     create_eplb_communicator,
-    nixl_available,
+    has_nixl,
 )
 from vllm.distributed.eplb.rebalance_execute import (
     move_from_buffer,
@@ -542,7 +542,7 @@ def test_rearrange_expert_weights_with_redundancy(
 ):
     """Test the functionality of rearranging expert weights with redundancy."""
 
-    if eplb_communicator == "nixl" and not nixl_available:
+    if eplb_communicator == "nixl" and not has_nixl():
         pytest.skip("NIXL is not available")
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"Need at least {world_size} GPUs to run the test")
@@ -652,7 +652,7 @@ def test_async_transfer_layer_without_mtp(
 ):
     """Exercise async EPLB transfer path without MTP/spec decode."""
 
-    if eplb_communicator == "nixl" and not nixl_available:
+    if eplb_communicator == "nixl" and not has_nixl():
         pytest.skip("NIXL is not available")
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"Need at least {world_size} GPUs to run the test")
