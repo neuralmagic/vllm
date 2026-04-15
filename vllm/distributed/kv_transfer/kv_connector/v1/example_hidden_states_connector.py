@@ -207,9 +207,20 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(connector_metadata, ExampleHiddenStatesConnectorMetadata)
 
         os.makedirs(self._storage_path, exist_ok=True)
+
+        # Use the GPU slot_mapping from the attention metadata rather than
+        # recomputing from scheduler block IDs. On hybrid models, kernel
+        # block splitting makes the two diverge.
+        slot_mapping = attn_metadata.slot_mapping
+
+        offset = 0
         for request in connector_metadata.requests:
+            num_tokens = request.token_ids.shape[0]
+            req_slot_mapping = slot_mapping[offset:offset + num_tokens]
+            offset += num_tokens
+
             hidden_states = extract_from_kv_cache(
-                kv_layer, request.slot_mapping, request.token_ids.shape[0]
+                kv_layer, req_slot_mapping, num_tokens
             )
             tensors = {
                 "hidden_states": hidden_states.detach().cpu(),

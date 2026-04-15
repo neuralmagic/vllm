@@ -3751,6 +3751,13 @@ class GPUModelRunner(
             for layer_name in kv_cache_group.layer_names:
                 slot_mappings_by_layer[layer_name] = slot_mapping
 
+        # Supplementary layers (e.g. CacheOnly) share group 0's block table,
+        # so they use group 0's slot_mapping.
+        if self.kv_cache_config.supplementary_specs:
+            group0_slot_mapping = slot_mappings_by_gid[0]
+            for layer_name in self.kv_cache_config.supplementary_specs:
+                slot_mappings_by_layer[layer_name] = group0_slot_mapping
+
         if ubatch_slices is not None:
             result: list[dict[str, torch.Tensor]] = []
             for ubatch in ubatch_slices:

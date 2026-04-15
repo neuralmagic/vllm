@@ -220,6 +220,14 @@ def build_slot_mappings_by_layer(
     for slot_mapping, kv_cache_group in zip(slot_mappings, kv_cache_groups):
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
+
+    # Supplementary layers (e.g. CacheOnly) share group 0's block table,
+    # so they use group 0's slot_mapping.
+    if kv_cache_config.supplementary_specs:
+        group0_slot_mapping = slot_mappings[0]
+        for layer_name in kv_cache_config.supplementary_specs:
+            slot_mappings_by_layer[layer_name] = group0_slot_mapping
+
     return slot_mappings_by_layer
 
 
