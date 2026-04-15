@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CacheOnlySpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -121,6 +122,8 @@ class KVBlockZeroer:
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
             if not isinstance(spec, FullAttentionSpec):
+                continue
+            if isinstance(spec, CacheOnlySpec):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
