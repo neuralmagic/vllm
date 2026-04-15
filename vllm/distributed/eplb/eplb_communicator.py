@@ -562,8 +562,10 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._release_all_cached_handles()
             if self._registered_desc is not None:
                 self._nixl_wrapper.deregister_memory(self._registered_desc)
+                self._registered_desc = None
             for agent_name in self._remote_agents.values():
                 self._nixl_wrapper.remove_remote_agent(agent_name)
+            self._remote_agents.clear()
         except Exception as e:
             logger.warning("Error during NixlEplbCommunicator cleanup: %s", e)
 
