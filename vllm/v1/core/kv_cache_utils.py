@@ -1378,9 +1378,11 @@ def _report_kv_cache_config(
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
+    supplementary_specs: dict[str, KVCacheSpec] | None = None,
 ) -> int:
     """
-    Calculate maximum memory usage in bytes from KV cache groups.
+    Calculate maximum memory usage in bytes from KV cache groups and
+    supplementary specs.
 
     This correctly accounts for padding in hybrid models. For example, if a
     model has 8 full attention layers and 9 sliding window layers, they will
@@ -1394,29 +1396,38 @@ def _max_memory_usage_bytes_from_groups(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-        return sum(
+        main_memory = sum(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    else:
+        # General case: group_size pools, each shared by one layer per group
+        # Memory = group_size * page_size * blocks_for_max_len
+        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        page_size = get_uniform_page_size(
+            [group.kv_cache_spec for group in kv_cache_groups]
+        )
+        blocks_needed = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                page_size,
+            )
+            for group in kv_cache_groups
+        )
+        main_memory = group_size * page_size * blocks_needed
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
-    group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
+    supp_memory = sum(
+        spec.max_memory_usage_bytes(vllm_config)
+        for spec in (supplementary_specs or {}).values()
     )
-    blocks_needed = sum(
-        cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
-        for group in kv_cache_groups
-    )
-
-    return group_size * page_size * blocks_needed
+    return main_memory + supp_memory
 
 
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    supplementary_specs: dict[str, KVCacheSpec] | None = None,
 ) -> int:
     """
     Binary search for the maximum model length that fits in available memory.
@@ -1427,7 +1438,9 @@ def _estimate_max_model_len_from_groups(
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
         return (
-            _max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
+            _max_memory_usage_bytes_from_groups(
+                vllm_config, kv_cache_groups, supplementary_specs
+            )
             <= available_memory
         )
 
@@ -1452,6 +1465,7 @@ def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
     projected_groups_per_worker: list[list[KVCacheGroupSpec]],
     available_memory: list[int],
+    supplementary_specs_per_worker: list[dict[str, KVCacheSpec]] | None = None,
 ) -> None:
     """
     When max_model_len is set to -1, this function estimates the largest
@@ -1464,6 +1478,8 @@ def _auto_fit_max_model_len(
         projected_groups_per_worker: KV cache groups projected to each worker.
         available_memory: Memory available for KV cache in bytes for each
             worker.
+        supplementary_specs_per_worker: Supplementary specs per worker, used
+            to include supplementary memory in the budget.
     """
     original_max = vllm_config.model_config.max_model_len
 
@@ -1477,13 +1493,21 @@ def _auto_fit_max_model_len(
         )
         return
 
+    supp_per_worker = supplementary_specs_per_worker or [
+        None
+    ] * len(projected_groups_per_worker)
+
     # Find the max_model_len that fits across all workers.
     auto_fit_max = original_max
     limiting_worker_mem = available_memory[0]
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    for groups, avail_mem, supp in zip(
+        projected_groups_per_worker, available_memory, supp_per_worker
+    ):
         if not groups:
             continue
-        worker_max = _estimate_max_model_len_from_groups(vllm_config, groups, avail_mem)
+        worker_max = _estimate_max_model_len_from_groups(
+            vllm_config, groups, avail_mem, supplementary_specs=supp
+        )
         if worker_max < auto_fit_max:
             auto_fit_max = worker_max
             limiting_worker_mem = avail_mem
@@ -1616,22 +1640,6 @@ def get_kv_cache_configs(
         for worker_spec in kv_cache_specs
     ]
 
-    if vllm_config.model_config.original_max_model_len == -1:
-        _auto_fit_max_model_len(
-            vllm_config, projected_groups_per_worker, available_memory
-        )
-
-    # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-        if not groups:
-            continue
-        _check_enough_kv_cache_memory(
-            avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
-            vllm_config.model_config.max_model_len,
-            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
-        )
-
     # Project supplementary specs to each worker (only include layers
     # present on that worker).
     def _project_supplementary(
@@ -1639,11 +1647,50 @@ def get_kv_cache_configs(
     ) -> dict[str, KVCacheSpec]:
         return {k: v for k, v in global_supplementary.items() if k in worker_spec}
 
-    kv_cache_configs: list[KVCacheConfig] = []
-    for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
+    supplementary_per_worker = [
+        _project_supplementary(ws) for ws in kv_cache_specs
+    ]
+
+    if vllm_config.model_config.original_max_model_len == -1:
+        _auto_fit_max_model_len(
+            vllm_config,
+            projected_groups_per_worker,
+            available_memory,
+            supplementary_specs_per_worker=supplementary_per_worker,
+        )
+
+    # Check if the available memory is enough per worker.
+    for groups, avail_mem, supp in zip(
+        projected_groups_per_worker, available_memory, supplementary_per_worker
     ):
-        worker_supplementary = _project_supplementary(kv_cache_spec_one_worker)
+        if not groups:
+            continue
+        _check_enough_kv_cache_memory(
+            avail_mem,
+            partial(
+                _max_memory_usage_bytes_from_groups, vllm_config, groups, supp
+            ),
+            vllm_config.model_config.max_model_len,
+            partial(
+                _estimate_max_model_len_from_groups,
+                vllm_config,
+                groups,
+                supplementary_specs=supp,
+            ),
+        )
+
+    kv_cache_configs: list[KVCacheConfig] = []
+    for (
+        projected_groups,
+        kv_cache_spec_one_worker,
+        available_memory_one_worker,
+        worker_supplementary,
+    ) in zip(
+        projected_groups_per_worker,
+        kv_cache_specs,
+        available_memory,
+        supplementary_per_worker,
+    ):
         assert sum(len(group.layer_names) for group in projected_groups) + len(
             worker_supplementary
         ) == len(kv_cache_spec_one_worker), (

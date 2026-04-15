@@ -185,6 +185,7 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.attn_utils import _reshape_one_layer
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -6710,36 +6711,19 @@ class GPUModelRunner(
         # their raw tensors reshaped and included in kv_caches.
         for layer_name, spec in kv_cache_config.supplementary_specs.items():
             assert isinstance(spec, AttentionSpec)
-            raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert raw_tensor.numel() % spec.page_size_bytes == 0
-            num_blocks = raw_tensor.numel() // spec.page_size_bytes
 
-            # Get the attn backend from the layer module itself.
             layer_type = cast(type[Any], AttentionLayerBase)
             supp_layers = get_layers_from_vllm_config(
                 self.vllm_config, layer_type, [layer_name]
             )
             attn_backend = supp_layers[layer_name].get_attn_backend()
 
-            kv_cache_shape = attn_backend.get_kv_cache_shape(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
-            )
-            try:
-                kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                assert len(kv_cache_stride_order) == len(kv_cache_shape)
-            except (AttributeError, NotImplementedError):
-                kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-            kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
-            inv_order = [
-                kv_cache_stride_order.index(i)
-                for i in range(len(kv_cache_stride_order))
-            ]
-            kv_caches[layer_name] = (
-                raw_tensor.view(spec.dtype).view(kv_cache_shape).permute(*inv_order)
+            kv_caches[layer_name] = _reshape_one_layer(
+                layer_name,
+                spec,
+                kv_cache_raw_tensors[layer_name],
+                attn_backend,
+                self.cache_config.cache_dtype,
             )
 
         if has_attn and has_mamba:
