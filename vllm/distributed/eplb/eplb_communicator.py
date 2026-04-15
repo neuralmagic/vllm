@@ -58,6 +58,12 @@ class EplbCommunicator(ABC):
     def execute(self) -> None:
         pass
 
+    @property
+    def needs_profile_buffer_reservation(self) -> bool:
+        """Whether the profile path must run a dummy collective operation to reserve
+        communication buffers."""
+        return True
+
     def set_stream(self, cuda_stream: torch.cuda.Stream | None) -> None:
         self._cuda_stream = cuda_stream
 
@@ -233,6 +239,10 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._init_step("agents", self._init_remote_agents)
         self._init_step("send meta", self._exchange_remote_send_meta)
         self._log_initialized()
+
+    @property
+    def needs_profile_buffer_reservation(self) -> bool:
+        return False
 
     @staticmethod
     def _init_step(name: str, fn: object, *args: object, **kwargs: object) -> None:
