@@ -9,6 +9,8 @@ pytest-shard
 # --- Core Tools & Bindings ---
 absl-py
 arctic-inference
+lm_eval[api]
+modelscope
 
 # --- Audio Processing ---
 librosa
