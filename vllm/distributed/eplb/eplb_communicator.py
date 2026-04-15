@@ -234,7 +234,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._peer_partition_bytes: int = 0
         self._dtype_max_bytes: dict[torch.dtype, int] = {}
         self._cuda_device_id = int(self._device.index or 0)
-        self._xfer_cache: dict[tuple[int, int], tuple[int, int, int]] = {}
+        self._xfer_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
         self._init_step("buffers", self._init_registered_buffers, expert_weights)
         self._init_step("agents", self._init_remote_agents)
         self._init_step("send meta", self._exchange_remote_send_meta)
@@ -313,13 +313,13 @@ class NixlEplbCommunicator(EplbCommunicator):
             total_max_bytes += max_bytes
 
         self._peer_partition_bytes = total_max_bytes
-        total_bytes = self._peer_partition_bytes * self._world_size
+        send_total_bytes = self._peer_partition_bytes * self._world_size
 
         self._send_buffer = torch.empty(
-            total_bytes, device=self._device, dtype=torch.uint8
+            send_total_bytes, device=self._device, dtype=torch.uint8
         )
         self._recv_buffer = torch.empty(
-            total_bytes, device=self._device, dtype=torch.uint8
+            self._peer_partition_bytes, device=self._device, dtype=torch.uint8
         )
 
         descs = self._nixl_wrapper.get_reg_descs([self._send_buffer, self._recv_buffer])
@@ -411,9 +411,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             if pending:
                 time.sleep(0.0005)
 
-    def _get_or_create_xfer(self, src: int, total_bytes: int) -> int:
+    def _get_or_create_xfer(self, src: int, total_bytes: int, recv_offset: int) -> int:
         """Return a cached xfer handle or create and cache a new one."""
-        key = (src, total_bytes)
+        key = (src, total_bytes, recv_offset)
         cached = self._xfer_cache.get(key)
         if cached is not None:
             return cached[2]
@@ -422,7 +422,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         local_desc = self._nixl_wrapper.get_xfer_descs(
             [
                 (
-                    recv_base + src * self._peer_partition_bytes,
+                    recv_base + recv_offset,
                     total_bytes,
                     self._cuda_device_id,
                 )
@@ -502,6 +502,10 @@ class NixlEplbCommunicator(EplbCommunicator):
             )
 
             # Phase 2: look up or create descriptors and issue all READs.
+            # Data from all peers is packed sequentially into the single
+            # partition-sized recv buffer at running offsets.
+            recv_offsets: dict[int, int] = {}
+            recv_offset = 0
             for src in range(self._world_size):
                 if src == self._rank:
                     continue
@@ -516,16 +520,20 @@ class NixlEplbCommunicator(EplbCommunicator):
                 if actual_total_bytes == 0:
                     continue
 
-                xfer_handle = self._get_or_create_xfer(src, actual_total_bytes)
+                recv_offsets[src] = recv_offset
+                xfer_handle = self._get_or_create_xfer(
+                    src, actual_total_bytes, recv_offset
+                )
                 self._nixl_wrapper.transfer(xfer_handle)
                 xfer_handles.append(xfer_handle)
+                recv_offset += actual_total_bytes
 
             # Phase 3: single wait for all in-flight transfers, then unpack.
             self._wait_for_all_transfers(xfer_handles)
 
             with torch.cuda.stream(self._cuda_stream):
-                for src in range(self._world_size):
-                    byte_offset = src * self._peer_partition_bytes
+                for src, offset in recv_offsets.items():
+                    byte_offset = offset
                     for dtype in self._dtypes:
                         peer_tensors = self._recv_tensors.get(
                             dtype, [[] for _ in range(self._world_size)]
