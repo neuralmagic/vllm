@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -99,7 +100,7 @@ class ExampleHiddenStatesConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class ExampleHiddenStatesConnector(KVConnectorBase_V1):
+class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     """
     Simple debug implementation of a HiddenStatesConnector.
 
@@ -206,9 +207,20 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         assert isinstance(connector_metadata, ExampleHiddenStatesConnectorMetadata)
 
         os.makedirs(self._storage_path, exist_ok=True)
+
+        # Use the GPU slot_mapping from the attention metadata rather than
+        # recomputing from scheduler block IDs. On hybrid models, kernel
+        # block splitting makes the two diverge.
+        slot_mapping = attn_metadata.slot_mapping
+
+        offset = 0
         for request in connector_metadata.requests:
+            num_tokens = request.token_ids.shape[0]
+            req_slot_mapping = slot_mapping[offset : offset + num_tokens]
+            offset += num_tokens
+
             hidden_states = extract_from_kv_cache(
-                kv_layer, request.slot_mapping, request.token_ids.shape[0]
+                kv_layer, req_slot_mapping, num_tokens
             )
             tensors = {
                 "hidden_states": hidden_states.detach().cpu(),
@@ -330,6 +342,15 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         _ = self._req_blocks.pop(req_id, None)
 
         return False, {"hidden_states_path": req_filename}
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        # CacheOnly layers are supplementary — they share block IDs with
+        # group 0, so block_ids[0] is always the right one.
+        return self.request_finished(request, block_ids[0])
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:

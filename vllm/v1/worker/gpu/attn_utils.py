@@ -114,6 +114,18 @@ def init_attn_backend(
                 min_cg_attn_backend = attn_backend.__name__
         attn_groups.append(groups)
 
+    # Include supplementary layers (e.g. CacheOnly) in attn_backends so
+    # their tensors can be reshaped and bound.
+    supp_layer_names = list(kv_cache_config.supplementary_specs.keys())
+    if supp_layer_names:
+        layer_type = cast(type[Any], AttentionLayerBase)
+        supp_layers = get_layers_from_vllm_config(
+            vllm_config, layer_type, supp_layer_names
+        )
+        for layer_name in supp_layer_names:
+            if layer_name in supp_layers:
+                attn_backends[layer_name] = supp_layers[layer_name].get_attn_backend()
+
     return (
         attn_backends,
         attn_groups,
@@ -135,10 +147,49 @@ def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
     for group in kv_cache_config.kv_cache_groups:
         for layer_name in group.layer_names:
             layer_names.add(layer_name)
+    # Supplementary layers (e.g. CacheOnly) also have tensors but no group.
+    layer_names.update(kv_cache_config.supplementary_specs.keys())
     assert layer_names == set(kv_cache_raw_tensors.keys()), (
         "Some layers are not correctly initialized"
     )
     return kv_cache_raw_tensors
+
+
+def _reshape_one_layer(
+    layer_name: str,
+    kv_cache_spec: AttentionSpec,
+    raw_tensor: torch.Tensor,
+    attn_backend: type[AttentionBackend],
+    cache_dtype: str,
+) -> torch.Tensor:
+    """Reshape a raw byte tensor into the backend-specific KV cache shape."""
+    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+    kv_cache_shape = attn_backend.get_kv_cache_shape(
+        num_blocks,
+        kv_cache_spec.block_size,
+        kv_cache_spec.num_kv_heads,
+        kv_cache_spec.head_size,
+        cache_dtype,
+    )
+
+    # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
+    try:
+        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+        assert len(kv_cache_stride_order) == len(kv_cache_shape)
+    except (AttributeError, NotImplementedError):
+        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+
+    kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
+    inv_order = [
+        kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))
+    ]
+
+    dtype = kv_cache_spec.dtype
+    viewed = raw_tensor.view(dtype)
+    viewed = viewed.view(kv_cache_shape)
+    return viewed.permute(*inv_order)
 
 
 def _reshape_kv_cache(
@@ -148,43 +199,33 @@ def _reshape_kv_cache(
     cache_dtype: str,
 ) -> dict[str, torch.Tensor]:
     kv_caches: dict[str, torch.Tensor] = {}
+
+    # Reshape group layers.
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
         for layer_name in kv_cache_group_spec.layer_names:
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
             assert isinstance(kv_cache_spec, AttentionSpec)
-
-            raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-
-            attn_backend = attn_backends[layer_name]
-            kv_cache_shape = attn_backend.get_kv_cache_shape(
-                num_blocks,
-                kv_cache_spec.block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
+            kv_caches[layer_name] = _reshape_one_layer(
+                layer_name,
+                kv_cache_spec,
+                kv_cache_raw_tensors[layer_name],
+                attn_backends[layer_name],
                 cache_dtype,
             )
 
-            # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
-            try:
-                kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                assert len(kv_cache_stride_order) == len(kv_cache_shape)
-            except (AttributeError, NotImplementedError):
-                kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+    # Reshape supplementary layers (e.g. CacheOnly).
+    for layer_name, spec in kv_cache_config.supplementary_specs.items():
+        assert isinstance(spec, AttentionSpec)
+        kv_caches[layer_name] = _reshape_one_layer(
+            layer_name,
+            spec,
+            kv_cache_raw_tensors[layer_name],
+            attn_backends[layer_name],
+            cache_dtype,
+        )
 
-            kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
-            inv_order = [
-                kv_cache_stride_order.index(i)
-                for i in range(len(kv_cache_stride_order))
-            ]
-
-            dtype = kv_cache_spec.dtype
-            raw_tensor = raw_tensor.view(dtype)
-            raw_tensor = raw_tensor.view(kv_cache_shape)
-            kv_caches[layer_name] = raw_tensor.permute(*inv_order)
     return kv_caches
 
 
@@ -212,6 +253,14 @@ def build_slot_mappings_by_layer(
     for slot_mapping, kv_cache_group in zip(slot_mappings, kv_cache_groups):
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
+
+    # Supplementary layers (e.g. CacheOnly) share group 0's block table,
+    # so they use group 0's slot_mapping.
+    if kv_cache_config.supplementary_specs:
+        group0_slot_mapping = slot_mappings[0]
+        for layer_name in kv_cache_config.supplementary_specs:
+            slot_mappings_by_layer[layer_name] = group0_slot_mapping
+
     return slot_mappings_by_layer
 
 

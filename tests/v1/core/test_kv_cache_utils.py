@@ -38,6 +38,7 @@ from vllm.v1.core.kv_cache_utils import (
     tensor_data,
 )
 from vllm.v1.kv_cache_interface import (
+    CacheOnlySpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -2165,3 +2166,97 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+def new_cache_only_spec(
+    block_size=16,
+    num_kv_heads=4,
+    head_size=128,
+    dtype=torch.float32,
+):
+    return CacheOnlySpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+
+
+def test_get_kv_cache_groups_cache_only_stripped():
+    """CacheOnly layers should be stripped from groups (they are supplementary)."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    kv_cache_spec = {
+        "layer_0": new_kv_cache_spec(),
+        "layer_1": new_kv_cache_spec(),
+        "cache_layer": new_cache_only_spec(),
+    }
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    # CacheOnly should NOT appear in any group — only regular layers
+    assert len(groups) == 1
+    assert "layer_0" in groups[0].layer_names
+    assert "layer_1" in groups[0].layer_names
+    assert "cache_layer" not in groups[0].layer_names
+
+
+def test_split_supplementary_specs():
+    """split_supplementary_specs should separate CacheOnly from regular specs."""
+    kv_cache_spec = {
+        "layer_0": new_kv_cache_spec(),
+        "layer_1": new_sliding_window_spec(),
+        "cache_layer": new_cache_only_spec(),
+    }
+    regular, supplementary = kv_cache_utils.split_supplementary_specs(kv_cache_spec)
+    assert "layer_0" in regular
+    assert "layer_1" in regular
+    assert "cache_layer" not in regular
+    assert "cache_layer" in supplementary
+    assert isinstance(supplementary["cache_layer"], CacheOnlySpec)
+
+
+def test_get_kv_cache_groups_cache_only_excluded_from_unify():
+    """CacheOnly should not crash unify_hybrid_kv_cache_specs."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = True
+    kv_cache_spec = {
+        "layer_0": new_kv_cache_spec(),
+        "layer_1": new_sliding_window_spec(),
+        "cache_layer": new_cache_only_spec(),
+    }
+    # Should not raise — CacheOnly is pre-filtered before unification
+    groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_spec)
+    # Only regular layers, unified into one group
+    assert len(groups) == 1
+    assert "cache_layer" not in groups[0].layer_names
+
+
+def test_get_kv_cache_config_from_groups_budget():
+    """Memory budget should account for supplementary CacheOnly bytes per block."""
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+
+    main_spec = new_kv_cache_spec()
+    cache_spec = new_cache_only_spec()
+
+    main_page = main_spec.page_size_bytes  # 16 * 2 * 64 * 4 * 2 = 16384
+    cache_page = cache_spec.page_size_bytes  # 16 * 4 * 128 * 4 = 32768
+
+    # 2 main layers in one group: group_size=2, total main = 2 * main_page
+    # 1 supplementary cache_only layer: cache_page
+    # bytes_per_block = 2 * main_page + cache_page
+    available = (2 * main_page + cache_page) * 10  # room for 10 blocks
+    groups = [
+        KVCacheGroupSpec(["layer_0", "layer_1"], main_spec),
+    ]
+    supplementary = {"cache_layer": cache_spec}
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, available, supplementary_specs=supplementary
+    )
+    assert config.num_blocks == 10
+    # 2 main tensors + 1 supplementary tensor
+    assert len(config.kv_cache_tensors) == 3
+    assert config.kv_cache_tensors[0].size == main_page * 10
+    assert config.kv_cache_tensors[1].size == main_page * 10
+    assert config.kv_cache_tensors[2].size == cache_page * 10
+    assert config.kv_cache_tensors[2].shared_by == ["cache_layer"]
+    # supplementary_specs should be set on the config
+    assert "cache_layer" in config.supplementary_specs
+    assert isinstance(config.supplementary_specs["cache_layer"], CacheOnlySpec)

@@ -188,6 +188,7 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.attn_utils import _reshape_one_layer
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -3747,6 +3748,13 @@ class GPUModelRunner(
             for layer_name in kv_cache_group.layer_names:
                 slot_mappings_by_layer[layer_name] = slot_mapping
 
+        # Supplementary layers (e.g. CacheOnly) share group 0's block table,
+        # so they use group 0's slot_mapping.
+        if self.kv_cache_config.supplementary_specs:
+            group0_slot_mapping = slot_mappings_by_gid[0]
+            for layer_name in self.kv_cache_config.supplementary_specs:
+                slot_mappings_by_layer[layer_name] = group0_slot_mapping
+
         if ubatch_slices is not None:
             result: list[dict[str, torch.Tensor]] = []
             for ubatch in ubatch_slices:
@@ -5817,9 +5825,11 @@ class GPUModelRunner(
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
+            split_supplementary_specs,
         )
 
         kv_cache_spec = self.get_kv_cache_spec()
+        _, supplementary_specs = split_supplementary_specs(kv_cache_spec)
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
         min_blocks = self.compilation_config.max_cudagraph_capture_size or 1
 
@@ -5827,7 +5837,10 @@ class GPUModelRunner(
         saved_override = self.cache_config.num_gpu_blocks_override
         self.cache_config.num_gpu_blocks_override = min_blocks
         minimal_config = get_kv_cache_config_from_groups(
-            self.vllm_config, kv_cache_groups, available_memory=0
+            self.vllm_config,
+            kv_cache_groups,
+            available_memory=0,
+            supplementary_specs=supplementary_specs,
         )
         self.cache_config.num_gpu_blocks_override = saved_override
 
@@ -6486,6 +6499,8 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 layer_names.add(layer_name)
+        # Supplementary layers (e.g. CacheOnly) also have tensors but no group.
+        layer_names.update(kv_cache_config.supplementary_specs.keys())
         assert layer_names == set(kv_cache_raw_tensors.keys()), (
             "Some layers are not correctly initialized"
         )
@@ -6598,6 +6613,26 @@ class GPUModelRunner(
                     kv_caches[layer_name] = state_tensors
                 else:
                     raise NotImplementedError
+
+        # Reshape supplementary layers (e.g. CacheOnly for hidden-state
+        # extraction).  They are not part of any attn_group but still need
+        # their raw tensors reshaped and included in kv_caches.
+        for layer_name, spec in kv_cache_config.supplementary_specs.items():
+            assert isinstance(spec, AttentionSpec)
+
+            layer_type = cast(type[Any], AttentionLayerBase)
+            supp_layers = get_layers_from_vllm_config(
+                self.vllm_config, layer_type, [layer_name]
+            )
+            attn_backend = supp_layers[layer_name].get_attn_backend()
+
+            kv_caches[layer_name] = _reshape_one_layer(
+                layer_name,
+                spec,
+                kv_cache_raw_tensors[layer_name],
+                attn_backend,
+                self.cache_config.cache_dtype,
+            )
 
         if has_attn and has_mamba:
             self._update_hybrid_attention_mamba_layout(kv_caches, kernel_block_sizes)
