@@ -313,6 +313,13 @@ class NixlEplbCommunicator(EplbCommunicator):
             total_max_bytes += max_bytes
 
         self._peer_partition_bytes = total_max_bytes
+
+        # The send buffer needs world_size partitions because remote peers
+        # READ from fixed offsets (rank * partition_bytes).
+        # This allocates world_size * partition_bytes
+        # which can cause OOM on large models.
+        # TODO(ilmarkov): shrink to const * partition_bytes and execute
+        # communication in multiple steps dealing with the worst case.
         send_total_bytes = self._peer_partition_bytes * self._world_size
 
         self._send_buffer = torch.empty(
