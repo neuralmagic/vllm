@@ -128,7 +128,13 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         hidden_states: torch.Tensor,
         tokens_per_req: list[int],
     ) -> None:
-        """Receive stacked hidden states from the proposer and accumulate.
+        """Receive stacked hidden states from the proposer, accumulate, and
+        persist to disk.
+
+        Because ``request_finished()`` runs on the *scheduler* process (which
+        has a separate connector instance), we must write the file here on the
+        worker side.  Each call overwrites the previous file for a given
+        request so that the latest accumulated state is always on disk.
 
         Args:
             hidden_states: [total_tokens, num_hidden_states, hidden_size]
@@ -138,6 +144,8 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         """
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, ExampleHiddenStatesConnectorMetadata)
+
+        os.makedirs(self._storage_path, exist_ok=True)
 
         offset = 0
         for i, request in enumerate(connector_metadata.requests):
@@ -152,6 +160,15 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 self._accumulated_hs[req_id] = []
             self._accumulated_hs[req_id].append(hs)
             self._accumulated_tokens[req_id] = request.token_ids
+
+            # Write the full accumulated hidden states to disk so the file
+            # is ready when the scheduler calls request_finished().
+            full_hs = torch.cat(self._accumulated_hs[req_id], dim=0)
+            tensors = {
+                "hidden_states": full_hs,
+                "token_ids": torch.tensor(request.token_ids),
+            }
+            safetensors.torch.save_file(tensors, request.filename)
 
     # ==============================
     # Scheduler-side methods
@@ -213,17 +230,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         req_id = request.request_id
         filename = self._request_filenames.pop(req_id, None)
         _ = self._active_requests.pop(req_id, None)
-
-        if req_id in self._accumulated_hs and filename:
-            os.makedirs(self._storage_path, exist_ok=True)
-            hs = torch.cat(self._accumulated_hs.pop(req_id), dim=0)
-            token_ids_list = self._accumulated_tokens.pop(req_id, [])
-            tensors = {
-                "hidden_states": hs,
-                "token_ids": torch.tensor(token_ids_list),
-            }
-            safetensors.torch.save_file(tensors, filename)
-
+        # File was already written by save_hidden_states() on the worker.
         return False, {"hidden_states_path": filename}
 
     def request_finished_all_groups(
