@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import TracebackType
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from typing_extensions import Self, override
 
@@ -17,20 +17,25 @@ from vllm.utils.import_utils import PlaceholderModule
 
 from .utils import sanitize_filename
 
-try:
-    import matplotlib.pyplot as plt
-except ImportError:
-    plt = PlaceholderModule("matplotlib").placeholder_attr("pyplot")
-
-try:
+if TYPE_CHECKING:
     import pandas as pd
-except ImportError:
-    pd = PlaceholderModule("pandas")
 
-try:
-    import seaborn as sns
-except ImportError:
-    seaborn = PlaceholderModule("seaborn")
+
+def _import_plot_deps():
+    """Lazy-import matplotlib/pandas/seaborn; only used inside `_plot_fig`."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = PlaceholderModule("matplotlib").placeholder_attr("pyplot")
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = PlaceholderModule("pandas")
+    try:
+        import seaborn as sns
+    except ImportError:
+        sns = PlaceholderModule("seaborn")
+    return plt, pd, sns
 
 
 @dataclass
@@ -265,6 +270,8 @@ def _plot_fig(
     fig_height: float,
     fig_dpi: int,
 ):
+    plt, pd, sns = _import_plot_deps()
+
     fig_group, fig_data = fig_group_data
 
     row_groups = full_groupby(
