@@ -2294,7 +2294,10 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
+                if isinstance(
+                    self.drafter,
+                    (EagleProposer, DFlashProposer, ExtractHiddenStatesProposer),
+                ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -6566,12 +6569,27 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
-                    )
+                    typed_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
+                    if (
+                        kv_cache_spec.page_size_padded is not None
+                        and kv_cache_spec.page_size_padded
+                        > kv_cache_spec.real_page_size_bytes
+                    ):
+                        # Padded spec (e.g. HiddenStateCacheSpec aligned to
+                        # common page in hybrid models). Use as_strided to
+                        # skip padding gaps between blocks.
+                        dtype_sz = get_dtype_size(dtype)
+                        stride_0 = kv_cache_spec.page_size_padded // dtype_sz
+                        inner = torch.empty(kv_cache_shape[1:], dtype=dtype)
+                        kv_caches[layer_name] = torch.as_strided(
+                            typed_tensor,
+                            size=kv_cache_shape,
+                            stride=(stride_0, *inner.stride()),
+                        ).permute(*inv_order)
+                    else:
+                        kv_caches[layer_name] = typed_tensor.view(
+                            kv_cache_shape
+                        ).permute(*inv_order)
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
