@@ -18,23 +18,6 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
-def _import_plot_deps():
-    """Lazy-import matplotlib/pandas/seaborn; only used inside `_plot_fig`."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        plt = PlaceholderModule("matplotlib").placeholder_attr("pyplot")
-    try:
-        import pandas as pd
-    except ImportError:
-        pd = PlaceholderModule("pandas")
-    try:
-        import seaborn as sns
-    except ImportError:
-        sns = PlaceholderModule("seaborn")
-    return plt, pd, sns
-
-
 def _first_present(run_data: dict[str, object], keys: list[str]):
     for key in keys:
         for candidate in {key, key.replace("_", "-"), key.replace("-", "_")}:
@@ -200,7 +183,19 @@ def _plot_fig(
         print("[END FIGURE]")
         return
 
-    plt, pd, sns = _import_plot_deps()
+    # Lazy-import matplotlib/pandas/seaborn
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = PlaceholderModule("matplotlib").placeholder_attr("pyplot")
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = PlaceholderModule("pandas")
+    try:
+        import seaborn as sns
+    except ImportError:
+        sns = PlaceholderModule("seaborn")
 
     df = pd.DataFrame.from_records(fig_data)
     df = df.dropna(subset=["tokens_per_user", "tokens_per_gpu"])

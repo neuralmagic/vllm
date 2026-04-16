@@ -21,23 +21,6 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
-def _import_plot_deps():
-    """Lazy-import matplotlib/pandas/seaborn; only used inside `_plot_fig`."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        plt = PlaceholderModule("matplotlib").placeholder_attr("pyplot")
-    try:
-        import pandas as pd
-    except ImportError:
-        pd = PlaceholderModule("pandas")
-    try:
-        import seaborn as sns
-    except ImportError:
-        sns = PlaceholderModule("seaborn")
-    return plt, pd, sns
-
-
 @dataclass
 class PlotFilterBase(ABC):
     var: str
@@ -270,7 +253,19 @@ def _plot_fig(
     fig_height: float,
     fig_dpi: int,
 ):
-    plt, pd, sns = _import_plot_deps()
+    # Lazy-import matplotlib/pandas/seaborn
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = PlaceholderModule("matplotlib").placeholder_attr("pyplot")
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = PlaceholderModule("pandas")
+    try:
+        import seaborn as sns
+    except ImportError:
+        sns = PlaceholderModule("seaborn")
 
     fig_group, fig_data = fig_group_data
 

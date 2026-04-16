@@ -102,9 +102,6 @@ os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "1"
 
 # see https://github.com/vllm-project/vllm/issues/10480 and
 # https://github.com/vllm-project/vllm/issues/10619.
-# The env var alone is enough; torch._inductor.config reads it on first
-# import. Avoiding a direct attribute write here lets us skip eagerly
-# loading the whole `torch._inductor` tree at `import vllm` time.
 os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 
 # Enable Triton autotuning result caching to disk by default.
