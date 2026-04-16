@@ -25,7 +25,7 @@ from vllm.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
-    MoEPrepareAndFinalizeNoDPEPMonolithic,
+    make_moe_prepare_and_finalize_no_dp_ep,
 )
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
@@ -94,6 +94,10 @@ def run_single_case(m, n, k, topk, num_experts, block_size):
     Run one (M,N,K) configuration on a single GPU and assert DeepGEMM ==
     Triton baseline within tolerance.
     """
+    import deep_gemm
+
+    router = create_fused_moe_router(topk, num_experts)
+
     tokens_bf16 = (
         torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         .clamp_min_(-1)
@@ -104,11 +108,9 @@ def run_single_case(m, n, k, topk, num_experts, block_size):
     # expert weight tensors
     w1, w2, w1_s, w2_s = make_block_quant_fp8_weights(num_experts, n, k, block_size)
 
-    router_logits = torch.randn(m, num_experts, device="cuda", dtype=torch.float32)
-
-    router = create_fused_moe_router(topk, num_experts)
-
-    topk_weights, topk_ids = router.select_experts(tokens_bf16, router_logits)
+    (dg_w1, dg_w1_s), (dg_w2, dg_w2_s) = deep_gemm.transform_weights_for_mega_moe(
+        (w1, w1_s), (w2, w2_s)
+    )
 
     quant_config = fp8_w8a8_moe_quant_config(
         w1_scale=w1_s,
@@ -119,14 +121,19 @@ def run_single_case(m, n, k, topk, num_experts, block_size):
     moe_config = make_dummy_moe_config()
 
     deep_gemm_experts = mk.FusedMoEKernel(
-        prepare_finalize=MoEPrepareAndFinalizeNoDPEPMonolithic(),
+        prepare_finalize=make_moe_prepare_and_finalize_no_dp_ep(False),
         fused_experts=DeepGemmMegaExperts(
             moe_config=moe_config,
             quant_config=quant_config,
-            router=router,
+            top_k=topk,
         ),
         inplace=False,
     )
+
+    #############################
+
+    router_logits = torch.randn(m, num_experts, device="cuda", dtype=torch.float32)
+    topk_weights, topk_ids = router.select_experts(tokens_bf16, router_logits)
 
     # triton reference
     out_triton = fused_experts(
@@ -140,7 +147,7 @@ def run_single_case(m, n, k, topk, num_experts, block_size):
     )
 
     # DeepGemm
-    out_deepgemm = deep_gemm_experts.apply_monolithic(
+    out_deepgemm = deep_gemm_experts.apply(
         hidden_states=tokens_bf16,
         w1=w1,
         w2=w2,
