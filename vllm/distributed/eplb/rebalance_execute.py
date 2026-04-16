@@ -272,7 +272,7 @@ def move_to_buffer(
                 recv_ranks.append(ranks_to_recv[recver_pos])
             for dst in recv_ranks:
                 for w in expert_weights:
-                    communicator.add_send(w[src], dst)
+                    communicator.add_send(w[src], dst, expert_id=int(expert))
 
     # 3. Post recvs
     if recv_count > 0:
@@ -302,10 +302,10 @@ def move_to_buffer(
             else:
                 src = ranks_to_send[recver_pos - remainder_start]
             for b in expert_weights_buffers:
-                communicator.add_recv(b[dst], src)
+                communicator.add_recv(b[dst], src, expert_id=int(expert))
 
     # 4. Execute the P2P operations. The real communication happens here.
-    communicator.execute()
+    communicator.execute(old_indices=old_indices)
     # wait for the communication to finish
     return (
         is_unchanged,
