@@ -150,12 +150,14 @@ MOE_MARLIN_QUANT_TEST_CONFIGS = [
     {
         "a_type": [scalar_types.bfloat16],
         "b_type": scalar_types.float4_e2m1f,
+        "c_type": [scalar_types.bfloat16],
         "group_blocks": [2],
     },
     # MXFP8
     {
         "a_type": [scalar_types.bfloat16],
         "b_type": scalar_types.float8_e4m3fn,
+        "c_type": [scalar_types.bfloat16],
         "group_blocks": [2],
     },
     # AWQ-INT4 with INT8 activation
@@ -806,24 +808,26 @@ def test_mixtral_moe(
 
 MARLIN_MOE_SCENARIOS = [
     # (m, n, k, e, topk, ep_size, act_order, is_k_full)
+    # No act_order: is_k_full=True matches usual case (marlin_is_k_full).
+    # N>=256 required for Marlin kernel thread config for MXFP8.
     # Single token, small matrices
-    (1, 128, 256, 5, 2, 1, False, False),
+    (1, 128, 256, 5, 2, 1, False, True),
     # Single token, large matrices
-    (1, 1024, 2048, 5, 2, 1, False, False),
+    (1, 1024, 2048, 5, 2, 1, False, True),
     # Unaligned m, small matrices
-    (133, 128, 256, 5, 2, 1, False, False),
+    (133, 256, 256, 5, 2, 1, False, True),
     # Unaligned m, large matrices
-    (133, 1024, 2048, 12, 3, 1, False, False),
+    (133, 1024, 2048, 12, 3, 1, False, True),
     # Aligned batch, small matrices
-    (128, 128, 256, 5, 2, 1, False, False),
+    (128, 256, 256, 5, 2, 1, False, True),
     # Aligned batch, large matrices
-    (128, 1024, 2048, 12, 3, 1, False, False),
+    (128, 1024, 2048, 12, 3, 1, False, True),
     # Expert parallelism
-    (64, 1024, 2048, 12, 3, 4, False, False),
-    # Act order with is_k_full=True
+    (64, 1024, 2048, 12, 3, 4, False, True),
+    # Act order with is_k_full=True (no tensor parallelism)
     (1, 1024, 2048, 5, 2, 1, True, True),
-    # Act order with is_k_full=False, unaligned m
-    (133, 128, 256, 5, 2, 1, True, False),
+    # Act order with is_k_full=False (tensor parallelism)
+    (133, 256, 256, 5, 2, 1, True, False),
 ]
 
 
@@ -851,7 +855,7 @@ def marlin_moe_generate_valid_test_cases():
             return False
         if group_size in [k, n]:
             return False
-        if not act_order and is_k_full:
+        if b_type == scalar_types.float8_e4m3fn and group_size == 32 and is_k_full:
             return False
         return a_type.size_bits < 16 or a_type is c_type
 
