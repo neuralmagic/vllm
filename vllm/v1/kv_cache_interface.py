@@ -310,6 +310,18 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
 
 
+@dataclass(frozen=True)
+class CacheOnlySpec(MLAAttentionSpec):
+    """KV cache spec for hidden-state-only storage (no attention computation).
+
+    Inherits from MLAAttentionSpec so that gpu_model_runner.py handles it
+    via existing AttentionSpec code paths. Pre-filtered by get_kv_cache_groups()
+    before any type-unification routing.
+    """
+
+    pass
+
+
 @dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):
     attention_chunk_size: int

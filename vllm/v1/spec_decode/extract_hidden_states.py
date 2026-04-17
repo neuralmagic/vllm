@@ -129,6 +129,11 @@ class ExtractHiddenStatesProposer:
         if num_tokens_across_dp is not None:
             num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
+        # Use the CacheOnly group's slot_mapping (not the main attention
+        # group's from common_attn_metadata) since HMA gives each group
+        # its own block table.
+        cache_only_slot_mapping = self._resolve_slot_mapping(slot_mappings)
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -136,7 +141,7 @@ class ExtractHiddenStatesProposer:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=self._get_slot_mapping(
-                num_input_tokens, common_attn_metadata.slot_mapping
+                num_input_tokens, cache_only_slot_mapping
             ),
         ):
             self.model(
@@ -149,6 +154,23 @@ class ExtractHiddenStatesProposer:
         # shape [batch_size, 2] (target + spec verification); slice to
         # return only the target-sampled column.
         return sampled_token_ids[:, :1]
+
+    def _resolve_slot_mapping(
+        self,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None = None,
+    ) -> torch.Tensor | None:
+        """Pick the CacheOnly layer's slot_mapping from per-layer mappings.
+
+        With HMA each group has its own block table, so the CacheOnly group
+        needs its own slot_mapping rather than the main group's.
+        """
+        if slot_mappings is None:
+            return None
+        layer_name = self.attn_layer_names[0]
+        mapping = slot_mappings[0] if isinstance(slot_mappings, list) else slot_mappings
+        return mapping[layer_name]
 
     def _get_slot_mapping(
         self,
