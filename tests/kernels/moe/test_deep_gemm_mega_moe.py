@@ -10,6 +10,7 @@ import math
 import pytest
 import torch
 
+from vllm.config import VllmConfig, get_current_vllm_config
 # vLLM fused-expert reference (Triton fallback + DeepGEMM option)
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config
@@ -38,57 +39,14 @@ from vllm.utils.deep_gemm import (
     per_block_cast_to_fp8,
 )
 from vllm.utils.torch_utils import set_random_seed
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    get_dp_group,
+)
 
 from .parallel_utils import ProcessGroupInfo, parallel_launch
 
 BLOCK_SIZE = [128, 128]
-
-
-def make_block_quant_fp8_weights(
-    e: int,
-    n: int,
-    k: int,
-    block_size: list[int],
-):
-    """
-    Generate (w1, w2) expert weights and their per-block scale tensors
-    in FP8 block-quantized format.
-
-      w1 shape: (E, 2N, K)
-      w2 shape: (E, K, N)
-    """
-    dtype = torch.bfloat16
-    fp8_max, fp8_min = (
-        torch.finfo(torch.float8_e4m3fn).max,
-        torch.finfo(torch.float8_e4m3fn).min,
-    )
-
-    # bf16 reference weights
-    w1_bf16 = torch.randn(e, 2 * n, k, device="cuda", dtype=dtype) / 10
-    w2_bf16 = torch.randn(e, k, n, device="cuda", dtype=dtype) / 10
-    w1_bf16.clamp_(fp8_min, fp8_max)
-    w2_bf16.clamp_(fp8_min, fp8_max)
-
-    block_n, block_k = block_size
-    n_tiles_w1 = math.ceil((2 * n) / block_n)
-    k_tiles_w1 = math.ceil(k / block_k)
-    n_tiles_w2 = math.ceil(k / block_n)
-    k_tiles_w2 = math.ceil(n / block_k)
-
-    w1 = torch.empty_like(w1_bf16, dtype=torch.float8_e4m3fn)
-    w2 = torch.empty_like(w2_bf16, dtype=torch.float8_e4m3fn)
-    w1_s = torch.empty(e, n_tiles_w1, k_tiles_w1, device="cuda", dtype=torch.float32)
-    w2_s = torch.empty(e, n_tiles_w2, k_tiles_w2, device="cuda", dtype=torch.float32)
-
-    for i in range(e):
-        w1[i], w1_s[i] = per_block_cast_to_fp8(
-            w1_bf16[i], block_size=block_size, use_ue8m0=True
-        )
-        w2[i], w2_s[i] = per_block_cast_to_fp8(
-            w2_bf16[i], block_size=block_size, use_ue8m0=True
-        )
-
-    return w1, w2, w1_s, w2_s
 
 
 # activation fp8 x weights fp4
@@ -117,19 +75,64 @@ def run_single_case(
     _, a1_scale = per_token_group_quant_fp8(tokens_bf16, block_size[1])
 
     # expert weight tensors
-    w1, w2, w1_s, w2_s = make_block_quant_fp8_weights(num_experts, n, k, block_size)
+    (w1_bf16, w1, w1_s, w1_gs), (w2_bf16, w2, w2_s, w2_gs) = make_test_weights(
+        num_experts,
+        n,
+        k,
+        torch.bfloat16,
+        "nvfp4",
+        False,
+        block_size,
+    )
 
     (dg_w1, dg_w1_s), (dg_w2, dg_w2_s) = deep_gemm.transform_weights_for_mega_moe(
         (w1, w1_s), (w2, w2_s)
     )
 
-    quant_config = fp8_w8a8_moe_quant_config(
-        w1_scale=w1_s,
-        w2_scale=w2_s,
+    a1_gscale = torch.ones((e,), device="cuda", dtype=torch.float32)
+    a2_gscale = torch.ones((e,), device="cuda", dtype=torch.float32)
+    a1_scale = a1_gscale
+    a2_scale = a2_gscale
+
+    quant_config = FusedMoEQuantConfig.make(
+        "nvfp4",
+        per_act_token_quant=False,
+        block_shape=block_shape,
+        w1_scale=dg_w1_s,
+        w2_scale=dg_w2_s,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
         a1_scale=a1_scale,
-        block_shape=block_size,
+        a2_scale=a2_scale,
+        g1_alphas=(1 / w1_gs) if w1_gs is not None else None,
+        g2_alphas=(1 / w2_gs) if w2_gs is not None else None,
+    ),
+
+    vllm_config = get_current_vllm_config()
+
+    moe_parallel_config = FusedMoEParallelConfig.make(
+        tp_size_=get_tensor_model_parallel_world_size(),
+        pcp_size_=1,
+        dp_size_=get_dp_group().world_size,
+        sp_size_=1,
+        vllm_parallel_config=vllm_config.parallel_config,
     )
-    moe_config = make_dummy_moe_config()
+
+    moe_config = FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=topk,
+        hidden_dim=k,
+        intermediate_size_per_partition=n, # // dp_size
+        num_local_experts=num_experts,  # // dp_size
+        num_logical_experts=num_experts,
+        moe_parallel_config=moe_parallel_config,
+        in_dtype=torch.bfloat16, # or fp8?
+        max_num_tokens=next_power_of_2(m),
+        activation=MoEActivation.SILU,
+        device=vllm_config.device_config.device,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        moe_parallel_config=moe_parallel_config,
+    )
 
     deep_gemm_experts = mk.FusedMoEKernel(
         prepare_finalize=make_moe_prepare_and_finalize_no_dp_ep(False),
