@@ -34,8 +34,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CacheOnlySpec,
     KVCacheSpec,
-    MLAAttentionSpec,
 )
 
 ########## Custom Ops ########
@@ -322,11 +322,14 @@ class CacheOnlyAttentionLayer(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        # Note: we use MLAAttentionSpec here to because it will
-        # produce page sizes of (block_size * num_kv_heads * head_size * dtype_size)
-        # whereas FullAttentionSpec will add an additional factor of 2
-        return MLAAttentionSpec(
-            block_size=self.block_size,
+        # Use the current cache_config.block_size rather than the value
+        # captured at __init__ time.  For hybrid models (e.g. Qwen3.5)
+        # block_size is adjusted upward after model loading to match the
+        # Mamba page size.  The CacheOnly layer shares slot_mapping with
+        # group 0, so it must use the same block_size.
+        block_size = vllm_config.cache_config.block_size
+        return CacheOnlySpec(
+            block_size=block_size,
             num_kv_heads=self.num_heads,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,
