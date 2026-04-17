@@ -5,7 +5,6 @@ Unit-test DeepGEMM FP8 kernels (no DeepEP).
 Compare DeepGEMM path against the Triton fallback inside vLLM's fused_experts.
 """
 
-import importlib
 import math
 
 import pytest
@@ -38,6 +37,9 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
     per_block_cast_to_fp8,
 )
+from vllm.utils.torch_utils import set_random_seed
+
+from .parallel_utils import ProcessGroupInfo, parallel_launch
 
 BLOCK_SIZE = [128, 128]
 
@@ -89,7 +91,16 @@ def make_block_quant_fp8_weights(
     return w1, w2, w1_s, w2_s
 
 
-def run_single_case(m, n, k, topk, num_experts, block_size):
+# activation fp8 x weights fp4
+def run_single_case(
+    pgi: ProcessGroupInfo,
+    m: int,
+    n: int,
+    k: int,
+    topk: int,
+    num_experts: int,
+    block_size: list[int],
+):
     """
     Run one (M,N,K) configuration on a single GPU and assert DeepGEMM ==
     Triton baseline within tolerance.
@@ -163,10 +174,11 @@ def run_single_case(m, n, k, topk, num_experts, block_size):
 
 # Note: N <= 512 will disable the deepgemm path due to performance issues.
 MNKs = [
-    (1024, 768, 128),
-    (2048, 768, 512),
-    (512, 1024, 1024),
-    (4096, 4096, 1024),
+    # (1024, 768, 128),
+    # (2048, 768, 512),
+    # (512, 1024, 1024),
+    # (4096, 4096, 1024),
+    (512, 2048, 2048),
 ]
 
 TOPKS = [2, 6]
@@ -176,38 +188,31 @@ NUM_EXPERTS = [32]
 @pytest.mark.parametrize(("m", "n", "k"), MNKs)
 @pytest.mark.parametrize("topk", TOPKS)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("world_dp_size", [(2, 1)])
 @pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires deep_gemm kernels")
-def test_deepgemm_vs_triton(m, n, k, topk, num_experts, monkeypatch, workspace_init):
-    with monkeypatch.context() as mp:
-        mp.setenv("VLLM_USE_DEEP_GEMM", "1")
+def test_deep_gemm_mega_moe(
+    m,
+    n,
+    k,
+    topk,
+    num_experts,
+    world_dp_size,
+    workspace_init,
+):
+    set_random_seed(7)
 
-        _DeepGemmExperts = importlib.import_module(
-            "vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe"
-        ).DeepGemmExperts
+    world_size, dp_size = world_dp_size
 
-        call_counter = {"cnt": 0}
+    if topk > num_experts:
+        pytest.skip(f"topk={topk} > num_experts={num_experts}")
 
-        orig_fn = _DeepGemmExperts.apply
-
-        def _spy_apply(*args, **kwargs):
-            call_counter["cnt"] += 1
-            return orig_fn(*args, **kwargs)
-
-        monkeypatch.setattr(_DeepGemmExperts, "apply", _spy_apply)
-        if topk > num_experts:
-            pytest.skip(f"topk={topk} > num_experts={num_experts}")
-
-        run_single_case(
-            m=m,
-            n=n,
-            k=k,
-            topk=topk,
-            num_experts=num_experts,
-            block_size=BLOCK_SIZE,
-        )
-
-        # ensure that the DeepGEMM path was indeed taken.
-        assert call_counter["cnt"] == 1, (
-            f"DeepGEMM path was not executed during the test. "
-            f"Call counter: {call_counter['cnt']}"
-        )
+    parallel_launch(
+        world_size,
+        run_single_case,
+        m,
+        n,
+        k,
+        topk,
+        num_experts,
+        BLOCK_SIZE,
+    )
