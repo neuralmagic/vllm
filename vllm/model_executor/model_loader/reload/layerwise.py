@@ -183,7 +183,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         )
 
         # Do not online process attention layers, must wait until finalize
-        if isinstance(layer, (Attention, MLAAttention)):  # type: ignore[operator]
+        if isinstance(layer, (Attention, MLAAttention)):
             return ret
 
         # Log warnings allocating excessive buffers on device
@@ -199,7 +199,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                 )
 
         # Process and copy when all weights are loaded
-        if info.load_numel >= info.load_numel_total:
+        if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
             _layerwise_process(layer, info)
             if layer in LOADING_LAYERS:
                 LOADING_LAYERS.remove(layer)
