@@ -182,8 +182,12 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             info.load_numel_total,
         )
 
-        # Log warnings if reloading and allocating extra buffers on device
-        if info.kernel_tensors is not None and has_device_tensors(bound_args):
+        # Do not online process attention layers, must wait until finalize
+        if isinstance(layer, (Attention, MLAAttention)):  # type: ignore[operator]
+            return ret
+
+        # Log warnings allocating excessive buffers on device
+        if has_device_tensors(bound_args):
             LOADING_LAYERS.add(layer)
             if len(LOADING_LAYERS) >= 2:
                 names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
@@ -195,9 +199,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                 )
 
         # Process and copy when all weights are loaded
-        if info.load_numel >= info.load_numel_total and not isinstance(  # type: ignore[operator]
-            layer, (Attention, MLAAttention)
-        ):
+        if info.load_numel >= info.load_numel_total:
             _layerwise_process(layer, info)
             if layer in LOADING_LAYERS:
                 LOADING_LAYERS.remove(layer)
