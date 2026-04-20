@@ -106,7 +106,7 @@ def run_single_case(
         a2_scale=a2_scale,
         g1_alphas=(1 / w1_gs) if w1_gs is not None else None,
         g2_alphas=(1 / w2_gs) if w2_gs is not None else None,
-    ),
+    )
 
     vllm_config = get_current_vllm_config()
 
