@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from inspect import BoundArguments
+
 import torch
 
 from .types import LayerTensors
@@ -38,4 +40,12 @@ def get_layer_size(layer: torch.nn.Module) -> int:
         tensor.numel()
         for name, tensor in get_layer_tensors(layer).items()
         if name not in SKIP_TENSORS
+    )
+
+
+def has_device_tensors(bound_args: BoundArguments) -> bool:
+    return any(
+        isinstance(value, torch.Tensor)
+        and value.device not in (torch.device("meta"), torch.device("cpu"))
+        for value in bound_args.arguments.values()
     )
