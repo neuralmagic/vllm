@@ -191,7 +191,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                     "Allocating extra memory to buffers to load %s layers.\n"
                     "This extra memory usage can be avoided by ordering weights "
                     "by their parent layer when reloading.",
-                    names,
+                    list(names),
                 )
 
         # Process and copy when all weights are loaded
