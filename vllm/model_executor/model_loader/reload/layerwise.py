@@ -186,8 +186,8 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         if info.kernel_tensors is not None and has_device_tensors(bound_args):
             LOADING_LAYERS.add(layer)
             if len(LOADING_LAYERS) >= 2:
-                names = [layer.__class__.__name__ for layer in LOADING_LAYERS]
-                logger.warning(
+                names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
+                logger.warning_once(
                     "Allocating extra memory to buffers to load %s layers.\n"
                     "This extra memory usage can be avoided by ordering weights "
                     "by their parent layer when reloading.",
