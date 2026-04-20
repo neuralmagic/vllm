@@ -5,25 +5,30 @@ Unit-test DeepGEMM FP8 kernels (no DeepEP).
 Compare DeepGEMM path against the Triton fallback inside vLLM's fused_experts.
 """
 
-import math
-
 import pytest
 import torch
 
-from vllm.config import VllmConfig, get_current_vllm_config
 # vLLM fused-expert reference (Triton fallback + DeepGEMM option)
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from tests.kernels.moe.utils import make_dummy_moe_config
+from tests.kernels.moe.utils import make_test_weights
+from vllm.config import get_current_vllm_config
+from vllm.distributed import (
+    get_dp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
-)
-from vllm.model_executor.layers.fused_moe.config import (
-    fp8_w8a8_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
     DeepGemmMegaExperts,
 )
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    FusedMoEConfig,
+    FusedMoEParallelConfig,
+    FusedMoEQuantConfig,
+    RoutingMethodType,
+    fused_experts,
+)
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     make_moe_prepare_and_finalize_no_dp_ep,
 )
@@ -36,13 +41,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.utils.deep_gemm import (
     calc_diff,
     is_deep_gemm_supported,
-    per_block_cast_to_fp8,
 )
+from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    get_dp_group,
-)
 
 from .parallel_utils import ProcessGroupInfo, parallel_launch
 
@@ -80,24 +81,24 @@ def run_single_case(
         n,
         k,
         torch.bfloat16,
-        "nvfp4",
-        False,
-        block_size,
+        quant_dtype="nvfp4",
+        per_out_ch_quant=False,
+        # block_shape=block_size,
     )
 
     (dg_w1, dg_w1_s), (dg_w2, dg_w2_s) = deep_gemm.transform_weights_for_mega_moe(
         (w1, w1_s), (w2, w2_s)
     )
 
-    a1_gscale = torch.ones((e,), device="cuda", dtype=torch.float32)
-    a2_gscale = torch.ones((e,), device="cuda", dtype=torch.float32)
+    a1_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
+    a2_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
     a1_scale = a1_gscale
     a2_scale = a2_gscale
 
     quant_config = FusedMoEQuantConfig.make(
         "nvfp4",
         per_act_token_quant=False,
-        block_shape=block_shape,
+        block_shape=None,  # block_shape,
         w1_scale=dg_w1_s,
         w2_scale=dg_w2_s,
         a1_gscale=a1_gscale,
@@ -122,11 +123,11 @@ def run_single_case(
         num_experts=num_experts,
         experts_per_token=topk,
         hidden_dim=k,
-        intermediate_size_per_partition=n, # // dp_size
+        intermediate_size_per_partition=n,  # // dp_size
         num_local_experts=num_experts,  # // dp_size
         num_logical_experts=num_experts,
         moe_parallel_config=moe_parallel_config,
-        in_dtype=torch.bfloat16, # or fp8?
+        in_dtype=torch.bfloat16,  # or fp8?
         max_num_tokens=next_power_of_2(m),
         activation=MoEActivation.SILU,
         device=vllm_config.device_config.device,

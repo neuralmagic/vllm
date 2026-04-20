@@ -184,6 +184,8 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
     ) -> torch.Tensor:
         import deep_gemm
 
+        raise AssertionError("never get here")
+
         #
         # call experts
         #
