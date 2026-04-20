@@ -131,7 +131,6 @@ def run_single_case(
         activation=MoEActivation.SILU,
         device=vllm_config.device_config.device,
         routing_method=RoutingMethodType.DeepSeekV3,
-        moe_parallel_config=moe_parallel_config,
     )
 
     deep_gemm_experts = mk.FusedMoEKernel(
