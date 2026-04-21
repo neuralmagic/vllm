@@ -523,6 +523,7 @@ def rearrange_expert_weights_inplace(
 
     ep_size = ep_group.size()
     ep_rank = ep_group.rank()
+    # num_physical_experts == ep_size * num_local_physical_experts
     assert num_physical_experts == ep_size * expert_weights[0][0].shape[0]
 
     first_layer_weights = list(expert_weights[0])
