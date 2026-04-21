@@ -10,24 +10,30 @@ import torch
 
 # vLLM fused-expert reference (Triton fallback + DeepGEMM option)
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from tests.kernels.moe.utils import make_test_weights
-from vllm.config import get_current_vllm_config
+from tests.kernels.moe.utils import (
+    make_test_weights,
+    per_token_cast_to_fp4,
+)
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_dp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEConfig,
+    fused_experts,
+)
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
 )
-from vllm.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
-    DeepGemmMegaExperts,
-)
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    FusedMoEConfig,
+from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
-    fused_experts,
+)
+from vllm.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
+    DeepGemmMegaExperts,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     make_moe_prepare_and_finalize_no_dp_ep,
@@ -44,15 +50,40 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.worker.workspace import (
+    init_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
-from .parallel_utils import ProcessGroupInfo, parallel_launch
+from .modular_kernel_tools.parallel_utils import (
+    ProcessGroupInfo,
+    parallel_launch_with_config,
+)
 
 BLOCK_SIZE = [128, 128]
+
+
+def cast_grouped_weights_to_fp4(
+    bf16_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import deep_gemm
+
+    num_groups, n, k = bf16_weights.shape
+    w = torch.empty((num_groups, n, k // 2), device="cuda", dtype=torch.int8)
+    w_sf = torch.empty((num_groups, n, k // 32), device="cuda", dtype=torch.float)
+    for i in range(num_groups):
+        w[i], w_sf[i] = per_token_cast_to_fp4(
+            bf16_weights[i], use_ue8m0=True, gran_k=32
+        )
+    w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+    return w, w_sf
 
 
 # activation fp8 x weights fp4
 def run_single_case(
     pgi: ProcessGroupInfo,
+    vllm_config: VllmConfig,
+    cpu_group,
     m: int,
     n: int,
     k: int,
@@ -66,6 +97,9 @@ def run_single_case(
     """
     import deep_gemm
 
+    if not is_workspace_manager_initialized():
+        init_workspace_manager(torch.accelerator.current_accelerator())
+
     router = create_fused_moe_router(topk, num_experts)
 
     tokens_bf16 = (
@@ -76,18 +110,22 @@ def run_single_case(
     _, a1_scale = per_token_group_quant_fp8(tokens_bf16, block_size[1])
 
     # expert weight tensors
-    (w1_bf16, w1, w1_s, w1_gs), (w2_bf16, w2, w2_s, w2_gs) = make_test_weights(
+    (w1, _, _, _), (w2, _, _, _) = make_test_weights(
         num_experts,
         n,
         k,
         torch.bfloat16,
-        quant_dtype="nvfp4",
+        quant_dtype=None,
         per_out_ch_quant=False,
-        # block_shape=block_size,
+        block_shape=None,
     )
 
+    w1_weights = cast_grouped_weights_to_fp4(w1)
+    w2_weights = cast_grouped_weights_to_fp4(w2)
+
     (dg_w1, dg_w1_s), (dg_w2, dg_w2_s) = deep_gemm.transform_weights_for_mega_moe(
-        (w1, w1_s), (w2, w2_s)
+        w1_weights,
+        w2_weights,
     )
 
     a1_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
@@ -105,11 +143,11 @@ def run_single_case(
         a2_gscale=a2_gscale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
-        g1_alphas=(1 / w1_gs) if w1_gs is not None else None,
-        g2_alphas=(1 / w2_gs) if w2_gs is not None else None,
+        # g1_alphas=(1 / w1_gs) if w1_gs is not None else None,
+        # g2_alphas=(1 / w2_gs) if w2_gs is not None else None,
     )
 
-    vllm_config = get_current_vllm_config()
+    # vllm_config = get_current_vllm_config()
 
     moe_parallel_config = FusedMoEParallelConfig.make(
         tp_size_=get_tensor_model_parallel_world_size(),
@@ -157,15 +195,16 @@ def run_single_case(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         inplace=False,
-        quant_config=quant_config,
+        quant_config=FUSED_MOE_UNQUANTIZED_CONFIG,
     )
 
     # DeepGemm
     out_deepgemm = deep_gemm_experts.apply(
         hidden_states=tokens_bf16,
-        w1=w1,
-        w2=w2,
-        router_logits=router_logits,
+        w1=dg_w1,
+        w2=dg_w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
         activation=MoEActivation.SILU,
         global_num_experts=num_experts,
         apply_router_weight_on_input=False,
@@ -191,27 +230,40 @@ NUM_EXPERTS = [32]
 @pytest.mark.parametrize(("m", "n", "k"), MNKs)
 @pytest.mark.parametrize("topk", TOPKS)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("world_dp_size", [(2, 1)])
+@pytest.mark.parametrize("dp_size", [2])
 @pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires deep_gemm kernels")
 def test_deep_gemm_mega_moe(
-    m,
-    n,
-    k,
-    topk,
-    num_experts,
-    world_dp_size,
+    m: int,
+    n: int,
+    k: int,
+    topk: int,
+    num_experts: int,
+    dp_size: int,
     workspace_init,
 ):
     set_random_seed(7)
 
-    world_size, dp_size = world_dp_size
+    world_size = dp_size
 
     if topk > num_experts:
         pytest.skip(f"topk={topk} > num_experts={num_experts}")
 
-    parallel_launch(
+    parallel_config = ParallelConfig(
+        pipeline_parallel_size=1,
+        data_parallel_size=dp_size,
+        tensor_parallel_size=1,
+        # enable_expert_parallel=use_ep,
+        # all2all_backend=backend,
+        # enable_eplb=enable_eplb,
+    )
+
+    vllm_config = VllmConfig(parallel_config=parallel_config)
+
+    parallel_launch_with_config(
         world_size,
         run_single_case,
+        vllm_config,
+        None,  # env
         m,
         n,
         k,

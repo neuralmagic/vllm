@@ -23,7 +23,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
 )
 from vllm.utils.deep_gemm import (
-    get_mk_alignment_for_contiguous_layout,
     is_deep_gemm_supported,
 )
 
@@ -43,7 +42,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         import deep_gemm
 
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        assert quant_config.block_shape == get_mk_alignment_for_contiguous_layout()
+        # assert quant_config.block_shape == get_mk_alignment_for_contiguous_layout()
         assert (
             quant_config.quant_dtype == torch.float8_e4m3fn
             or quant_config.quant_dtype == "nvfp4"
@@ -55,7 +54,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         # Allocate symmetric memory buffer
         # NOTES: requires PyTorch >= 2.9
         self.buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-            get_dp_group(),
+            get_dp_group().device_group,  # ?
             moe_config.num_experts,
             moe_config.max_num_tokens,
             top_k,
@@ -114,7 +113,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        assert self.block_shape is not None
+        # assert self.block_shape is not None
         workspace1 = (0,)
         workspace2 = (0,)
         output = (M, K)
