@@ -175,7 +175,9 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         self.buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
         # Run the fused mega MoE kernel
-        deep_gemm.fp8_fp4_mega_moe(output, w1, w2, self.buffer)
+        deep_gemm.fp8_fp4_mega_moe(
+            output, (w1, self.w1_scale), (w2, self.w2_scale), self.buffer
+        )
 
     def apply_monolithic(
         self,

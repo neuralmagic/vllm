@@ -44,6 +44,7 @@ from vllm.model_executor.layers.fused_moe.router.router_factory import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     calc_diff,
     is_deep_gemm_supported,
@@ -162,23 +163,22 @@ def run_single_case(
         w2_weights,
     )
 
-    a1_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
-    a2_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
+    # a1_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
+    # a2_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
     # a1_scale = a1_gscale
     # a2_scale = a2_gscale
 
     quant_config = FusedMoEQuantConfig.make(
-        "nvfp4",  # ?
+        current_platform.fp8_dtype(),
         per_act_token_quant=False,
-        block_shape=None,  # block_shape,
+        block_shape=block_size,
         w1_scale=dg_w1_s,
         w2_scale=dg_w2_s,
-        a1_gscale=a1_gscale,
-        a2_gscale=a2_gscale,
         a1_scale=a1_scale,
         # a2_scale=a2_scale,
         # g1_alphas=(1 / w1_gs) if w1_gs is not None else None,
         # g2_alphas=(1 / w2_gs) if w2_gs is not None else None,
+        weight_dtype="nvfp4",
     )
 
     # vllm_config = get_current_vllm_config()
