@@ -48,7 +48,7 @@ from vllm.utils.deep_gemm import (
     calc_diff,
     is_deep_gemm_supported,
 )
-from vllm.utils.math_utils import next_power_of_2
+from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import (
     init_workspace_manager,
@@ -77,6 +77,38 @@ def cast_grouped_weights_to_fp4(
         )
     w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
     return w, w_sf
+
+
+def rank_chunk(num: int, r: int, w: int) -> int:
+    rem = num % w
+    return (num // w) + (1 if r < rem else 0)
+
+
+def chunk_by_rank(
+    t: torch.Tensor,
+    r: int,
+    w: int,
+    dim: int = 0,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    chunk = cdiv(t.shape[dim], w)
+    t = t.narrow(dim, r * chunk, chunk)
+    if device is not None:
+        t = t.to(device)
+    return t
+
+
+def maybe_chunk_by_rank(
+    t: torch.Tensor | None,
+    r: int,
+    w: int,
+    dim: int = 0,
+    device: torch.device | None = None,
+) -> torch.Tensor | None:
+    if t is not None:
+        return chunk_by_rank(t, r, w, dim, device)
+    else:
+        return t
 
 
 # activation fp8 x weights fp4
@@ -109,10 +141,12 @@ def run_single_case(
     )
     _, a1_scale = per_token_group_quant_fp8(tokens_bf16, block_size[1])
 
+    print(f"A1_SCALE {a1_scale.shape}")
+
     # expert weight tensors
     (w1, _, _, _), (w2, _, _, _) = make_test_weights(
         num_experts,
-        n,
+        n,  # dp_size,
         k,
         torch.bfloat16,
         quant_dtype=None,
@@ -130,11 +164,11 @@ def run_single_case(
 
     a1_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
     a2_gscale = torch.ones((num_experts,), device="cuda", dtype=torch.float32)
-    a1_scale = a1_gscale
-    a2_scale = a2_gscale
+    # a1_scale = a1_gscale
+    # a2_scale = a2_gscale
 
     quant_config = FusedMoEQuantConfig.make(
-        "nvfp4",
+        "nvfp4",  # ?
         per_act_token_quant=False,
         block_shape=None,  # block_shape,
         w1_scale=dg_w1_s,
@@ -142,7 +176,7 @@ def run_single_case(
         a1_gscale=a1_gscale,
         a2_gscale=a2_gscale,
         a1_scale=a1_scale,
-        a2_scale=a2_scale,
+        # a2_scale=a2_scale,
         # g1_alphas=(1 / w1_gs) if w1_gs is not None else None,
         # g2_alphas=(1 / w2_gs) if w2_gs is not None else None,
     )

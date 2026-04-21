@@ -58,7 +58,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
             moe_config.num_experts,
             moe_config.max_num_tokens,
             top_k,
-            moe_config.hidden_dim,
+            moe_config.hidden_dim,  # XXXX for quant
             moe_config.intermediate_size_per_partition,
         )
 
@@ -114,6 +114,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         # assert self.block_shape is not None
+        print(f"K = {K}")
         workspace1 = (0,)
         workspace2 = (0,)
         output = (M, K)
@@ -153,6 +154,18 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         import deep_gemm
 
         num_tokens = hidden_states.shape[0]
+
+        print(
+            f"XXXX {
+                (
+                    num_tokens,
+                    self.buffer.x.shape,
+                    hidden_states.dtype,
+                    hidden_states.shape,
+                    a1q_scale.shape if a1q_scale is not None else None,
+                )
+            }"
+        )
 
         # Copy inputs into the buffer before each call
         # You may fuse these into previous kernels
