@@ -25,7 +25,6 @@ logger = init_logger(__name__)
 
 def start_async_worker(
     state: "EplbState",
-    is_profile: bool = False,
 ) -> threading.Thread:
     eplb_group = get_eplb_group().device_group
     rank = eplb_group.rank()

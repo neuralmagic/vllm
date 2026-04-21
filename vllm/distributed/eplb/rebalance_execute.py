@@ -440,11 +440,8 @@ async def transfer_layer(
             (num_local_physical_experts, hidden_size_i).
             For example, a linear layer may have up and down projection.
         expert_weights_buffer: Intermediate buffers (one per weight tensor).
-        ep_group: The device process group for expert parallelism.
+        ep_rank: The rank in the EP group.
         communicator: EplbCommunicator instance for P2P communication.
-        is_profile (bool): If `True`, do not perform any actual weight copy.
-            This is used during profile run, where we only perform dummy
-            communications to reserve enough memory for the buffers.
         cuda_stream: CUDA stream for async copies (can be None for sync mode).
 
     Returns:
