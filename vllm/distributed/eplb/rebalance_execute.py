@@ -451,7 +451,7 @@ async def transfer_layer(
 
     assert old_layer_indices.shape == new_layer_indices.shape
     num_physical_experts = old_layer_indices.shape[0]
-    assert len(expert_weights) >= 1 and len(expert_weights[0]) >= 1
+    assert len(expert_weights) >= 1 and expert_weights[0].shape[0] >= 1
     num_local_physical_experts = expert_weights[0].shape[0]
     assert num_physical_experts == ep_group.size() * num_local_physical_experts
 

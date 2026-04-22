@@ -120,7 +120,7 @@ async def transfer_run_periodically(
                     new_layer_indices=new_physical_to_logical_map[layer_idx],
                     expert_weights=model_state.model.expert_weights[layer_idx],
                     expert_weights_buffer=model_state.expert_buffer,
-                    ep_rank=eplb_group.rank(),
+                    ep_group=eplb_group,
                     communicator=model_state.communicator,
                     cuda_stream=cuda_stream,
                 )
