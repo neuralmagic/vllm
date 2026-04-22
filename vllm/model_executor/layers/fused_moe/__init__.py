@@ -37,9 +37,6 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
 )
-from vllm.model_executor.layers.fused_moe.runner.moe_runner_factory import (
-    create_moe_runner,
-)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
@@ -85,7 +82,6 @@ __all__ = [
     "UnquantizedFusedMoEMethod",
     "activation_without_mul",
     "apply_moe_activation",
-    "create_moe_runner",
     "fused_moe_make_expert_params_mapping",
     "get_config",
     "override_config",

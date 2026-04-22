@@ -686,7 +686,7 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
         if self.do_naive_dispatch_combine:
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel
