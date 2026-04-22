@@ -193,7 +193,8 @@ class FixFunctionalizationPass(VllmInductorPass):
                 hasattr(torch.ops.vllm, "fused_concat_and_cache_mla_rope")
                 and at_target == torch.ops.vllm.fused_concat_and_cache_mla_rope.default
             ):
-                mutated_args = {1: "q_pe", 2: "k_pe"}
+                # k_pe is now read-only; only q_pe is mutated in place.
+                mutated_args = {1: "q_pe"}
                 self.defunctionalize(
                     graph,
                     node,

@@ -32,6 +32,17 @@ logger = init_logger(__name__)
 _ATEN_SLICE_TO_END: int = 9223372036854775807
 
 
+# fused_concat_and_cache_mla_rope returns a fresh contiguous post-rope k_pe
+# tensor (shape [num_tokens, 1, rot_dim]) rather than mutating the strided
+# `k_pe` input view. This lets downstream ops (in particular the opaque
+# unified_mla_attention_with_output, which lives in a separate Inductor
+# partition) read k_pe directly across the partition boundary, avoiding an
+# extra Triton copy kernel that would otherwise be inserted to materialise
+# the strided view. The op still mutates `q_pe` in place (via the original
+# strided slice), and still writes into `kv_cache`; only the k_pe output
+# path changed.
+
+
 def fused_concat_and_cache_mla_rope_impl(
     positions: torch.Tensor,
     q_pe: torch.Tensor,
@@ -52,6 +63,9 @@ def fused_concat_and_cache_mla_rope_impl(
         f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
     )
     layer_slot_mapping = slot_mapping.get(layer_name)
+    # Allocate a fresh contiguous output for the post-rope k_pe (see module
+    # comment above the op for why this is not done in-place on `k_pe`).
+    k_pe_out = torch.empty_like(k_pe, memory_format=torch.contiguous_format)
     ops.concat_and_cache_mla_rope_fused(
         positions,
         q_pe,
@@ -64,8 +78,9 @@ def fused_concat_and_cache_mla_rope_impl(
         kv_cache_dtype,
         kv_cache_scale,
         layer_slot_mapping is not None,
+        k_pe_out,
     )
-    return torch.empty(0, device=kv_c.device, dtype=kv_c.dtype)
+    return k_pe_out
 
 
 def fused_concat_and_cache_mla_rope_fake(
@@ -79,14 +94,14 @@ def fused_concat_and_cache_mla_rope_fake(
     kv_cache_scale: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
-    return torch.empty(0, dtype=kv_c.dtype, device=kv_c.device)
+    return torch.empty_like(k_pe, memory_format=torch.contiguous_format)
 
 
 direct_register_custom_op(
     op_name="fused_concat_and_cache_mla_rope",
     op_func=fused_concat_and_cache_mla_rope_impl,
     fake_impl=fused_concat_and_cache_mla_rope_fake,
-    mutates_args=["q_pe", "k_pe"],
+    mutates_args=["q_pe"],
 )
 
 
@@ -190,7 +205,15 @@ class KVCacheMLARoPEFusionPattern:
                 kv_cache_scale=k_scale,
                 layer_name=layer_name,
             )
-            return res[0], res[1], res[2]
+            # auto_functionalized layout (mutates_args=["q_pe"]):
+            #   res[0] -> actual op return (k_pe_out, contiguous)
+            #   res[1] -> mutated q_pe
+            # The pattern's first slot must stay rank-1 (it feeds
+            # `kv_cache_dummy_dep` of unified_mla_attention_with_output, which
+            # the original pattern produced via
+            # unified_mla_kv_cache_update -> torch.empty(0)). Mint a fresh
+            # rank-1 dummy with the same dtype/device.
+            return kv_c_normed.new_empty(0), res[1], res[0]
 
         return pattern, replacement
 
@@ -242,7 +265,8 @@ class KVCacheMLARoPEFusionPattern:
                 kv_cache_scale=k_scale,
                 layer_name=_ln,
             )
-            return res[0], res[1], res[2]
+            # See _mk_pattern_with_layer_name_input for slot semantics.
+            return kv_c_normed.new_empty(0), res[1], res[0]
 
         return pattern, replacement
 
@@ -362,7 +386,7 @@ class KVCacheMLARoPEDeepseekScalingFusionPattern:
             h = self.qk_nope_head_dim + self.qk_rope_head_dim
             v2 = mm.reshape(-1, self.num_heads, h)
             q_pe_slice = v2[:, :, self.qk_nope_head_dim :]
-            res = self.FUSED_OP(
+            k_pe_out = self.FUSED_OP(
                 positions=positions,
                 q_pe=q_pe_slice,
                 k_pe=k_pe,
@@ -373,7 +397,11 @@ class KVCacheMLARoPEDeepseekScalingFusionPattern:
                 kv_cache_scale=k_scale,
                 layer_name=layer_name,
             )
-            return res, v2, k_pe
+            # k_pe_out is the contiguous post-rope key returned by the op.
+            # The first slot must stay rank-1 (it feeds `kv_cache_dummy_dep`
+            # of unified_mla_attention_with_output, originally produced via
+            # unified_mla_kv_cache_update -> torch.empty(0)).
+            return kv_c_normed.new_empty(0), v2, k_pe_out
 
         return pattern, replacement
 
@@ -423,7 +451,7 @@ class KVCacheMLARoPEDeepseekScalingFusionPattern:
             h = self.qk_nope_head_dim + self.qk_rope_head_dim
             v2 = mm.reshape(-1, self.num_heads, h)
             q_pe_slice = v2[:, :, self.qk_nope_head_dim :]
-            res = self.FUSED_OP(
+            k_pe_out = self.FUSED_OP(
                 positions=positions,
                 q_pe=q_pe_slice,
                 k_pe=k_pe,
@@ -434,7 +462,8 @@ class KVCacheMLARoPEDeepseekScalingFusionPattern:
                 kv_cache_scale=k_scale,
                 layer_name=_ln,
             )
-            return res, v2, k_pe
+            # See _mk_pattern_with_layer_name_input for slot semantics.
+            return kv_c_normed.new_empty(0), v2, k_pe_out
 
         return pattern, replacement
 
