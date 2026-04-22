@@ -170,6 +170,7 @@ def get_ep_ranks_with_experts_batch(
 
 
 def move_to_buffer(
+    num_local_experts: int,
     old_indices: np.ndarray,
     new_indices: np.ndarray,
     expert_weights: Sequence[torch.Tensor],
@@ -182,6 +183,7 @@ def move_to_buffer(
     Rearranges expert weights during EPLB rebalancing.
 
     Args:
+        num_local_experts: Number of local experts.
         old_indices: (num_experts_total,) ndarray of current (old)
             global-to-local expert assignments.
         new_indices: (num_experts_total,) ndarray of desired (new)
@@ -196,8 +198,6 @@ def move_to_buffer(
         TransferMetadata: Metadata needed for completing remote weight transfers.
     """
     assert old_indices.shape == new_indices.shape
-    assert len(expert_weights[0]) >= 1
-    num_local_experts = expert_weights[0].shape[0]
     recv_primary_mask = np.zeros((num_local_experts,), dtype=np.bool_)
     send_expert_ids = np.full((num_local_experts,), -1, dtype=np.int64)
     send_src_rows = np.full((num_local_experts,), -1, dtype=np.int32)
@@ -423,7 +423,7 @@ async def transfer_layer(
     new_layer_indices: torch.Tensor,
     expert_weights: Sequence[torch.Tensor],
     expert_weights_buffer: Sequence[torch.Tensor],
-    ep_rank: int,
+    ep_group: ProcessGroup,
     communicator: EplbCommunicator,
     cuda_stream: torch.cuda.Stream | None = None,
 ) -> TransferMetadata:
@@ -440,6 +440,7 @@ async def transfer_layer(
             (num_local_physical_experts, hidden_size_i).
             For example, a linear layer may have up and down projection.
         expert_weights_buffer: Intermediate buffers (one per weight tensor).
+        ep_group: The device process group for expert parallelism.
         ep_rank: The rank in the EP group.
         communicator: EplbCommunicator instance for P2P communication.
         cuda_stream: CUDA stream for async copies (can be None for sync mode).
@@ -449,19 +450,24 @@ async def transfer_layer(
             including is_unchanged and is_received_locally masks.
     """
 
+    ep_size = ep_group.size()
     assert old_layer_indices.shape == new_layer_indices.shape
+    num_physical_experts = old_layer_indices.shape[0]
     assert len(expert_weights[0]) >= 1
+    num_local_physical_experts = expert_weights[0].shape[0]
+    assert num_physical_experts == ep_size * num_local_physical_experts
 
     old_layer_indices_np = old_layer_indices.cpu().numpy()
     new_layer_indices_np = new_layer_indices.cpu().numpy()
 
     return move_to_buffer(
+        num_local_experts=num_local_physical_experts,
         old_indices=old_layer_indices_np,
         new_indices=new_layer_indices_np,
         expert_weights=expert_weights,
         expert_weights_buffers=expert_weights_buffer,
         cuda_stream=cuda_stream,
-        ep_rank=ep_rank,
+        ep_rank=ep_group.rank(),
         communicator=communicator,
     )
 
@@ -516,12 +522,12 @@ def rearrange_expert_weights_inplace(
     assert len(expert_weights) == num_moe_layers
     assert len(expert_weights[0]) >= 1
 
+    num_local_physical_experts = expert_weights[0][0].shape[0]
     assert new_global_expert_indices.shape == (num_moe_layers, num_physical_experts)
 
     ep_size = ep_group.size()
     ep_rank = ep_group.rank()
-    # num_physical_experts == ep_size * num_local_physical_experts
-    assert num_physical_experts == ep_size * expert_weights[0][0].shape[0]
+    assert num_physical_experts == ep_size * num_local_physical_experts
 
     first_layer_weights = list(expert_weights[0])
 
@@ -557,6 +563,7 @@ def rearrange_expert_weights_inplace(
 
     for layer_idx in range(num_moe_layers):
         transfer_metadata = move_to_buffer(
+            num_local_experts=num_local_physical_experts,
             old_indices=old_global_expert_indices_cpu[layer_idx],
             new_indices=new_global_expert_indices_cpu[layer_idx],
             expert_weights=expert_weights[layer_idx],
