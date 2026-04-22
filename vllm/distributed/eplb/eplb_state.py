@@ -28,7 +28,6 @@ physical experts.
 
 import threading
 from collections.abc import Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 
 import torch
@@ -270,8 +269,8 @@ class EplbState:
         self.stop_requested: bool = False
         """
         Flag to signal the async worker thread to stop. Set by
-        shutdown_async_worker() and stop_async_worker(); checked by the
-        async thread after each blocking wait in transfer_run_periodically.
+        stop_async_worker(); checked by the async thread after each blocking
+        wait in transfer_run_periodically.
         """
         self.cuda_device_index: int | None = None
         """
@@ -832,11 +831,12 @@ class EplbState:
             return
         self.stop_requested = True
 
-        # Unblock the outer rearrange_event.wait() if the worker is idle there.
-        with suppress(AssertionError):
+        # Unblock the async worker if vLLM is in between EPLB runs
+        if not self.rearrange_event.is_recorded():
             self.rearrange_event.record()
 
-        # Unblock consumed_event.wait() if the worker is blocked there.
+        # Unblock the async worker if it is waiting for the main thread to consume the
+        # intermediate buffer
         for model_state in self.model_states.values():
             if model_state.pending_result is not None:
                 model_state.pending_result.consumed_event.record()
@@ -844,7 +844,13 @@ class EplbState:
             model_state.pending_result = None
 
         # Terminate the async_worker thread
-        self.async_worker.join(timeout=5.0)
+        _STOP_TIMEOUT = 5.0
+        self.async_worker.join(timeout=_STOP_TIMEOUT)
+        if self.async_worker.is_alive():
+            raise TimeoutError(
+                f"Async EPLB worker did not stop within {_STOP_TIMEOUT}s; "
+                "state may be corrupted."
+            )
         self.async_worker = None
 
         self.stop_requested = False
