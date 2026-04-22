@@ -52,7 +52,7 @@ class EplbCommunicator(ABC):
         self,
         tensors: list[torch.Tensor],
         dst_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,
     ) -> None:
         pass
 
@@ -61,7 +61,7 @@ class EplbCommunicator(ABC):
         self,
         tensors: list[torch.Tensor],
         src_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,
     ) -> None:
         pass
 
@@ -100,7 +100,7 @@ class TorchDistNcclEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         dst_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,  # unused by this backend
     ) -> None:
         for tensor in tensors:
             self._p2p_ops.append(
@@ -116,7 +116,7 @@ class TorchDistNcclEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         src_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,  # unused by this backend
     ) -> None:
         for tensor in tensors:
             self._p2p_ops.append(
@@ -157,7 +157,7 @@ class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         dst_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,  # unused by this backend
     ) -> None:
         for tensor in tensors:
             self._ops.append(("send", tensor, dst_rank))
@@ -166,7 +166,7 @@ class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         src_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,  # unused by this backend
     ) -> None:
         for tensor in tensors:
             self._ops.append(("recv", tensor, src_rank))
@@ -296,13 +296,13 @@ class NixlEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         dst_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,
     ) -> None:
-        assert expert_id is not None, "NixlEplbCommunicator.add_send requires expert_id"
         assert dst_rank != self._rank, (
             "EPLB communicator should not enqueue same-rank sends: "
             f"rank={self._rank}, dst_rank={dst_rank}"
         )
+        # An expert sent to multiple peers is packed only once; skip duplicates.
         if expert_id not in self._expert_send_map:
             self._expert_send_map[expert_id] = tensors
 
@@ -310,9 +310,8 @@ class NixlEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         src_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,
     ) -> None:
-        assert expert_id is not None, "NixlEplbCommunicator.add_recv requires expert_id"
         assert src_rank != self._rank, (
             "EPLB communicator should not enqueue same-rank recvs: "
             f"rank={self._rank}, src_rank={src_rank}"
@@ -338,6 +337,10 @@ class NixlEplbCommunicator(EplbCommunicator):
 
     def _init_registered_buffers(self, expert_weights: Sequence[torch.Tensor]) -> None:
         total_bytes = max(sum(t.nbytes for t in expert_weights), 1)
+        assert total_bytes % self._num_local_experts == 0, (
+            f"Number of bytes in moe layer {total_bytes} is not divisible"
+            f"by number of local experts {self._num_local_experts}"
+        )
         self._expert_bytes = total_bytes // self._num_local_experts
 
         self._send_buffer = torch.empty(
@@ -520,6 +523,7 @@ class NixlEplbCommunicator(EplbCommunicator):
                         (remote_base + remote_off, self._expert_bytes, remote_dev)
                     )
                     recv_offset += self._expert_bytes
+                    assert recv_offset <= self._recv_buffer.nbytes
                 local_h, remote_h, xfer_h = self._create_peer_xfer(
                     src, local_descs, remote_descs
                 )
@@ -581,7 +585,7 @@ class PyNcclEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         dst_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,  # unused by this backend
     ) -> None:
         self._ensure_group_started()
         for tensor in tensors:
@@ -591,7 +595,7 @@ class PyNcclEplbCommunicator(EplbCommunicator):
         self,
         tensors: list[torch.Tensor],
         src_rank: int,
-        expert_id: int | None = None,
+        expert_id: int,  # unused by this backend
     ) -> None:
         self._ensure_group_started()
         for tensor in tensors:
