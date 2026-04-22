@@ -196,7 +196,7 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
                     get_info_size(LAYERWISE_INFO[layer]) for layer in LOADING_LAYERS
                 )
                 logger.warning_once(
-                    "Allocating %.1f MB of device memory to buffers to load %s layers.\n"
+                    "Allocating %.1f MB of device memory to buffers to load %s layers. "
                     "This extra memory usage can be avoided by ordering weights "
                     "by their parent layer when reloading.",
                     mem_used / 1e6,
