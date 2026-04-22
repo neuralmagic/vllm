@@ -441,7 +441,6 @@ async def transfer_layer(
             For example, a linear layer may have up and down projection.
         expert_weights_buffer: Intermediate buffers (one per weight tensor).
         ep_group: The device process group for expert parallelism.
-        ep_rank: The rank in the EP group.
         communicator: EplbCommunicator instance for P2P communication.
         cuda_stream: CUDA stream for async copies (can be None for sync mode).
 
@@ -450,12 +449,11 @@ async def transfer_layer(
             including is_unchanged and is_received_locally masks.
     """
 
-    ep_size = ep_group.size()
     assert old_layer_indices.shape == new_layer_indices.shape
     num_physical_experts = old_layer_indices.shape[0]
     assert len(expert_weights[0]) >= 1
     num_local_physical_experts = expert_weights[0].shape[0]
-    assert num_physical_experts == ep_size * num_local_physical_experts
+    assert num_physical_experts == ep_group.size() * num_local_physical_experts
 
     old_layer_indices_np = old_layer_indices.cpu().numpy()
     new_layer_indices_np = new_layer_indices.cpu().numpy()
