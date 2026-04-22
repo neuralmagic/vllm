@@ -101,7 +101,7 @@ async def transfer_run_periodically(
             layer_idx = 0
             # Set the async worker's CUDA stream on the communicator
             model_state.communicator.set_stream(cuda_stream)
-            current_num_layers = model_state.model.num_moe_layers
+            num_layers = model_state.model.num_moe_layers
 
             # Snapshot the physical_to_logical_map (synchronized with
             # rearrange_event) and copy it to CPU
@@ -120,12 +120,8 @@ async def transfer_run_periodically(
             # of this loop will copy the new set of expert weights into
             # model_state.expert_buffer, which will be consumed by the main thread in
             # move_to_workspace
-            while model_state.rebalanced and layer_idx < current_num_layers:
-                (
-                    is_unchanged,
-                    is_received_locally,
-                    recv_metadata,
-                ) = await transfer_layer(
+            while model_state.rebalanced and layer_idx < num_layers:
+                transfer_metadata = await transfer_layer(
                     old_layer_indices=physical_to_logical_map_cpu[layer_idx],
                     new_layer_indices=new_physical_to_logical_map[layer_idx],
                     expert_weights=model_state.model.expert_weights[layer_idx],
@@ -137,7 +133,7 @@ async def transfer_run_periodically(
                 )
 
                 # Wait until all writes to expert_buffer have finished before making the
-                # AsynEplbLayerResult visible to the main thread.
+                # AsyncEplbLayerResult visible to the main thread.
                 cuda_stream.synchronize()
 
                 # This event guarantees that expert_buffer will not be overwritten by
@@ -148,9 +144,7 @@ async def transfer_run_periodically(
                 model_state.pending_result = AsyncEplbLayerResult(
                     layer_idx=layer_idx,
                     new_physical_to_logical_map=new_physical_to_logical_map[layer_idx],
-                    is_unchanged=is_unchanged,
-                    is_received_locally=is_received_locally,
-                    recv_metadata=recv_metadata,
+                    transfer_metadata=transfer_metadata,
                     consumed_event=consumed_event,
                 )
 

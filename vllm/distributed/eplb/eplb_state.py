@@ -177,7 +177,13 @@ class EplbModelState:
     """
     rebalanced: bool
     """
-    The flag indicates whether the experts rebalance have been computed.
+    This flag is only used when running Async EPLB. It is set to True by the main thread
+    after the new expert maps have been computed. This indicates that the async worker
+    should start transferring weights. move_to_workspace sets this flag to False when
+    all weights have been transferred and the new map has been successfully committed.
+
+    rebalanced relies on the GIL to synchronize access between the main thread and
+    the async worker.
     """
     eplb_stats: EplbStats | None
     """
@@ -196,6 +202,9 @@ class EplbModelState:
     Set by the async worker after all writes to expert_buffer are done. Consumed
     and reset to None by the main thread in move_to_workspace() after the contents of
     expert_buffer have been transferred out. At most one result is pending at a time.
+
+    pending_result relies on the GIL to synchronize access between the main thread and
+    the async worker.
     """
 
 
@@ -577,8 +586,8 @@ class EplbState:
             # Run _move_to_workspace if all ranks have finished transferring the
             # new weights to the intermediate buffer
             for eplb_model_state in self.model_states.values():
-                # rebalanced must remain consistent amongst all ranks otherwise this
-                # all_reduce will hang
+                # rebalanced must remain consistent amongst all ranks otherwise the
+                # all_reduce in _all_ranks_result_ready will hang
                 if eplb_model_state.rebalanced and self._all_ranks_result_ready(
                     eplb_model_state
                 ):
@@ -1168,9 +1177,7 @@ def _move_to_workspace(
     move_from_buffer(
         expert_weights=model_state.model.expert_weights[result.layer_idx],
         expert_weights_buffers=model_state.expert_buffer,
-        is_unchanged=result.is_unchanged,
-        is_received_locally=result.is_received_locally,
-        recv_metadata=result.recv_metadata,
+        transfer_metadata=result.transfer_metadata,
         new_indices=result.new_physical_to_logical_map.numpy(),
         ep_rank=ep_rank,
     )
