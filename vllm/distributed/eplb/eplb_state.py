@@ -826,7 +826,15 @@ class EplbState:
             )
 
     def stop_async_worker(self) -> None:
-        """ """
+        """
+        Signal the async EPLB worker to stop and block until it exits.
+
+        Sets stop_requested, then unblocks the worker regardless of which wait
+        it is currently blocked on — either the idle rearrange_event.wait() or
+        the per-layer consumed_event.wait() mid-transfer. Raises TimeoutError
+        if the thread does not exit within the timeout. No-op if no worker is
+        running.
+        """
         if self.async_worker is None:
             return
         self.stop_requested = True
