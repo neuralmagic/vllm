@@ -5,12 +5,14 @@ from inspect import BoundArguments
 
 import torch
 
-from .types import LayerTensors
+from .types import LayerReloadingInfo, LayerTensors
 
 __all__ = [
     "get_layer_tensors",
     "get_layer_params_buffers",
     "get_layer_size",
+    "has_device_tensors",
+    "get_info_size",
 ]
 
 
@@ -44,8 +46,28 @@ def get_layer_size(layer: torch.nn.Module) -> int:
 
 
 def has_device_tensors(bound_args: BoundArguments) -> bool:
+    """
+    Return True if the loaded weights exist on an accelerator device
+
+    :param bound_args: args to load weights
+    :return: True if weights are on accelerator device
+    """
     return any(
-        isinstance(value, torch.Tensor)
-        and value.device not in (torch.device("meta"), torch.device("cpu"))
+        isinstance(value, torch.Tensor) and value.device.type not in ("meta", "cpu")
         for value in bound_args.arguments.values()
+    )
+
+
+def get_info_size(info: LayerReloadingInfo) -> int:
+    """
+    Calculate the number of bytes used by loaded weights for a given layer
+
+    :param info: layerwise info to get size of
+    :return: number of bytes used by loaded weights
+    """
+    return sum(
+        value.nbytes
+        for _, args in info.loaded_weights
+        for value in args.arguments.values()
+        if isinstance(value, torch.Tensor) and value.device.type not in ("meta", "cpu")
     )

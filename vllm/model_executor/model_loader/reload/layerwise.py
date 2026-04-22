@@ -22,6 +22,7 @@ from .meta import (
 )
 from .types import LayerReloadingInfo
 from .utils import (
+    get_info_size,
     get_layer_params_buffers,
     get_layer_size,
     get_layer_tensors,
@@ -191,18 +192,21 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
             LOADING_LAYERS.add(layer)
             if len(LOADING_LAYERS) >= 2:
                 names = sorted([layer.__class__.__name__ for layer in LOADING_LAYERS])
+                mem_used = sum(
+                    get_info_size(LAYERWISE_INFO[layer]) for layer in LOADING_LAYERS
+                )
                 logger.warning_once(
-                    "Allocating extra memory to buffers to load %s layers.\n"
+                    "Allocating %.1f MB of device memory to buffers to load %s layers.\n"
                     "This extra memory usage can be avoided by ordering weights "
                     "by their parent layer when reloading.",
+                    mem_used / 1e6,
                     str(list(names)),
                 )
 
         # Process and copy when all weights are loaded
         if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
             _layerwise_process(layer, info)
-            if layer in LOADING_LAYERS:
-                LOADING_LAYERS.remove(layer)
+            LOADING_LAYERS.discard(layer)
 
         return ret
 
