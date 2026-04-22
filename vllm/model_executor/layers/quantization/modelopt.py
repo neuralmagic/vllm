@@ -12,17 +12,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoeWeightScaleSupported,
-    RoutedExperts,
-)
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
-    FusedMoEQuantConfig,
-    RoutingMethodType,
-)
-from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
+    FusedMoEQuantConfig,
+    FusedMoeWeightScaleSupported,
+    MoEActivation,
+    RoutedExperts,
+    RoutingMethodType,
+    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
@@ -879,7 +876,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._maybe_init_expert_routing_tables(),
-            shared_experts=layer.shared_experts,
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -956,6 +952,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
@@ -970,6 +967,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
 
@@ -1391,7 +1389,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             experts_cls=self.experts_cls,
-            shared_experts=layer.shared_experts,
             routing_tables=layer._maybe_init_expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
@@ -1440,6 +1437,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
@@ -1454,6 +1452,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
 
@@ -2033,6 +2032,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic

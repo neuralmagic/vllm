@@ -224,7 +224,6 @@ def make_unquantized_moe_kernel(
                 moe_config=moe_config,
                 quant_config=quant_config,
             ),
-            shared_experts=None,
             inplace=False,
         )
 
@@ -239,7 +238,6 @@ def make_unquantized_moe_kernel(
                 moe_config=moe_config,
                 quant_config=quant_config,
             ),
-            shared_experts=None,
             inplace=not moe_config.disable_inplace,
         )
     elif backend == UnquantizedMoeBackend.TRITON:
@@ -251,7 +249,6 @@ def make_unquantized_moe_kernel(
                 moe_config=moe_config,
                 quant_config=quant_config,
             ),
-            shared_experts=None,
             inplace=not moe_config.disable_inplace,
         )
     elif backend == UnquantizedMoeBackend.XPU:
@@ -263,7 +260,6 @@ def make_unquantized_moe_kernel(
                 moe_config=moe_config,
                 quant_config=quant_config,
             ),
-            shared_experts=None,
             inplace=not moe_config.disable_inplace,
         )
     return kernel

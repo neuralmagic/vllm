@@ -13,16 +13,13 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
-    RoutedExperts,
-)
-from vllm.model_executor.layers.fused_moe.activation import (
-    MoEActivation,
-    apply_moe_activation,
-)
-from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+    FusedMoEMethodBase,
     FusedMoEQuantConfig,
+    MoEActivation,
+    RoutedExperts,
+    SharedExperts,
+    apply_moe_activation,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -636,6 +633,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         if layer.apply_router_weight_on_input:

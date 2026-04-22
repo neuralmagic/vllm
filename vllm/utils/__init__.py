@@ -41,9 +41,13 @@ def is_moe_layer(module: torch.nn.Module) -> bool:
     # presence of quant_method.maybe_init_modular_kernel?
     # return (hasattr(module, "quant_method")
     #         and hasattr(module.quant_method, "moe_kernel"))
-    return (
-        module.__class__.__name__ == "FusedMoE"
-        or module.__class__.__name__ == "SharedFusedMoE"
-        or module.__class__.__name__ == "DefaultMoERunner"
-        or module.__class__.__name__ == "ChunkingMoERunner"
-    )
+
+    def _check_bases(cls):
+        if cls.__name__ == "MoERunner":
+            return True
+
+        for b in cls.__bases__:
+            if _check_bases(b):
+                return True
+
+    return _check_bases(module.__class__)

@@ -7,12 +7,11 @@ import torch
 from packaging import version
 
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
-    RoutedExperts,
-)
-from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+    FusedMoEMethodBase,
     FusedMoEQuantConfig,
+    RoutedExperts,
+    SharedExperts,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -482,6 +481,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts

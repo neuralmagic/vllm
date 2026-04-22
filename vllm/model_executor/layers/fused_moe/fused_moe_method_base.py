@@ -16,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
 )
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExperts,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
@@ -42,10 +45,12 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         return self.moe_kernel is not None
 
     @property
-    def mk_owns_shared_expert(self) -> bool:
+    def mk_can_overlap_shared_experts(self) -> bool:
         # NOTE(rob): temporary attribute to indicate support for
         # completed migration to the new internal MK interface.
-        return self.moe_kernel is not None and self.moe_kernel.owns_shared_experts
+        return (
+            self.moe_kernel is not None and self.moe_kernel.can_overlap_shared_experts
+        )
 
     @abstractmethod
     def create_weights(
@@ -133,6 +138,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         """

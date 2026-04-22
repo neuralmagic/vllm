@@ -9,12 +9,11 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
+    FusedMoEQuantConfig,
     RoutedExperts,
+    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
-from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEQuantConfig,
-)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
@@ -326,7 +325,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 mxfp4_backend=self.mxfp4_backend,
                 experts_cls=self.experts_cls,
                 routing_tables=layer._maybe_init_expert_routing_tables(),
-                shared_experts=layer.shared_experts,
             )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -380,6 +378,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
@@ -394,6 +393,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             expert_map=layer.expert_map,
+            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
 

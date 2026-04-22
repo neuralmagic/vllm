@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
     MoEActivation,
     RoutedExperts,
+    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -445,6 +446,7 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.rocm_aiter_moe_enabled:
@@ -634,6 +636,7 @@ class QuarkW4A8Fp8MoEMethod(QuarkMoEMethod):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
@@ -1042,6 +1045,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         if not self.emulate:

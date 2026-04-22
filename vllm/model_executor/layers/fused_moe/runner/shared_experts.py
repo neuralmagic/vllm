@@ -42,14 +42,14 @@ class SharedExperts(torch.nn.Module):
         self,
         layer: torch.nn.Module,
         moe_config: FusedMoEConfig,
-        mk_owns_shared_expert: bool,
+        mk_can_overlap_shared_experts: bool,
     ):
         super().__init__()
 
         self._output: torch.Tensor | None = None
         self._layer = layer
         self._moe_config = moe_config
-        self._mk_owns_shared_expert = mk_owns_shared_expert
+        self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
         self._use_dp_chunking = moe_config.moe_parallel_config.use_dp_chunking
 
         # Allow disabling of the separate shared experts stream for
@@ -89,7 +89,7 @@ class SharedExperts(torch.nn.Module):
         if self._has_external_experts and not self._use_dp_chunking:
             return SharedExpertsOrder.EXTERNAL
 
-        if self._mk_owns_shared_expert:
+        if self._mk_can_overlap_shared_experts:
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
         should_run_shared_in_aux_stream = (

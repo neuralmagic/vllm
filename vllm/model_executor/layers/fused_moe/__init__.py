@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+    FusedMoEQuantConfig,
     RoutingMethodType,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
@@ -39,6 +40,9 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner_factory import (
     create_moe_runner,
 )
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExperts,
+)
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
@@ -65,6 +69,7 @@ __all__ = [
     "FusedMoE",
     "FusedMoEActivationFormat",
     "FusedMoEConfig",
+    "FusedMoEQuantConfig",
     "FusedMoEExpertsModular",
     "FusedMoEMethodBase",
     "FusedMoEPrepareAndFinalizeModular",
@@ -75,6 +80,7 @@ __all__ = [
     "MoERunner",
     "RoutedExperts",
     "RoutingMethodType",
+    "SharedExperts",
     "SharedFusedMoE",
     "UnquantizedFusedMoEMethod",
     "activation_without_mul",

@@ -982,6 +982,7 @@ class RoutedExperts(torch.nn.Module):
         topk_ids: torch.Tensor | None = None,
         router_logits: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        shared_experts: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -1004,6 +1005,7 @@ class RoutedExperts(torch.nn.Module):
         quant_method = self.quant_method
 
         if quant_method.is_monolithic:
+            assert shared_experts is None
             # Monolithic kernels handle routing internally
             return quant_method.apply_monolithic(
                 layer=self,  # Pass RoutedExperts as layer
@@ -1017,6 +1019,7 @@ class RoutedExperts(torch.nn.Module):
                 x=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                shared_experts=shared_experts,
                 shared_experts_input=shared_experts_input,
             )
 

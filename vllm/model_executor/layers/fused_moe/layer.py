@@ -30,9 +30,6 @@ from vllm.model_executor.layers.fused_moe.router.router_factory import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
 )
-from vllm.model_executor.layers.fused_moe.runner.moe_runner_factory import (
-    create_moe_runner,
-)
 from vllm.model_executor.layers.fused_moe.utils import (
     disable_inplace,
 )
@@ -117,6 +114,7 @@ def determine_expert_counts(
     return global_num_experts, logical_num_experts, num_fused_shared_experts
 
 
+# TODO: rename this
 def FusedMoE(
     num_experts: int,  # Global number of experts
     top_k: int,
@@ -152,7 +150,8 @@ def FusedMoE(
     apply_scale_to_output: bool = False,
     zero_expert_type: str | None = None,
 ) -> MoERunner:
-    """FusedMoE layer for MoE models.
+    # TODO update comment
+    """FusedMoE layer builder for MoE models.
 
     This layer contains both MergedColumnParallel weights (gate_up_proj /
     w13) and RowParallelLinear weights (down_proj/ w2).
@@ -281,7 +280,7 @@ def FusedMoE(
         is_lora_enabled=vllm_config.lora_config is not None,
         activation=moe_activation,
         device=vllm_config.device_config.device,
-        routing_method=router.routing_method_type,
+        routing_method=router.routing_method_type,  # Not ideal
         # TODO: in_dtype == out_dtype?
         disable_inplace=disable_inplace() or shared_experts is not None,
     )
@@ -312,13 +311,7 @@ def FusedMoE(
         activation=moe_activation,
     )
 
-    # TODO(bnell): this needs to be stored as a parameter for weight loading.
-    # ditch this eventually.
-
-    # Storing the runner in the FusedMoE is an intermediate state, eventually
-    # the runner will own the FusedMoE layer and provide the execution interface
-    # for MoE ops.
-    runner = create_moe_runner(
+    runner = MoERunner(
         layer_name=layer_name,
         moe_config=moe_config,
         router=router,
@@ -331,10 +324,6 @@ def FusedMoE(
         apply_scale_to_output=apply_scale_to_output,
         routed_scaling_factor=routed_scaling_factor,
     )
-
-    # HACK XXXXXXXXXXXXXXXXXXXXXXXX
-    # This is needed by various _setup_kernels in quant methods.
-    routed_experts.shared_experts = runner.shared_experts
 
     # For smuggling this layer into the fused moe custom op
     register_layer_for_moe_forward_op(vllm_config, runner)

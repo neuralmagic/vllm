@@ -61,7 +61,6 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             FusedMoEKernel(
                 prepare_finalize,
                 old_quant_method.select_gemm_impl(prepare_finalize, routed_experts),
-                shared_experts=shared_experts,
                 inplace=inplace,
             ),
         )
@@ -96,6 +95,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
@@ -109,5 +109,6 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
             global_num_experts=layer.global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             expert_map=None if self.disable_expert_map else layer.expert_map,
+            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
