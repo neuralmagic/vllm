@@ -18,9 +18,9 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.shared_fused_moe import (
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    FusedMoE,
     MoERunner,
-    SharedFusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -128,8 +128,8 @@ class AfmoeMoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        # Routed experts using SharedFusedMoE
-        self.experts = SharedFusedMoE(
+        # Routed experts using FusedMoE
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,

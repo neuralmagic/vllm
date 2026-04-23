@@ -36,8 +36,8 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
     MoERunner,
-    SharedFusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -339,7 +339,7 @@ class SarvamMLAMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.experts = SharedFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=self.num_experts,
             top_k=self.top_k,
@@ -373,20 +373,7 @@ class SarvamMLAMoE(nn.Module):
             router_logits=router_logits,
         )
 
-        if self.shared_experts is not None:
-            shared_output, expert_output = final_hidden
-        else:
-            shared_output, expert_output = None, final_hidden
-
-        if shared_output is not None:
-            expert_output = expert_output + shared_output
-
-        if self.tp_size > 1:
-            expert_output = self.experts.maybe_all_reduce_tensor_model_parallel(
-                expert_output
-            )
-
-        return expert_output.view(num_tokens, hidden_dim)
+        return final_hidden.view(num_tokens, hidden_dim)
 
 
 class SarvamMLABlock(nn.Module):

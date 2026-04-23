@@ -5,7 +5,6 @@ from collections.abc import Callable
 
 import torch
 
-import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -147,7 +146,7 @@ def FusedMoE(
     shared_experts: torch.nn.Module | None = None,
     routed_input_transform: torch.nn.Module | None = None,
     routed_output_transform: torch.nn.Module | None = None,
-    apply_scale_to_output: bool = False,
+    apply_routed_scale_to_output: bool = False,
     zero_expert_type: str | None = None,
 ) -> MoERunner:
     # TODO update comment
@@ -170,6 +169,14 @@ def FusedMoE(
         quant_config: Quantization configure.
         enable_eplb: Whether to enable expert parallelism load balancer.
         router_logits_dtype: Data type for router logits buffers.
+        routed_scaling_factor: A scaling factor that is applied to the topk_weights
+                               by the router or the output of the layer depending
+                               on the value of `apply_routed_scale_to_output`
+        apply_routed_scale_to_output: Determine whether or not `routed_scaling_factor`
+                                      is applied to the topk_weights or to the experts
+                                      output. It is applied to the experts output
+                                      instead of the topk_weights when this feature is
+                                      not supported by the router (or the experts).
     """
     vllm_config = get_current_vllm_config()
 
@@ -235,8 +242,13 @@ def FusedMoE(
         topk_group=topk_group,
         custom_routing_function=custom_routing_function,
         scoring_func=scoring_func,
+        # When apply_routed_scale_to_output is True, we set the scaling factor
+        # to 1.0 so it ends up being a nop. Applying the scale will be handled
+        # by the runner in this case.
+        # The member variable must be set in the same way as the router since
+        # some quantization methods can access it.
         routed_scaling_factor=routed_scaling_factor
-        if not apply_scale_to_output
+        if not apply_routed_scale_to_output
         else 1.0,
         e_score_correction_bias=e_score_correction_bias,
         num_fused_shared_experts=num_fused_shared_experts,
@@ -275,7 +287,7 @@ def FusedMoE(
         in_dtype=moe_in_dtype,
         moe_backend=vllm_config.kernel_config.moe_backend,
         router_logits_dtype=router_logits_dtype,
-        max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+        max_num_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         has_bias=has_bias,
         is_lora_enabled=vllm_config.lora_config is not None,
         activation=moe_activation,
@@ -292,8 +304,6 @@ def FusedMoE(
     routed_experts = RoutedExperts(
         layer_name,
         params_dtype,
-        hidden_size,
-        intermediate_size,
         moe_config,
         quant_config,
         expert_map_manager=expert_map_manager,
@@ -321,8 +331,12 @@ def FusedMoE(
         shared_experts=shared_experts,
         routed_experts=routed_experts,
         enable_dbo=vllm_config.parallel_config.enable_dbo,
-        apply_scale_to_output=apply_scale_to_output,
-        routed_scaling_factor=routed_scaling_factor,
+        # When apply_routed_scale_to_output is True, we allow
+        # the scaling factor to be passed to the runner, otherwise
+        # we pass 1.0 so it ends up being a nop.
+        routed_scaling_factor=routed_scaling_factor
+        if apply_routed_scale_to_output
+        else 1.0,
     )
 
     # For smuggling this layer into the fused moe custom op

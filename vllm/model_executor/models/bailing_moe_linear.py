@@ -22,7 +22,7 @@ from vllm.model_executor.layers.fla.ops.layernorm_guard import (
     layernorm_fn,
 )
 from vllm.model_executor.layers.fused_moe import (
-    SharedFusedMoE,
+    FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -354,8 +354,8 @@ class BailingMoeV25(nn.Module):
         else:
             self.shared_experts = None
 
-        # Routed experts using SharedFusedMoE
-        self.experts = SharedFusedMoE(
+        # Routed experts using FusedMoE
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=self.num_experts,
             top_k=self.top_k,
@@ -370,6 +370,8 @@ class BailingMoeV25(nn.Module):
             topk_group=self.topk_group,
             use_grouped_topk=self.use_grouped_topk,
             router_logits_dtype=self.router_dtype,
+            routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scale_to_output=True,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -384,22 +386,6 @@ class BailingMoeV25(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-
-        # Handle tuple return from SharedFusedMoE
-        if self.shared_experts is not None:
-            shared_output, final_hidden_states = final_hidden_states
-        else:
-            shared_output = None
-
-        final_hidden_states *= self.routed_scaling_factor
-
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
-
-        if self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
-                final_hidden_states
-            )
 
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -711,7 +697,7 @@ class BailingMoELinearAttention(nn.Module, MambaBase):
 
         # Get KV cache and state indices
         if attn_metadata is not None:
-            kv_cache = self.kv_cache[0][0]
+            kv_cache = self.kv_cache[0]
             state_indices_tensor = attn_metadata.state_indices_tensor
             clear_linear_attention_cache_for_new_sequences(
                 kv_cache, state_indices_tensor, attn_metadata

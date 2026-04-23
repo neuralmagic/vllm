@@ -19,6 +19,9 @@ from vllm.model_executor.layers.fused_moe import MoERunner, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     _get_config_dtype_str,
 )
+from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
+    UnfusedOAITritonExperts,
+)
 from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     MarlinExperts,
 )
@@ -27,9 +30,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
-)
-from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
-    UnfusedOAITritonExperts,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEKernel,
@@ -49,6 +49,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         assert not self.base_layer.routed_experts.use_ep, (
             "EP support for Fused MoE LoRA is not implemented yet."
+        )
+        assert not self.base_layer.quant_method.is_monolithic, (
+            "Monolithic kernels are not supported for Fused MoE LoRA."
         )
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -118,8 +121,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:  # fall back to the default config
             get_config_func = functools.partial(
                 try_get_optimal_moe_lora_config,
-                w1_shape=layer.w13_weight.size(),
-                w2_shape=layer.w2_weight.size(),
+                w1_shape=layer.w13_weight.shape,
+                w2_shape=layer.w2_weight.shape,
                 rank=rank,
                 top_k=top_k,
                 dtype=config_dtype,
@@ -619,7 +622,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     ) -> bool:
         """Returns True if the layer can be replaced by this LoRA layer."""
 
-        # source_layer is FusedMoE or SharedFusedMoE
+        # source_layer is FusedMoE
         return isinstance(source_layer, MoERunner) and len(packed_modules_list) == 2
 
 
@@ -781,5 +784,5 @@ class FusedMoE3DWithLoRA(FusedMoEWithLoRA):
         model_config: PretrainedConfig | None = None,
     ) -> bool:
         """Returns True if the layer can be replaced by this LoRA layer."""
-        # source_layer is FusedMoE or SharedFusedMoE
+        # source_layer is FusedMoE
         return isinstance(source_layer, MoERunner) and len(packed_modules_list) == 1

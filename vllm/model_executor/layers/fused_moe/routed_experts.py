@@ -16,7 +16,6 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
-    FusedMoEParallelConfig,
 )
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
@@ -32,42 +31,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 
 logger = init_logger(__name__)
-
-
-# TODO(rob): move this down to the kernel.
-def maybe_roundup_hidden_size(
-    hidden_size: int,
-    act_dtype: torch.dtype,
-    moe_parallel_config: FusedMoEParallelConfig,
-    is_lora_enabled: bool,
-    model_type: str | None,
-) -> int:
-    """
-    Given layer hidden size and MoE configurations, round up hidden_size
-    if necessary.
-
-    Args:
-        hidden_size: Layer hidden-size
-        act_dtype: Data type of the layer activations.
-        moe_parallel_config: Fused MoE parallelization strategy configuration.
-        is_lora_enabled: True if the engine is enabled with LoRA. This
-            is used in the case of mxfp4 quantization in selecting the
-            MxFP4Backend.
-        model_type: for checking if gpt-oss
-
-    Return:
-        Rounded up hidden_size if rounding up is required based on the configs.
-        Original hidden size otherwise.
-    """
-    from vllm.model_executor.layers.fused_moe.all2all_utils import (
-        maybe_roundup_layer_hidden_size,
-    )
-
-    hidden_size = maybe_roundup_layer_hidden_size(
-        hidden_size, act_dtype, moe_parallel_config
-    )
-
-    return hidden_size
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -91,8 +54,6 @@ class RoutedExperts(torch.nn.Module):
         self,
         layer_name: str,
         params_dtype: torch.dtype | None,
-        unpadded_hidden_size: int,  # put in moe_config?
-        intermediate_size: int,
         moe_config: FusedMoEConfig,
         quant_config: QuantizationConfig | None,
         expert_map_manager: ExpertMapManager,
@@ -125,24 +86,13 @@ class RoutedExperts(torch.nn.Module):
             self.moe_config,
         )
 
-        #
-        # TODO: this will be replaced by method on quant_method.
-        #
-
-        vllm_config = get_current_vllm_config()
-
-        # Round up hidden size before creating moe_config.
-        # This way moe_config is created with the correct hidden_size from the start.
-        unpadded_hidden_size = self.moe_config.hidden_dim
-        model_type = (
-            vllm_config.model_config.hf_config.model_type
-            if vllm_config.model_config is not None
-            else None
-        )
-
+        # Round up hidden size and update moe_config.
+        # TODO: move roundup to _get_quant_method?
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
         # operation is typically unquantized (i.e. float16/bfloat16).
+        vllm_config = get_current_vllm_config()
+
         if vllm_config.model_config is not None:
             moe_in_dtype = vllm_config.model_config.dtype
         elif params_dtype is not None:
@@ -153,25 +103,18 @@ class RoutedExperts(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
             moe_in_dtype = params_dtype
 
-        hidden_size = maybe_roundup_hidden_size(
-            hidden_size=self.moe_config.hidden_dim,
-            act_dtype=moe_in_dtype,
-            moe_parallel_config=self.moe_config.moe_parallel_config,
-            is_lora_enabled=vllm_config.lora_config is not None,
-            model_type=model_type,
+        self.hidden_size, self.intermediate_size_per_partition = (
+            self.quant_method.maybe_roundup_sizes(
+                self.hidden_size,
+                self.moe_config.intermediate_size_per_partition,
+                moe_in_dtype,
+                self.moe_config.moe_parallel_config,
+            )
         )
-
-        self.moe_config.hidden_dim = hidden_size
-        # self.moe_config.intermediate_size_per_partition = (
-        #    intermediate_size_per_partition
-        # )
-        self.intermediate_size_per_partition = (
-            moe_config.intermediate_size_per_partition
+        self.moe_config.hidden_dim = self.hidden_size
+        self.moe_config.intermediate_size_per_partition = (
+            self.intermediate_size_per_partition
         )
-
-        #
-        # END TODO: this will be replaced by method on quant_method.
-        #
 
         if (
             self.moe_config.moe_parallel_config.enable_eplb
@@ -191,9 +134,9 @@ class RoutedExperts(torch.nn.Module):
         moe_quant_params = {
             "num_experts": moe_config.num_local_experts,
             "hidden_size": self.hidden_size,
-            "unpadded_hidden_size": unpadded_hidden_size,
+            "unpadded_hidden_size": self.moe_config.hidden_dim_unpadded,
             "intermediate_size_per_partition": (
-                moe_config.intermediate_size_per_partition
+                self.moe_config.intermediate_size_per_partition
             ),
             "params_dtype": params_dtype,
             "weight_loader": self.weight_loader,
@@ -202,7 +145,9 @@ class RoutedExperts(torch.nn.Module):
 
         # need full intermediate size pre-sharding for WNA16 act order
         if self._needs_intermediate_size_param(self.quant_method):
-            moe_quant_params["intermediate_size_full"] = intermediate_size
+            moe_quant_params["intermediate_size_full"] = (
+                self.moe_config.intermediate_size
+            )
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
@@ -581,7 +526,7 @@ class RoutedExperts(torch.nn.Module):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
-        if self.quant_config and self.quant_config.get_name() == "mxfp4":
+        if self.quant_config and self.quant_config.get_name() == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
@@ -981,8 +926,8 @@ class RoutedExperts(torch.nn.Module):
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
         router_logits: torch.Tensor | None = None,
+        shared_experts: torch.nn.Module | None = None,  # SharedExperts
         shared_experts_input: torch.Tensor | None = None,
-        shared_experts: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -997,6 +942,7 @@ class RoutedExperts(torch.nn.Module):
             topk_weights: Routing weights from router (for modular kernels)
             topk_ids: Selected expert IDs from router (for modular kernels)
             router_logits: Router logits (for monolithic kernels)
+            shared_experts: The shared experts (if any)
             shared_experts_input: Input for shared experts (if any)
 
         Returns:

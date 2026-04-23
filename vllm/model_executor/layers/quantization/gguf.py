@@ -3,7 +3,10 @@
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization import QuantizationMethods
 
 import gguf
 import torch
@@ -75,6 +78,16 @@ class GGUFConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "GGUFConfig":
         return cls()
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg: dict[str, Any], user_quant: str | None, hf_config=None
+    ) -> "QuantizationMethods | None":
+        # When user explicitly specifies --quantization gguf, override
+        # whatever quantization method is in the HF model config (e.g. fp8).
+        if user_quant == "gguf":
+            return "gguf"
+        return None
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

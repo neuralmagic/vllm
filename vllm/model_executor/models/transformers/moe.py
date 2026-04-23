@@ -24,7 +24,7 @@ import torch.nn as nn
 from vllm.config.utils import getattr_iter
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     MoERunner,
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 
 # --8<-- [start:transformers_fused_moe]
-@CustomOp.register("transformers_fused_moe")
+@PluggableLayer.register("transformers_fused_moe")
 class TransformersFusedMoE(MoERunner):
     """Custom FusedMoE for the Transformers modeling backend."""
 
