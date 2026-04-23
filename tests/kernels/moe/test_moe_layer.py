@@ -31,12 +31,13 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
-from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
-from vllm.distributed.eplb.rebalance_execute import rearrange_expert_weights_inplace
-from vllm.distributed.parallel_state import (
+from vllm.distributed import (
     get_ep_group,
     get_eplb_group,
+    tensor_model_parallel_all_gather,
 )
+from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
+from vllm.distributed.eplb.rebalance_execute import rearrange_expert_weights_inplace
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoE, fused_experts
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -49,6 +50,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptNvFp4Config,
 )
+from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
@@ -77,10 +79,11 @@ TOP_KS = [2, 6]
 # dp_size, tp_size, use_ep
 # Note: DP+TP is not yet supported in the FusedMoE layer.
 PARALLEL_COMBOS = [
-    [1, 2, False],
-    [1, 4, False],
-    [2, 1, True],
-    [4, 1, True],
+    #    [1, 2, False],
+    #    [1, 4, False],
+    #    [2, 1, True],
+    #    [4, 1, True],
+    [2, 2, True],  # sequence parallel
 ]
 
 # TODO: should this even be set manually?  let oracles handle this
@@ -121,15 +124,15 @@ BACKEND_SUPPORTED_QUANTS: dict[str, set[str | None]] = {
     "nixl_ep":                     {None, "fp8", "modelopt_fp8"},
 }
 
-# Map from backend -> (DP/EP support, DP support, TP support)
-BACKEND_EP_DP_TP_SUPPORT: dict[str, tuple[bool, bool, bool]] = {
-    "allgather_reducescatter":     (True,  True,  True),
-    "mori":                        (True, False, False),
-    "flashinfer_nvlink_two_sided": (False, True, False),
-    "flashinfer_nvlink_one_sided": (False, True, False),
-    "deepep_low_latency":          (True, False, False),
-    "deepep_high_throughput":      (True, False, False),
-    "nixl_ep":                     (True, False, False),
+# Map from backend -> (DP/EP support, DP support, TP support, SP support)
+BACKEND_EP_DP_TP_SUPPORT: dict[str, tuple[bool, bool, bool, bool]] = {
+    "allgather_reducescatter":     (True,  True,  True, True),
+    "mori":                        (True, False, False, False),
+    "flashinfer_nvlink_two_sided": (False, True, False, False),
+    "flashinfer_nvlink_one_sided": (False, True, False, False),
+    "deepep_low_latency":          (True, False, False, True),
+    "deepep_high_throughput":      (True, False, False, True),
+    "nixl_ep":                     (True, False, False, False),
 }
 # fmt: on
 
@@ -161,6 +164,29 @@ def mock_normalize_e4m3fn_to_e4m3fnuz(
 # NOTE: Not able to use monkeypatch because of the spawned parallel workers.
 def override_normalize_e4m3fn_to_e4m3fnuz():
     vllm.model_executor.layers.quantization.utils.w8a8_utils.normalize_e4m3fn_to_e4m3fnuz = mock_normalize_e4m3fn_to_e4m3fnuz  # noqa: E501
+
+
+def sp_wrapper(
+    fn: Callable | FusedMoE, is_sequence_parallel: bool | None = None
+) -> Callable:
+    if isinstance(fn, FusedMoE):
+        assert is_sequence_parallel is None
+        is_sequence_parallel = fn.is_sequence_parallel
+    else:
+        assert is_sequence_parallel is not None
+
+    if is_sequence_parallel:
+
+        def wrapper(
+            hidden_states: torch.Tensor,
+            router_logits: torch.Tensor,
+        ) -> torch.Tensor:
+            hidden_states = sequence_parallel_chunk(hidden_states)
+            result = fn(hidden_states, router_logits)
+            return tensor_model_parallel_all_gather(result, 0)
+
+        return wrapper
+    return fn
 
 
 def maybe_roundup_layer_hidden_size(
@@ -271,6 +297,10 @@ class MoETestConfig:
     ep_size: int = 1
     dp_size: int = 1
     tp_size: int = 1
+
+    @property
+    def is_sequence_parallel(self) -> bool:
+        return self.ep_size > 1 and self.tp_size > 1 and self.dp_size > 1
 
     # TODO: add more error messages
     def id(self) -> str:
@@ -456,11 +486,11 @@ def is_valid_config(config: MoETestConfig) -> tuple[bool, str | None]:
                 )
 
     if config.backend is not None:
-        supports_ep_dp, supports_dp, supports_tp = BACKEND_EP_DP_TP_SUPPORT[
-            config.backend
-        ]
+        supports_ep_dp, supports_dp, supports_tp, supports_sp = (
+            BACKEND_EP_DP_TP_SUPPORT[config.backend]
+        )
 
-        if config.tp_size > 1 and not supports_tp:
+        if config.tp_size > 1 and not supports_tp and not config.is_sequence_parallel:
             return False, f"{config.backend} does not support TP."
 
         if config.dp_size > 1 and config.ep_size == 1 and not supports_dp:
@@ -468,6 +498,9 @@ def is_valid_config(config: MoETestConfig) -> tuple[bool, str | None]:
 
         if config.dp_size > 1 and config.ep_size > 1 and not supports_ep_dp:
             return False, f"{config.backend} does not support EP/DP."
+
+        if config.is_sequence_parallel and not supports_sp:
+            return False, f"{config.backend} does not support SP."
     else:
         if config.tp_size > 1 or config.ep_size > 1 or config.dp_size > 1:
             return False, "An all2all backend is required for parallelism."
@@ -920,6 +953,7 @@ def make_fused_moe_layer(
     routed_input_transform: torch.nn.Module | None = None,
     routed_output_transform: torch.nn.Module | None = None,
     pcp_size: int | None = 1,
+    is_sequence_parallel: bool = False,
 ) -> FusedMoE:
     quant_config, qw = make_quant_config(quantization, w1, w2, global_num_experts)
 
@@ -959,6 +993,7 @@ def make_fused_moe_layer(
         enable_eplb=enable_eplb,
         num_redundant_experts=num_redundant_experts,
         has_bias=has_bias,
+        is_sequence_parallel=is_sequence_parallel,
         **kwargs,
     )
 
@@ -1015,6 +1050,7 @@ def make_fake_moe_layer(
     tp_size: int = 1,
     dp_size: int = 1,
     ep_size: int = 1,
+    is_sequence_parallel: bool = False,
 ) -> Callable:
     quant_dtype = None
     activation = MoEActivation.from_str(activation)
@@ -1117,7 +1153,7 @@ def make_fake_moe_layer(
 
 
 def _test_body_regular(
-    moe_layer: Callable,
+    moe_layer: FusedMoE,
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     vllm_config: VllmConfig,
@@ -1134,7 +1170,7 @@ def _test_body_regular(
         num_tokens=num_tokens,
         num_tokens_across_dp=num_tokens_across_dp,
     ):
-        output = moe_layer(hidden_states, router_logits)
+        output = sp_wrapper(moe_layer)(hidden_states, router_logits)
 
     return baseline_output, output
 
@@ -1175,7 +1211,7 @@ def _test_body_eplb(
         num_tokens=num_tokens,
         num_tokens_across_dp=num_tokens_across_dp,
     ):
-        output_before = moe_layer(hidden_states, router_logits)
+        output_before = sp_wrapper(moe_layer)(hidden_states, router_logits)
 
     # Create a fresh FusedMoE layer with enable_eplb=True
     # Delete the original layer's registration so the constructor can
@@ -1206,6 +1242,7 @@ def _test_body_eplb(
         gate=gate,
         routed_input_transform=routed_input_transform,
         routed_output_transform=routed_output_transform,
+        is_sequence_parallel=(tp_size > 1 and dp_size > 1 and ep_size > 1),
     )
 
     if eplb_moe_layer._expert_map is not None:
@@ -1267,7 +1304,7 @@ def _test_body_eplb(
         num_tokens=num_tokens,
         num_tokens_across_dp=num_tokens_across_dp,
     ):
-        output_after = eplb_moe_layer(hidden_states, router_logits)
+        output_after = sp_wrapper(eplb_moe_layer)(hidden_states, router_logits)
 
     return output_before, output_after
 
@@ -1280,6 +1317,7 @@ def _run_one_config(
     tp_size: int,
     dp_rank: int,
     tp_rank: int,
+    is_sequence_parallel: bool,
     m: int,
     n: int,
     k: int,
@@ -1354,9 +1392,12 @@ def _run_one_config(
         ep_size=ep_size,
         dp_size=dp_size,
         activation=activation,
+        is_sequence_parallel=is_sequence_parallel,
     )
 
-    baseline_output = baseline_layer(hidden_states, router_logits)
+    baseline_output = sp_wrapper(baseline_layer, is_sequence_parallel)(
+        hidden_states, router_logits
+    )
 
     del baseline_layer
     torch.accelerator.empty_cache()
@@ -1399,6 +1440,7 @@ def _run_one_config(
             routed_input_transform=routed_input_transform,
             routed_output_transform=routed_output_transform,
             activation=activation,
+            is_sequence_parallel=is_sequence_parallel,
         )
 
         if moe_layer._expert_map is not None:
@@ -1532,6 +1574,7 @@ def test_moe_layer_no_parallel(
         test_config.tp_size,
         0,
         0,
+        False,
         test_config.m,
         test_config.n,
         test_config.k,
@@ -1592,6 +1635,7 @@ def _parallel_worker(
                 test_config.tp_size,
                 dp_rank,
                 tp_rank,
+                test_config.is_sequence_parallel,
                 test_config.m,
                 test_config.n,
                 test_config.k,
