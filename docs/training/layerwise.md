@@ -1,6 +1,6 @@
 # What is Layerwise (Re)loading?
 
-Layerwise reloading is the system used to handle the loading of new weight data into existing weight data destinations without triggering recompilation of the cuda graph and other runtime artifacts. This system is used to enable [QeRL](https://arxiv.org/pdf/2510.11696)-style post training flows, where full-precision trainer weights are quantized and loaded into a target vLLM instance for fast, high-exploration rollouts. The core implementation can be found in [layerwise.py](../../../vllm/model_executor/model_loader/reload/layerwise.py).
+Layerwise reloading is the system used to handle the loading of new weight data into existing weight data destinations without triggering recompilation of the cuda graph and other runtime artifacts. This system is used to enable [QeRL](https://arxiv.org/pdf/2510.11696)-style post training flows, where full-precision trainer weights are quantized and loaded into a target vLLM instance for fast, high-exploration rollouts. The core implementation can be found in [layerwise.py](../../vllm/model_executor/model_loader/reload/layerwise.py).
 
 ![Layerwise](../assets/training/layerwise.png)
 
@@ -101,7 +101,7 @@ llm.collective_rpc("reload_weights", kwargs={"weights_iterator": weights_iterato
 
 ### Low Level `layerwise` API
 
-[layerwise.py](../../../vllm/model_executor/model_loader/reload/layerwise.py) Implements the following functions to execute its lifecycle:
+[layerwise.py](../../vllm/model_executor/model_loader/reload/layerwise.py) Implements the following functions to execute its lifecycle:
 
 | Function | Purpose | Quantized Reload | Online Quantization |
 | - | - | - | - |
@@ -109,8 +109,8 @@ llm.collective_rpc("reload_weights", kwargs={"weights_iterator": weights_iterato
 | `restore_layer_on_meta` | Restore layer to model format at start of reload | Called by `initialize_layerwise_reload` | Not called. Online quantized weights already start on meta device via `...OnlineLinearMethod.create_weights` |
 | `initialize_online_processing` | Wrap weight loaders with the `online_process_loader` wrapper, which buffers weights until all layer weights have been loaded | Called by `initialize_layerwise_reload` | Called by `...OnlineLinearMethod.create_weights` |
 | `_layerwise_process` | Process layer once all weights are loaded | Called by `online_process_loader` during loading | Called by `online_process_loader` during loading |
-| Copy into kernel tensors | Copy processed weights into original tensor locations to affect compiled cuda graphs, etc. | Called by `online_process_loader` after processing | Not called. There is no compiled cuda graph yet |
-| `finalize_layerwise_reload` | Catch any layers which did not load all weights (for example attention weights or weights with padding) | Called by `BaseModelLoader` | Called by `BaseModelLoader` |
+| `_copy_and_restore_kernel_tensors` | Copy processed weights into original tensor locations to affect compiled cuda graphs, etc. | Called by `_layerwise_process` after `process_weights_after_loading` | Not called. There is no compiled cuda graph yet |
+| `finalize_layerwise_processing` | Catch any layers which did not load all weights (for example attention weights or weights with padding) | Called by `BaseModelLoader` | Called by `BaseModelLoader` |
 
 You can plug into this lifecycle directly by calling the `initialize_layerwise_reload`, loading weights, then calling `finalize_layerwise_processing`:
 
@@ -142,6 +142,5 @@ For this reason, users must take care as to the order of weights when they are r
 Users will see a warning like the one below if weights are loaded out-of-order.
 
 ```console
-WARNING [layerwise.py:190] Allocating extra memory to buffers to load ["QKVParallelLinear", "MergedColumnParallelLinear"] layers.
-WARNING [layerwise.py:190] This extra memory usage can be avoided by ordering weights by their parent layer when reloading.
+WARNING [layerwise.py:198] Allocating 28.5 MB of device memory to buffers to load ["QKVParallelLinear", "MergedColumnParallelLinear"] layers. This extra memory usage can be avoided by ordering weights by their parent layer when reloading.
 ```
