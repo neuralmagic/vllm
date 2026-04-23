@@ -48,6 +48,11 @@ class MoERunnerInterface(torch.nn.Module):
     def is_internal_router(self) -> bool:
         raise NotImplementedError
 
+    @property
+    @abstractmethod
+    def _quant_method(self) -> FusedMoEMethodBase:
+        raise NotImplementedError
+
     # Temporary hack
     @abstractmethod
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
