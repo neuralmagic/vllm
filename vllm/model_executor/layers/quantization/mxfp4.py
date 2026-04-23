@@ -82,7 +82,6 @@ class Mxfp4Config(QuantizationConfig):
             logger.debug_once(
                 "MXFP4 linear layer is not implemented - falling back to "
                 "UnquantizedLinearMethod.",
-                scope="local",
             )
             return UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
@@ -91,7 +90,6 @@ class Mxfp4Config(QuantizationConfig):
             logger.debug_once(
                 "MXFP4 attention layer is not implemented. "
                 "Skipping quantization for this layer.",
-                scope="local",
             )
         return None
 

@@ -207,7 +207,7 @@ def select_unquantized_moe_backend(
             k_cls, config, None, None, activation_format
         )
         if supported:
-            logger.info_once(_make_log_backend(backend), scope="local")
+            logger.info_once(_make_log_backend(backend))
             return backend, k_cls
         raise ValueError(_make_log_unsupported(backend, reason))
 
@@ -268,12 +268,10 @@ def select_unquantized_moe_backend(
                     k_cls, moe_config, None, None, activation_format
                 )
                 if supported:
-                    logger.info_once(_make_log_backend(backend), scope="local")
+                    logger.info_once(_make_log_backend(backend))
                     return backend, k_cls
                 else:
-                    logger.debug_once(
-                        _make_log_unsupported(backend, reason), scope="local"
-                    )
+                    logger.debug_once(_make_log_unsupported(backend, reason))
 
             raise NotImplementedError(
                 "Found VLLM_USE_FLASHINFER_MOE_FP16=1, but no "
@@ -295,10 +293,10 @@ def select_unquantized_moe_backend(
             k_cls, moe_config, None, None, activation_format
         )
         if supported:
-            logger.info_once(_make_log_backend(backend), scope="local")
+            logger.info_once(_make_log_backend(backend))
             return backend, k_cls
 
-        logger.debug_once(_make_log_unsupported(backend, reason), scope="local")
+        logger.debug_once(_make_log_unsupported(backend, reason))
 
     raise NotImplementedError(
         "No Unquantized MoE backend supports the deployment configuration."
@@ -351,7 +349,7 @@ def make_unquantized_moe_kernel(
     )
     assert prepare_finalize is not None
 
-    logger.info_once("Using %s", prepare_finalize.__class__.__name__, scope="local")
+    logger.info_once("Using %s", prepare_finalize.__class__.__name__)
 
     # Create Experts
     if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
