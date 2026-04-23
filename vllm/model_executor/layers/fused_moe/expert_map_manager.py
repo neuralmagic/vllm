@@ -365,6 +365,9 @@ class ExpertMapManager:
         self,
         new_ep_size: int | None = None,
         new_ep_rank: int | None = None,
+        dp_size: int | None = None,
+        top_k: int | None = None,
+        max_num_batched_tokens: int | None = None,
     ) -> None:
         """
         Update expert mappings for new EP configuration.
@@ -374,6 +377,10 @@ class ExpertMapManager:
         Args:
             new_ep_size: New EP world size (if changed)
             new_ep_rank: New EP rank (if changed)
+            dp_size: New DP size (if changed, for AITER buffer reinitialization)
+            top_k: New top_k (if changed, for AITER buffer reinitialization)
+            max_num_batched_tokens: New max batched tokens (if changed, for AITER
+            buffer reinitialization)
         """
         if new_ep_size is not None:
             self.moe_parallel_config.ep_size = new_ep_size
@@ -386,6 +393,16 @@ class ExpertMapManager:
         )
         self._calculate_expert_maps()
         self._maybe_init_routing_tables()
+
+        # Reinitialize AITER buffer if needed and parameters provided
+        if self.num_fused_shared_experts > 0 and all(
+            x is not None for x in [dp_size, top_k, max_num_batched_tokens]
+        ):
+            self._init_aiter_shared_experts_topK_buffer(
+                dp_size=dp_size,  # type: ignore
+                top_k=top_k,  # type: ignore
+                max_num_batched_tokens=max_num_batched_tokens,  # type: ignore
+            )
 
     def get_compressed_map_string(self) -> str:
         """
