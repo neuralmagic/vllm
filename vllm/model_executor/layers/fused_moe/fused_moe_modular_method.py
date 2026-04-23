@@ -84,7 +84,7 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
 
     def apply(
         self,
-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,

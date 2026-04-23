@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, TypeAlias
 
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -44,7 +44,7 @@ _config: dict[str, Any] | None = None
 
 
 # Temporary alias for FusedMoE, eventually we be its own class.
-RoutedExperts = FusedMoE
+RoutedExperts: TypeAlias = FusedMoE
 
 
 @contextmanager

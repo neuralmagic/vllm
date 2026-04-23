@@ -162,7 +162,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
     def apply(
         self,
-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -173,7 +173,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
     def apply_monolithic(
         self,
-        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
