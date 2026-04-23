@@ -198,7 +198,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
         return None
 
-    def _add_fused_moe_to_target_scheme_map(self):  # XXXXXXXXXXXXXXXXXXXXXX
+    def _add_fused_moe_to_target_scheme_map(self):
         """
         Helper function to update target_scheme_map
         since linear layers get fused into FusedMoE
