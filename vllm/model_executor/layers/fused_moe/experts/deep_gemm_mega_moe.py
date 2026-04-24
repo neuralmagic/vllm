@@ -95,6 +95,13 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
         )
 
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        # Activation FP8 quantization (UE8M0 packed scales, gran_k=32) is
+        # done inside apply(). Setting this to True causes the prepare step
+        # to pass defer_input_quant=True, skipping standard quantization.
+        return True
+
     def supports_expert_map(self) -> bool:
         return True
 
@@ -159,17 +166,16 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
         num_tokens = hidden_states.shape[0]
 
-        from deep_gemm.utils import per_token_cast_to_fp8  # FIX
-
+        # Quantize activations to FP8 with UE8M0 packed scale factors.
+        # expects_unquantized_inputs=True so hidden_states is BF16.
         assert a1q_scale is None
-        hidden_states, a1q_scale = per_token_cast_to_fp8(
+        tokens_fp8, tokens_sf = deep_gemm.utils.per_token_cast_to_fp8(
             hidden_states, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
         )
 
-        # hidden_states and a1q_scale are already FP8 + UE8M0 packed scales
-        # from the prepare_finalize step. Just copy into the symmetric buffer.
-        self.buffer.x[:num_tokens].copy_(hidden_states)
-        self.buffer.x_sf[:num_tokens].copy_(a1q_scale)
+        # Copy into the symmetric buffer.
+        self.buffer.x[:num_tokens].copy_(tokens_fp8)
+        self.buffer.x_sf[:num_tokens].copy_(tokens_sf)
         self.buffer.topk_idx[:num_tokens].copy_(topk_ids)
         self.buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
