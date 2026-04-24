@@ -393,18 +393,6 @@ def per_token_cast_to_fp8(
     return fp8_data.view(m, n + pad_size)[:, :n], (x_amax / 448.0).view(m, -1)
 
 
-# replace with math
-def ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-
-def align(x: int, y: int) -> int:
-    return ceil_div(x, y) * y
-
-
-# end replace with math
-
-
 def ceil_to_ue8m0(x: torch.Tensor):
     bits = x.abs().float().view(torch.int)
     exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).bool().int()
@@ -440,7 +428,7 @@ def per_token_cast_to_fp4(
     m, n = x.shape
     assert n % 2 == 0
     assert not use_packed_ue8m0 or use_ue8m0
-    padded_n = align(n, gran_k)
+    padded_n = round_up(n, gran_k)
     x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
     x_padded[:, :n] = x
     x_view = x_padded.view(m, -1, gran_k)

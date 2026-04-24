@@ -7,7 +7,6 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import (
     get_dp_group,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -25,8 +24,6 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_mega_moe_supported,
 )
 
-logger = init_logger(__name__)
-
 
 class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
     """DeepGemm-based fused MoE expert implementation."""
@@ -39,14 +36,11 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         import deep_gemm
 
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        assert (
-            quant_config.quant_dtype == torch.float8_e4m3fn
-            or quant_config.quant_dtype == "nvfp4"
-            or quant_config.weight_quant_dtype == "mxfp4"
-        )
+        # activation quantization is handled by apply
+        assert quant_config.quant_dtype is None
+        assert quant_config.weight_quant_dtype == "mxfp4"
         assert not quant_config.per_act_token_quant
         assert not quant_config.per_out_ch_quant
-        # self.router = router
 
         # Allocate symmetric memory buffer
         # NOTES: requires PyTorch >= 2.9
@@ -55,7 +49,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
             moe_config.num_experts,
             moe_config.max_num_tokens,
             moe_config.experts_per_token,
-            moe_config.hidden_dim,  # XXXX for quant
+            moe_config.hidden_dim,
             moe_config.intermediate_size_per_partition,
         )
 
@@ -83,7 +77,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation in [MoEActivation.SILU, MoEActivation.SWIGLUSTEP]  # ???????
+        return activation in [MoEActivation.SILU, MoEActivation.SWIGLUSTEP]
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -189,47 +183,3 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
             (w2, self.quant_config.w2_scale),
             self.buffer,
         )
-
-    def apply_monolithic(
-        self,
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        router_logits: torch.Tensor,
-        activation: MoEActivation,
-        global_num_experts: int,
-        expert_map: torch.Tensor | None,
-        a1q_scale: torch.Tensor | None,
-        apply_router_weight_on_input: bool,
-        # grouped topk + fused topk bias parameters
-        num_expert_group: int | None = None,
-        e_score_correction_bias: torch.Tensor | None = None,
-        routed_scaling_factor: float | None = None,
-        topk_group: int | None = None,
-    ) -> torch.Tensor:
-        import deep_gemm
-
-        raise AssertionError("never get here")
-
-        #
-        # call experts
-        #
-        topk_weights, topk_ids = self.router.select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
-
-        num_tokens, K = hidden_states.shape
-
-        # Copy inputs into the buffer before each call
-        # You may fuse these into previous kernels
-        self.buffer.x[:num_tokens].copy_(hidden_states)
-        self.buffer.x_sf[:num_tokens].copy_(a1q_scale)
-        self.buffer.topk_idx[:num_tokens].copy_(topk_ids)
-        self.buffer.topk_weights[:num_tokens].copy_(topk_weights)
-
-        # Run the fused mega MoE kernel
-        y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
-        deep_gemm.fp8_fp4_mega_moe(y, w1, w2, self.buffer)
-
-        return y
