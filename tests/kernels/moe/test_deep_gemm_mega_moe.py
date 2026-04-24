@@ -29,7 +29,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
     DeepGemmMegaExperts,
-    MoEPrepareAndFinalizeMegaMoE,
+)
+from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+    make_moe_prepare_and_finalize_no_dp_ep,
 )
 from vllm.utils.deep_gemm import (
     calc_diff,
@@ -149,7 +151,7 @@ def run_single_case(
 
     # Build FusedMoEQuantConfig with FP4 weight scales
     quant_config = FusedMoEQuantConfig.make(
-        quant_dtype=torch.float8_e4m3fn,
+        quant_dtype=None,  # torch.float8_e4m3fn,
         per_act_token_quant=False,
         block_shape=block_size,
         w1_scale=dg_w1_s,
@@ -181,7 +183,7 @@ def run_single_case(
 
     # Build modular kernel with DeepGemmMegaExperts
     deep_gemm_kernel = mk.FusedMoEKernel(
-        prepare_finalize=MoEPrepareAndFinalizeMegaMoE(),
+        prepare_finalize=make_moe_prepare_and_finalize_no_dp_ep(False),
         fused_experts=DeepGemmMegaExperts(
             moe_config=moe_config,
             quant_config=quant_config,
@@ -216,6 +218,8 @@ def run_single_case(
 
 
 MNKs = [
+    (512, 1024, 1024),
+    (4096, 4096, 1024),
     (512, 2048, 2048),
 ]
 
