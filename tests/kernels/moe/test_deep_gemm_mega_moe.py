@@ -35,7 +35,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
 )
 from vllm.utils.deep_gemm import (
     calc_diff,
-    is_deep_gemm_supported,
+    is_deep_gemm_mega_moe_supported,
 )
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
@@ -231,7 +231,9 @@ NUM_EXPERTS = [32]
 @pytest.mark.parametrize("topk", TOPKS)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("dp_size", [2])
-@pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires deep_gemm kernels")
+@pytest.mark.skipif(
+    not is_deep_gemm_mega_moe_supported(), reason="Requires deep_gemm kernels"
+)
 def test_deep_gemm_mega_moe(
     m: int,
     n: int,

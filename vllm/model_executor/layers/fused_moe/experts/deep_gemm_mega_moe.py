@@ -22,7 +22,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
 )
 from vllm.utils.deep_gemm import (
-    is_deep_gemm_supported,
+    is_deep_gemm_mega_moe_supported,
 )
 
 logger = init_logger(__name__)
@@ -65,7 +65,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return is_deep_gemm_supported()
+        return is_deep_gemm_mega_moe_supported()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
