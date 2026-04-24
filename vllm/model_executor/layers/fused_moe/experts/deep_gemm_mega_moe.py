@@ -29,6 +29,76 @@ from vllm.utils.deep_gemm import (
 logger = init_logger(__name__)
 
 
+class MoEPrepareAndFinalizeMegaMoE(mk.FusedMoEPrepareAndFinalizeModular):
+    """Prepare/finalize for mega_moe that quantizes activations to FP8
+    with UE8M0 packed scale factors (gran_k=32), as required by the
+    DeepGEMM mega_moe kernel."""
+
+    @property
+    def activation_format(self) -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
+
+    def max_num_tokens_per_rank(self) -> int | None:
+        return None
+
+    def topk_indices_dtype(self) -> torch.dtype | None:
+        return None
+
+    def num_dispatchers(self) -> int:
+        return 1
+
+    def output_is_reduced(self) -> bool:
+        return False
+
+    def prepare(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
+    ) -> mk.PrepareResultType:
+        from deep_gemm.utils import per_token_cast_to_fp8
+
+        if apply_router_weight_on_input:
+            topk = topk_ids.size(1)
+            assert topk == 1, (
+                "apply_router_weight_on_input is only implemented for topk=1"
+            )
+            a1 = a1 * topk_weights.to(a1.dtype)
+
+        if defer_input_quant:
+            a1q, a1q_scale = a1, None
+        else:
+            # Quantize to FP8 with per-32 UE8M0 packed scale factors,
+            # the format required by DeepGEMM mega_moe.
+            a1q, a1q_scale = per_token_cast_to_fp8(
+                a1, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+            )
+
+        return a1q, a1q_scale, None, None, None
+
+    def finalize(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> None:
+        weight_and_reduce_impl.apply(
+            output=output,
+            fused_expert_output=fused_expert_output,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
+
 class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
     """DeepGemm-based fused MoE expert implementation."""
 
@@ -54,7 +124,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         # Allocate symmetric memory buffer
         # NOTES: requires PyTorch >= 2.9
         self.buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-            get_dp_group().device_group,  # ?
+            get_dp_group().device_group,
             moe_config.num_experts,
             moe_config.max_num_tokens,
             top_k,
@@ -113,8 +183,6 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # assert self.block_shape is not None
-        print(f"K = {K}")
         workspace1 = (0,)
         workspace2 = (0,)
         output = (M, K)
@@ -155,20 +223,8 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
         num_tokens = hidden_states.shape[0]
 
-        print(
-            f"XXXX {
-                (
-                    num_tokens,
-                    self.buffer.x.shape,
-                    hidden_states.dtype,
-                    hidden_states.shape,
-                    a1q_scale.shape if a1q_scale is not None else None,
-                )
-            }"
-        )
-
-        # Copy inputs into the buffer before each call
-        # You may fuse these into previous kernels
+        # hidden_states and a1q_scale are already FP8 + UE8M0 packed scales
+        # from the prepare_finalize step. Just copy into the symmetric buffer.
         self.buffer.x[:num_tokens].copy_(hidden_states)
         self.buffer.x_sf[:num_tokens].copy_(a1q_scale)
         self.buffer.topk_idx[:num_tokens].copy_(topk_ids)
@@ -176,7 +232,10 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
         # Run the fused mega MoE kernel
         deep_gemm.fp8_fp4_mega_moe(
-            output, (w1, self.w1_scale), (w2, self.w2_scale), self.buffer
+            output,
+            (w1, self.quant_config.w1_scale),
+            (w2, self.quant_config.w2_scale),
+            self.buffer,
         )
 
     def apply_monolithic(
