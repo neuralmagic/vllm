@@ -156,6 +156,7 @@ def run_single_case(
         block_shape=block_size,
         w1_scale=dg_w1_s,
         w2_scale=dg_w2_s,
+        weight_dtype="mxfp4",
     )
 
     moe_parallel_config = FusedMoEParallelConfig.make(
@@ -187,7 +188,6 @@ def run_single_case(
         fused_experts=DeepGemmMegaExperts(
             moe_config=moe_config,
             quant_config=quant_config,
-            top_k=topk,
         ),
         inplace=False,
     )

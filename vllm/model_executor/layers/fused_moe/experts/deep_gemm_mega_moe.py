@@ -20,7 +20,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
-    kFp8Static128BlockSym,
+    kMxfp4Static,
 )
 from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
@@ -36,8 +36,6 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         self,
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
-        # router: FusedMoERouter,
-        top_k: int,
     ):
         import deep_gemm
 
@@ -47,6 +45,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         #    quant_config.quant_dtype == torch.float8_e4m3fn
         #    or quant_config.quant_dtype == "nvfp4"
         # )
+        assert quant_config.weight_quant_dtype == "mxfp4"
         assert not quant_config.per_act_token_quant
         assert not quant_config.per_out_ch_quant
         # self.router = router
@@ -57,7 +56,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
             get_dp_group().device_group,
             moe_config.num_experts,
             moe_config.max_num_tokens,
-            top_k,
+            moe_config.experts_per_token,
             moe_config.hidden_dim,  # XXXX for quant
             moe_config.intermediate_size_per_partition,
         )
@@ -80,7 +79,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
     ) -> bool:
         SUPPORTED_W_A = [
-            (kFp8Static128BlockSym, kFp8Dynamic128Sym),
+            (kMxfp4Static, kFp8Dynamic128Sym),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
@@ -120,6 +119,13 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
         import deep_gemm
+
+        # TODO
+        # w1_weights = cast_grouped_weights_to_fp4(w1_local)
+        # w2_weights = cast_grouped_weights_to_fp4(w2_local)
+        # (dg_w1, dg_w1_s), (dg_w2, dg_w2_s) = deep_gemm.transform_weights_for_mega_moe(
+        #     w1_weights, w2_weights
+        # )
 
         # Transform weights (FP4 with UE8M0 SF) into the required layout
         # TODO: real names
