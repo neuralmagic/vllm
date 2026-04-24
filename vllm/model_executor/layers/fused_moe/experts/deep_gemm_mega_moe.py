@@ -44,6 +44,9 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
         # Allocate symmetric memory buffer
         # NOTES: requires PyTorch >= 2.9
+
+        # print(f"DG MOE_CONFIG {moe_config}")
+
         self.buffer = deep_gemm.get_symm_buffer_for_mega_moe(
             get_dp_group().device_group,
             moe_config.num_experts,
@@ -77,7 +80,12 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation in [MoEActivation.SILU, MoEActivation.SWIGLUSTEP]
+        return activation in [
+            MoEActivation.SILU,
+            MoEActivation.SWIGLUSTEP,
+            # TODO(bnell): hack temporarily add swigluoai for testing
+            MoEActivation.SWIGLUOAI,
+        ]
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
