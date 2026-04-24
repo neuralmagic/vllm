@@ -66,6 +66,8 @@ class Mxfp4MoeBackend(Enum):
     TRITON_UNFUSED = "TRITON_UNFUSED"
     # XPU
     XPU = "XPU"
+    # DeepGemm mega_moe
+    DEEPGEMM_MEGA = "DEEPGEMM_MEGA"
     # Emulation
     EMULATION = "EMULATION"
 
@@ -156,6 +158,13 @@ def backend_to_kernel_cls(
 
         return [XPUExpertsMXFp4]
 
+    elif backend == Mxfp4MoeBackend.DEEPGEMM_MEGA:
+        from vllm.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
+            DeepGemmMegaExperts,
+        )
+
+        return [DeepGemmMegaExperts]
+
     elif backend == Mxfp4MoeBackend.EMULATION:
         from vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe import (
             OCP_MXQuantizationEmulationTritonExperts,
@@ -179,6 +188,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> Mxfp4MoeBackend:
         "triton_unfused": Mxfp4MoeBackend.TRITON_UNFUSED,
         "marlin": Mxfp4MoeBackend.MARLIN,
         "aiter": Mxfp4MoeBackend.AITER,
+        "deepgemm_mega": Mxfp4MoeBackend.DEEPGEMM_MEGA,
         "xpu": Mxfp4MoeBackend.XPU,
         "emulation": Mxfp4MoeBackend.EMULATION,
     }
@@ -196,6 +206,7 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
     Only includes BF16 backends. MXFP8 backends are selected via env vars.
     """
     _AVAILABLE_BACKENDS = [
+        Mxfp4MoeBackend.DEEPGEMM_MEGA,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.AITER,
         Mxfp4MoeBackend.TRITON,
@@ -519,9 +530,13 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     elif backend in TRTLLM_BACKENDS:
         intermediate_size = round_up(intermediate_size, 256)
         hidden_size = round_up(hidden_size, 256)
-    elif backend in (
-        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
-        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+    elif (
+        backend
+        in (
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+        )
+        or backend == Mxfp4MoeBackend.DEEPGEMM_MEGA
     ):
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
@@ -903,6 +918,26 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MEGA:
+        import deep_gemm
+
+        # transform_weights_for_mega_moe: interleaves gate/up for L1,
+        # transposes scale factors for UTCCP layout.
+        (w13_weight, w13_weight_scale), (w2_weight, w2_weight_scale) = (
+            deep_gemm.transform_weights_for_mega_moe(
+                (w13_weight, w13_weight_scale),
+                (w2_weight, w2_weight_scale),
+            )
+        )
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
+
     elif mxfp4_backend == Mxfp4MoeBackend.XPU:
         # No additional transformation needed for XPU backend
         return (
@@ -1216,6 +1251,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER,
+        Mxfp4MoeBackend.DEEPGEMM_MEGA,
     ):
         return mxfp4_w4a16_moe_quant_config(
             w1_bias=w1_bias,
@@ -1251,13 +1287,27 @@ def make_mxfp4_moe_kernel(
     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
 
     # Create Prepare/Finalize.
-    prepare_finalize = maybe_make_prepare_finalize(
-        moe=moe_config,
-        quant_config=moe_quant_config,
-        routing_tables=routing_tables,
-        allow_new_interface=True,
-        use_monolithic=is_monolithic,
-    )
+    prepare_finalize: mk.FusedMoEPrepareAndFinalize | None
+    if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MEGA:
+        # Mega_moe handles all-to-all communication internally via symmetric
+        # memory. Do NOT use maybe_make_prepare_finalize() here — it would
+        # select an external all-to-all backend (DeepEP, etc.) that conflicts
+        # with mega_moe's built-in dispatch/combine.
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+            make_moe_prepare_and_finalize_no_dp_ep,
+        )
+
+        prepare_finalize = make_moe_prepare_and_finalize_no_dp_ep(
+            use_monolithic=False,
+        )
+    else:
+        prepare_finalize = maybe_make_prepare_finalize(
+            moe=moe_config,
+            quant_config=moe_quant_config,
+            routing_tables=routing_tables,
+            allow_new_interface=True,
+            use_monolithic=is_monolithic,
+        )
     assert prepare_finalize is not None
 
     logger.info_once("Using %s", prepare_finalize.__class__.__name__)

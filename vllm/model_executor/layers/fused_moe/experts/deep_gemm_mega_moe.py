@@ -19,7 +19,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
-    kFp8Dynamic128Sym,
     kMxfp4Static,
 )
 from vllm.utils.deep_gemm import (
@@ -40,12 +39,11 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         import deep_gemm
 
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        # assert quant_config.block_shape == get_mk_alignment_for_contiguous_layout()
-        # assert (
-        #    quant_config.quant_dtype == torch.float8_e4m3fn
-        #    or quant_config.quant_dtype == "nvfp4"
-        # )
-        assert quant_config.weight_quant_dtype == "mxfp4"
+        assert (
+            quant_config.quant_dtype == torch.float8_e4m3fn
+            or quant_config.quant_dtype == "nvfp4"
+            or quant_config.weight_quant_dtype == "mxfp4"
+        )
         assert not quant_config.per_act_token_quant
         assert not quant_config.per_out_ch_quant
         # self.router = router
@@ -79,7 +77,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
     ) -> bool:
         SUPPORTED_W_A = [
-            (kMxfp4Static, kFp8Dynamic128Sym),
+            (kMxfp4Static, None),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
@@ -89,10 +87,16 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        # NOTE(rob): discovered an IMA with this combination. Needs investigation.
+        # Mega_moe handles all-to-all internally via symmetric memory.
+        # Reject any config that would use an external all-to-all backend.
         return not (
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
+            or moe_parallel_config.use_deepep_ht_kernels
+            or moe_parallel_config.use_deepep_ll_kernels
+            or moe_parallel_config.use_mori_kernels
+            or moe_parallel_config.use_nixl_ep_kernels
+            or moe_parallel_config.use_batched_activation_format
         )
 
     @property
@@ -125,6 +129,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         return (workspace1, workspace2, output)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
+        return
         import deep_gemm
 
         # TODO
