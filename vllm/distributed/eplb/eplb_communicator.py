@@ -338,7 +338,7 @@ class NixlEplbCommunicator(EplbCommunicator):
     def _init_registered_buffers(self, expert_weights: Sequence[torch.Tensor]) -> None:
         total_bytes = max(sum(t.nbytes for t in expert_weights), 1)
         assert total_bytes % self._num_local_experts == 0, (
-            f"Number of bytes in moe layer {total_bytes} is not divisible"
+            f"Number of bytes in moe layer {total_bytes} is not divisible "
             f"by number of local experts {self._num_local_experts}"
         )
         self._expert_bytes = total_bytes // self._num_local_experts
