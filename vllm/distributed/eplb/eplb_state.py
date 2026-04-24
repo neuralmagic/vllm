@@ -547,17 +547,27 @@ class EplbState:
                 balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
 
                 if ep_group.rank() == 0:
+                    steps_remaining = (
+                        self.expert_rearrangement_step_interval
+                        - self.expert_rearrangement_step
+                    )
+                    if steps_remaining >= 0:
+                        rearrange_status = (
+                            f"steps until the next rearrangement: {steps_remaining}"
+                        )
+                    else:
+                        rearrange_status = (
+                            f"async rearrangement overdue by {-steps_remaining} steps"
+                        )
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
-                        "max_tokens=%d, balancedness=%.4f, "
-                        "steps until the next rearrangement: %d",
+                        "max_tokens=%d, balancedness=%.4f, %s",
                         self.global_step,
                         eplb_model_state.model_name,
                         avg_tokens,
                         max_tokens,
                         balancedness,
-                        self.expert_rearrangement_step_interval
-                        - self.expert_rearrangement_step,
+                        rearrange_status,
                     )
 
             window_load_list = self._sync_load_window()
@@ -1248,6 +1258,10 @@ def _move_to_workspace(
     )
 
     if result.layer_idx == model_state.model.num_moe_layers - 1:
+        logger.info(
+            "Async EPLB rearrangement finished for model %s.",
+            model_state.model_name,
+        )
         model_state.rebalanced = False
 
     # Reset pending_result before unblocking the async worker
