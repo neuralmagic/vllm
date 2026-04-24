@@ -368,6 +368,9 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
                 shared_experts=layer.shared_experts,
             )
 
+            # Let experts do backend-specific weight post-processing.
+            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight
         w2 = layer.w2_weight

@@ -128,26 +128,24 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         output = (M, K)
         return (workspace1, workspace2, output)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
-        return
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import deep_gemm
 
-        # TODO
-        # w1_weights = cast_grouped_weights_to_fp4(w1_local)
-        # w2_weights = cast_grouped_weights_to_fp4(w2_local)
-        # (dg_w1, dg_w1_s), (dg_w2, dg_w2_s) = deep_gemm.transform_weights_for_mega_moe(
-        #     w1_weights, w2_weights
-        # )
+        from vllm.model_executor.utils import replace_parameter
 
-        # Transform weights (FP4 with UE8M0 SF) into the required layout
-        # TODO: real names
         (
-            (layer.w13_weight, layer.w13_weight_scale),
-            (layer.w2_weight, layer.w2_weight_scale),
+            (w13_weight, w13_weight_scale),
+            (w2_weight, w2_weight_scale),
         ) = deep_gemm.transform_weights_for_mega_moe(
             (layer.w13_weight, layer.w13_weight_scale),
             (layer.w2_weight, layer.w2_weight_scale),
         )
+
+        # register or replace?
+        replace_parameter(layer, "w13_weight", w13_weight)
+        replace_parameter(layer, "w13_weight_scale", w13_weight_scale)
+        replace_parameter(layer, "w2_weight", w2_weight)
+        replace_parameter(layer, "w2_weight_scale", w2_weight_scale)
 
     def apply(
         self,

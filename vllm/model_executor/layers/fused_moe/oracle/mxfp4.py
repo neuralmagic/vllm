@@ -919,16 +919,8 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
     elif mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MEGA:
-        import deep_gemm
-
-        # transform_weights_for_mega_moe: interleaves gate/up for L1,
-        # transposes scale factors for UTCCP layout.
-        (w13_weight, w13_weight_scale), (w2_weight, w2_weight_scale) = (
-            deep_gemm.transform_weights_for_mega_moe(
-                (w13_weight, w13_weight_scale),
-                (w2_weight, w2_weight_scale),
-            )
-        )
+        # Weight transformation is handled by
+        # DeepGemmMegaExperts.process_weights_after_loading().
         return (
             w13_weight,
             w2_weight,
