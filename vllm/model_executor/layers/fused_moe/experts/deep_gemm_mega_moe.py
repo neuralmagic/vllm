@@ -42,11 +42,10 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         assert not quant_config.per_act_token_quant
         assert not quant_config.per_out_ch_quant
 
-        # Allocate symmetric memory buffer
-        # NOTES: requires PyTorch >= 2.9
-
         # print(f"DG MOE_CONFIG {moe_config}")
 
+        # Allocate symmetric memory buffer
+        # NOTES: requires PyTorch >= 2.9
         self.buffer = deep_gemm.get_symm_buffer_for_mega_moe(
             get_dp_group().device_group,
             moe_config.num_experts,
@@ -130,24 +129,74 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         output = (M, K)
         return (workspace1, workspace2, output)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
+        pass
+
+    @staticmethod
+    def _ue8m0_uint8_to_float32(sf: torch.Tensor) -> torch.Tensor:
+        """Convert UE8M0 uint8 scale factors to float32.
+
+        Each uint8 is an E8M0 exponent byte. Reconstruct the float32 value
+        by placing the byte in the exponent field: float = 2^(byte - 127).
+        """
+        return (sf.to(torch.int32) << 23).view(torch.float32)
+
+    @staticmethod
+    def convert_weights_for_mega_moe(
+        w13_weight: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Convert gpt_oss checkpoint weights into mega_moe kernel format.
+
+        Handles three transformations:
+        1. De-interleave w13 gate/up rows from checkpoint interleaved layout
+        2. Convert uint8 UE8M0 scales to packed int32 via
+           transform_sf_into_required_layout
+        3. Apply transform_weights_for_mega_moe for final kernel layout
+
+        Returns (w13_weight, w13_scale, w2_weight, w2_scale) in mega_moe
+        format.
+        """
         import deep_gemm
 
-        from vllm.model_executor.utils import replace_parameter
+        # 1. De-interleave w13 gate/up rows.
+        #    Checkpoint: [gate[0], up[0], gate[1], up[1], ...]
+        #    mega_moe expects: [gate[0..N-1], up[0..N-1]]
+        gate_w, up_w = w13_weight[:, ::2, :], w13_weight[:, 1::2, :]
+        w13_weight = torch.cat([gate_w, up_w], dim=1).contiguous()
 
-        (
-            (w13_weight, w13_weight_scale),
-            (w2_weight, w2_weight_scale),
-        ) = deep_gemm.transform_weights_for_mega_moe(
-            (layer.w13_weight, layer.w13_weight_scale),
-            (layer.w2_weight, layer.w2_weight_scale),
+        gate_s, up_s = w13_scale[:, ::2, :], w13_scale[:, 1::2, :]
+        w13_scale = torch.cat([gate_s, up_s], dim=1).contiguous()
+
+        # 2. Convert uint8 UE8M0 scales to float32, then pack via
+        #    transform_sf_into_required_layout (TMA alignment + int32 packing).
+        #    k parameter must be the unpacked dimension (K, not K//2).
+        num_experts, w13_mn, w13_packed_k = w13_weight.shape
+        w13_scale = DeepGemmMegaExperts._ue8m0_uint8_to_float32(w13_scale)
+        w13_scale = deep_gemm.transform_sf_into_required_layout(
+            w13_scale, w13_mn, w13_packed_k * 2, (1, 32), num_experts
         )
 
-        # register or replace?
-        replace_parameter(layer, "w13_weight", w13_weight)
-        replace_parameter(layer, "w13_weight_scale", w13_weight_scale)
-        replace_parameter(layer, "w2_weight", w2_weight)
-        replace_parameter(layer, "w2_weight_scale", w2_weight_scale)
+        _, w2_mn, w2_packed_k = w2_weight.shape
+        w2_scale = DeepGemmMegaExperts._ue8m0_uint8_to_float32(w2_scale)
+        w2_scale = deep_gemm.transform_sf_into_required_layout(
+            w2_scale, w2_mn, w2_packed_k * 2, (1, 32), num_experts
+        )
+
+        # 3. Transform weights for mega_moe layout:
+        #    L1: re-interleave gate/up in groups of 8, transpose SF for UTCCP
+        #    L2: transpose SF for UTCCP
+        (
+            (w13_weight, w13_scale),
+            (w2_weight, w2_scale),
+        ) = deep_gemm.transform_weights_for_mega_moe(
+            (w13_weight, w13_scale),
+            (w2_weight, w2_scale),
+        )
+
+        return w13_weight, w13_scale, w2_weight, w2_scale
 
     def apply(
         self,
@@ -184,10 +233,12 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         self.buffer.topk_idx[:num_tokens].copy_(topk_ids)
         self.buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
+        print(f"QQ {self.w1_scale.dtype, self.w1_scale.shape}")
+
         # Run the fused mega MoE kernel
         deep_gemm.fp8_fp4_mega_moe(
             output,
-            (w1, self.quant_config.w1_scale),
-            (w2, self.quant_config.w2_scale),
+            (w1, self.w1_scale),
+            (w2, self.w2_scale),
             self.buffer,
         )
