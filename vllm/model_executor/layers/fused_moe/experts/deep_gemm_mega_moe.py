@@ -161,6 +161,17 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         """
         import deep_gemm
 
+        def xform_layout(w: torch.Tensor, w_sf: torch.Tensor) -> torch.Tensor:
+            num_experts, w_mn, w_packed_k = w.shape
+            w_sf = DeepGemmMegaExperts._ue8m0_uint8_to_float32(w_sf)
+            return deep_gemm.transform_sf_into_required_layout(
+                w_sf, w_mn, w_packed_k * 2, (1, 32), num_experts
+            )
+
+        # 0. Cast uint8 packed FP4 weights to int8 (kPackedFP4 = torch::kInt8).
+        w13_weight = w13_weight.view(torch.int8)
+        w2_weight = w2_weight.view(torch.int8)
+
         # 1. De-interleave w13 gate/up rows.
         #    Checkpoint: [gate[0], up[0], gate[1], up[1], ...]
         #    mega_moe expects: [gate[0..N-1], up[0..N-1]]
@@ -173,17 +184,8 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         # 2. Convert uint8 UE8M0 scales to float32, then pack via
         #    transform_sf_into_required_layout (TMA alignment + int32 packing).
         #    k parameter must be the unpacked dimension (K, not K//2).
-        num_experts, w13_mn, w13_packed_k = w13_weight.shape
-        w13_scale = DeepGemmMegaExperts._ue8m0_uint8_to_float32(w13_scale)
-        w13_scale = deep_gemm.transform_sf_into_required_layout(
-            w13_scale, w13_mn, w13_packed_k * 2, (1, 32), num_experts
-        )
-
-        _, w2_mn, w2_packed_k = w2_weight.shape
-        w2_scale = DeepGemmMegaExperts._ue8m0_uint8_to_float32(w2_scale)
-        w2_scale = deep_gemm.transform_sf_into_required_layout(
-            w2_scale, w2_mn, w2_packed_k * 2, (1, 32), num_experts
-        )
+        w13_scale = xform_layout(w13_weight, w13_scale)
+        w2_scale = xform_layout(w2_weight, w2_scale)
 
         # 3. Transform weights for mega_moe layout:
         #    L1: re-interleave gate/up in groups of 8, transpose SF for UTCCP
@@ -232,8 +234,6 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         self.buffer.x_sf[:num_tokens].copy_(tokens_sf)
         self.buffer.topk_idx[:num_tokens].copy_(topk_ids)
         self.buffer.topk_weights[:num_tokens].copy_(topk_weights)
-
-        print(f"QQ {self.w1_scale.dtype, self.w1_scale.shape}")
 
         # Run the fused mega MoE kernel
         deep_gemm.fp8_fp4_mega_moe(
