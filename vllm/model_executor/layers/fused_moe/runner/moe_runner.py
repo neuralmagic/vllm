@@ -359,9 +359,8 @@ class MoERunner(MoERunnerInterface):
     def _maybe_reduce_final_output(
         self,
         states: torch.Tensor,
-        trunc_size: int,
     ) -> torch.Tensor:
-        """Truncate padded dimensions and all-reduce the combined output.
+        """All-reduce the combined output if needed.
 
         This is the "late" all-reduce path. When neither fused nor shared
         output was individually reduced, the combined sum is all-reduced
@@ -378,7 +377,7 @@ class MoERunner(MoERunnerInterface):
         ):
             states = tensor_model_parallel_all_reduce(states)
 
-        return states[..., :trunc_size]
+        return states
 
     def _encode_layer_name(self) -> str | LayerName:
         if _USE_LAYERNAME:
@@ -581,6 +580,9 @@ class MoERunner(MoERunnerInterface):
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
 
+        # Remember 40794. Double check tests/lora/test_gpt_oss.py::test_gpt_oss_tp2
+        fused_output = fused_output[:, :og_hidden_dim]
+
         # If combine kernel already reduced fused, reduce shared to match.
         # See note above re: the two all-reduce points.
         shared_output = self._maybe_reduce_shared_expert_output(shared_output)
@@ -597,7 +599,7 @@ class MoERunner(MoERunnerInterface):
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(result, og_hidden_dim)
+        result = self._maybe_reduce_final_output(result)
 
         return self._maybe_add_zero_expert_output(result)
 
