@@ -263,10 +263,10 @@ if __name__ == "__main__":
     # Print geomean speedups
     geo_table_grouped = compute_geomean_speedups(
         df,
-        baseline_col="Torch (Compiled)",
-        speedup_cols=["CUDA", "Triton"],
+        baseline_col="Torch (Compiled) (us)",
+        speedup_cols=["CUDA (us)", "Triton (us)"],
         groupby_cols=["col_major", "group_shape"],
     )
 
-    print("Speedup over Torch (Compiled)")
+    print("\nSpeedup over Torch (Compiled)")
     print(geo_table_grouped.to_string(index=False))
