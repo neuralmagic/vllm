@@ -206,8 +206,8 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
     Only includes BF16 backends. MXFP8 backends are selected via env vars.
     """
     _AVAILABLE_BACKENDS = [
-        Mxfp4MoeBackend.DEEPGEMM_MEGA,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+        Mxfp4MoeBackend.DEEPGEMM_MEGA,
         Mxfp4MoeBackend.AITER,
         Mxfp4MoeBackend.TRITON,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
@@ -230,6 +230,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     """
     _AVAILABLE_BACKENDS = [
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+        Mxfp4MoeBackend.DEEPGEMM_MEGA,
         Mxfp4MoeBackend.DEEPGEMM_MXFP4,
         # TRITON_UNFUSED has bug with MTP support
         # TODO re-enable after kernel is fixed
@@ -989,6 +990,18 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_weight.data,
             _upcast_e8m0_to_fp32(w13_weight_scale.data),
             _upcast_e8m0_to_fp32(w2_weight_scale.data),
+            w13_bias,
+            w2_bias,
+        )
+
+    if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MEGA:
+        # Weights stay as uint8 packed FP4 — no layout change needed.
+        # Convert E8M0 uint8 scales to float32.
+        return (
+            w13_weight.data,
+            w2_weight.data,
+            w13_weight_scale,
+            w2_weight_scale,
             w13_bias,
             w2_bias,
         )

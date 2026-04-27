@@ -16,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
@@ -133,15 +136,6 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
         pass
 
     @staticmethod
-    def _ue8m0_uint8_to_float32(sf: torch.Tensor) -> torch.Tensor:
-        """Convert UE8M0 uint8 scale factors to float32.
-
-        Each uint8 is an E8M0 exponent byte. Reconstruct the float32 value
-        by placing the byte in the exponent field: float = 2^(byte - 127).
-        """
-        return (sf.to(torch.int32) << 23).view(torch.float32)
-
-    @staticmethod
     def convert_weights_for_mega_moe(
         w13_weight: torch.Tensor,
         w13_scale: torch.Tensor,
@@ -163,7 +157,7 @@ class DeepGemmMegaExperts(mk.FusedMoEExpertsModular):
 
         def xform_layout(w: torch.Tensor, w_sf: torch.Tensor) -> torch.Tensor:
             num_experts, w_mn, w_packed_k = w.shape
-            w_sf = DeepGemmMegaExperts._ue8m0_uint8_to_float32(w_sf)
+            w_sf = _upcast_e8m0_to_fp32(w_sf)
             return deep_gemm.transform_sf_into_required_layout(
                 w_sf, w_mn, w_packed_k * 2, (1, 32), num_experts
             )
