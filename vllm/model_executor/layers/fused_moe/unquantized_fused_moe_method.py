@@ -312,7 +312,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             x,
             topk_weights,
             topk_ids,
-            shared_experts=shared_experts,
+            shared_experts,
             shared_experts_input,
         )
 
