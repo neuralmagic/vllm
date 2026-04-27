@@ -106,8 +106,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             has_g_idx=self.has_g_idx,
         )
 
-        print(f"LLC {mp_linear_kernel_config}")
-
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
 
         if kernel_type.__name__ not in self._kernel_backends_being_used:

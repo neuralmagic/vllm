@@ -159,12 +159,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> "QuantizeMethodBase | None":
-        print(f"GOT HERE {layer.__class__, isinstance(layer, LinearBase)}")
-
         if isinstance(layer, LinearBase):
             # collect schemes
             quant_scheme = self.get_scheme(layer=layer, layer_name=prefix)
-            print(f"GOT HERE QS {quant_scheme}")
             input_tfms, output_tfms = get_linear_transform_schemes(
                 layer, prefix, self.transform_config, self.packed_modules_mapping
             )
@@ -187,9 +184,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, ParallelLMHead):
             try:
                 quant_scheme = self.get_scheme(layer=layer, layer_name=prefix)
-                print(f"FOUND QS {quant_scheme}")
             except ValueError:
-                print(f"FAILED FOUND QS {quant_scheme}")
                 quant_scheme = None
             if quant_scheme is not None:
                 layer.scheme = quant_scheme
@@ -201,7 +196,6 @@ class CompressedTensorsConfig(QuantizationConfig):
             return CompressedTensorsMoEMethod.get_moe_method(
                 self, layer, layer_name=prefix
             )
-        print("NEVER!!!!!!!!!!!!!!!!!!!!!")
         return None
 
     def _add_fused_moe_to_target_scheme_map(self):
@@ -934,7 +928,6 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         details
         """
         weight_loader = extra_weight_attrs.get("weight_loader")
-        print(f"SCHEME = {layer.__class__, layer.scheme, layer.prefix}")
         layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,

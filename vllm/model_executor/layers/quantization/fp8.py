@@ -18,7 +18,6 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.scaled_mm import MarlinFP8ScaledMMLinearKernel
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
@@ -196,9 +195,9 @@ class Fp8Config(QuantizationConfig):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.is_checkpoint_fp8_serialized:
-                moe_quant_method = Fp8MoEMethod(self, layer.moe_config)
+                moe_quant_method = Fp8MoEMethod(self, layer)
             else:
-                moe_quant_method = Fp8OnlineMoEMethod(self, layer.moe_config)
+                moe_quant_method = Fp8OnlineMoEMethod(self, layer)
             return moe_quant_method
         elif isinstance(layer, Attention):
             return Fp8KVCacheMethod(self)
@@ -569,8 +568,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config, moe_config: FusedMoEConfig):
-        super().__init__(moe_config)
+    def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
+        super().__init__(layer.moe_config)
         self.quant_config = quant_config
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant: bool = self.weight_block_size is not None
@@ -927,8 +926,8 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
 
     uses_meta_device: bool = True
 
-    def __init__(self, quant_config: Fp8Config, moe_config: FusedMoEConfig):
-        super().__init__(quant_config, moe_config)
+    def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
+        super().__init__(quant_config, layer)
         assert not quant_config.is_checkpoint_fp8_serialized
         assert quant_config.activation_scheme == "dynamic"
         assert quant_config.weight_block_size is None
