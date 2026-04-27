@@ -516,13 +516,7 @@ class FusedMoE(PluggableLayer):
     def _maybe_init_expert_routing_tables(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        # Currently routing_tables only needed for round-robin expert placement
-        # with DeepEP-ll or NIXL EP all2all backends.
-        if self.expert_placement_strategy != "round_robin" or (
-            not self.moe_parallel_config.needs_round_robin_routing_tables
-        ):
-            return None
-
+        # Return cached routing tables if already registered as buffers
         if hasattr(self, "expert_global_to_physical"):
             return cast(
                 tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -533,7 +527,9 @@ class FusedMoE(PluggableLayer):
                 ),
             )
 
-        # Explicitly ensure routing tables are initialized in ExpertMapManager
+        # Delegate to ExpertMapManager to initialize routing tables if needed
+        # (ExpertMapManager determines if routing tables are needed based on
+        # placement strategy and backend configuration)
         self.expert_map_manager._maybe_init_routing_tables()
 
         # Get routing tables from ExpertMapManager

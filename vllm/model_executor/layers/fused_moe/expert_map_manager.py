@@ -483,13 +483,11 @@ class ExpertMapManager:
         This is a public method that can be called to explicitly initialize
         routing tables. It's safe to call multiple times (idempotent).
         """
+        # Only needed for round-robin with DeepEP-ll or NIXL EP backends
         if self._placement_strategy != "round_robin":
             return
 
-        if (
-            not self.moe_parallel_config.use_deepep_ll_kernels
-            and not self.moe_parallel_config.use_nixl_ep_kernels
-        ):
+        if not self.moe_parallel_config.needs_round_robin_routing_tables:
             return
 
         if self._expert_map is None:
