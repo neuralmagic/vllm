@@ -183,7 +183,7 @@ if __name__ == "__main__":
         "--batch-sizes",
         type=int,
         nargs="+",
-        default=[1, 16, 128, 512, 1024],
+        default=[1, 16, 128, 512, 2048, 8192],
         help="Batch sizes to benchmark",
     )
     parser.add_argument(
@@ -206,7 +206,8 @@ if __name__ == "__main__":
     dtype = STR_DTYPE_TO_TORCH_DTYPE[args.dtype]
 
     hidden_sizes = args.hidden_sizes
-    batch_sizes = args.batch_sizes
+    # vLLM compiles the largest batch size first, which affects perf
+    batch_sizes = sorted(args.batch_sizes, reverse=True)
 
     if args.group_sizes is not None:
         group_shapes = []
