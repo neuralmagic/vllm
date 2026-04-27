@@ -45,6 +45,7 @@ def bench_compile(fn: Callable):
 torch._dynamo.config.recompile_limit = 8888
 
 
+@default_vllm_config()
 def calculate_diff(
     batch_size: int,
     hidden_size: int,
@@ -139,10 +140,17 @@ def compute_geomean_speedups(
     from scipy.stats import gmean
 
     def geo_speedup(group: pd.DataFrame) -> pd.Series:
+        import numpy as np
+
         ratios = {
             col: (group[baseline_col] / group[col]).values for col in speedup_cols
         }
-        return pd.Series({col: gmean(vals) for col, vals in ratios.items()})
+        return pd.Series(
+            {
+                col: gmean(vals) if np.isfinite(vals) else np.nan
+                for col, vals in ratios.items()
+            }
+        )
 
     if groupby_cols is None:
         result = geo_speedup(df).to_frame().T
