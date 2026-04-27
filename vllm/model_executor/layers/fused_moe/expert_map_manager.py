@@ -476,8 +476,13 @@ class ExpertMapManager:
             if self._expert_mask is not None:
                 self._expert_mask = self._expert_mask.to(self.device)
 
-    def _maybe_init_routing_tables(self) -> None:
-        """Initialize routing tables if needed for round-robin."""
+    def ensure_routing_tables_initialized(self) -> None:
+        """
+        Ensure routing tables are initialized if needed for round-robin.
+
+        This is a public method that can be called to explicitly initialize
+        routing tables. It's safe to call multiple times (idempotent).
+        """
         if self._placement_strategy != "round_robin":
             return
 
@@ -490,7 +495,13 @@ class ExpertMapManager:
         if self._expert_map is None:
             return
 
-        self._routing_tables = self._ensure_round_robin_expert_routing_tables()
+        # Only initialize if not already initialized
+        if not hasattr(self, "_routing_tables"):
+            self._routing_tables = self._ensure_round_robin_expert_routing_tables()
+
+    def _maybe_init_routing_tables(self):
+        """Initialize routing tables if needed for round-robin (internal)."""
+        self.ensure_routing_tables_initialized()
 
     def _ensure_round_robin_expert_routing_tables(
         self,

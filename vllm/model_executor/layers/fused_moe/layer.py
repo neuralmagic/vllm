@@ -262,12 +262,6 @@ class FusedMoE(PluggableLayer):
 
         self.top_k = top_k
 
-        # AITER buffer initialization is handled by ExpertMapManager
-        if self.use_ep and self.rocm_aiter_fmoe_enabled:
-            assert self.expert_mask is None or torch.all(
-                (self.expert_mask == 0) | (self.expert_mask == 1)
-            ), "Aiter Fused MoE kernel only supports expert_map with 0 and 1s."
-
         assert intermediate_size % self.tp_size == 0
         intermediate_size_per_partition = intermediate_size // self.tp_size
         self.renormalize = renormalize
@@ -539,10 +533,15 @@ class FusedMoE(PluggableLayer):
                 ),
             )
 
+        # Explicitly ensure routing tables are initialized in ExpertMapManager
+        self.expert_map_manager._maybe_init_routing_tables()
+
+        # Get routing tables from ExpertMapManager
         routing_tables = self.expert_map_manager.routing_tables
         if routing_tables is None:
             return None
 
+        # Register routing tables as buffers for this layer
         global_to_physical, physical_to_global, local_global = routing_tables
         self.register_buffer("expert_global_to_physical", global_to_physical)
         self.register_buffer("expert_physical_to_global", physical_to_global)
@@ -553,6 +552,9 @@ class FusedMoE(PluggableLayer):
     def update_expert_map(self):
         # ep_size and ep_rank should already be updated
         # Update ExpertMapManager with new EP configuration
+        # Note: ExpertMapManager.update() recalculates expert maps and
+        # reinitializes routing tables internally, so no need to call
+        # _maybe_init_expert_routing_tables() again
         vllm_config = get_current_vllm_config()
         self.expert_map_manager.update(
             new_ep_size=self.ep_size,
@@ -571,7 +573,15 @@ class FusedMoE(PluggableLayer):
         self.expert_placement_strategy = self.expert_map_manager.placement_strategy
         self.register_buffer("_expert_map", self.expert_map_manager.expert_map)
         self.register_buffer("expert_mask", self.expert_map_manager.expert_mask)
-        self._maybe_init_expert_routing_tables()
+
+        # Update routing table buffers if they exist
+        # Note: Routing tables are already initialized by ExpertMapManager.update()
+        routing_tables = self.expert_map_manager.routing_tables
+        if routing_tables is not None:
+            global_to_physical, physical_to_global, local_global = routing_tables
+            self.register_buffer("expert_global_to_physical", global_to_physical)
+            self.register_buffer("expert_physical_to_global", physical_to_global)
+            self.register_buffer("expert_local_to_global", local_global)
 
     def _load_per_tensor_weight_scale(
         self,
