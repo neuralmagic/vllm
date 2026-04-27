@@ -2,15 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import abstractmethod
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 
 if current_platform.is_cuda_alike():
 
@@ -148,8 +151,7 @@ class BaseRouter(FusedMoERouter):
         self,
         top_k: int,
         global_num_experts: int,
-        eplb_state: EplbLayerState,
-        enable_eplb: bool = False,
+        eplb_manager: EplbManager | None = None,
         # TODO(bnell): Once the MK is constructed at layer init time, we
         # can make this a plain value instead of a callback.
         indices_type_getter: Callable[[], torch.dtype | None] | None = None,
@@ -159,12 +161,17 @@ class BaseRouter(FusedMoERouter):
         time, so we need to supply a callback to get it at runtime.  This is
         because the indices type is supplied by modular kernels which are
         created after MoE layer/router construction.
+
+        Args:
+            top_k: Number of experts to select per token
+            global_num_experts: Total number of experts
+            eplb_manager: Optional EPLB manager for load balancing
+            indices_type_getter: Optional callback to get indices dtype
         """
         super().__init__()
         self.top_k = top_k
         self.global_num_experts = global_num_experts
-        self.eplb_state = eplb_state
-        self.enable_eplb = enable_eplb
+        self.eplb_manager = eplb_manager
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
 
@@ -174,18 +181,19 @@ class BaseRouter(FusedMoERouter):
 
     def _validate_eplb_state(self) -> None:
         """Validate that EPLB state is properly initialized if EPLB is enabled."""
-        if self.enable_eplb:
-            if self.eplb_state.expert_load_view is None:
+        if self.eplb_manager is not None:
+            eplb_state = self.eplb_manager.state
+            if eplb_state.expert_load_view is None:
                 raise ValueError("enable_eplb=True requires expert_load_view != None")
-            if self.eplb_state.logical_to_physical_map is None:
+            if eplb_state.logical_to_physical_map is None:
                 raise ValueError(
                     "enable_eplb=True requires logical_to_physical_map != None"
                 )
-            if self.eplb_state.logical_replica_count is None:
+            if eplb_state.logical_replica_count is None:
                 raise ValueError(
                     "enable_eplb=True requires logical_replica_count != None"
                 )
-            if self.eplb_state.should_record_tensor is None:
+            if eplb_state.should_record_tensor is None:
                 raise ValueError(
                     "enable_eplb=True requires should_record_tensor != None"
                 )
@@ -198,17 +206,18 @@ class BaseRouter(FusedMoERouter):
 
     def _apply_eplb_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """Apply EPLB mapping to convert logical expert IDs to physical expert IDs."""
-        if self.enable_eplb:
-            assert self.eplb_state.expert_load_view is not None
-            assert self.eplb_state.logical_to_physical_map is not None
-            assert self.eplb_state.logical_replica_count is not None
-            assert self.eplb_state.should_record_tensor is not None
+        if self.eplb_manager is not None:
+            eplb_state = self.eplb_manager.state
+            assert eplb_state.expert_load_view is not None
+            assert eplb_state.logical_to_physical_map is not None
+            assert eplb_state.logical_replica_count is not None
+            assert eplb_state.should_record_tensor is not None
             return eplb_map_to_physical_and_record(
                 topk_ids=topk_ids,
-                logical_to_physical_map=self.eplb_state.logical_to_physical_map,
-                logical_replica_count=self.eplb_state.logical_replica_count,
-                expert_load_view=self.eplb_state.expert_load_view,
-                record_enabled=self.eplb_state.should_record_tensor,
+                logical_to_physical_map=eplb_state.logical_to_physical_map,
+                logical_replica_count=eplb_state.logical_replica_count,
+                expert_load_view=eplb_state.expert_load_view,
+                record_enabled=eplb_state.should_record_tensor,
             )
         return topk_ids
 

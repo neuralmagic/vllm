@@ -341,7 +341,6 @@ class FusedMoE(PluggableLayer):
         compilation_config.static_all_moe_layers.append(prefix)
         self.layer_name = prefix
 
-        self.enable_eplb = enable_eplb
         self.expert_placement_strategy: ExpertPlacementStrategy = (
             vllm_config.parallel_config.expert_placement_strategy
         )
@@ -392,7 +391,7 @@ class FusedMoE(PluggableLayer):
                 moe_parallel_config=self.moe_parallel_config,
                 num_expert_group=num_expert_group,
                 num_redundant_experts=num_redundant_experts,
-                enable_eplb=self.enable_eplb,
+                enable_eplb=enable_eplb,
             )
 
             self._expert_map: torch.Tensor | None
@@ -470,7 +469,7 @@ class FusedMoE(PluggableLayer):
         self.router = create_fused_moe_router(
             top_k=top_k,
             global_num_experts=self.global_num_experts,
-            eplb_state=self.eplb_state,
+            eplb_manager=self.eplb_manager,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,
@@ -480,7 +479,6 @@ class FusedMoE(PluggableLayer):
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            enable_eplb=enable_eplb,
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
             indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
@@ -546,7 +544,7 @@ class FusedMoE(PluggableLayer):
                 "is_act_and_mul=False is supported only for CUDA and ROCm for now"
             )
 
-        if self.enable_eplb and not self.quant_method.supports_eplb:
+        if enable_eplb and not self.quant_method.supports_eplb:
             # TODO: Add support for additional quantization methods.
             # The implementation for other quantization methods does not
             # contain essential differences, but the current quant API

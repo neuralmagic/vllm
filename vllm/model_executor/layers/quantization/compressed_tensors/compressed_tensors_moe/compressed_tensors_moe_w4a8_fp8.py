@@ -309,10 +309,6 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        if layer.enable_eplb:
-            raise NotImplementedError(
-                "EPLB not supported for `CompressedTensorsW4A8Fp8MoEMethod` yet."
-            )
         assert self.moe_quant_config is not None
 
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
