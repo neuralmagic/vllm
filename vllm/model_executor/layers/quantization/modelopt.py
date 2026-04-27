@@ -1167,33 +1167,35 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if (
-            torch.unique(layer.input_scale).numel() != 1
-            or torch.unique(layer.weight_scale_2).numel() != 1
-        ):
-            logger.warning_once(
-                "In NVFP4 linear, the global scale for input or weight are different"
-                " for parallel layers (e.g. q_proj, k_proj, v_proj). This "
-                " will likely results in reduce accuracy. Please verify the model"
-                " accuracy. Consider using a checkpoint with a shared global NVFP4"
-                " scale for parallel layers."
-            )
-
-        # Rename ModelOpt checkpoint names to standardized names
-        input_global_scale = layer.input_scale.max().to(torch.float32)
-        layer.input_global_scale = Parameter(input_global_scale, requires_grad=False)
+        # ModelOpt stores actual scales (not inverted)
+        stored_input_gs = layer.input_scale.data.to(torch.float32)
+        stored_weight_gs = layer.weight_scale_2.data.to(torch.float32)
         del layer.input_scale
-
-        weight_global_scale = layer.weight_scale_2.max().to(torch.float32)
-        layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
         del layer.weight_scale_2
 
-        # Pre-compute alpha and inverse for runtime quantization
-        layer.alpha = Parameter(
-            layer.input_global_scale * layer.weight_global_scale, requires_grad=False
+        # Input: use max across partitions for conservative quantization
+        input_global_scale = stored_input_gs.max()
+
+        # Compute per-partition alpha = input_gs * weight_gs[i]
+        alpha_per_partition = input_global_scale * stored_weight_gs
+        if (
+            torch.unique(stored_weight_gs).numel() == 1
+            and torch.unique(stored_input_gs).numel() == 1
+        ):
+            layer.alpha = Parameter(alpha_per_partition[0:1], requires_grad=False)
+        else:
+            alpha_per_column = alpha_per_partition.repeat_interleave(
+                torch.tensor(layer.logical_widths, device=alpha_per_partition.device)
+            )
+            layer.alpha = Parameter(alpha_per_column, requires_grad=False)
+
+        # Set scalar values for non-CUTLASS backends
+        layer.input_global_scale = Parameter(input_global_scale, requires_grad=False)
+        layer.weight_global_scale = Parameter(
+            stored_weight_gs.max(), requires_grad=False
         )
         layer.input_global_scale_inv = Parameter(
-            (1.0 / layer.input_global_scale).to(torch.float32), requires_grad=False
+            (1.0 / input_global_scale).to(torch.float32), requires_grad=False
         )
 
         # Convert layer to NVFP4 linear kernel format

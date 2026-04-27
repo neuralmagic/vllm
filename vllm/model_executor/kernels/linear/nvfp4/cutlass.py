@@ -43,6 +43,19 @@ class CutlassNvFp4LinearKernel(NvFp4LinearKernel):
         layer.weight = torch.nn.Parameter(padded_weight, requires_grad=False)
         layer.weights_padding_cols = weights_padding_cols
 
+        # Pad alpha vector to match padded weight N dimension
+        if layer.alpha.numel() > 1:
+            padded_n = padded_weight.size(0)
+            if layer.alpha.numel() < padded_n:
+                layer.alpha = torch.nn.Parameter(
+                    torch.nn.functional.pad(
+                        layer.alpha.data,
+                        (0, padded_n - layer.alpha.numel()),
+                        value=1.0,
+                    ),
+                    requires_grad=False,
+                )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,

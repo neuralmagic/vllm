@@ -19,6 +19,7 @@
 #include "libtorch_stable/torch_utils.h"
 
 #include "cutlass_extensions/common.hpp"
+#include "cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp"
 
 #include "cutlass/cutlass.h"
 
@@ -26,6 +27,7 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp"
 
 #include "cutlass/util/packed_stride.hpp"
 
@@ -92,13 +94,24 @@ struct Fp4GemmSm100 {
   using ClusterShape = typename Config::ClusterShape;
   using PerSmTileShape_MNK = typename Config::PerSmTileShape_MNK;
 
+  // EVT epilogue: D = Alpha * Accum, where Alpha is per-column or scalar
+  using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+  using Alpha = cutlass::epilogue::fusion::Sm90RowOrScalarBroadcast<
+      0, PerSmTileShape_MNK, float, Stride<_0, _1, _0>>;
+  using AlphaCompute = cutlass::epilogue::fusion::Sm90Compute<
+      cutlass::multiplies, ElementD, float,
+      cutlass::FloatRoundStyle::round_to_nearest>;
+  using EVTCompute =
+      cutlass::epilogue::fusion::Sm90EVT<AlphaCompute, Alpha, Accum>;
+
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
           ArchTag, OperatorClass, PerSmTileShape_MNK, ClusterShape,
           cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
           ElementAccumulator, ElementC, LayoutCTag, AlignmentC, ElementD,
           LayoutDTag, AlignmentD,
-          cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+          cutlass::epilogue::collective::EpilogueScheduleAuto,
+          EVTCompute>::CollectiveOp;
 
   using CollectiveMainloop =
       typename cutlass::gemm::collective::CollectiveBuilder<
@@ -169,7 +182,10 @@ typename Config::Gemm::Arguments args_from_options(
        static_cast<ElementD*>(D.data_ptr()),
        stride_D}};
   auto& fusion_args = arguments.epilogue.thread;
-  fusion_args.alpha_ptr = static_cast<ElementCompute const*>(alpha.data_ptr());
+  fusion_args = {
+      {static_cast<float const*>(alpha.data_ptr()), alpha.numel() != 1},
+      {},
+      {}};
   return arguments;
 }
 
@@ -264,7 +280,11 @@ void cutlass_scaled_fp4_mm_sm100a(torch::stable::Tensor& D,
   CHECK_INPUT(A_sf, SF_DTYPE, "scale_a");
   CHECK_INPUT(B_sf, SF_DTYPE, "scale_b");
 
-  CHECK_INPUT(alpha, torch::headeronly::ScalarType::Float, "alpha");
+  CHECK_TH_CUDA(alpha, "alpha");
+  CHECK_CONTIGUOUS(alpha, "alpha");
+  CHECK_TYPE(alpha, torch::headeronly::ScalarType::Float, "alpha");
+  STD_TORCH_CHECK(alpha.dim() <= 1,
+                  "alpha must be a scalar or 1D vector, got dim=", alpha.dim());
 
   STD_TORCH_CHECK(A.dim() == 2, "a must be a matrix");
   STD_TORCH_CHECK(B.dim() == 2, "b must be a matrix");
