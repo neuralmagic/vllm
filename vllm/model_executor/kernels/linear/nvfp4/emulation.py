@@ -26,6 +26,16 @@ class EmulationNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Emulation requires scalar weight_global_scale and input_global_scale_inv
+        if layer.weight_global_scale.numel() > 1:
+            layer.weight_global_scale = torch.nn.Parameter(
+                layer.weight_global_scale.data.max().reshape(1),
+                requires_grad=False,
+            )
+        igs = layer.input_global_scale.data
+        layer.input_global_scale_inv = torch.nn.Parameter(
+            (1.0 / igs.min()).to(torch.float32), requires_grad=False
+        )
         # Move the E2M1 lookup table to the device now, because
         # `.to(device)` is not allowed during CUDA graph capture.
         kE2M1ToFloat_handle.val = kE2M1ToFloat_handle.val.to(layer.weight.device)

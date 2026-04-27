@@ -48,6 +48,7 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
         )
         layer.weight = torch.nn.Parameter(padded_weight, requires_grad=False)
         layer.weights_padding_cols = weights_padding_cols
+        self._prepare_quantization_params(layer)
 
     def apply_weights(
         self,
@@ -119,6 +120,7 @@ class FlashInferTrtllmNvFp4LinearKernel(NvFp4LinearKernel):
             .view(torch.float8_e4m3fn),
             requires_grad=False,
         )
+        self._prepare_quantization_params(layer)
 
     def apply_weights(
         self,
@@ -179,6 +181,7 @@ class FlashInferCudnnNvFp4LinearKernel(NvFp4LinearKernel):
         )
         layer.weight = torch.nn.Parameter(padded_weight, requires_grad=False)
         layer.weights_padding_cols = weights_padding_cols
+        self._prepare_quantization_params(layer)
 
     def apply_weights(
         self,

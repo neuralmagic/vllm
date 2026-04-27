@@ -82,42 +82,20 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Rename CT checkpoint names to standardized names
         layer.weight = layer.weight_packed
         del layer.weight_packed
 
-        # CT stores global scales as divisors (1/actual_scale)
+        # CT stores global scales as divisors (1/actual_scale);
+        # convert to actual scales per partition
         stored_input_gs = layer.input_global_scale.data.to(torch.float32)
         stored_weight_gs = layer.weight_global_scale.data.to(torch.float32)
-
-        # Input: use max of stored (= min of actual) for conservative quantization
-        input_gs_inv = stored_input_gs.max()
-        input_gs = (1.0 / input_gs_inv).to(torch.float32)
-
-        # Weight: per-partition actual scale (actual = 1/stored)
-        weight_gs_per_partition = 1.0 / stored_weight_gs
-
-        # Compute per-partition alpha = input_gs * weight_gs[i]
-        alpha_per_partition = input_gs * weight_gs_per_partition
-        if (
-            torch.unique(stored_weight_gs).numel() == 1
-            and torch.unique(stored_input_gs).numel() == 1
-        ):
-            layer.alpha = Parameter(alpha_per_partition[0:1], requires_grad=False)
-        else:
-            alpha_per_column = alpha_per_partition.repeat_interleave(
-                torch.tensor(layer.logical_widths, device=alpha_per_partition.device)
-            )
-            layer.alpha = Parameter(alpha_per_column, requires_grad=False)
-
-        # Set scalar values for non-CUTLASS backends
-        layer.input_global_scale = Parameter(input_gs, requires_grad=False)
-        layer.weight_global_scale = Parameter(
-            weight_gs_per_partition.max(), requires_grad=False
+        layer.input_global_scale = Parameter(
+            (1.0 / stored_input_gs).to(torch.float32), requires_grad=False
         )
-        layer.input_global_scale_inv = Parameter(input_gs_inv, requires_grad=False)
+        layer.weight_global_scale = Parameter(
+            (1.0 / stored_weight_gs).to(torch.float32), requires_grad=False
+        )
 
-        # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(

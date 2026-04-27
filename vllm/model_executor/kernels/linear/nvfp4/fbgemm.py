@@ -33,6 +33,7 @@ class FbgemmNvFp4LinearKernel(NvFp4LinearKernel):
         layer.weight_scale = torch.nn.Parameter(
             swizzled.view(-1).view(torch.uint8), requires_grad=False
         )
+        self._prepare_quantization_params(layer)
 
     def apply_weights(
         self,

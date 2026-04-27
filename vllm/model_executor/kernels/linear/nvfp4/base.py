@@ -12,8 +12,8 @@ class NvFp4LinearLayerConfig:
     """Configuration for an NVFP4 linear layer.
 
     All NVFP4 layers share the same structure: packed uint8 weights (2 FP4 values per
-    byte), FP8-E4M3 per-block weight scales (group size 16), and scalar global
-    scales for both weights and activations.
+    byte), FP8-E4M3 per-block weight scales (group size 16), and per-partition
+    global scales for both weights and activations.
     """
 
     pass
@@ -46,6 +46,28 @@ class NvFp4LinearKernel(ABC):
     def can_implement(cls, config: NvFp4LinearLayerConfig) -> tuple[bool, str | None]:
         """Return whether this kernel can handle *config*."""
         raise NotImplementedError
+
+    @staticmethod
+    def _prepare_quantization_params(layer: torch.nn.Module) -> None:
+        """Derive input_global_scale_inv and per-column alpha from
+        per-partition input_global_scale and weight_global_scale."""
+        igs = layer.input_global_scale.data
+        wgs = layer.weight_global_scale.data
+
+        igs_for_quant = igs.min()
+        layer.input_global_scale_inv = torch.nn.Parameter(
+            (1.0 / igs_for_quant).to(torch.float32), requires_grad=False
+        )
+
+        alpha = igs_for_quant * wgs
+        if alpha.numel() == len(layer.logical_widths):
+            alpha = alpha.repeat_interleave(
+                torch.tensor(
+                    layer.logical_widths,
+                    device=alpha.device,
+                )
+            )
+        layer.alpha = torch.nn.Parameter(alpha, requires_grad=False)
 
     @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

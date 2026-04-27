@@ -37,6 +37,12 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             "will be used leveraging the Marlin kernel. This may degrade "
             "performance for compute-heavy workloads."
         )
+        # Marlin requires scalar weight_global_scale
+        if layer.weight_global_scale.numel() > 1:
+            layer.weight_global_scale = torch.nn.Parameter(
+                layer.weight_global_scale.data.max().reshape(1),
+                requires_grad=False,
+            )
         prepare_fp4_layer_for_marlin(layer)
 
     def apply_weights(
