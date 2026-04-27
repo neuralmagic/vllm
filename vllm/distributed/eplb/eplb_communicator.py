@@ -278,6 +278,88 @@ class NixlEplbCommunicator(EplbCommunicator):
     def needs_profile_buffer_reservation(self) -> bool:
         return False
 
+    def _probe_ipc_capability(self, buf: torch.Tensor, label: str) -> None:
+        """Log whether cuIpcGetMemHandle succeeds on ``buf``."""
+        import ctypes
+        import ctypes.util
+
+        try:
+            libcuda = ctypes.CDLL("libcuda.so.1")
+        except OSError:
+            logger.warning(
+                "EPLB NixlComm rank=%d: cannot load libcuda.so.1, "
+                "skipping IPC probe for %s",
+                self._rank,
+                label,
+            )
+            return
+
+        CU_IPC_HANDLE_SIZE = 64
+        handle = (ctypes.c_byte * CU_IPC_HANDLE_SIZE)()
+        ptr = ctypes.c_uint64(buf.data_ptr())
+
+        ret = libcuda.cuIpcGetMemHandle(ctypes.byref(handle), ptr)
+        if ret == 0:
+            logger.info(
+                "EPLB NixlComm rank=%d: cuIpcGetMemHandle OK for %s (data_ptr=0x%x)",
+                self._rank,
+                label,
+                buf.data_ptr(),
+            )
+        else:
+            logger.warning(
+                "EPLB NixlComm rank=%d: cuIpcGetMemHandle FAILED for %s "
+                "(data_ptr=0x%x, cuda_err=%d) -- memory may not support "
+                "legacy CUDA IPC",
+                self._rank,
+                label,
+                buf.data_ptr(),
+                ret,
+            )
+
+        # Also log the memory type via cuPointerGetAttribute
+        CU_POINTER_ATTRIBUTE_MEMORY_TYPE = 2
+        mem_type = ctypes.c_uint(0)
+        ret2 = libcuda.cuPointerGetAttribute(
+            ctypes.byref(mem_type),
+            ctypes.c_uint(CU_POINTER_ATTRIBUTE_MEMORY_TYPE),
+            ptr,
+        )
+        # 1=host, 2=device, 3=array, 4=unified
+        mem_type_names = {1: "host", 2: "device", 3: "array", 4: "unified"}
+        logger.info(
+            "EPLB NixlComm rank=%d: %s memory_type=%s (raw=%d, ret=%d)",
+            self._rank,
+            label,
+            mem_type_names.get(mem_type.value, "unknown"),
+            mem_type.value,
+            ret2,
+        )
+
+        # Check if memory is from cuMemCreate (VMM) via IS_LEGACY_CUDA_IPC_CAPABLE
+        CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE = 14
+        is_legacy_ipc = ctypes.c_int(0)
+        ret3 = libcuda.cuPointerGetAttribute(
+            ctypes.byref(is_legacy_ipc),
+            ctypes.c_uint(CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE),
+            ptr,
+        )
+        if ret3 == 0:
+            logger.info(
+                "EPLB NixlComm rank=%d: %s is_legacy_ipc_capable=%d",
+                self._rank,
+                label,
+                is_legacy_ipc.value,
+            )
+        else:
+            logger.info(
+                "EPLB NixlComm rank=%d: %s is_legacy_ipc_capable query "
+                "returned err=%d (attribute may not be supported)",
+                self._rank,
+                label,
+                ret3,
+            )
+
     @staticmethod
     def _init_step(name: str, fn: object, *args: object, **kwargs: object) -> None:
         try:
@@ -378,6 +460,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             alloc_info.get("num_alloc_retries", 0),
             alloc_info.get("num_ooms", 0),
         )
+
+        self._probe_ipc_capability(self._send_buffer, "send_buffer")
+        self._probe_ipc_capability(self._recv_buffer, "recv_buffer")
 
         descs = self._nixl_wrapper.get_reg_descs([self._send_buffer, self._recv_buffer])
         self._nixl_wrapper.register_memory(descs)
