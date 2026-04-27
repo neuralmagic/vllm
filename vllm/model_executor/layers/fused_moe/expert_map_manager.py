@@ -262,7 +262,6 @@ class ExpertMapManager:
                 max_num_tokens=max_num_batched_tokens * dp_size,
                 is_EP=self.use_ep,
             )
-        self._local_num_experts += self.num_fused_shared_experts
 
     @property
     def use_ep(self) -> int:
@@ -391,6 +390,7 @@ class ExpertMapManager:
         self._placement_strategy = self._determine_placement_strategy(
             self._placement_strategy
         )
+
         self._calculate_expert_maps()
         self._maybe_init_routing_tables()
 
@@ -469,6 +469,8 @@ class ExpertMapManager:
             return_expert_mask=self.rocm_aiter_enabled,
         )
 
+        self._local_num_experts += self.num_fused_shared_experts
+
         # Move to device if specified
         if self.device is not None:
             if self._expert_map is not None:
@@ -505,6 +507,10 @@ class ExpertMapManager:
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build routing tables for round-robin placement."""
+        assert self.num_fused_shared_experts == 0, (
+            "Round robin not supported for AITER."
+        )
+
         device_kwargs = {"device": self.device} if self.device is not None else {}
 
         global_indices = torch.arange(
