@@ -343,11 +343,40 @@ class NixlEplbCommunicator(EplbCommunicator):
         )
         self._expert_bytes = total_bytes // self._num_local_experts
 
+        logger.info(
+            "EPLB NixlComm rank=%d: %d expert weight tensors, "
+            "total_bytes=%d (%.2f GiB), expert_bytes=%d, "
+            "num_local_experts=%d, weight shapes=%s",
+            self._rank,
+            len(expert_weights),
+            total_bytes,
+            total_bytes / (1024**3),
+            self._expert_bytes,
+            self._num_local_experts,
+            [tuple(t.shape) for t in expert_weights],
+        )
+
         self._send_buffer = torch.empty(
             total_bytes, device=self._device, dtype=torch.uint8
         )
         self._recv_buffer = torch.empty(
             total_bytes, device=self._device, dtype=torch.uint8
+        )
+
+        alloc_info = torch.accelerator.memory_stats(self._device)
+        logger.info(
+            "EPLB NixlComm rank=%d: send_buffer data_ptr=0x%x, "
+            "recv_buffer data_ptr=0x%x, "
+            "allocator active_bytes=%.2f GiB, "
+            "reserved_bytes=%.2f GiB, "
+            "num_alloc_retries=%d, num_ooms=%d",
+            self._rank,
+            self._send_buffer.data_ptr(),
+            self._recv_buffer.data_ptr(),
+            alloc_info.get("active_bytes.all.current", 0) / (1024**3),
+            alloc_info.get("reserved_bytes.all.current", 0) / (1024**3),
+            alloc_info.get("num_alloc_retries", 0),
+            alloc_info.get("num_ooms", 0),
         )
 
         descs = self._nixl_wrapper.get_reg_descs([self._send_buffer, self._recv_buffer])
@@ -498,6 +527,19 @@ class NixlEplbCommunicator(EplbCommunicator):
             recv_offsets: dict[tuple[int, int], int] = {}
             recv_offset = 0
             recv_base = self._recv_buffer.data_ptr()
+            logger.info(
+                "EPLB NixlComm rank=%d: execute() phase 2 - "
+                "send_buffer data_ptr=0x%x, recv_buffer data_ptr=0x%x, "
+                "sends=%d experts to %d peers, recvs from %d peers, "
+                "cuda_device_id=%d",
+                self._rank,
+                self._send_buffer.data_ptr(),
+                recv_base,
+                len(self._expert_send_map),
+                len({dst for dst in range(self._world_size) if dst != self._rank}),
+                len(self._recv_map),
+                self._cuda_device_id,
+            )
             for src in range(self._world_size):
                 if src == self._rank:
                     continue
@@ -524,6 +566,20 @@ class NixlEplbCommunicator(EplbCommunicator):
                     )
                     recv_offset += self._expert_bytes
                     assert recv_offset <= self._recv_buffer.nbytes
+                logger.info(
+                    "EPLB NixlComm rank=%d: READ from src=%d, "
+                    "%d experts, remote_base=0x%x, remote_dev=%d, "
+                    "local range=[0x%x, 0x%x), remote range=[0x%x, 0x%x)",
+                    self._rank,
+                    src,
+                    len(expert_ids),
+                    remote_base,
+                    remote_dev,
+                    local_descs[0][0],
+                    local_descs[-1][0] + local_descs[-1][1],
+                    remote_descs[0][0],
+                    remote_descs[-1][0] + remote_descs[-1][1],
+                )
                 local_h, remote_h, xfer_h = self._create_peer_xfer(
                     src, local_descs, remote_descs
                 )
