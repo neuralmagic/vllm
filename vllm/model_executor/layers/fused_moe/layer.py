@@ -16,7 +16,6 @@ from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_world_size,
 )
-from vllm.distributed.eplb.eplb_state import EplbLayerState, EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -26,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
@@ -195,12 +195,24 @@ class FusedMoE(PluggableLayer):
         compilation_config.static_all_moe_layers.append(prefix)
         self.layer_name = prefix
 
-        self.enable_eplb = enable_eplb
-        # TODO(bnell): should this be owned by router?
-        self.eplb_state = EplbLayerState()
         self.expert_placement_strategy: ExpertPlacementStrategy = (
             vllm_config.parallel_config.expert_placement_strategy
         )
+
+        # Create EPLB manager (always constructed for consistent API)
+        self.eplb_manager: EplbManager | None = None
+        if enable_eplb:
+            self.eplb_manager = EplbManager(
+                ep_size=self.moe_parallel_config.ep_size,
+                global_num_experts=self.global_num_experts,
+                logical_num_experts=self.logical_num_experts,
+                num_redundant_experts=num_redundant_experts,
+            )
+        else:
+            # EPLB validation is handled by EplbManager.__init__
+            assert not self.use_ep or num_redundant_experts == 0, (
+                "Redundant experts are only supported with EPLB."
+            )
 
         # ROCm aiter shared experts fusion
         # AITER only supports gated activations (silu/gelu), so disable it
@@ -225,18 +237,6 @@ class FusedMoE(PluggableLayer):
                 "n_shared_experts is only supported on ROCm aiter when "
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled"
             )
-
-        # Determine expert maps
-        if self.use_ep:
-            if self.enable_eplb:
-                assert self.global_num_experts % self.ep_size == 0, (
-                    "EPLB currently only supports even distribution of "
-                    "experts across ranks."
-                )
-            else:
-                assert num_redundant_experts == 0, (
-                    "Redundant experts are only supported with EPLB."
-                )
 
         # Create ExpertMapManager to handle expert mapping and placement
         self.expert_map_manager = ExpertMapManager(
@@ -295,7 +295,7 @@ class FusedMoE(PluggableLayer):
         self.router = create_fused_moe_router(
             top_k=top_k,
             global_num_experts=self.global_num_experts,
-            eplb_state=self.eplb_state,
+            eplb_manager=self.eplb_manager,
             renormalize=renormalize,
             use_grouped_topk=use_grouped_topk,
             num_expert_group=num_expert_group,
@@ -305,7 +305,6 @@ class FusedMoE(PluggableLayer):
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            enable_eplb=enable_eplb,
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
             indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
@@ -371,7 +370,7 @@ class FusedMoE(PluggableLayer):
                 "is_act_and_mul=False is supported only for CUDA and ROCm for now"
             )
 
-        if self.enable_eplb and not self.quant_method.supports_eplb:
+        if enable_eplb and not self.quant_method.supports_eplb:
             # TODO: Add support for additional quantization methods.
             # The implementation for other quantization methods does not
             # contain essential differences, but the current quant API
@@ -1210,82 +1209,18 @@ class FusedMoE(PluggableLayer):
                         yield param_name
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
-        def _maybe_make_contiguous(
-            name: str, p: torch.nn.Parameter
-        ) -> torch.nn.Parameter:
-            """
-            In some cases, the last 2 dimensions (the non-expert dimensions)
-            of the weight scale tensor are transposed. This function
-            transforms the tensor (view update) so the tensor is contiguous().
-            Example: A non-contiguous scale tensor,
-              `x` of shape (E, 32, 16) and stride (512, 1, 32) is transformed to
-              `x_` of shape (E, 16, 32) and stride (512, 32, 1).
-              Note that we specifically use torch.transpose() so `x_` refers
-              to the same underlying memory. The tensors `x` and `x_`, pointing
-              to the same underlying memory make this transformation safe in the
-              context of EPLB. i.e. It is the same memory and just the view
-              is different.
-            Note: This function handles the "weight_scale" tensors specifically.
-            This could however be generalized to handle similar tensors.
-            """
-            if p.ndim != 3:
-                return p
-            if p.is_contiguous():
-                # Already contiguous. do nothing.
-                return p
-            # p is non-contiguous. We only handle the case where the last 2
-            # dimensions of the scales tensor is transposed. We can handle
-            # other cases when they become relevant.
-            is_transposed_12 = p.stride(1) == 1 and p.stride(2) != 1
-            if "weight_scale" not in name or not is_transposed_12:
-                # do nothing.
-                return p
+        """
+        Collect expert weights for EPLB load balancing.
 
-            # Do not update the layer parameter as the layer's MoE operations would
-            # expect the parameter's tensor to the same shape / stride. Instead,
-            # make a new torch.nn.Parameter that is used just in the context of
-            # EPLB.
-            return torch.nn.Parameter(
-                torch.transpose(p.data, 1, 2), requires_grad=False
-            )
+        Returns weights reshaped as (local_num_experts, -1) for efficient
+        expert weight swapping during load balancing.
 
-        weights = list(self.named_parameters())
-        weights = [(name, _maybe_make_contiguous(name, p)) for name, p in weights]
+        Delegates to EplbManager.
 
-        # `w13_input_scale` and `w2_input_scale` are global per-tensor
-        # activation scales shared across all experts (e.g. NVFP4).
-        # They are broadcast views (stride 0) from .expand() and are
-        # not actual expert weights, so exclude them from EPLB.
-        NON_EXPERT_WEIGHTS = {
-            "e_score_correction_bias",
-            "w13_input_scale",
-            "w2_input_scale",
-        }
-
-        assert all(
-            weight.is_contiguous()
-            for name, weight in weights
-            if not (
-                name.startswith("_shared_experts.")
-                or name.startswith("_gate.")
-                or name.startswith("_routed_input_transform.")
-                or name.startswith("_routed_output_transform.")
-            )
-            and name not in NON_EXPERT_WEIGHTS
-        )
-
-        return [
-            weight.view(self.local_num_experts, -1)
-            for name, weight in weights
-            if name not in NON_EXPERT_WEIGHTS
-            and weight.shape != torch.Size([])
-            and not name.startswith("_shared_experts.")
-            # exclude parameters from non-expert submodules,
-            # e.g. gate/shared/transforms.
-            and not name.startswith("_gate.")
-            and not name.startswith("_routed_input_transform.")
-            and not name.startswith("_routed_output_transform.")
-        ]
+        Returns:
+            Iterable of expert weight tensors
+        """
+        return EplbManager.get_expert_weights(self)
 
     def set_eplb_state(
         self,
@@ -1299,10 +1234,22 @@ class FusedMoE(PluggableLayer):
 
         This is used later in forward pass, where we get the expert mapping
         and record the load metrics in `expert_load_view`.
+
+        Delegates to EplbManager for state management.
+
+        Args:
+            moe_layer_idx: Index of this MoE layer
+            expert_load_view: View into global expert load tracking tensor
+            logical_to_physical_map: Mapping from logical to physical expert IDs
+            logical_replica_count: Number of replicas for each logical expert
         """
-        self.eplb_state.expert_load_view = expert_load_view[moe_layer_idx]
-        self.eplb_state.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
-        self.eplb_state.logical_replica_count = logical_replica_count[moe_layer_idx]
+        if self.eplb_manager is not None:
+            self.eplb_manager.set_state(
+                moe_layer_idx,
+                expert_load_view,
+                logical_to_physical_map,
+                logical_replica_count,
+            )
 
     def ensure_moe_quant_config_init(self):
         if self.quant_method.moe_quant_config is None:
@@ -1345,41 +1292,30 @@ class FusedMoE(PluggableLayer):
         num_experts: int,
         num_redundant_experts: int = 0,
     ) -> list[tuple[str, str, int, str]]:
-        num_physical_experts = num_experts + num_redundant_experts
+        """
+        Create expert parameter mapping for weight loading.
 
-        # In the returned mapping:
-        # - `expert_id` is the physical expert id
-        # - `weight_name` contains the weight name of the logical expert
-        # So that we should map the expert id to logical in `weight_name`
-        physical_to_logical_map = (
-            EplbState.build_initial_global_physical_to_logical_map(
-                num_experts, num_redundant_experts
-            )
+        Delegates to EplbManager for proper handling of redundant experts.
+
+        Args:
+            model: The model containing the MoE layer
+            ckpt_gate_proj_name: Name of gate projection in checkpoint
+            ckpt_down_proj_name: Name of down projection in checkpoint
+            ckpt_up_proj_name: Name of up projection in checkpoint
+            num_experts: Number of logical (non-redundant) experts
+            num_redundant_experts: Number of redundant experts
+
+        Returns:
+            List of tuples (param_name, weight_name, expert_id, shard_id)
+        """
+        return EplbManager.make_expert_params_mapping(
+            model,
+            ckpt_gate_proj_name,
+            ckpt_down_proj_name,
+            ckpt_up_proj_name,
+            num_experts,
+            num_redundant_experts,
         )
-
-        base_layer = (
-            "base_layer."
-            if any(".base_layer." in name for name, _ in model.named_parameters())
-            else ""
-        )
-
-        return [
-            # (param_name, weight_name, expert_id, shard_id)
-            (
-                f"experts.{base_layer}w13_"
-                if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
-                else f"experts.{base_layer}w2_",
-                f"experts.{physical_to_logical_map[expert_id]}.{weight_name}.{base_layer}",
-                expert_id,
-                shard_id,
-            )
-            for expert_id in range(num_physical_experts)
-            for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name),
-                ("w2", ckpt_down_proj_name),
-                ("w3", ckpt_up_proj_name),
-            ]
-        ]
 
     @property
     def hidden_size(self) -> int:
