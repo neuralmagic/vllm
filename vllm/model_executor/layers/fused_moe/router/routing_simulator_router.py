@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -9,6 +8,7 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
 if TYPE_CHECKING:
@@ -317,13 +317,11 @@ class RoutingSimulatorRouter(BaseRouter):
         top_k: int,
         global_num_experts: int,
         eplb_manager: "EplbManager | None" = None,
-        indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_manager=eplb_manager,
-            indices_type_getter=indices_type_getter,
         )
 
     @property

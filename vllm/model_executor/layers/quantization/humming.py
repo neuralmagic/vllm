@@ -10,14 +10,14 @@ import torch
 
 from vllm import envs
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEConfig,
     FusedMoEMethodBase,
+    FusedMoEQuantConfig,
     RoutedExperts,
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEQuantConfig,
     FusedMoEQuantDesc,
 )
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (

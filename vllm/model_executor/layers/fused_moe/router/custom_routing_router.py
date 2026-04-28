@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
 if TYPE_CHECKING:
@@ -22,13 +23,11 @@ class CustomRoutingRouter(BaseRouter):
         custom_routing_function: Callable,
         eplb_manager: "EplbManager | None" = None,
         renormalize: bool = True,
-        indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_manager=eplb_manager,
-            indices_type_getter=indices_type_getter,
         )
         self.custom_routing_function = custom_routing_function
         self.renormalize = renormalize

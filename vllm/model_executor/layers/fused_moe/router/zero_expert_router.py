@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,6 +9,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
+from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     zero_experts_compute_triton,
 )
@@ -42,13 +42,11 @@ class ZeroExpertRouter(BaseRouter):
         renormalize: bool = False,
         routed_scaling_factor: float = 1.0,
         eplb_manager: "EplbManager | None" = None,
-        indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_manager=eplb_manager,
-            indices_type_getter=indices_type_getter,
         )
         self.e_score_correction_bias = e_score_correction_bias
         self.num_logical_experts = num_logical_experts

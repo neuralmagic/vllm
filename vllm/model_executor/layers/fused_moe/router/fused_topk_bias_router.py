@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
+from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
 if TYPE_CHECKING:
@@ -242,7 +242,6 @@ class FusedTopKBiasRouter(BaseRouter):
         renormalize: bool = True,
         routed_scaling_factor: float = 1.0,
         eplb_manager: "EplbManager | None" = None,
-        indices_type_getter: Callable[[], torch.dtype | None] | None = None,
         *,
         scoring_func: str = "sigmoid",
         hash_indices_table: torch.Tensor | None = None,
@@ -251,7 +250,6 @@ class FusedTopKBiasRouter(BaseRouter):
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_manager=eplb_manager,
-            indices_type_getter=indices_type_getter,
         )
         self.e_score_correction_bias = e_score_correction_bias
         self.renormalize = renormalize

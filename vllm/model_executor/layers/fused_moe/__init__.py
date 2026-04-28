@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
-from typing import Any, TypeAlias
+from typing import Any
 
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -20,7 +20,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
-    FusedMoeWeightScaleSupported,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
@@ -28,10 +27,17 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEExpertsModular,
     FusedMoEPrepareAndFinalizeModular,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts import (
+    FusedMoeWeightScaleSupported,
+    RoutedExperts,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    MoERunner,
+)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
@@ -41,10 +47,6 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.triton_utils import HAS_TRITON
 
 _config: dict[str, Any] | None = None
-
-
-# Temporary alias for FusedMoE, eventually we be its own class.
-RoutedExperts: TypeAlias = FusedMoE
 
 
 @contextmanager
@@ -62,26 +64,27 @@ def get_config() -> dict[str, Any] | None:
 
 __all__ = [
     "FusedMoE",
-    "FusedMoERouter",
+    "FusedMoEActivationFormat",
     "FusedMoEConfig",
     "FusedMoEQuantConfig",
     "FusedMoEParallelConfig",
-    "FusedMoEMethodBase",
-    "MoEActivation",
-    "UnquantizedFusedMoEMethod",
-    "FusedMoeWeightScaleSupported",
     "FusedMoEExpertsModular",
-    "FusedMoEActivationFormat",
+    "FusedMoEMethodBase",
     "FusedMoEPrepareAndFinalizeModular",
+    "FusedMoERouter",
+    "FusedMoeWeightScaleSupported",
     "GateLinear",
-    "RoutingMethodType",
+    "MoEActivation",
+    "MoERunner",
     "RoutedExperts",
+    "RoutingMethodType",
     "SharedExperts",
+    "UnquantizedFusedMoEMethod",
     "activation_without_mul",
     "apply_moe_activation",
     "fused_moe_make_expert_params_mapping",
-    "override_config",
     "get_config",
+    "override_config",
 ]
 
 if HAS_TRITON:
