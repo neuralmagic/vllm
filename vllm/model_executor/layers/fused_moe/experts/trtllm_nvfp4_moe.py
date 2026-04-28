@@ -195,6 +195,13 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         assert self.quant_config.w1_scale is not None
         assert self.quant_config.w2_scale is not None
 
+        # trtllm_fp4_block_scale_routed_moe does not support autotuning
+        # so skip this kernel during dummy run for autotuning.
+        import vllm.utils.flashinfer as fi_utils
+
+        if fi_utils._is_fi_autotuning:
+            return
+
         # Pack topk ids and weights into format expected by the kernel.
         packed_tensor = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
 
