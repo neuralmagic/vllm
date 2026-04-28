@@ -1245,7 +1245,6 @@ def make_mxfp4_moe_kernel(
     experts_cls: type[mk.FusedMoEExperts],
     mxfp4_backend: Mxfp4MoeBackend,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-    shared_experts: torch.nn.Module | None = None,
 ) -> mk.FusedMoEKernel:
     """Create a FusedMoEKernel for the given MXFP4 backend."""
     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
@@ -1281,11 +1280,6 @@ def make_mxfp4_moe_kernel(
     kernel = mk.FusedMoEKernel(
         prepare_finalize,
         experts,
-        shared_experts=(
-            shared_experts
-            if moe_config.moe_parallel_config.use_batched_activation_format
-            else None
-        ),
         inplace=(
             not moe_config.disable_inplace and mxfp4_backend not in TRTLLM_BACKENDS
         ),
