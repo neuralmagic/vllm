@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
+from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
     CustomRoutingRouter,
 )

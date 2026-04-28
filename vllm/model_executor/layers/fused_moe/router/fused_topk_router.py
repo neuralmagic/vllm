@@ -125,7 +125,7 @@ class FusedTopKRouter(BaseRouter):
         global_num_experts: int,
         scoring_func: str = "softmax",
         renormalize: bool = True,
-        eplb_manager: EplbManager | None = None,
+        eplb_manager: "EplbManager | None" = None,
         indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(

@@ -241,7 +241,7 @@ class FusedTopKBiasRouter(BaseRouter):
         e_score_correction_bias: torch.Tensor | None = None,
         renormalize: bool = True,
         routed_scaling_factor: float = 1.0,
-        eplb_manager: EplbManager | None = None,
+        eplb_manager: "EplbManager | None" = None,
         indices_type_getter: Callable[[], torch.dtype | None] | None = None,
         *,
         scoring_func: str = "sigmoid",

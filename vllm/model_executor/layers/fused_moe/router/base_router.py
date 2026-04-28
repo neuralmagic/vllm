@@ -2,18 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import abstractmethod
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.eplb_manager import EplbManager
 
 if current_platform.is_cuda_alike():
 

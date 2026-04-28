@@ -261,7 +261,7 @@ class GroupedTopKRouter(BaseRouter):
         routed_scaling_factor: float = 1.0,
         e_score_correction_bias: torch.Tensor | None = None,
         num_fused_shared_experts: int = 0,
-        eplb_manager: EplbManager | None = None,
+        eplb_manager: "EplbManager | None" = None,
         indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(
