@@ -41,7 +41,7 @@ class ZeroExpertRouter(BaseRouter):
         scoring_func: str = "softmax",
         renormalize: bool = False,
         routed_scaling_factor: float = 1.0,
-        eplb_manager: EplbManager | None = None,
+        eplb_manager: "EplbManager | None" = None,
         indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(

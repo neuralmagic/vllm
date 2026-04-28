@@ -20,7 +20,7 @@ class CustomRoutingRouter(BaseRouter):
         top_k: int,
         global_num_experts: int,
         custom_routing_function: Callable,
-        eplb_manager: EplbManager | None = None,
+        eplb_manager: "EplbManager | None" = None,
         renormalize: bool = True,
         indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
