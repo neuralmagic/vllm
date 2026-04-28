@@ -135,8 +135,7 @@ def determine_expert_placement_strategy(
             return "linear"
         if (
             moe_parallel_config.use_all2all_kernels
-            and not moe_parallel_config.use_deepep_ll_kernels
-            and not moe_parallel_config.use_nixl_ep_kernels
+            and not moe_parallel_config.needs_round_robin_routing_tables
         ):
             logger.warning(
                 "Round-robin expert placement currently only supports "
@@ -418,8 +417,7 @@ class ExpertMapManager:
 
         if (
             self.moe_parallel_config.use_all2all_kernels
-            and not self.moe_parallel_config.use_deepep_ll_kernels
-            and not self.moe_parallel_config.use_nixl_ep_kernels
+            and not self.moe_parallel_config.needs_round_robin_routing_tables
         ):
             logger.warning(
                 "Round-robin placement requires DeepEP-ll or NIXL backend. "
@@ -464,10 +462,7 @@ class ExpertMapManager:
         if self._placement_strategy != "round_robin":
             return
 
-        if (
-            not self.moe_parallel_config.use_deepep_ll_kernels
-            and not self.moe_parallel_config.use_nixl_ep_kernels
-        ):
+        if not self.moe_parallel_config.needs_round_robin_routing_tables:
             return
 
         if self._expert_map is None:

@@ -3,7 +3,7 @@
 
 from collections.abc import Iterable
 from enum import Enum
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 import torch
 from torch.nn.parameter import UninitializedParameter
@@ -131,7 +131,7 @@ class RoutedExperts(torch.nn.Module):
                 f"EPLB is not supported {self.quant_method.__class__.__name__}."
             )
 
-        moe_quant_params = {
+        moe_quant_params: dict[str, Any] = {
             "num_experts": moe_config.num_local_experts,
             "hidden_size": self.hidden_size,
             "unpadded_hidden_size": self.moe_config.hidden_dim_unpadded,
@@ -526,7 +526,13 @@ class RoutedExperts(torch.nn.Module):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
-        if self.quant_config and self.quant_config.get_name() == "gpt_oss_mxfp4":
+        quant_config_name = self.quant_config and self.quant_config.get_name()
+
+        if quant_config_name == "humming":
+            assert hasattr(self.quant_method, "weight_schema")
+            quant_config_name = self.quant_method.weight_schema.quant_method
+
+        if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]

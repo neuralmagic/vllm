@@ -194,6 +194,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         layer: "RoutedExperts",
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Apply the MoE operation using monolithic kernels.

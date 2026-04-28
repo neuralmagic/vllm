@@ -946,6 +946,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.is_monolithic
         assert self.moe_kernel is not None
@@ -1439,6 +1440,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.is_monolithic
         assert self.moe_kernel is not None
@@ -1919,6 +1921,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         layer: RoutedExperts,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from flashinfer.fused_moe.core import (
             ActivationType,

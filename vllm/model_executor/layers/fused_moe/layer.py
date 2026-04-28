@@ -132,6 +132,7 @@ def FusedMoE(
     custom_routing_function: Callable | None = None,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
+    swiglu_limit: float | None = None,
     e_score_correction_bias: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
     activation: str = "silu",
@@ -148,6 +149,7 @@ def FusedMoE(
     routed_output_transform: torch.nn.Module | None = None,
     apply_routed_scale_to_output: bool = False,
     zero_expert_type: str | None = None,
+    hash_indices_table: torch.Tensor | None = None,
 ) -> MoERunner:
     # TODO update comment
     """FusedMoE layer builder for MoE models.
@@ -255,6 +257,7 @@ def FusedMoE(
         eplb_manager=eplb_manager,
         zero_expert_type=zero_expert_type,
         num_logical_experts=logical_num_experts,
+        hash_indices_table=hash_indices_table,
     )
 
     # TODO: move this???????????  is this even needed???
@@ -308,13 +311,14 @@ def FusedMoE(
         quant_config,
         expert_map_manager=expert_map_manager,
         # Extra params that are needed by quant_methods, pass along for now
-        top_k=top_k,
+        top_k=top_k,  # can get from moe_config
         use_grouped_topk=use_grouped_topk,
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         custom_routing_function=custom_routing_function,
         scoring_func=scoring_func,
         routed_scaling_factor=routed_scaling_factor,
+        swiglu_limit=swiglu_limit,
         # TODO get from router? needs to be truncated?
         e_score_correction_bias=e_score_correction_bias,
         apply_router_weight_on_input=apply_router_weight_on_input,
