@@ -846,7 +846,7 @@ def create_shared_experts_from_config(
     s_w2 = shared_experts_config.w2
 
     # Apply TP chunking if needed
-    if tp_size > 1:
+    if tp_size > 1 and not is_sequence_parallel:
         s_w1 = tp_chunk_gate_up(s_w1, tp_rank, tp_size, dim=1, device=device)
         s_w2 = chunk_by_rank(s_w2, tp_rank, tp_size, dim=0, device=device)
     else:
@@ -1455,15 +1455,12 @@ def _run_one_config(
         is_sequence_parallel=is_sequence_parallel,
     )
 
-    if False:
-        baseline_output = baseline_layer(hidden_states, router_logits)
-    else:
-        with set_current_vllm_config(vllm_config):
-            # Compute baseline output with SP wrapper if needed
-            # sp_wrapper handles sequence chunking/gathering for SP
-            baseline_output = sp_wrapper(baseline_layer, is_sequence_parallel)(
-                hidden_states, router_logits
-            )
+    with set_current_vllm_config(vllm_config):
+        # Compute baseline output with SP wrapper if needed
+        # sp_wrapper handles sequence chunking/gathering for SP
+        baseline_output = sp_wrapper(baseline_layer, is_sequence_parallel)(
+            hidden_states, router_logits
+        )
 
     del baseline_layer
     torch.accelerator.empty_cache()
@@ -1492,7 +1489,7 @@ def _run_one_config(
         # Setup shared experts if needed
         # In SP mode, shared experts should NOT be TP-chunked (same as routed experts)
         # tp_size is used for sequence splitting, not weight splitting
-        if is_sequence_parallel:
+        if False and is_sequence_parallel:
             shared_experts = create_shared_experts_from_config(
                 shared_experts_config, in_dtype, 1, 0, True, device
             )
@@ -1500,9 +1497,9 @@ def _run_one_config(
             shared_experts = create_shared_experts_from_config(
                 shared_experts_config,
                 in_dtype,
-                tp_size,
-                tp_rank,
-                False,
+                tp_size if not is_sequence_parallel else 1,
+                tp_rank if not is_sequence_parallel else 0,
+                is_sequence_parallel,
                 device,
             )
 
