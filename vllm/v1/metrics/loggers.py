@@ -526,6 +526,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        #
+        # EPLB load balancing
+        #
+        gauge_eplb_balancedness = self._gauge_cls(
+            name="vllm:eplb_balancedness",
+            documentation=(
+                "EPLB balancedness ratio: avg tokens-per-rank / max "
+                "tokens-per-rank, summed across MoE layers. 1.0 = perfectly "
+                "balanced expert load across EP ranks."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_eplb_balancedness = create_metric_per_engine(
+            gauge_eplb_balancedness, per_engine_labelvalues
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1107,6 +1124,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             if scheduler_stats.perf_stats is not None:
                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
+
+            if scheduler_stats.eplb_stats is not None:
+                for (
+                    balancedness
+                ) in scheduler_stats.eplb_stats.balancedness_per_model.values():
+                    self.gauge_eplb_balancedness[engine_idx].set(balancedness)
 
             if (
                 self.kv_cache_metrics_enabled

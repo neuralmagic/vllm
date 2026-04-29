@@ -10,6 +10,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.stats import EplbMetrics
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -200,6 +201,10 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # latest EPLB balancedness samples per model (main + drafter), populated
+    # by the worker after eplb_step()
+    eplb_stats: EplbMetrics | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.
