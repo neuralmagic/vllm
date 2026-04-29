@@ -325,8 +325,6 @@ class FusedMoE(PluggableLayer):
             vllm_parallel_config=vllm_config.parallel_config,
         )
 
-        print(f"CONF {self.moe_parallel_config}")
-
         assert self.moe_parallel_config.is_sequence_parallel == is_sequence_parallel
 
         self.global_num_experts = num_experts + num_redundant_experts

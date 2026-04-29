@@ -79,10 +79,10 @@ TOP_KS = [2, 6]
 # dp_size, tp_size, use_ep
 # Note: DP+TP is not yet supported in the FusedMoE layer.
 PARALLEL_COMBOS = [
-    #    [1, 2, False],
-    #    [1, 4, False],
-    #    [2, 1, True],
-    #    [4, 1, True],
+    [1, 2, False],
+    [1, 4, False],
+    [2, 1, True],
+    [4, 1, True],
     [2, 2, True],  # sequence parallel
 ]
 
@@ -169,6 +169,15 @@ def override_normalize_e4m3fn_to_e4m3fnuz():
 def sp_wrapper(
     fn: Callable | FusedMoE, is_sequence_parallel: bool | None = None
 ) -> Callable:
+    """Wrapper to handle sequence parallelism chunking and gathering.
+
+    For SP with EP:
+    - The TP group is created with the original tensor_parallel_size (e.g., 2)
+    - get_tp_group() has the correct world_size for SP operations
+    - sequence_parallel_chunk() uses get_tensor_model_parallel_world_size()
+    - tensor_model_parallel_all_gather() uses get_tp_group()
+    - Both should work correctly even when EP is enabled
+    """
     if isinstance(fn, FusedMoE):
         assert is_sequence_parallel is None
         is_sequence_parallel = fn.is_sequence_parallel
@@ -181,8 +190,13 @@ def sp_wrapper(
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
         ) -> torch.Tensor:
+            # Split sequence across TP ranks
+            # Both hidden_states and router_logits have [num_tokens, ...] shape
             hidden_states = sequence_parallel_chunk(hidden_states)
+            router_logits = sequence_parallel_chunk(router_logits)
+            # Run MoE on local chunk
             result = fn(hidden_states, router_logits)
+            # Gather results from all TP ranks
             return tensor_model_parallel_all_gather(result, 0)
 
         return wrapper
@@ -300,7 +314,12 @@ class MoETestConfig:
 
     @property
     def is_sequence_parallel(self) -> bool:
-        return self.ep_size > 1 and self.tp_size > 1 and self.dp_size > 1
+        # Sequence parallelism: EP enabled + TP dimension used for sequence splitting
+        # In test config: ep_size represents total expert parallel size
+        # tp_size represents the original TP dimension (becomes sp_size in FusedMoE)
+        # dp_size represents data parallel size
+        # For SP: we need EP enabled (ep_size > 1) and sequence splitting (tp_size > 1)
+        return self.ep_size > 1 and self.tp_size > 1
 
     # TODO: add more error messages
     def id(self) -> str:
@@ -504,6 +523,27 @@ def is_valid_config(config: MoETestConfig) -> tuple[bool, str | None]:
     else:
         if config.tp_size > 1 or config.ep_size > 1 or config.dp_size > 1:
             return False, "An all2all backend is required for parallelism."
+
+    # Sequence parallelism specific validations
+    if config.is_sequence_parallel:
+        if config.ep_size == 1:
+            return False, "Sequence parallelism requires EP to be enabled (ep_size > 1)"
+
+        if config.tp_size == 1:
+            return (
+                False,
+                "Sequence parallelism requires tp_size > 1 for sequence splitting",
+            )
+
+        # SP is essentially EP + sequence splitting
+        # Verify the relationship: ep_size should equal dp_size * tp_size
+        # (when pcp_size=1).
+        expected_ep_size = config.dp_size * config.tp_size
+        if config.ep_size != expected_ep_size:
+            return False, (
+                f"For sequence parallelism: ep_size ({config.ep_size}) should equal "
+                f"dp_size * tp_size ({expected_ep_size})"
+            )
 
     if config.enable_eplb:
         if config.ep_size == 1:
@@ -1203,6 +1243,8 @@ def _test_body_eplb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = torch.accelerator.current_accelerator()
 
+    is_sequence_parallel = moe_layer.is_sequence_parallel
+
     """EPLB test body: compare output before and after expert weight rearrangement."""
     # Get "before" output with original weight arrangement
     with set_forward_context(
@@ -1242,7 +1284,7 @@ def _test_body_eplb(
         gate=gate,
         routed_input_transform=routed_input_transform,
         routed_output_transform=routed_output_transform,
-        is_sequence_parallel=(tp_size > 1 and dp_size > 1 and ep_size > 1),
+        is_sequence_parallel=is_sequence_parallel,
     )
 
     if eplb_moe_layer._expert_map is not None:
@@ -1312,12 +1354,12 @@ def _test_body_eplb(
 # TODO: make this take a MoETestConfig
 def _run_one_config(
     vllm_config: VllmConfig,
-    ep_size: int,
-    dp_size: int,
-    tp_size: int,
-    dp_rank: int,
-    tp_rank: int,
-    is_sequence_parallel: bool,
+    ep_size: int,  # Expert parallel size (total across all ranks)
+    dp_size: int,  # Data parallel size (number of DP groups)
+    tp_size: int,  # Tensor parallel size OR sequence parallel size (when use_ep=True)
+    dp_rank: int,  # Current rank in data parallel dimension
+    tp_rank: int,  # Current rank in tensor/sequence parallel dimension
+    is_sequence_parallel: bool,  # Whether to use sequence parallelism
     m: int,
     n: int,
     k: int,
@@ -1331,15 +1373,22 @@ def _run_one_config(
     use_routed_input_transform: bool,
     **kwargs,
 ) -> None:
-    set_random_seed(7)
-
     """Generic test loop that sets up environment and delegates to test_body_fn.
 
-    This function is called directly by test_moe_layer and test_moe_layer_eplb
-    via parallel_launch_with_config, passing either _test_body_regular or
-    _test_body_eplb as the test_body_fn parameter.
+    Parameter Interpretation:
+    - When is_sequence_parallel=False (standard TP or EP):
+      * ep_size: Number of expert parallel ranks (or 1 if no EP)
+      * tp_size: Number of tensor parallel ranks (or 1 if no TP)
+      * Weights are chunked by ep_size (experts) and tp_size (tensors)
+
+    - When is_sequence_parallel=True (EP + sequence splitting):
+      * ep_size: Number of expert parallel ranks (equals dp_size * tp_size)
+      * tp_size: Number of ranks to split sequence across (becomes sp_size in FusedMoE)
+      * Weights are chunked by ep_size (experts) but NOT by tp_size
+      * Input sequences are chunked by tp_size (via sp_wrapper)
     """
-    world_size = tp_size * dp_size
+    set_random_seed(7)
+    # world_size = tp_size * dp_size
     use_ep = ep_size > 1
 
     assert vllm_config.parallel_config.enable_expert_parallel == use_ep
@@ -1375,6 +1424,8 @@ def _run_one_config(
     routed_output_transform = test_data.routed_output_transform
     activation = "silu"
 
+    # Create baseline layer with FULL weights (no EP chunking)
+    # Baseline represents the expected output using full model
     baseline_layer = make_fake_moe_layer(
         w1=w1,
         w2=w2,
@@ -1395,20 +1446,34 @@ def _run_one_config(
         is_sequence_parallel=is_sequence_parallel,
     )
 
-    baseline_output = sp_wrapper(baseline_layer, is_sequence_parallel)(
-        hidden_states, router_logits
-    )
+    with set_current_vllm_config(vllm_config):
+        # Compute baseline output with SP wrapper if needed
+        # sp_wrapper handles sequence chunking/gathering for SP
+        baseline_output = sp_wrapper(baseline_layer, is_sequence_parallel)(
+            hidden_states, router_logits
+        )
 
     del baseline_layer
     torch.accelerator.empty_cache()
 
     with set_current_vllm_config(vllm_config):
-        # Chunk weights for EP/TP (after baseline is created)
+        # Chunk weights for EP BEFORE creating FusedMoE
+        # FusedMoE uses EP-chunked weights and handles reductions internally
         if ep_size > 1:
-            w1 = chunk_by_rank(w1, dp_rank, dp_size, dim=0, device=device)
-            w2 = chunk_by_rank(w2, dp_rank, dp_size, dim=0, device=device)
+            # Split experts across ranks (dimension 0 is the expert dimension)
+            # When EP is enabled, use EP group rank and ep_size for chunking
+            ep_rank = get_ep_group().rank_in_group
+            w1 = chunk_by_rank(w1, ep_rank, ep_size, dim=0, device=device)
+            w2 = chunk_by_rank(w2, ep_rank, ep_size, dim=0, device=device)
+            # Update num_experts to reflect local count after chunking
+            # local_num_experts = w1.shape[0]
+        else:
+            # local_num_experts = num_experts
+            pass
 
-        if tp_size > 1:
+        # Chunk weights for TP (only if NOT doing sequence parallelism)
+        # Sequence parallelism splits tokens/sequences, not weight tensors
+        if tp_size > 1 and not is_sequence_parallel:
             w1 = tp_chunk_gate_up(w1, tp_rank, tp_size, dim=1, device=device)
             w2 = chunk_by_rank(w2, tp_rank, tp_size, dim=2, device=device)
 
@@ -1447,8 +1512,10 @@ def _run_one_config(
             moe_layer._expert_map = moe_layer._expert_map.to(device)
 
         num_tokens = m
+        # num_tokens_across_dp should have one entry per DP group, not per total rank
+        # When EP is enabled, dp_size represents the number of DP groups
         num_tokens_across_dp = torch.tensor(
-            [num_tokens] * world_size,
+            [num_tokens] * dp_size,
             device=device,
             dtype=torch.int,
         )
@@ -1720,7 +1787,19 @@ def test_moe_layer(
     """
     num_gpus = current_platform.device_count()
     world_size = tp_size * dp_size
-    ep_size = 1 if not use_ep else world_size  # or dp_size?
+    # When use_ep=True: FusedMoEParallelConfig flattens tp_size across dp ranks
+    # Result: ep_size = dp_size * pcp_size * tp_size
+    # Since pcp_size=1 in these tests: ep_size = dp_size * tp_size = world_size
+    # When use_ep=False: no expert parallelism, ep_size = 1
+    # if not use_ep:
+    #    ep_size = 1
+    #    # assert world_size == 1, "TP without EP not supported in these test combos"
+    # else:
+    #    # EP enabled: experts split across all ranks (dp * tp)
+    #    ep_size = dp_size * tp_size  # pcp_size=1 assumed
+
+    ep_size = 1 if not use_ep else world_size
+
     assert world_size > 1
 
     # Check if enough GPUs available
