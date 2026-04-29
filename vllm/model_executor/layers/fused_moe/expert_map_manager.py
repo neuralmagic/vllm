@@ -378,7 +378,7 @@ class ExpertMapManager:
             dp_size: New DP size (if changed, for AITER buffer reinitialization)
             top_k: New top_k (if changed, for AITER buffer reinitialization)
             max_num_batched_tokens: New max batched tokens (if changed, for AITER
-            buffer reinitialization)
+                                    buffer reinitialization)
         """
         if new_ep_size is not None:
             self.moe_parallel_config.ep_size = new_ep_size
