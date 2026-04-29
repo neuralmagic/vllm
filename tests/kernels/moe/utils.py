@@ -501,26 +501,16 @@ class TestMLP(torch.nn.Module):
         w1: torch.Tensor,
         w2: torch.Tensor,
         out_dtype: torch.dtype,
-        tp_size: int = 1,
-        is_sequence_parallel: bool = False,
     ):
         super().__init__()
         self.gate_up_proj = BaselineMM(w1, out_dtype)
         self.down_proj = BaselineMM(w2, out_dtype)
         self.act_fn = BaselineSiluAndMul()
-        self.tp_size = tp_size
-        self.is_sequence_parallel = is_sequence_parallel
 
     def forward(self, x):
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
-        # Apply TP reduction if weights are TP-chunked
-        # if False and (self.tp_size > 1 or self.is_sequence_parallel):
-        if False and self.is_sequence_parallel:
-            from vllm.distributed import tensor_model_parallel_all_reduce
-
-            x = tensor_model_parallel_all_reduce(x)
         return x
 
 

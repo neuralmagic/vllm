@@ -853,14 +853,7 @@ def create_shared_experts_from_config(
         s_w1 = s_w1.to(device)
         s_w2 = s_w2.to(device)
 
-    # Pass tp_size so TestMLP knows whether to apply TP reduction
-    return TestMLP(
-        w1=s_w1,
-        w2=s_w2,
-        out_dtype=in_dtype,
-        tp_size=tp_size,
-        is_sequence_parallel=is_sequence_parallel,
-    )
+    return TestMLP(w1=s_w1, w2=s_w2, out_dtype=in_dtype)
 
 
 # Make version that takes a MoETestConfig?
@@ -1397,7 +1390,7 @@ def _run_one_config(
       * Input sequences are chunked by tp_size (via sp_wrapper)
     """
     set_random_seed(7)
-    # world_size = tp_size * dp_size
+
     use_ep = ep_size > 1
 
     assert vllm_config.parallel_config.enable_expert_parallel == use_ep
@@ -1474,11 +1467,6 @@ def _run_one_config(
             ep_rank = get_ep_group().rank_in_group
             w1 = chunk_by_rank(w1, ep_rank, ep_size, dim=0, device=device)
             w2 = chunk_by_rank(w2, ep_rank, ep_size, dim=0, device=device)
-            # Update num_experts to reflect local count after chunking
-            # local_num_experts = w1.shape[0]
-        else:
-            # local_num_experts = num_experts
-            pass
 
         # Chunk weights for TP (only if NOT doing sequence parallelism)
         # Sequence parallelism splits tokens/sequences, not weight tensors
@@ -1489,19 +1477,14 @@ def _run_one_config(
         # Setup shared experts if needed
         # In SP mode, shared experts should NOT be TP-chunked (same as routed experts)
         # tp_size is used for sequence splitting, not weight splitting
-        if False and is_sequence_parallel:
-            shared_experts = create_shared_experts_from_config(
-                shared_experts_config, in_dtype, 1, 0, True, device
-            )
-        else:
-            shared_experts = create_shared_experts_from_config(
-                shared_experts_config,
-                in_dtype,
-                tp_size if not is_sequence_parallel else 1,
-                tp_rank if not is_sequence_parallel else 0,
-                is_sequence_parallel,
-                device,
-            )
+        shared_experts = create_shared_experts_from_config(
+            shared_experts_config,
+            in_dtype,
+            tp_size,
+            tp_rank,
+            is_sequence_parallel,
+            device,
+        )
 
         # Determine hidden size for MoE layer
         # When using routed_input_transform, experts operate in latent space
@@ -1812,13 +1795,6 @@ def test_moe_layer(
     # Result: ep_size = dp_size * pcp_size * tp_size
     # Since pcp_size=1 in these tests: ep_size = dp_size * tp_size = world_size
     # When use_ep=False: no expert parallelism, ep_size = 1
-    # if not use_ep:
-    #    ep_size = 1
-    #    # assert world_size == 1, "TP without EP not supported in these test combos"
-    # else:
-    #    # EP enabled: experts split across all ranks (dp * tp)
-    #    ep_size = dp_size * tp_size  # pcp_size=1 assumed
-
     ep_size = 1 if not use_ep else world_size
 
     assert world_size > 1
