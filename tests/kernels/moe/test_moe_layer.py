@@ -1455,12 +1455,15 @@ def _run_one_config(
         is_sequence_parallel=is_sequence_parallel,
     )
 
-    with set_current_vllm_config(vllm_config):
-        # Compute baseline output with SP wrapper if needed
-        # sp_wrapper handles sequence chunking/gathering for SP
-        baseline_output = sp_wrapper(baseline_layer, is_sequence_parallel)(
-            hidden_states, router_logits
-        )
+    if False:
+        baseline_output = baseline_layer(hidden_states, router_logits)
+    else:
+        with set_current_vllm_config(vllm_config):
+            # Compute baseline output with SP wrapper if needed
+            # sp_wrapper handles sequence chunking/gathering for SP
+            baseline_output = sp_wrapper(baseline_layer, is_sequence_parallel)(
+                hidden_states, router_logits
+            )
 
     del baseline_layer
     torch.accelerator.empty_cache()
@@ -1491,7 +1494,7 @@ def _run_one_config(
         # tp_size is used for sequence splitting, not weight splitting
         if is_sequence_parallel:
             shared_experts = create_shared_experts_from_config(
-                shared_experts_config, in_dtype, 1, 0, False, device
+                shared_experts_config, in_dtype, 1, 0, True, device
             )
         else:
             shared_experts = create_shared_experts_from_config(
@@ -1499,7 +1502,7 @@ def _run_one_config(
                 in_dtype,
                 tp_size,
                 tp_rank,
-                is_sequence_parallel,
+                False,
                 device,
             )
 

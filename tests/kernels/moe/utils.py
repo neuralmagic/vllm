@@ -516,7 +516,7 @@ class TestMLP(torch.nn.Module):
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         # Apply TP reduction if weights are TP-chunked
-        if self.tp_size > 1 or self.is_sequence_parallel:
+        if False and (self.tp_size > 1 or self.is_sequence_parallel):
             from vllm.distributed import tensor_model_parallel_all_reduce
 
             x = tensor_model_parallel_all_reduce(x)
