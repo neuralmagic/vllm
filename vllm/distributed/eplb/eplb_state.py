@@ -27,8 +27,6 @@ physical experts.
 """
 
 import json
-import os
-import tempfile
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -920,11 +918,11 @@ class EplbState:
         latest_load_list: list[torch.Tensor],
         ep_size: int,
     ) -> None:
-        """Append expert-load snapshots to per-model JSON files.
+        """Append expert-load snapshots to a per-model JSONL file.
 
         Only called from rank 0. Each model gets its own file in
-        ``expert_load_dump_dir``.  The file is rewritten atomically on
-        every call so a crash never leaves a corrupt file.
+        ``expert_load_dump_dir``.  One JSON object is appended per line
+        on every call, so the cost is O(1) regardless of history length.
         """
         dump_dir = self.parallel_config.eplb_config.expert_load_dump_dir
         if dump_dir is None:
@@ -938,24 +936,16 @@ class EplbState:
         ):
             model = eplb_model_state.model
             safe_name = eplb_model_state.model_name.replace("/", "_")
-            file_path = dump_path / f"{safe_name}_expert_load.json"
+            file_path = dump_path / f"{safe_name}_expert_load.jsonl"
 
-            if file_path.exists():
-                with open(file_path) as f:
-                    data = json.load(f)
-            else:
-                data = {
-                    "model_name": eplb_model_state.model_name,
-                    "world_size": ep_size,
-                    "num_moe_layers": model.num_moe_layers,
-                    "num_physical_experts": model.num_physical_experts,
-                    "num_logical_experts": model.num_logical_experts,
-                    "num_redundant_experts": model.num_redundant_experts,
-                    "window_size": self.expert_load_window_size,
-                    "snapshots": [],
-                }
-
-            snapshot = {
+            record = {
+                "model_name": eplb_model_state.model_name,
+                "world_size": ep_size,
+                "num_moe_layers": model.num_moe_layers,
+                "num_physical_experts": model.num_physical_experts,
+                "num_logical_experts": model.num_logical_experts,
+                "num_redundant_experts": model.num_redundant_experts,
+                "window_size": self.expert_load_window_size,
                 "step": self.global_step,
                 "window_expert_load": window_load.cpu().tolist(),
                 "latest_expert_load": latest_load.cpu().tolist(),
@@ -963,18 +953,9 @@ class EplbState:
                     eplb_model_state.physical_to_logical_map.cpu().tolist()
                 ),
             }
-            data["snapshots"].append(snapshot)
 
-            fd, tmp_path = tempfile.mkstemp(
-                dir=dump_dir, suffix=".tmp", prefix=".expert_load_"
-            )
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f)
-                os.replace(tmp_path, file_path)
-            except BaseException:
-                os.unlink(tmp_path)
-                raise
+            with open(file_path, "a") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     @classmethod
     def from_mapping(
