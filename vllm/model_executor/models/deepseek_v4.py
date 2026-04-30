@@ -1364,6 +1364,10 @@ class DeepseekV4Model(nn.Module):
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
 
+        #print([name for name in params_dict if "compressor" in name and "layers.10" in name])
+        #exit(0)
+        # ['layers.10.attn.indexer.compressor.ape', 'layers.10.attn.indexer.compressor.fused_wkv_wgate.weight', 'layers.10.attn.indexer.compressor.norm.weight', 'layers.10.attn.mla_attn.compressor.ape', 'layers.10.attn.mla_attn.compressor.fused_wkv_wgate.weight', 'layers.10.attn.mla_attn.compressor.norm.weight']
+
         for name, loaded_weight in weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -1374,6 +1378,9 @@ class DeepseekV4Model(nn.Module):
                 name = name.replace(weight_name, param_name)
 
                 param = params_dict[name]
+                # 'layers.10.attn.mla_attn.compressor.fused_wkv_wgate.weight'
+                #  layers.10.attn.mla_attn.compressor.fused_wkv_wgate.weight_scale
+                # KeyError: 'layers.10.attn.mla_attn.compressor.fused_wkv_wgate.weight_scale'
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(name)
