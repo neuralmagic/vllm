@@ -1410,8 +1410,14 @@ class DeepseekV4Model(nn.Module):
                             return_success=True,
                         )
                         if success:
+
                             name = name_mapped
                             break
+                    else:
+                        print(expert_mapping)
+                        assert False, name
+                        # ('experts.w2_', 'experts.223.w2.', 223, 'w2')
+                        # layers.0.ffn.experts.0.down_proj.input_global_scale
                     loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:
@@ -1437,13 +1443,23 @@ class DeepseekV4Model(nn.Module):
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        return FusedMoE.make_expert_params_mapping(
+        checkpoint_mapping = FusedMoE.make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
         )
+
+        quantized_mapping = FusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts,
+        )
+
+        return checkpoint_mapping + quantized_mapping
 
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
