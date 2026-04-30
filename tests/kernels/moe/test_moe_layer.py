@@ -1217,10 +1217,12 @@ def _test_body_eplb(
 
     expert_weights = [list(eplb_moe_layer.get_expert_weights())]
 
+    expert_buffer = [torch.empty_like(w) for w in expert_weights[0]]
     communicator = create_eplb_communicator(
         group_coordinator=get_eplb_group(),
         backend=vllm_config.parallel_config.eplb_config.communicator,
-        expert_weights=expert_weights[0],
+        expert_weights=expert_weights,
+        expert_buffer=expert_buffer,
     )
 
     # Rearrange expert weights across EP ranks
@@ -1230,6 +1232,7 @@ def _test_body_eplb(
         expert_weights=expert_weights,
         ep_group=cpu_group,
         communicator=communicator,
+        expert_buffer=expert_buffer,
     )
 
     # Build logical_to_physical_map from shuffled_indices

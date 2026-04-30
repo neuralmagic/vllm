@@ -178,6 +178,7 @@ def move_to_buffer(
     cuda_stream: torch.cuda.Stream | None,
     ep_rank: int,
     communicator: EplbCommunicator,
+    layer_idx: int = 0,
 ) -> TransferMetadata:
     """
     Rearranges expert weights during EPLB rebalancing.
@@ -193,6 +194,7 @@ def move_to_buffer(
         cuda_stream: CUDA stream for async copies (can be None for sync mode).
         ep_rank: Rank of this process in expert parallel group.
         communicator: EplbCommunicator instance for P2P communication.
+        layer_idx: Index of the MoE layer being transferred.
 
     Returns:
         TransferMetadata: Metadata needed for completing remote weight transfers.
@@ -264,6 +266,8 @@ def move_to_buffer(
                 with torch.cuda.stream(cuda_stream):
                     for w, b in zip(expert_weights, expert_weights_buffers):
                         b[dst].copy_(w[src_local], non_blocking=True)
+
+    communicator.set_transfer_context(old_indices, layer_idx)
 
     # 2. Post sends
     if send_count > 0:
@@ -431,6 +435,7 @@ def transfer_layer(
     is_profile: bool = False,
     cuda_stream: torch.cuda.Stream | None = None,
     rank_mapping: dict[int, int] | None = None,
+    layer_idx: int = 0,
 ) -> TransferMetadata:
     """
     Rearranges the expert weights in place according to the new expert indices.
@@ -452,6 +457,7 @@ def transfer_layer(
             communications to reserve enough memory for the buffers.
         cuda_stream: CUDA stream for async copies (can be None for sync mode).
         rank_mapping: Optional rank mapping for elastic expert parallelism.
+        layer_idx: Index of the MoE layer being transferred.
 
     Returns:
         TransferMetadata: Metadata needed for completing remote weight transfers,
@@ -499,6 +505,7 @@ def transfer_layer(
         cuda_stream=cuda_stream,
         ep_rank=ep_group.rank(),
         communicator=communicator,
+        layer_idx=layer_idx,
     )
 
 
@@ -510,6 +517,7 @@ def rearrange_expert_weights_inplace(
     communicator: EplbCommunicator,
     is_profile: bool = False,
     rank_mapping: dict[int, int] | None = None,
+    expert_buffer: Sequence[torch.Tensor] | None = None,
 ) -> None:
     """
     Rearranges the expert weights in place according to the new expert indices.
@@ -530,6 +538,9 @@ def rearrange_expert_weights_inplace(
             This is used during profile run, where we only perform dummy
             communications to reserve enough memory for the buffers.
         rank_mapping: A dictionary mapping old rank to new rank.
+        expert_buffer: Pre-allocated receive buffer tensors (one per
+            weight tensor in a single layer).  When provided, reuses
+            this buffer instead of allocating a fresh one.
     """
     if rank_mapping is not None:
         if len(rank_mapping) == ep_group.size():
@@ -566,10 +577,10 @@ def rearrange_expert_weights_inplace(
             # Reserve NCCL communication buffers via a dummy all_gather.
             # Backends that pre-allocate their own transfer buffers
             # skip this to avoid the extra memory spike during profiling.
-            weights_buffer: list[torch.Tensor] = [
+            profile_buffer: list[torch.Tensor] = [
                 torch.empty_like(w) for w in first_layer_weights
             ]
-            for weight, buffer in zip(expert_weights[0], weights_buffer):
+            for weight, buffer in zip(expert_weights[0], profile_buffer):
                 dummy_recv_buffer = [buffer for _ in range(ep_size)]
                 torch.distributed.barrier()
                 all_gather(
@@ -579,10 +590,10 @@ def rearrange_expert_weights_inplace(
                 )
         return
 
-    # Buffers to hold the expert weights during the exchange.
-    # NOTE: Currently we assume the same weights across different layers
-    # have the same shape.
-    weights_buffer = [torch.empty_like(w) for w in first_layer_weights]
+    if expert_buffer is not None:
+        weights_buffer = list(expert_buffer)
+    else:
+        weights_buffer = [torch.empty_like(w) for w in first_layer_weights]
 
     # NOTE(bowen): We need this synchronize to run, but I don't know why.
     # If you figure out the reason, please let me know -- thank you!
@@ -601,6 +612,7 @@ def rearrange_expert_weights_inplace(
             cuda_stream=None,
             ep_rank=ep_rank,
             communicator=communicator,
+            layer_idx=layer_idx,
         )
 
         move_from_buffer(

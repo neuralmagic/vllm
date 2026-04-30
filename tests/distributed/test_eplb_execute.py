@@ -277,12 +277,15 @@ def assert_verification_synced(local_ok: bool, msg: str) -> None:
     assert bool(ok_tensor.item()), msg
 
 
-def create_eplb_communicator_or_raise(*, group_coordinator, backend, expert_weights):
+def create_eplb_communicator_or_raise(
+    *, group_coordinator, backend, expert_weights, expert_buffer=None
+):
     try:
         return create_eplb_communicator(
             group_coordinator=group_coordinator,
             backend=backend,
             expert_weights=expert_weights,
+            expert_buffer=expert_buffer,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -355,7 +358,8 @@ def _test_async_transfer_layer_without_mtp_worker(
         communicator = create_eplb_communicator_or_raise(
             group_coordinator=ep_group_coordinator,
             backend=eplb_communicator,
-            expert_weights=expert_weights[0],
+            expert_weights=expert_weights,
+            expert_buffer=expert_buffer,
         )
         communicator.set_stream(cuda_stream)
 
@@ -460,10 +464,12 @@ def _test_rearrange_expert_weights_with_redundancy(
             num_layers, num_local_experts, hidden_sizes, ep_rank, device, old_indices
         )
 
+        expert_buffer = [torch.empty_like(w) for w in expert_weights[0]]
         communicator = create_eplb_communicator_or_raise(
             group_coordinator=ep_group_coordinator,
             backend=eplb_communicator,
-            expert_weights=expert_weights[0],
+            expert_weights=expert_weights,
+            expert_buffer=expert_buffer,
         )
 
         # Execute weight rearrangement
@@ -474,6 +480,7 @@ def _test_rearrange_expert_weights_with_redundancy(
             ep_group,
             is_profile=False,
             communicator=communicator,
+            expert_buffer=expert_buffer,
         )
 
     # Verify the rearrangement result
@@ -593,10 +600,12 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
                 layer_copy.append(weight.clone())
             original_weights.append(layer_copy)
 
+        expert_buffer = [torch.empty_like(w) for w in expert_weights[0]]
         communicator = create_eplb_communicator_or_raise(
             group_coordinator=ep_group_coordinator,
             backend="torch_nccl",
-            expert_weights=expert_weights[0],
+            expert_weights=expert_weights,
+            expert_buffer=expert_buffer,
         )
 
         # Execute rearrangement (should be no change)
@@ -607,6 +616,7 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
             ep_group,
             communicator,
             is_profile=False,
+            expert_buffer=expert_buffer,
         )
 
     # Verify that the weights have not changed
@@ -726,10 +736,12 @@ def _test_rearrange_expert_weights_profile_mode(env, world_size) -> None:
                 layer_copy.append(weight.clone())
             original_weights.append(layer_copy)
 
+        expert_buffer = [torch.empty_like(w) for w in expert_weights[0]]
         communicator = create_eplb_communicator_or_raise(
             group_coordinator=ep_group_coordinator,
             backend="torch_nccl",
-            expert_weights=expert_weights[0],
+            expert_weights=expert_weights,
+            expert_buffer=expert_buffer,
         )
 
         # Execute profile mode rearrangement
@@ -740,6 +752,7 @@ def _test_rearrange_expert_weights_profile_mode(env, world_size) -> None:
             ep_group,
             communicator,
             is_profile=True,  # Profile mode
+            expert_buffer=expert_buffer,
         )
 
     # In profile mode, the weights should remain unchanged
