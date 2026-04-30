@@ -128,8 +128,8 @@ BACKEND_SUPPORTED_QUANTS: dict[str, set[str | None]] = {
 BACKEND_EP_DP_TP_SUPPORT: dict[str, tuple[bool, bool, bool, bool]] = {
     "allgather_reducescatter":     (True,  True,  True, True),
     "mori":                        (True, False, False, False),
-    "flashinfer_nvlink_two_sided": (False, True, False, False),
-    "flashinfer_nvlink_one_sided": (False, True, False, False),
+    "flashinfer_nvlink_two_sided": (True, True, False, False),
+    "flashinfer_nvlink_one_sided": (True, True, False, False),
     "deepep_low_latency":          (True, False, False, True),
     "deepep_high_throughput":      (True, False, False, True),
     "nixl_ep":                     (True, False, False, False),
@@ -557,14 +557,6 @@ def is_valid_config(config: MoETestConfig) -> tuple[bool, str | None]:
 
         if config.num_experts % config.dp_size != 0:
             return False, "EPLB requires num_experts divisible by ep_size"
-
-    # Disable fp4 tests until flashinfer is updated or the Dockerfile is
-    # modified to install cublasLt.h. See #39525.
-    if (
-        config.quantization == "modelopt_fp4"
-        and current_platform.is_device_capability_family(100)
-    ):
-        return False, "Temporarily skip until #39525 is resolved"
 
     return True, None
 
