@@ -918,12 +918,7 @@ class EplbState:
         latest_load_list: list[torch.Tensor],
         ep_size: int,
     ) -> None:
-        """Append expert-load snapshots to a per-model JSONL file.
-
-        Only called from rank 0. Each model gets its own file in
-        ``expert_load_dump_dir``.  One JSON object is appended per line
-        on every call, so the cost is O(1) regardless of history length.
-        """
+        """Append expert-load snapshots to a per-model JSONL file."""
         dump_dir = self.parallel_config.eplb_config.expert_load_dump_dir
         if dump_dir is None:
             return
