@@ -1561,7 +1561,7 @@ def _run_one_config(
         else:
             atol, rtol = 3.5e-2, 3.5e-2
     elif quantization in ("fp8", "fp8_blocked", "modelopt_fp8"):
-        atol, rtol = 65e-2, 65e-2
+        atol, rtol = 6.5e-2, 6.5e-2
     elif quantization == "modelopt_fp4":
         if k >= 2048:
             atol = rtol = 1e-1 + (k * 1e-4)
