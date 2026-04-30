@@ -279,6 +279,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
             )
 
+        # HARD CODE
+        self.wo_scale_name = "weight_scale_inv" if hasattr(self.wo_a, "weight_scale_inv") else "weight_scale"
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -316,7 +319,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         wo_a_fp8 = self.wo_a.weight
-        wo_a_scale = self.wo_a.weight_scale_inv
+        wo_a_scale = self.wo_a.weight_scale  #getattr(self.wo_a, self.wo_scale_name)
 
         z = torch.empty(
             (num_tokens, self.n_local_groups, self.o_lora_rank),
@@ -349,9 +352,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return cublas_gemm_bf16_bf16_fp32(
-                    hidden_states, compressor.fused_wkv_wgate.weight
-                )
+                return compressor.fused_wkv_wgate(hidden_states)
+                # return cublas_gemm_bf16_bf16_fp32(
+                #     hidden_states, compressor.fused_wkv_wgate.weight
+                # )
 
             aux_fns[0] = compressor_kv_score
 
@@ -364,9 +368,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return cublas_gemm_bf16_bf16_fp32(
-                    hidden_states, indexer.compressor.fused_wkv_wgate.weight
-                )
+                return indexer.compressor.fused_wkv_wgate(hidden_states)
+                # return cublas_gemm_bf16_bf16_fp32(
+                #     hidden_states, indexer.compressor.fused_wkv_wgate.weight
+                # )
 
             aux_fns[1] = indexer_weights_proj
             aux_fns[2] = indexer_compressor_kv_score
@@ -1068,7 +1073,7 @@ class DeepseekV4Indexer(nn.Module):
             hidden_size,
             self.n_head,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.weights_proj",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
