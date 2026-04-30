@@ -1029,9 +1029,11 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             get_current_vllm_config().model_config.hf_config, "model_type", None
         )
 
+        # TODO: Remove once all OCP MX schemes use the kernel abstraction
+        _AITER_NATIVE_OCP_MX_SCHEMES = ("w_mxfp4", "w_mxfp4_a_mxfp4")
         self.emulate = (
             not current_platform.supports_mx()
-            or not self.ocp_mx_scheme.startswith("w_mxfp4")
+            or self.ocp_mx_scheme not in _AITER_NATIVE_OCP_MX_SCHEMES
         ) and (
             self.mxfp4_backend is Mxfp4MoeBackend.NONE or not self.use_rocm_aiter_moe
         )
@@ -1582,7 +1584,7 @@ class QuarkOCP_MX_MoEMethod_OSS(QuarkOCP_MX_MoEMethod):
     ) -> torch.Tensor:
         if layer.enable_eplb:
             raise NotImplementedError(
-                "EPLB not supported for `QuarkW4MXFp4MoEMethod_OSS` yet."
+                f"EPLB not supported for {self.__class__.__name__} yet."
             )
 
         from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
