@@ -3,7 +3,7 @@
 
 from typing import Any
 
-from pydantic import Field, ValidationInfo, field_validator
+from pydantic import ConfigDict, Field, ValidationInfo, field_validator
 
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -47,7 +47,7 @@ def _coerce_quant_key(v: Any) -> QuantKey | None:
         ) from None
 
 
-@config
+@config(config=ConfigDict(arbitrary_types_allowed=True))
 class QuantSpec:
     """Quantization spec for one layer kind (linear or MoE).
 
