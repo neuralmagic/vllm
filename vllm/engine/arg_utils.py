@@ -517,6 +517,11 @@ class EngineArgs:
     tokenizer_revision: str | None = ModelConfig.tokenizer_revision
     quantization: QuantizationMethods | str | None = ModelConfig.quantization
     quantization_config: "dict[str, Any] | QuantizationConfigArgs | None" = None
+    """User-facing quantization configuration. Carries per-layer-kind
+    QuantSpecs (linear, moe) and ignore patterns; see
+    :class:`QuantizationConfigArgs`. Auto-populated from the matching online
+    shorthand when `quantization` is one of the values in
+    `ONLINE_QUANT_SHORTHAND_NAMES`."""
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
@@ -774,6 +779,9 @@ class EngineArgs:
         )
         model_group.add_argument("--max-model-len", **model_kwargs["max_model_len"])
         model_group.add_argument("--quantization", "-q", **model_kwargs["quantization"])
+        model_group.add_argument(
+            "--quantization-config", **model_kwargs["quantization_config"]
+        )
         model_group.add_argument(
             "--allow-deprecated-quantization",
             **model_kwargs["allow_deprecated_quantization"],
