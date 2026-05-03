@@ -44,16 +44,17 @@ For fine-grained control, use a `quantization_config` dictionary.
 
 ### Separate Schemes for Dense and MoE Layers
 
-You can apply different quantization schemes to dense linear layers and MoE expert layers:
+You can apply different quantization schemes to dense linear layers and MoE expert layers via the `linear` and `moe` fields. Each accepts either a full spec dict, or a bare string naming an online shorthand (e.g. `"fp8_per_block"`) or weight format (e.g. `"fp8_per_block_static"`); fields not set fall back to the shorthand defaults.
 
 ```python
 from vllm import LLM
 
+# Linear: per-block FP8; MoE: per-tensor FP8 (inherited from the shorthand)
 llm = LLM(
     "ibm-granite/granite-3.0-1b-a400m-base",
     quantization="fp8_per_tensor",
     quantization_config={
-        "linear_scheme_override": "fp8_per_block",
+        "linear": "fp8_per_block",
     },
 )
 ```
@@ -63,11 +64,12 @@ Or,
 ```python
 from vllm import LLM
 
+# Linear: per-tensor FP8 (inherited); MoE: per-block FP8
 llm = LLM(
     "ibm-granite/granite-3.0-1b-a400m-base",
     quantization="fp8_per_tensor",
     quantization_config={
-        "moe_scheme_override": "fp8_per_block",
+        "moe": "fp8_per_block",
     },
 )
 ```

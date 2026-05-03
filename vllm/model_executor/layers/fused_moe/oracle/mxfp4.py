@@ -7,7 +7,9 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
+from vllm.config import get_current_vllm_config
 from vllm.config.kernel import MoEBackend
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -206,25 +208,39 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> Mxfp4MoeBackend:
     )
 
 
-def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
+def _get_priority_backends_for_gpt_oss(
+    activation_qk: QuantKey | None = None,
+) -> list[Mxfp4MoeBackend]:
     """
     Get available backends in priority order based on platform and config.
-    Only includes BF16 backends. MXFP8 backends are selected via env vars.
+
+    `activation_qk=None` returns BF16-activation backends.
+    `activation_qk=kMxfp8Dynamic` returns MXFP8-activation backends.
+    Any other value is rejected.
     """
-    _AVAILABLE_BACKENDS = [
-        Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
-        Mxfp4MoeBackend.AITER,
-        Mxfp4MoeBackend.TRITON,
-        Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
-        # TRITON_UNFUSED has bug with MTP support
-        # TODO re-enable after kernel is fixed
-        # TRITON_UNFUSED
-        Mxfp4MoeBackend.MARLIN,
-        Mxfp4MoeBackend.BATCHED_MARLIN,
-        Mxfp4MoeBackend.XPU,
-        Mxfp4MoeBackend.EMULATION,
-    ]
-    return _AVAILABLE_BACKENDS
+    if activation_qk is None:
+        return [
+            Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+            Mxfp4MoeBackend.AITER,
+            Mxfp4MoeBackend.TRITON,
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+            # TRITON_UNFUSED has bug with MTP support
+            # TODO re-enable after kernel is fixed
+            # TRITON_UNFUSED
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+            Mxfp4MoeBackend.XPU,
+            Mxfp4MoeBackend.EMULATION,
+        ]
+    if activation_qk == kMxfp8Dynamic:
+        return [
+            Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+        ]
+    raise ValueError(
+        f"no MXFP4 MoE backend supports activation={activation_qk}; "
+        f"supported: None (bf16), {kMxfp8Dynamic}"
+    )
 
 
 def _get_priority_backends() -> list[Mxfp4MoeBackend]:
@@ -257,6 +273,15 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     return None
 
 
+def _user_moe_activation_override() -> QuantKey | None:
+    """Return the user's MoE activation override from QuantizationConfigArgs,
+    or None if unset."""
+    args = get_current_vllm_config().model_config.quantization_config
+    if not isinstance(args, QuantizationConfigArgs) or args.moe is None:
+        return None
+    return args.moe.activation
+
+
 def select_gpt_oss_mxfp4_moe_backend(
     config: FusedMoEConfig,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts] | None]:
@@ -264,6 +289,7 @@ def select_gpt_oss_mxfp4_moe_backend(
     Select the primary MXFP4 MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
     """
+    activation_qk = _user_moe_activation_override()
     device_capability = current_platform.get_device_capability()
     triton_kernels_supported = (
         has_triton_kernels()
@@ -332,16 +358,33 @@ def select_gpt_oss_mxfp4_moe_backend(
             and requested_backend == Mxfp4MoeBackend.MARLIN
         ):
             requested_backend = Mxfp4MoeBackend.BATCHED_MARLIN
+        # Upgrade BF16-act variants to MXFP8-act variants when the user
+        # requests MXFP8 activations via quantization_config.
+        if activation_qk == kMxfp8Dynamic:
+            requested_backend = {
+                Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16: (
+                    Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
+                ),
+                Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16: (
+                    Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8
+                ),
+            }.get(requested_backend, requested_backend)
+        backend_act = _backend_activation_key(requested_backend)
+        if activation_qk is not None and activation_qk != backend_act:
+            raise ValueError(
+                f"moe_backend={runner_backend!r} runs with activation="
+                f"{backend_act}, but activation={activation_qk} was requested"
+            )
         return _return_or_raise(
             requested_backend,
             config,
             kMxfp4Static,
-            _backend_activation_key(requested_backend),
+            backend_act,
             activation_format,
         )
 
     # Select kernels in order of backend.
-    AVAILABLE_BACKENDS = _get_priority_backends_for_gpt_oss()
+    AVAILABLE_BACKENDS = _get_priority_backends_for_gpt_oss(activation_qk)
 
     # Handle explicit FlashInfer MXFP4 BF16 configuration.
     if envs.is_set("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16"):
