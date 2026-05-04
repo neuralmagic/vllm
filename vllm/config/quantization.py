@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import Field, GetPydanticSchema, ValidationInfo, field_validator
+from pydantic_core import core_schema
 
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -47,7 +48,19 @@ def _coerce_quant_key(v: Any) -> QuantKey | None:
         ) from None
 
 
-@config(config=ConfigDict(arbitrary_types_allowed=True))
+# Stop pydantic from introspecting QuantKey: it transitively contains a
+# NamedTuple with `ClassVar[GroupShape]` declarations that pydantic refuses.
+QuantKeyField = Annotated[
+    QuantKey | None,
+    GetPydanticSchema(
+        lambda _src, _handler: core_schema.no_info_plain_validator_function(
+            _coerce_quant_key
+        )
+    ),
+]
+
+
+@config
 class QuantSpec:
     """Quantization spec for one layer kind (linear or MoE).
 
@@ -55,16 +68,11 @@ class QuantSpec:
     (typically inherited from the checkpoint, or unquantized for online).
     """
 
-    weight: QuantKey | None = None
+    weight: QuantKeyField = None
     """Weight quantization key, or a name from QUANT_KEY_NAMES."""
 
-    activation: QuantKey | None = None
+    activation: QuantKeyField = None
     """Activation quantization key, or a name from QUANT_KEY_NAMES."""
-
-    @field_validator("weight", "activation", mode="before")
-    @classmethod
-    def _coerce(cls, v: Any) -> QuantKey | None:
-        return _coerce_quant_key(v)
 
 
 @config
