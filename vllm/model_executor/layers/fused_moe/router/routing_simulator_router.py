@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -272,6 +273,17 @@ class ExcludeRankRouting(RoutingStrategy):
         )
         excluded_lo = self.excluded_rank * epr
         topk_ids = torch.where(raw < excluded_lo, raw, raw + epr)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            per_rank = torch.bincount(
+                (topk_ids.flatten() // epr).to(torch.long),
+                minlength=world_size,
+            )
+            logger.debug(
+                "ExcludeRankRouting: tokens-per-rank (excluded=%d): %s",
+                self.excluded_rank,
+                per_rank.tolist(),
+            )
 
         topk_weights = torch.ones(
             (num_tokens, top_k), dtype=torch.float32, device=device

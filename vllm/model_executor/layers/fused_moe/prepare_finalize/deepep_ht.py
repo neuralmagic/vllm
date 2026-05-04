@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from collections.abc import Callable
 
 import deep_ep
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -23,6 +25,8 @@ from vllm.v1.worker.ubatching import (
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
+
+logger = init_logger(__name__)
 
 
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -132,6 +136,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             allocate_on_comm_stream=False,
         )
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "DeepEPHT dispatch (send): tokens-per-rank=%s",
+                num_tokens_per_rank.tolist(),
+            )
+
         token_data = tokens
         if has_scales:
             token_data = (tokens, token_scales)
@@ -160,6 +170,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=self.async_prepare and not dbo_enabled(),
             allocate_on_comm_stream=False,
         )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "DeepEPHT dispatch (recv): per-local-expert=%s total=%d",
+                expert_num_tokens_per_expert_list,
+                sum(expert_num_tokens_per_expert_list),
+            )
 
         # record the handle for this ubatch
         a2a_idx = dbo_current_ubatch_id()
