@@ -8,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.distributed.parallel_state import get_ep_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
@@ -222,6 +223,62 @@ class DistributionBasedRouting(RoutingStrategy):
         }
 
 
+class ExcludeRankRouting(RoutingStrategy):
+    """
+    Uniform random routing that sends zero tokens to one EP rank.
+
+    Assumes naive in-order expert placement (no EPLB), so rank `r` owns
+    experts `[r * epr, (r + 1) * epr)` where `epr = num_experts // world_size`.
+    Sampling draws uniformly from the remaining `num_experts - epr` experts.
+    """
+
+    def __init__(self, excluded_rank: int = 1):
+        self.excluded_rank = excluded_rank
+
+    def route_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        indices_type: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = hidden_states.shape[0]
+        num_experts = router_logits.shape[-1]
+        device = hidden_states.device
+
+        if indices_type is None:
+            indices_type = torch.long
+
+        world_size = get_ep_group().world_size
+        if num_experts % world_size != 0:
+            raise ValueError(
+                f"ExcludeRankRouting assumes num_experts ({num_experts}) is "
+                f"divisible by world_size ({world_size})."
+            )
+        epr = num_experts // world_size
+        if not 0 <= self.excluded_rank < world_size:
+            raise ValueError(
+                f"excluded_rank {self.excluded_rank} out of range for "
+                f"world_size {world_size}."
+            )
+
+        # Sample from the reduced range, then shift past the excluded block.
+        raw = torch.randint(
+            low=0,
+            high=num_experts - epr,
+            size=(num_tokens, top_k),
+            dtype=indices_type,
+            device=device,
+        )
+        excluded_lo = self.excluded_rank * epr
+        topk_ids = torch.where(raw < excluded_lo, raw, raw + epr)
+
+        topk_weights = torch.ones(
+            (num_tokens, top_k), dtype=torch.float32, device=device
+        )
+        return topk_weights, topk_ids
+
+
 class RoutingSimulator:
     """
     Token-to-Expert Routing Simulator.
@@ -240,6 +297,7 @@ class RoutingSimulator:
         "normal_routing": DistributionBasedRouting(
             distribution="normal", mean=0.0, std=1.0
         ),
+        "exclude_rank": ExcludeRankRouting(excluded_rank=1),
     }
 
     @classmethod
