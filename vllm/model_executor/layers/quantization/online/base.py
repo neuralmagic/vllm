@@ -25,6 +25,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
+from vllm.model_executor.layers.quantization.online.autofit import (
+    AutofitOnlineLinearMethod,
+)
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerBlockOnlineLinearMethod,
     Fp8PerBlockOnlineMoEMethod,
@@ -40,6 +43,7 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kAutofit,
     kFp8Static128BlockSym,
     kFp8StaticTensorSym,
     kInt8StaticChannelSym,
@@ -56,6 +60,7 @@ _ONLINE_LINEAR_METHODS: dict[QuantKey, type] = {
     kFp8StaticTensorSym: Fp8PerTensorOnlineLinearMethod,
     kFp8Static128BlockSym: Fp8PerBlockOnlineLinearMethod,
     kMxfp8Dynamic: Mxfp8OnlineLinearMethod,
+    kAutofit: AutofitOnlineLinearMethod,
 }
 
 _ONLINE_MOE_METHODS: dict[QuantKey, type] = {

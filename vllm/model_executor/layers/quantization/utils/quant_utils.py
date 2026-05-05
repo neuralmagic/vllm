@@ -181,6 +181,12 @@ kInt8Static = QuantKey(INT8_DTYPE, scale=kInt8StaticGroupScale, symmetric=True)
 kInt8StaticChannelSym = QuantKey(torch.int8, kStaticChannelScale, symmetric=True)
 kInt8DynamicTokenSym = QuantKey(torch.int8, kDynamicTokenScale, symmetric=True)
 
+# Placeholder key for the autofit online method. The actual per-layer scheme
+# (bit width, group size) is chosen at weight-load time from a calibration-
+# free reconstruction-error sweep, so this key is only a dispatch token.
+kAutofitGroup128 = ScaleDesc(torch.bfloat16, True, GroupShape(1, 128))
+kAutofit = QuantKey(INT8_DTYPE, scale=kAutofitGroup128, symmetric=False)
+
 
 def create_fp8_quant_key(
     static: bool,

@@ -9,6 +9,7 @@ from pydantic_core import core_schema
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kAutofit,
     kFp8Dynamic128Sym,
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
@@ -31,6 +32,7 @@ QUANT_KEY_NAMES: dict[str, QuantKey] = {
     "mxfp8": kMxfp8Dynamic,
     "mxfp4": kMxfp4Dynamic,
     "int8_per_channel_static": kInt8StaticChannelSym,
+    "autofit": kAutofit,
 }
 
 
@@ -140,6 +142,12 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
     # INT8 weight-only on MoE; linear stays unquantized (no `linear` field).
     "int8_per_channel_weight_only": QuantizationConfigArgs(
         moe=QuantSpec(weight=kInt8StaticChannelSym),
+    ),
+    # Calibration-free per-layer autofit on Linear. The threshold and bit
+    # ladder are read from VLLM_AUTOFIT_THRESHOLD / VLLM_AUTOFIT_BITS at
+    # weight-load time.
+    "autofit": QuantizationConfigArgs(
+        linear=QuantSpec(weight=kAutofit),
     ),
 }
 
