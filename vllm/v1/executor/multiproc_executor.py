@@ -651,6 +651,13 @@ class WorkerProc:
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
     ) -> UnreadyWorkerProcHandle:
+        # Debug hook: when set, swap the spawn executable so each worker is
+        # launched under a wrapper (e.g. compute-sanitizer). Used to attach
+        # CUDA tooling that can't follow into spawned children directly.
+        _wrapper = os.environ.get("VLLM_SPAWN_WRAPPER")
+        if _wrapper:
+            multiprocessing.set_executable(_wrapper)
+
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent
         ready_reader, ready_writer = context.Pipe(duplex=False)

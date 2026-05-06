@@ -263,16 +263,19 @@ class ExcludeRankRouting(RoutingStrategy):
                 f"world_size {world_size}."
             )
 
-        # Sample from the reduced range, then shift past the excluded block.
-        raw = torch.randint(
-            low=0,
-            high=num_experts - epr,
-            size=(num_tokens, top_k),
-            dtype=indices_type,
-            device=device,
+        # Use masked-score topk so per-row indices are guaranteed unique,
+        # matching real router output (torch.topk of distinct scores).
+        # The previous torch.randint approach sampled with replacement and
+        # produced ~26% of rows with duplicate top-k entries; downstream
+        # MoE kernels assume within-row uniqueness.
+        scores = torch.rand(
+            (num_tokens, num_experts), dtype=torch.float32, device=device
         )
         excluded_lo = self.excluded_rank * epr
-        topk_ids = torch.where(raw < excluded_lo, raw, raw + epr)
+        scores[:, excluded_lo : excluded_lo + epr] = float("-inf")
+        topk_ids = torch.topk(scores, top_k, dim=-1, largest=True, sorted=False)[1].to(
+            indices_type
+        )
 
         if logger.isEnabledFor(logging.DEBUG):
             per_rank = torch.bincount(
