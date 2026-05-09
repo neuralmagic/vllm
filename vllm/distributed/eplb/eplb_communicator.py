@@ -19,13 +19,10 @@ from torch.distributed import (
     batch_isend_irecv,
 )
 
+import vllm.distributed.nixl_utils as nixl_utils
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclDataTypeEnum,
-)
-from vllm.distributed.nixl_utils import (
-    NixlWrapper,
-    nixl_agent_config,
 )
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
@@ -41,7 +38,7 @@ logger = init_logger(__name__)
 
 def has_nixl() -> bool:
     """Whether the optional NIXL / RIXL package is available."""
-    return NixlWrapper is not None
+    return nixl_utils.NixlWrapper is not None
 
 
 class EplbCommunicator(ABC):
@@ -284,7 +281,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             if nixl_agent_config is not None
             else None
         )
-        self._nixl_wrapper = NixlWrapper(self._make_agent_name(), config)
+        self._nixl_wrapper = nixl_wrapper_cls(self._make_agent_name(), config)
         self._nixl_memory_type = "VRAM"
         # NIXL registration handles; deregistered in __del__.
         self._registered_descs: list[object] = []
