@@ -245,7 +245,8 @@ class NixlEplbCommunicator(EplbCommunicator):
             "NixlEplbCommunicator requires non-empty all_expert_weights."
         )
         assert expert_buffer, "NixlEplbCommunicator requires non-empty expert_buffer."
-        if NixlWrapper is None:
+        nixl_wrapper_cls = nixl_utils.NixlWrapper
+        if nixl_wrapper_cls is None:
             raise RuntimeError("NIXL/ RIXL is unavailable.")
 
         self._cpu_group = cpu_group
@@ -276,6 +277,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._expert_to_src_row: list[dict[int, int]] | None = None
         self._layer_idx: int | None = None
 
+        nixl_agent_config = nixl_utils.nixl_agent_config
         config = (
             nixl_agent_config(capture_telemetry=False)
             if nixl_agent_config is not None
