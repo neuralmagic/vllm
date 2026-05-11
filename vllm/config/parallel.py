@@ -106,7 +106,6 @@ class EPLBConfig:
     """
     Number of steps to delay the first EPLB rearrangement.
     Subsequent rearrangements use ``step_interval``.
-    Clamped to ``step_interval`` if larger.
     If None, defaults to ``step_interval``.
     """
 
@@ -116,8 +115,6 @@ class EPLBConfig:
             raise ValueError("Async EPLB is only supported with the default policy.")
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
-        if self.initial_delay is not None and self.initial_delay > self.step_interval:
-            self.initial_delay = self.step_interval
         return self
 
 
