@@ -102,12 +102,22 @@ class EPLBConfig:
     at the same cadence as log_balancedness_interval.
     """
 
+    initial_delay: int | None = Field(default=None, ge=0)
+    """
+    Number of steps to delay the first EPLB rearrangement.
+    Subsequent rearrangements use ``step_interval``.
+    Clamped to ``step_interval`` if larger.
+    If None, defaults to ``step_interval``.
+    """
+
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
         if self.use_async and self.policy != "default":
             raise ValueError("Async EPLB is only supported with the default policy.")
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
+        if self.initial_delay is not None and self.initial_delay > self.step_interval:
+            self.initial_delay = self.step_interval
         return self
 
 

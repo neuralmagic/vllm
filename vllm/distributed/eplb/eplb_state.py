@@ -435,8 +435,11 @@ class EplbState:
             device=self.device,
         )
 
-        eplb_step_interval = self.parallel_config.eplb_config.step_interval
-        self.expert_rearrangement_step_interval = eplb_step_interval
+        eplb_config = self.parallel_config.eplb_config
+        initial_delay = eplb_config.initial_delay
+        if initial_delay is None:
+            initial_delay = eplb_config.step_interval
+        self.expert_rearrangement_step_interval = initial_delay
 
         policy_type = self.parallel_config.eplb_config.policy
         self.policy = EPLB_POLICIES[policy_type]
@@ -624,6 +627,9 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
+            self.expert_rearrangement_step_interval = (
+                self.parallel_config.eplb_config.step_interval
+            )
             self.rearrange()
 
         self._update_layer_should_record(log_stats=log_stats)
@@ -971,6 +977,11 @@ class EplbState:
         eplb_state.add_model(
             model=model,
             model_config=model_config,
+        )
+        # Elastic EP re-join: skip the initial delay and use steady-state
+        # cadence since this is not a fresh start.
+        eplb_state.expert_rearrangement_step_interval = (
+            parallel_config.eplb_config.step_interval
         )
         eplb_state.num_valid_physical_experts = num_valid_physical_experts
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
