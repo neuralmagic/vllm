@@ -50,7 +50,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsPP,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -1253,7 +1257,32 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class DeepseekV4Model(nn.Module):
+class DeepseekV4Model(nn.Module, EagleModelMixin):
+    def _maybe_add_hidden_state(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        if layer_idx in self.aux_hidden_state_layers:
+            if residual is not None and post_mix is not None:
+                # Fold the layer output into the HC residual stream to get the
+                # complete post-layer 3D state, same as mhc_fused_post_pre does
+                # at the start of the next layer. See deepseek_v4_mtp.py:137
+                # for the MTP equivalent.
+                value = torch.ops.vllm.mhc_post(
+                    hidden_states, residual, post_mix, res_mix
+                )
+            else:
+                value = hidden_states
+            # Flatten (N, hc_mult, H) → (N, hc_mult * H), matching MTP's
+            # _mtp_hidden_buffer layout (deepseek_v4.py, forward()).
+            aux_hidden_states.append(value.flatten(1))
+        return aux_hidden_states
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1386,7 +1415,7 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1400,8 +1429,12 @@ class DeepseekV4Model(nn.Module):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, None)
+
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1409,6 +1442,14 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states,
+                layer_idx + 1,
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
             )
         else:
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
@@ -1429,6 +1470,9 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1617,7 +1661,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -1665,7 +1709,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
