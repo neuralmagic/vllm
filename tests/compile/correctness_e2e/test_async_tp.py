@@ -118,10 +118,10 @@ def test_async_tp_pass_nvfp4_correctness(num_gpus_available: int, monkeypatch):
         "2048",
         "--max-num-seqs",
         "8",
-        "--load-format",
-        "dummy",
-        "--hf-overrides",
-        json.dumps(NVFP4_HF_OVERRIDES),
+        # "--load-format",
+        # "dummy",
+        # "--hf-overrides",
+        # json.dumps(NVFP4_HF_OVERRIDES),
     ]
 
     compilation_config = {

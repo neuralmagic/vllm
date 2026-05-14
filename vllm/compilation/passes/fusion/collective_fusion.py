@@ -330,6 +330,155 @@ direct_register_custom_op(
 )
 
 
+def fused_flashinfer_fp4_matmul_reduce_scatter_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    reduce_op: str,
+    orig_scatter_dim: int,
+    scatter_dim_after_maybe_reshape: int,
+    group_name: str,
+    output_shape: list[int],
+    out_dtype: torch.dtype | None = None,
+    view_a_scale_as_fp8: bool = False,
+    use_8x4_sf_layout: bool = False,
+    backend: str = "cutlass",
+) -> torch.Tensor:
+    """Fake implementation for torch.compile meta mode."""
+    world_size = c10d._resolve_process_group(group_name).size()
+    result_shape = list(output_shape)
+    result_shape[orig_scatter_dim] //= world_size
+    return torch.empty(result_shape, dtype=out_dtype or torch.bfloat16, device=A.device)
+
+
+def fused_flashinfer_fp4_matmul_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    reduce_op: str,
+    orig_scatter_dim: int,
+    scatter_dim_after_maybe_reshape: int,
+    group_name: str,
+    output_shape: list[int],
+    out_dtype: torch.dtype | None = None,
+    view_a_scale_as_fp8: bool = False,
+    use_8x4_sf_layout: bool = False,
+    backend: str = "cutlass",
+) -> torch.Tensor:
+    """
+    Fused FP4 GEMM + reduce_scatter using pipelined communication.
+
+    Pipelined reduce-scatter approach:
+    1. Shard A on M dimension: A_i = A[i*M/ws:(i+1)*M/ws, :] for each rank i
+    2. Each rank computes C_i = A_i @ B_local (with corresponding A_scale chunks)
+    3. Use _pipelined_produce_and_all2all to pipeline communication:
+       - Each rank produces all M-shards for distribution
+       - All-to-all distributes shards to ranks
+    4. After all2all, each rank j gets [C_0j, C_1j, ..., C_wsj]
+       (all partial results for its shard)
+    5. Locally reduce-scatter: sum across shards and keep j's results
+    6. FP4 scales are cloned if alignment is needed for swizzled layout
+
+    This overlaps communication with computation for better performance.
+    """
+    assert orig_scatter_dim == 0 and scatter_dim_after_maybe_reshape == 0, (
+        "FP4 reduce_scatter currently only supports scatter_dim=0"
+    )
+    assert A.ndim == 2 and B.ndim == 2, "FP4 reduce_scatter expects 2D inputs"
+    assert A.is_contiguous(), "FP4 reduce_scatter expects contiguous A"
+
+    world_size = c10d._resolve_process_group(group_name).size()
+    assert A.shape[0] % world_size == 0, "M must be divisible by world_size"
+
+    M, K = A.shape
+    N = B.shape[1]
+
+    # Handle scale view conversion upfront
+    if view_a_scale_as_fp8:
+        A_scale = A_scale.view(torch.float8_e4m3fn)
+
+    # Check scale alignment for scattered chunks
+    # A_scale has shape [M/16, K/16], when scattered becomes [M/16/world_size, K/16]
+    # Swizzled layout requires M divisible by 128
+    M_scale_scattered = A_scale.shape[0] // world_size
+    aligned_m_scale = ((M_scale_scattered + 7) // 8) * 8
+    scale_needs_alignment = (M_scale_scattered % 8) != 0
+
+    # Clone and align scales if needed
+    # (mirrors _fused_scaled_matmul_reduce_scatter_impl alignment logic)
+    if scale_needs_alignment:
+        M_pad = aligned_m_scale - M_scale_scattered
+        M_total_pad = M_pad * world_size
+        A_scale = torch.nn.functional.pad(
+            A_scale.contiguous(), (0, 0, 0, M_total_pad), mode="constant", value=0
+        )
+        A = torch.nn.functional.pad(
+            A.contiguous(), (0, 0, 0, M_total_pad), mode="constant", value=0
+        )
+
+    # Shard A and A_scale on M dimension for pipelined processing
+    A_shards = A.chunk(world_size)
+    A_scale_shards = A_scale.chunk(world_size)
+
+    # Output buffer for all2all communication
+    output = torch.empty(
+        [A.shape[0], N],
+        dtype=out_dtype or torch.bfloat16,
+        device=A.device,
+    )
+
+    def fp4_producer(dst_rank: int, out_chunk: torch.Tensor) -> None:
+        """Producer for pipelined all2all.
+
+        Computes GEMM for A_shard[dst_rank] with full local B.
+        This chunk will be sent to dst_rank in the all2all.
+        """
+        _flashinfer_fp4_mm_out(
+            A_shards[dst_rank],
+            B,
+            scale_a=A_scale_shards[dst_rank],
+            scale_b=B_scale,
+            alpha=alpha,
+            out=out_chunk,
+            out_dtype=out_dtype,
+            use_8x4_sf_layout=use_8x4_sf_layout,
+            backend=backend,
+        )
+
+    # Pipelined all2all: each rank produces shards and distributes them
+    # After all2all, output is organized as [world_size*M_shard, N]
+    # where results from all ranks are concatenated along dim=0
+    torch.distributed._symmetric_memory._pipelined_produce_and_all2all(
+        fp4_producer, output, group_name, out_chunk_dim=orig_scatter_dim
+    )
+
+    # Reshape to [world_size, M_shard, N] to see all rank contributions
+    M_shard = M // world_size
+    output_reshaped = output.view(world_size, M_shard, N)
+
+    # Sum across all rank contributions (dim=0)
+    output = torch.sum(output_reshaped, dim=0)
+
+    # Remove padding if it was added
+    if scale_needs_alignment:
+        # Account for padding in the M_shard calculation
+        M_shard_original = output_shape[0] // world_size
+        output = output[:M_shard_original, :]
+
+    return output.contiguous()
+
+
+direct_register_custom_op(
+    op_name="fused_flashinfer_fp4_matmul_reduce_scatter",
+    op_func=fused_flashinfer_fp4_matmul_reduce_scatter,
+    fake_impl=fused_flashinfer_fp4_matmul_reduce_scatter_fake,
+)
+
+
 class BasePattern:
     def __init__(self, dtype: torch.dtype, device: str | None) -> None:
         self.dtype = dtype
@@ -897,6 +1046,116 @@ class FlashInferAllGatherFP4Pattern(
         return _replacement
 
 
+class FlashInferFP4ReduceScatterPattern(
+    BasePattern, VllmPatternReplacement[..., torch.Tensor]
+):
+    """
+    Pattern matcher for FP4 GEMM + reduce_scatter fusion.
+
+    Matches: flashinfer_mm_fp4 -> reduce_scatter
+    Replaces: fused_flashinfer_fp4_matmul_reduce_scatter
+
+    Key insight: Scales are used locally for GEMM, only BF16 outputs are reduced.
+    """
+
+    def __init__(
+        self,
+        dtype: torch.dtype,
+        device: str | None,
+        backend: str,
+        use_8x4_sf_layout: bool,
+        a_scale_view: str,
+    ) -> None:
+        super().__init__(dtype, device)
+        self.backend = backend
+        self.use_8x4_sf_layout = use_8x4_sf_layout
+        self.a_scale_view = a_scale_view
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        """Sample inputs for pattern matching."""
+        # A: [16, 16] full size (not sharded in reduce_scatter)
+        a_2d = torch.empty([16, 16], device=self.device, dtype=torch.uint8)
+        # B: [16, 8] weight (N dimension will be sharded)
+        b_2d = torch.empty([16, 8], device=self.device, dtype=torch.uint8)
+        # Scales in swizzled layout
+        a_scale = torch.empty([128, 4], device=self.device, dtype=torch.int32)
+        b_scale = torch.empty([4, 128], device=self.device, dtype=torch.uint8)
+        alpha = torch.empty([], device=self.device, dtype=torch.float32)
+        return [a_2d, b_2d, a_scale, b_scale, alpha]
+
+    @property
+    def pattern(self) -> Callable[..., torch.Tensor]:
+        """Pattern to match: FP4 GEMM -> reduce_scatter."""
+
+        def _pattern(
+            a_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            # Handle scale view conversion
+            a_scale_viewed = a_scale
+            if self.a_scale_view in ("float8", "float8_uint8"):
+                a_scale_viewed = torch.ops.aten.view.dtype(a_scale, torch.float8_e4m3fn)
+            if self.a_scale_view in ("uint8", "float8_uint8"):
+                a_scale_viewed = torch.ops.aten.view.dtype(a_scale_viewed, torch.uint8)
+
+            # FP4 GEMM
+            fp4_mm = torch.ops.vllm.flashinfer_mm_fp4.default(
+                a_2d,
+                b_2d,
+                a_scale_viewed,
+                b_scale,
+                alpha,
+                self.dtype,
+                self.use_8x4_sf_layout,
+                self.backend,
+            )
+
+            # Reduce-scatter on M dimension
+            return torch.ops.vllm.reduce_scatter.default(
+                fp4_mm,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Callable[..., torch.Tensor]:
+        """Replacement: fused FP4 GEMM+reduce_scatter."""
+
+        def _replacement(
+            a_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            output_shape = [a_2d.shape[0], b_2d.shape[1]]
+
+            return torch.ops.vllm.fused_flashinfer_fp4_matmul_reduce_scatter.default(
+                a_2d,
+                b_2d,
+                a_scale,
+                b_scale,
+                alpha,
+                "sum",  # reduce_op
+                0,  # orig_scatter_dim
+                0,  # scatter_dim_after_maybe_reshape
+                self.tp.device_group.group_name,
+                output_shape,
+                self.dtype,  # out_dtype
+                self.a_scale_view in ("float8", "float8_uint8"),  # view_a_scale_as_fp8
+                self.use_8x4_sf_layout,
+                self.backend,
+            )
+
+        return _replacement
+
+
 class AsyncTPPass(VllmFusionPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
@@ -956,11 +1215,30 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
                                 a_scale_view=a_scale_view,
                             )
                         )
-                # NVFP4 reduce-scatter does not need scale communication: FP4
-                # scales are consumed by the local GEMM and only BF16 partial
-                # outputs are reduced. Keep this PR scoped to the all-gather
-                # path; reduce-scatter needs a dedicated FP4 producer rather
-                # than the existing FP8-style helper.
+                # FP4 Reduce-Scatter patterns
+                # Scales consumed locally, only BF16 outputs reduced
+                for backend in ("cutlass", "cudnn"):
+                    for a_scale_view in ("float8_uint8", "uint8"):
+                        self.register(
+                            FlashInferFP4ReduceScatterPattern(
+                                self.model_dtype,
+                                self.device,
+                                backend,
+                                use_8x4_sf_layout=False,
+                                a_scale_view=a_scale_view,
+                            )
+                        )
+                for use_8x4_sf_layout in (False, True):
+                    for a_scale_view in ("float8",):
+                        self.register(
+                            FlashInferFP4ReduceScatterPattern(
+                                self.model_dtype,
+                                self.device,
+                                "trtllm",
+                                use_8x4_sf_layout=use_8x4_sf_layout,
+                                a_scale_view=a_scale_view,
+                            )
+                        )
 
         self.dump_patterns(config, self.pm_pass)
 
