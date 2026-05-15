@@ -129,62 +129,42 @@ class DistributionBasedRouting(RoutingStrategy):
         device: torch.device,
         indices_type: torch.dtype,
     ) -> torch.Tensor:
-        """Sample expert IDs based on the specified distribution."""
+        """Sample expert IDs based on the specified distribution.
+
+        All distributions sample without replacement so that each token
+        is routed to top_k *distinct* experts, matching real MoE semantics.
+        """
 
         if self.distribution == "uniform":
-            # Uniform random sampling
-            return torch.randint(
-                low=0,
-                high=num_experts,
-                size=(num_tokens, top_k),
-                dtype=indices_type,
-                device=device,
+            probs = torch.ones(
+                num_tokens, num_experts, device=device, dtype=torch.float32
             )
+            return torch.multinomial(
+                probs, num_samples=top_k, replacement=False
+            ).to(dtype=indices_type)
 
         elif self.distribution == "normal":
-            # For normal distribution, sample continuous values and map to
-            # expert IDs
-            continuous_samples = self._sample_continuous_distribution(
-                num_tokens, top_k, device
+            mean = self.distribution_params["mean"]
+            std = self.distribution_params["std"]
+            # Per-expert probabilities derived from a normal distribution
+            # centered on the expert index space.
+            expert_indices = torch.arange(
+                num_experts, device=device, dtype=torch.float32
             )
-
-            # Map continuous samples to expert indices
-            # Normalize to [0, 1] range and scale to [0, num_experts)
-            normalized_samples = self._normalize_samples(continuous_samples)
-            expert_ids = (normalized_samples * num_experts).long()
-            expert_ids = torch.clamp(expert_ids, 0, num_experts - 1)
-
-            return expert_ids.to(dtype=indices_type)
+            logits = -(
+                (expert_indices - mean) ** 2 / (2 * std**2)
+            )
+            # Expand to [num_tokens, num_experts] and convert to
+            # probabilities via softmax.
+            probs = torch.softmax(logits, dim=-1).unsqueeze(0).expand(
+                num_tokens, -1
+            )
+            return torch.multinomial(
+                probs, num_samples=top_k, replacement=False
+            ).to(dtype=indices_type)
 
         else:
             raise ValueError(f"Unsupported distribution: {self.distribution}")
-
-    def _sample_continuous_distribution(
-        self, num_tokens: int, top_k: int, device: torch.device
-    ) -> torch.Tensor:
-        """Sample from continuous distributions."""
-        shape = (num_tokens, top_k)
-
-        if self.distribution == "normal":
-            mean = self.distribution_params["mean"]
-            std = self.distribution_params["std"]
-            return torch.normal(mean, std, size=shape, device=device)
-
-        else:
-            raise ValueError(
-                f"Unsupported continuous distribution: {self.distribution}"
-            )
-
-    def _normalize_samples(self, samples: torch.Tensor) -> torch.Tensor:
-        """Normalize samples to [0, 1] range."""
-        if self.distribution == "normal":
-            # Use sigmoid to map normal distribution to [0, 1]
-            return torch.sigmoid(samples)
-
-        else:
-            raise ValueError(
-                f"Unsupported distribution for normalization: {self.distribution}"
-            )
 
     def _generate_weights(
         self, num_tokens: int, top_k: int, device: torch.device
@@ -199,13 +179,11 @@ class DistributionBasedRouting(RoutingStrategy):
             )
 
         elif self.distribution == "normal":
-            # For normal distribution, generate weights from the same
-            # distribution
-            continuous_weights = self._sample_continuous_distribution(
-                num_tokens, top_k, device
-            )
-            # Normalize to positive values and sum to 1
-            weights = torch.abs(continuous_weights)
+            mean = self.distribution_params["mean"]
+            std = self.distribution_params["std"]
+            raw = torch.normal(mean, std, size=(num_tokens, top_k),
+                               device=device)
+            weights = torch.abs(raw)
             weights = weights / weights.sum(dim=-1, keepdim=True)
             return weights
 
