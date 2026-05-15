@@ -392,13 +392,21 @@ class NixlConnectorScheduler:
                 return count, True
 
         # No remote prefill for this request.
-        if params is not None:
+        if (
+            self.vllm_config.kv_transfer_config is not None
+            and self.vllm_config.kv_transfer_config.is_kv_consumer
+        ):
+            reason = (
+                self._get_no_remote_kv_reason(params, num_computed_tokens)
+                if params is not None
+                else "kv_transfer_params not set on request"
+            )
             logger.info(
                 "Local prefill recompute triggered for request %s: "
                 "no remote KV available. Reason: %s. "
                 "Will compute %d prompt tokens locally.",
                 request.request_id,
-                self._get_no_remote_kv_reason(params, num_computed_tokens),
+                reason,
                 request.num_prompt_tokens - num_computed_tokens,
             )
         return 0, False

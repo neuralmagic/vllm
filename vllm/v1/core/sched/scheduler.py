@@ -610,20 +610,28 @@ class Scheduler(SchedulerInterface):
                         num_locally_computed = (
                             request.num_prompt_tokens - num_computed_tokens
                         )
-                        if num_locally_computed > 0 and self.connector is not None:
+                        if (
+                            num_locally_computed > 0
+                            and self.vllm_config.kv_transfer_config is not None
+                            and self.vllm_config.kv_transfer_config.is_kv_consumer
+                        ):
+                            kv_params_status = (
+                                "present" if request.kv_transfer_params
+                                else "absent"
+                            )
                             logger.info(
                                 "Local prefill compute on decode for "
                                 "request %s: %d / %d prompt tokens will be "
-                                "computed locally. Reason: "
-                                "local_cache_hit=%d, external_kv_transfer=%d"
-                                ", remaining=%d tokens not covered by cache "
-                                "or remote KV.",
+                                "computed locally. "
+                                "kv_transfer_params=%s, "
+                                "local_cache_hit=%d, "
+                                "external_kv_transfer=%d.",
                                 request.request_id,
                                 num_locally_computed,
                                 request.num_prompt_tokens,
+                                kv_params_status,
                                 num_new_local_computed_tokens,
                                 num_external_computed_tokens,
-                                num_locally_computed,
                             )
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
