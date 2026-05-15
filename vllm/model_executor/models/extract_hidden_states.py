@@ -340,6 +340,13 @@ class ExtractHiddenStatesModel(nn.Module):
         self.vllm_config = vllm_config
         self.hf_config = vllm_config.speculative_config.draft_model_config.hf_config
         self.hidden_size = vllm_config.model_config.get_hidden_size()
+        # DeepSeek-V4 auxiliary hidden states are flattened from
+        # (N, hc_mult, hidden_size) to (N, hc_mult * hidden_size).
+        target_hf_config = vllm_config.model_config.hf_config
+        if hasattr(target_hf_config, "compress_ratios") and hasattr(
+            target_hf_config, "hc_mult"
+        ):
+            self.hidden_size = self.hidden_size * target_hf_config.hc_mult
         self.target_num_hidden_layers = (
             vllm_config.model_config.get_total_num_hidden_layers()
         )

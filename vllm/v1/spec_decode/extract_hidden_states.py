@@ -59,6 +59,13 @@ class ExtractHiddenStatesProposer:
             )
         self.num_hidden_states = len(layer_ids)
         self.hidden_size = vllm_config.model_config.get_hidden_size()
+        # DeepSeek-V4 auxiliary hidden states are flattened from
+        # (N, hc_mult, hidden_size) to (N, hc_mult * hidden_size).
+        target_hf_config = vllm_config.model_config.hf_config
+        if hasattr(target_hf_config, "compress_ratios") and hasattr(
+            target_hf_config, "hc_mult"
+        ):
+            self.hidden_size = self.hidden_size * target_hf_config.hc_mult
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.num_hidden_states, self.hidden_size),
             dtype=self.dtype,
