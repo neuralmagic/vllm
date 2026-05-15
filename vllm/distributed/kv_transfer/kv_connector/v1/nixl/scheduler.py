@@ -285,6 +285,34 @@ class NixlConnectorScheduler:
             request.max_tokens = 1
             params["_p_side_truncated"] = True
 
+    def _get_no_remote_kv_reason(
+        self, params: dict, num_computed_tokens: int
+    ) -> str:
+        """Return a human-readable reason why remote KV pull was skipped."""
+        if not params.get("do_remote_prefill") and not params.get("do_remote_decode"):
+            return "neither do_remote_prefill nor do_remote_decode is set"
+        if params.get("do_remote_decode"):
+            if not params.get("remote_block_ids"):
+                return "do_remote_decode set but remote_block_ids missing"
+            missing = [
+                p
+                for p in (
+                    "remote_engine_id",
+                    "remote_request_id",
+                    "remote_host",
+                    "remote_port",
+                )
+                if p not in params
+            ]
+            if missing:
+                return f"do_remote_decode set but missing params: {missing}"
+            remote_num_tokens = params.get("remote_num_tokens") or 0
+            return (
+                f"remote_num_tokens ({remote_num_tokens}) does not exceed "
+                f"num_computed_tokens ({num_computed_tokens})"
+            )
+        return "do_remote_prefill set but no tokens to pull"
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int, bool]:
@@ -351,8 +379,11 @@ class NixlConnectorScheduler:
                     self.kv_recompute_threshold > 0
                     and count < self.kv_recompute_threshold
                 ):
-                    logger.debug(
-                        "Skipping remote pull for %s: %d remote tokens < threshold %d",
+                    logger.info(
+                        "Local prefill recompute triggered for request %s: "
+                        "remote token count (%d) below "
+                        "kv_recompute_threshold (%d). Skipping remote KV "
+                        "pull, will recompute locally.",
                         request.request_id,
                         count,
                         self.kv_recompute_threshold,
@@ -361,6 +392,15 @@ class NixlConnectorScheduler:
                 return count, True
 
         # No remote prefill for this request.
+        if params is not None:
+            logger.info(
+                "Local prefill recompute triggered for request %s: "
+                "no remote KV available. Reason: %s. "
+                "Will compute %d prompt tokens locally.",
+                request.request_id,
+                self._get_no_remote_kv_reason(params, num_computed_tokens),
+                request.num_prompt_tokens - num_computed_tokens,
+            )
         return 0, False
 
     def update_state_after_alloc(

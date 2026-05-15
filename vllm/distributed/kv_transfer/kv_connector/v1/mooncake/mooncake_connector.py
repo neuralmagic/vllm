@@ -583,6 +583,15 @@ class MooncakeConnectorScheduler:
                 return count, True
 
         # No remote prefill for this request.
+        if params.get("do_remote_prefill"):
+            logger.info(
+                "Local prefill recompute triggered for request %s: "
+                "do_remote_prefill set but no tokens to pull "
+                "(num_computed_tokens=%d already covers prompt). "
+                "Will compute prompt tokens locally.",
+                request.request_id,
+                num_computed_tokens,
+            )
         return 0, False
 
     def update_state_after_alloc(

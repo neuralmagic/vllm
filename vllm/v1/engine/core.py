@@ -339,8 +339,11 @@ class EngineCore:
             not self.scheduler.get_kv_connector()
         ):
             logger.warning(
-                "Got kv_transfer_params, but no KVConnector found. "
-                "Disabling KVTransfer for this request."
+                "Local prefill recompute will be used for request %s: "
+                "got kv_transfer_params but no KVConnector is configured. "
+                "Reason: KVConnector not found, cannot receive remote KV "
+                "caches. All prompt tokens will be computed locally.",
+                request.request_id,
             )
 
         self.scheduler.add_request(request)
