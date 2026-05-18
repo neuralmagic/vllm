@@ -53,6 +53,9 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.deepep_timing import (
+    get_deepep_timing_collector,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     extract_routed_experts_for_current_batch,
     free_routing_buffers,
@@ -226,6 +229,14 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _drain_deepep_stats():
+    """Drain timing stats from the DeepEP collector (returns None if disabled)."""
+    collector = get_deepep_timing_collector()
+    if collector.enabled:
+        return collector.finish_step()
+    return None
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -4427,6 +4438,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts_dict=routed_experts_dict,
+                deepep_stats=_drain_deepep_stats(),
             )
 
         if not self.use_async_scheduling:

@@ -159,6 +159,18 @@ class MultiModalCacheStats(BaseCacheStats):
 
 
 @dataclass
+class DeepEPStats:
+    """Per-step timing stats for DeepEP all2all and MoE expert compute."""
+
+    dispatch_time_s: float = 0.0
+    combine_time_s: float = 0.0
+    expert_compute_time_s: float = 0.0
+    dispatch_tokens: int = 0
+    combine_tokens: int = 0
+    mode: str = ""  # "ht" or "ll"
+
+
+@dataclass
 class KVCacheEvictionEvent:
     """Single KV cache block eviction sample."""
 
@@ -196,6 +208,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    deepep_stats: DeepEPStats | None = None
 
 
 @dataclass

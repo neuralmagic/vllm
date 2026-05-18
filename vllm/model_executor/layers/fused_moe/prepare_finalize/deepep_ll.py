@@ -9,6 +9,9 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.deepep_timing import (
+    get_deepep_timing_collector,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
@@ -97,6 +100,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.buffer = buffer
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+
+        get_deepep_timing_collector().enable(mode="ll")
+
         # The dispatch function returns a handle that the combine function
         # requires. We store the handle here so it is available to the
         # combine function.
@@ -289,6 +295,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+
+        collector = get_deepep_timing_collector()
+        dispatch_start = dispatch_end = None
+        if collector.enabled:
+            dispatch_start = torch.cuda.Event(enable_timing=True)
+            dispatch_start.record()
+
         (
             expert_x,
             expert_num_tokens,
@@ -312,6 +325,14 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=False,
             return_recv_hook=True,
         )
+
+        if dispatch_start is not None:
+            dispatch_end = torch.cuda.Event(enable_timing=True)
+            dispatch_end.record()
+            collector.record_dispatch(
+                dispatch_start, dispatch_end, a1.shape[0]
+            )
+
         self.handles[a2a_idx] = handle
 
         return (
@@ -396,6 +417,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         combine_topk_ids = self._map_global_to_physical_ids(topk_ids)
         # TODO (varun) : Enable zero copy mode
         dbo_maybe_run_recv_hook()
+
+        collector = get_deepep_timing_collector()
+        combine_start = combine_end = None
+        if collector.enabled:
+            combine_start = torch.cuda.Event(enable_timing=True)
+            combine_start.record()
+
         _, _, recv_hook = self.buffer.low_latency_combine(
             fused_expert_output,
             combine_topk_ids,
@@ -406,6 +434,13 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             return_recv_hook=do_recv_hook,
             out=output,
         )
+
+        if combine_start is not None:
+            combine_end = torch.cuda.Event(enable_timing=True)
+            combine_end.record()
+            collector.record_combine(
+                combine_start, combine_end, fused_expert_output.shape[0]
+            )
 
         return recv_hook, lambda: None
 

@@ -7,6 +7,9 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.deepep_timing import (
+    get_deepep_timing_collector,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
@@ -59,6 +62,8 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.dp_size = dp_size
         self.rank_expert_offset = rank_expert_offset
         self.async_prepare = True
+
+        get_deepep_timing_collector().enable(mode="ht")
 
         # The dispatch function returns a handle that the combine function
         # requires. Under DBO microbatching we must track one handle per
@@ -136,6 +141,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if has_scales:
             token_data = (tokens, token_scales)
 
+        collector = get_deepep_timing_collector()
+        dispatch_start = dispatch_end = None
+        if collector.enabled:
+            dispatch_start = torch.cuda.Event(enable_timing=True)
+            dispatch_start.record()
+
         (
             token_data,
             expert_topk_ids,
@@ -160,6 +171,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=self.async_prepare and not dbo_enabled(),
             allocate_on_comm_stream=False,
         )
+
+        if dispatch_start is not None:
+            dispatch_end = torch.cuda.Event(enable_timing=True)
+            dispatch_end.record()
+            collector.record_dispatch(
+                dispatch_start, dispatch_end, tokens.shape[0]
+            )
 
         # record the handle for this ubatch
         a2a_idx = dbo_current_ubatch_id()
@@ -364,6 +382,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
+
+        collector = get_deepep_timing_collector()
+        combine_start = combine_end = None
+        if collector.enabled:
+            combine_start = torch.cuda.Event(enable_timing=True)
+            combine_start.record()
+
         combined_x, _, event = self.buffer.combine(
             # HT combine only supports BF16
             x=fused_expert_output,
@@ -374,6 +399,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             async_finish=do_async and not dbo_enabled(),
             allocate_on_comm_stream=False,
         )
+
+        if combine_start is not None:
+            combine_end = torch.cuda.Event(enable_timing=True)
+            combine_end.record()
+            collector.record_combine(
+                combine_start, combine_end, fused_expert_output.shape[0]
+            )
 
         dbo_switch_to_compute()
 

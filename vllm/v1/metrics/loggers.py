@@ -22,6 +22,7 @@ from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     CachingMetrics,
+    DeepEPStats,
     IterationStats,
     MultiModalCacheStats,
     PromptTokenStats,
@@ -401,6 +402,77 @@ class PerEngineStatLoggerAdapter(AggregateStatLoggerBase):
             per_engine_stat_logger.log_engine_initialized()
 
 
+class DeepEPMetricsProm:
+    """Prometheus counters for DeepEP all2all and MoE expert compute timing."""
+
+    _counter_cls = Counter
+
+    def __init__(
+        self,
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        deepep_labelnames = labelnames + ["mode"]
+
+        counter_dispatch_duration = self._counter_cls(
+            name="vllm:deepep_dispatch_duration_seconds_total",
+            documentation="Cumulative GPU seconds in DeepEP dispatch.",
+            labelnames=deepep_labelnames,
+        )
+        counter_combine_duration = self._counter_cls(
+            name="vllm:deepep_combine_duration_seconds_total",
+            documentation="Cumulative GPU seconds in DeepEP combine.",
+            labelnames=deepep_labelnames,
+        )
+        counter_dispatch_tokens = self._counter_cls(
+            name="vllm:deepep_dispatch_tokens_total",
+            documentation="Total tokens dispatched via DeepEP.",
+            labelnames=deepep_labelnames,
+        )
+        counter_combine_tokens = self._counter_cls(
+            name="vllm:deepep_combine_tokens_total",
+            documentation="Total tokens combined via DeepEP.",
+            labelnames=deepep_labelnames,
+        )
+
+        self._deepep_counters: dict[str, dict[int, dict[str, Counter]]] = {}
+        for mode in ("ht", "ll"):
+            mode_counters: dict[int, dict[str, Counter]] = {}
+            for idx, labelvalues in per_engine_labelvalues.items():
+                lv = list(labelvalues) + [mode]
+                mode_counters[idx] = {
+                    "dispatch_duration": counter_dispatch_duration.labels(*lv),
+                    "combine_duration": counter_combine_duration.labels(*lv),
+                    "dispatch_tokens": counter_dispatch_tokens.labels(*lv),
+                    "combine_tokens": counter_combine_tokens.labels(*lv),
+                }
+            self._deepep_counters[mode] = mode_counters
+
+        counter_expert_compute = self._counter_cls(
+            name="vllm:moe_expert_compute_duration_seconds_total",
+            documentation="Cumulative MoE expert kernel GPU time.",
+            labelnames=labelnames,
+        )
+        self.counter_expert_compute = create_metric_per_engine(
+            counter_expert_compute, per_engine_labelvalues
+        )
+
+    def observe(self, deepep_stats: DeepEPStats, engine_idx: int = 0):
+        mode = deepep_stats.mode
+        if mode in self._deepep_counters:
+            counters = self._deepep_counters[mode].get(engine_idx)
+            if counters:
+                counters["dispatch_duration"].inc(deepep_stats.dispatch_time_s)
+                counters["combine_duration"].inc(deepep_stats.combine_time_s)
+                counters["dispatch_tokens"].inc(deepep_stats.dispatch_tokens)
+                counters["combine_tokens"].inc(deepep_stats.combine_tokens)
+
+        if deepep_stats.expert_compute_time_s > 0:
+            self.counter_expert_compute[engine_idx].inc(
+                deepep_stats.expert_compute_time_s
+            )
+
+
 class PrometheusStatLogger(AggregateStatLoggerBase):
     _gauge_cls = Gauge
     _counter_cls = Counter
@@ -443,6 +515,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
+        )
+        self.deepep_metrics_prom = DeepEPMetricsProm(
+            labelnames, per_engine_labelvalues
         )
 
         #
@@ -1107,6 +1182,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             if scheduler_stats.perf_stats is not None:
                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
+
+            if scheduler_stats.deepep_stats is not None:
+                self.deepep_metrics_prom.observe(
+                    scheduler_stats.deepep_stats, engine_idx
+                )
 
             if (
                 self.kv_cache_metrics_enabled

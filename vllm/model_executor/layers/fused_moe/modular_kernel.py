@@ -25,6 +25,9 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+from vllm.model_executor.layers.fused_moe.deepep_timing import (
+    get_deepep_timing_collector,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     disable_inplace,
@@ -1407,6 +1410,12 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
         )
 
+        collector = get_deepep_timing_collector()
+        expert_start = expert_end = None
+        if collector.enabled:
+            expert_start = torch.cuda.Event(enable_timing=True)
+            expert_start.record()
+
         fused_out = self._fused_experts(
             in_dtype=hidden_states.dtype,
             a1q=a1q,
@@ -1423,6 +1432,13 @@ class FusedMoEKernelModularImpl:
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
         )
+
+        if expert_start is not None:
+            expert_end = torch.cuda.Event(enable_timing=True)
+            expert_end.record()
+            collector.record_expert_compute(
+                expert_start, expert_end, hidden_states.shape[0]
+            )
 
         return self._finalize(
             output,
