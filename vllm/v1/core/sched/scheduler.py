@@ -607,32 +607,6 @@ class Scheduler(SchedulerInterface):
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats is not None:
                         assert num_computed_tokens <= request.num_prompt_tokens
-                        num_locally_computed = (
-                            request.num_prompt_tokens - num_computed_tokens
-                        )
-                        if (
-                            num_locally_computed > 0
-                            and self.vllm_config.kv_transfer_config is not None
-                            and self.vllm_config.kv_transfer_config.is_kv_consumer
-                        ):
-                            kv_params_status = (
-                                "present" if request.kv_transfer_params
-                                else "absent"
-                            )
-                            logger.info(
-                                "Local prefill compute on decode for "
-                                "request %s: %d / %d prompt tokens will be "
-                                "computed locally. "
-                                "kv_transfer_params=%s, "
-                                "local_cache_hit=%d, "
-                                "external_kv_transfer=%d.",
-                                request.request_id,
-                                num_locally_computed,
-                                request.num_prompt_tokens,
-                                kv_params_status,
-                                num_new_local_computed_tokens,
-                                num_external_computed_tokens,
-                            )
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens,
@@ -1527,8 +1501,11 @@ class Scheduler(SchedulerInterface):
 
         if (
             stats := self.make_stats(
-                spec_decoding_stats, kv_connector_stats, cudagraph_stats,
-                perf_stats, deepep_stats
+                spec_decoding_stats,
+                kv_connector_stats,
+                cudagraph_stats,
+                perf_stats,
+                deepep_stats,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2004,15 +1981,6 @@ class Scheduler(SchedulerInterface):
         if request.request_id in self.failed_recving_kv_req_ids:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
-            logger.info(
-                "Local prefill recompute: promoting request %s from "
-                "WAITING_FOR_REMOTE_KVS back to WAITING. "
-                "Reason: async KV transfer failed. "
-                "Valid computed tokens: %d / %d total tokens.",
-                request.request_id,
-                request.num_computed_tokens,
-                request.num_tokens,
-            )
             if request.num_computed_tokens:
                 # Cache any valid computed tokens.
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
@@ -2179,19 +2147,6 @@ class Scheduler(SchedulerInterface):
                 )
                 total_affected_tokens += num_affected_tokens
 
-                logger.info(
-                    "Local prefill recompute triggered for request %s: "
-                    "KV cache load failed at block index %d (block_id=%d). "
-                    "Recomputing %d tokens (truncated from %d to %d "
-                    "computed tokens).",
-                    req_id,
-                    idx,
-                    block_id,
-                    num_affected_tokens,
-                    req_num_computed_tokens,
-                    request.num_computed_tokens,
-                )
-
                 # collect invalid block and all downstream dependent blocks
                 if evict_blocks:
                     blocks_to_evict.update(req_block_ids[idx:])
@@ -2272,16 +2227,10 @@ class Scheduler(SchedulerInterface):
             return all_failed_req_ids
 
         logger.warning(
-            "Recovered from KV load failure via local prefill recompute: "
-            "%d request(s) rescheduled (%d tokens affected). "
-            "Reason: remote KV cache transfer failed "
-            "(async_failures=%d, sync_failures=%d). "
-            "Affected request IDs: %s",
+            "Recovered from KV load failure: "
+            "%d request(s) rescheduled (%d tokens affected).",
             total_failed_requests,
             total_failed_tokens,
-            len(async_failed_req_ids),
-            len(sync_failed_req_ids),
-            async_failed_req_ids | sync_failed_req_ids,
         )
 
         # Mark async requests with KV load failures for retry once loading completes
