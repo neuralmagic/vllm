@@ -1413,7 +1413,7 @@ class FusedMoEKernelModularImpl:
         collector = get_deepep_timing_collector()
         expert_start = expert_end = None
         if collector.enabled:
-            expert_start = torch.cuda.Event(enable_timing=True)
+            expert_start, expert_end = collector.get_event_pair()
             expert_start.record()
 
         fused_out = self._fused_experts(
@@ -1434,10 +1434,10 @@ class FusedMoEKernelModularImpl:
         )
 
         if expert_start is not None:
-            expert_end = torch.cuda.Event(enable_timing=True)
             expert_end.record()
             collector.record_expert_compute(
-                expert_start, expert_end, hidden_states.shape[0]
+                expert_start, expert_end,
+                self.prepare_finalize.timing_layer_idx,
             )
 
         return self._finalize(

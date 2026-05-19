@@ -101,7 +101,11 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
 
-        get_deepep_timing_collector().enable(mode="ll")
+        self.timing_layer_idx: int = -1
+        if envs.VLLM_MOE_TIMING_ENABLED:
+            collector = get_deepep_timing_collector()
+            collector.enable(mode="ll")
+            self.timing_layer_idx = collector.register_layer()
 
         # The dispatch function returns a handle that the combine function
         # requires. We store the handle here so it is available to the
@@ -299,7 +303,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         collector = get_deepep_timing_collector()
         dispatch_start = dispatch_end = None
         if collector.enabled:
-            dispatch_start = torch.cuda.Event(enable_timing=True)
+            dispatch_start, dispatch_end = collector.get_event_pair()
             dispatch_start.record()
 
         (
@@ -327,10 +331,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         if dispatch_start is not None:
-            dispatch_end = torch.cuda.Event(enable_timing=True)
             dispatch_end.record()
             collector.record_dispatch(
-                dispatch_start, dispatch_end, a1.shape[0]
+                dispatch_start, dispatch_end, self.timing_layer_idx
             )
 
         self.handles[a2a_idx] = handle
@@ -421,7 +424,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         collector = get_deepep_timing_collector()
         combine_start = combine_end = None
         if collector.enabled:
-            combine_start = torch.cuda.Event(enable_timing=True)
+            combine_start, combine_end = collector.get_event_pair()
             combine_start.record()
 
         _, _, recv_hook = self.buffer.low_latency_combine(
@@ -436,10 +439,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         if combine_start is not None:
-            combine_end = torch.cuda.Event(enable_timing=True)
             combine_end.record()
             collector.record_combine(
-                combine_start, combine_end, fused_expert_output.shape[0]
+                combine_start, combine_end, self.timing_layer_idx
             )
 
         return recv_hook, lambda: None

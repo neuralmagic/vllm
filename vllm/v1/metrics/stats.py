@@ -160,13 +160,11 @@ class MultiModalCacheStats(BaseCacheStats):
 
 @dataclass
 class DeepEPStats:
-    """Per-step timing stats for DeepEP all2all and MoE expert compute."""
+    """Per-step per-layer timing stats for DeepEP and MoE expert compute."""
 
-    dispatch_time_s: float = 0.0
-    combine_time_s: float = 0.0
-    expert_compute_time_s: float = 0.0
-    dispatch_tokens: int = 0
-    combine_tokens: int = 0
+    dispatch_times_s: dict[int, float] = field(default_factory=dict)
+    combine_times_s: dict[int, float] = field(default_factory=dict)
+    expert_compute_times_s: dict[int, float] = field(default_factory=dict)
     mode: str = ""  # "ht" or "ll"
 
 

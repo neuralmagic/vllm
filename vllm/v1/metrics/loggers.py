@@ -403,7 +403,7 @@ class PerEngineStatLoggerAdapter(AggregateStatLoggerBase):
 
 
 class DeepEPMetricsProm:
-    """Prometheus counters for DeepEP all2all and MoE expert compute timing."""
+    """Per-layer Prometheus counters for DeepEP dispatch/combine and expert compute."""
 
     _counter_cls = Counter
 
@@ -412,65 +412,36 @@ class DeepEPMetricsProm:
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
     ):
-        deepep_labelnames = labelnames + ["mode"]
+        deepep_labelnames = [*labelnames, "mode", "layer"]
 
-        counter_dispatch_duration = self._counter_cls(
+        self.counter_dispatch = self._counter_cls(
             name="vllm:deepep_dispatch_duration_seconds_total",
-            documentation="Cumulative GPU seconds in DeepEP dispatch.",
+            documentation="Per-layer DeepEP dispatch duration.",
             labelnames=deepep_labelnames,
         )
-        counter_combine_duration = self._counter_cls(
+        self.counter_combine = self._counter_cls(
             name="vllm:deepep_combine_duration_seconds_total",
-            documentation="Cumulative GPU seconds in DeepEP combine.",
+            documentation="Per-layer DeepEP combine duration.",
             labelnames=deepep_labelnames,
         )
-        counter_dispatch_tokens = self._counter_cls(
-            name="vllm:deepep_dispatch_tokens_total",
-            documentation="Total tokens dispatched via DeepEP.",
-            labelnames=deepep_labelnames,
-        )
-        counter_combine_tokens = self._counter_cls(
-            name="vllm:deepep_combine_tokens_total",
-            documentation="Total tokens combined via DeepEP.",
-            labelnames=deepep_labelnames,
-        )
-
-        self._deepep_counters: dict[str, dict[int, dict[str, Counter]]] = {}
-        for mode in ("ht", "ll"):
-            mode_counters: dict[int, dict[str, Counter]] = {}
-            for idx, labelvalues in per_engine_labelvalues.items():
-                lv = list(labelvalues) + [mode]
-                mode_counters[idx] = {
-                    "dispatch_duration": counter_dispatch_duration.labels(*lv),
-                    "combine_duration": counter_combine_duration.labels(*lv),
-                    "dispatch_tokens": counter_dispatch_tokens.labels(*lv),
-                    "combine_tokens": counter_combine_tokens.labels(*lv),
-                }
-            self._deepep_counters[mode] = mode_counters
-
-        counter_expert_compute = self._counter_cls(
+        self.counter_expert_compute = self._counter_cls(
             name="vllm:moe_expert_compute_duration_seconds_total",
-            documentation="Cumulative MoE expert kernel GPU time.",
-            labelnames=labelnames,
+            documentation="Per-layer MoE expert compute duration.",
+            labelnames=deepep_labelnames,
         )
-        self.counter_expert_compute = create_metric_per_engine(
-            counter_expert_compute, per_engine_labelvalues
-        )
+        self._per_engine_labelvalues = per_engine_labelvalues
 
     def observe(self, deepep_stats: DeepEPStats, engine_idx: int = 0):
+        lv = self._per_engine_labelvalues[engine_idx]
         mode = deepep_stats.mode
-        if mode in self._deepep_counters:
-            counters = self._deepep_counters[mode].get(engine_idx)
-            if counters:
-                counters["dispatch_duration"].inc(deepep_stats.dispatch_time_s)
-                counters["combine_duration"].inc(deepep_stats.combine_time_s)
-                counters["dispatch_tokens"].inc(deepep_stats.dispatch_tokens)
-                counters["combine_tokens"].inc(deepep_stats.combine_tokens)
-
-        if deepep_stats.expert_compute_time_s > 0:
-            self.counter_expert_compute[engine_idx].inc(
-                deepep_stats.expert_compute_time_s
-            )
+        for layer_idx, t in deepep_stats.dispatch_times_s.items():
+            self.counter_dispatch.labels(*lv, mode, str(layer_idx)).inc(t)
+        for layer_idx, t in deepep_stats.combine_times_s.items():
+            self.counter_combine.labels(*lv, mode, str(layer_idx)).inc(t)
+        for layer_idx, t in deepep_stats.expert_compute_times_s.items():
+            self.counter_expert_compute.labels(
+                *lv, mode, str(layer_idx)
+            ).inc(t)
 
 
 class PrometheusStatLogger(AggregateStatLoggerBase):

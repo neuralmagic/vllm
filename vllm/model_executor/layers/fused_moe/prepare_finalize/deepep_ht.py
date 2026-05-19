@@ -5,6 +5,7 @@ from collections.abc import Callable
 import deep_ep
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.deepep_timing import (
@@ -63,7 +64,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.rank_expert_offset = rank_expert_offset
         self.async_prepare = True
 
-        get_deepep_timing_collector().enable(mode="ht")
+        self.timing_layer_idx: int = -1
+        if envs.VLLM_MOE_TIMING_ENABLED:
+            collector = get_deepep_timing_collector()
+            collector.enable(mode="ht")
+            self.timing_layer_idx = collector.register_layer()
 
         # The dispatch function returns a handle that the combine function
         # requires. Under DBO microbatching we must track one handle per
@@ -144,7 +149,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         collector = get_deepep_timing_collector()
         dispatch_start = dispatch_end = None
         if collector.enabled:
-            dispatch_start = torch.cuda.Event(enable_timing=True)
+            dispatch_start, dispatch_end = collector.get_event_pair()
             dispatch_start.record()
 
         (
@@ -163,8 +168,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             num_tokens_per_expert=dispatch_expert_num_tokens,
             topk_idx=rank_topk_ids,
             topk_weights=rank_topk_weights,
-            # expert_alignment rounds the number of tokens per expert
-            # to this value.
             expert_alignment=1,
             config=self._get_dispatch_config(),
             previous_event=previous_event,
@@ -173,10 +176,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         if dispatch_start is not None:
-            dispatch_end = torch.cuda.Event(enable_timing=True)
             dispatch_end.record()
             collector.record_dispatch(
-                dispatch_start, dispatch_end, tokens.shape[0]
+                dispatch_start, dispatch_end, self.timing_layer_idx
             )
 
         # record the handle for this ubatch
@@ -386,11 +388,10 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         collector = get_deepep_timing_collector()
         combine_start = combine_end = None
         if collector.enabled:
-            combine_start = torch.cuda.Event(enable_timing=True)
+            combine_start, combine_end = collector.get_event_pair()
             combine_start.record()
 
         combined_x, _, event = self.buffer.combine(
-            # HT combine only supports BF16
             x=fused_expert_output,
             handle=handle,
             topk_weights=None,
@@ -401,10 +402,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         if combine_start is not None:
-            combine_end = torch.cuda.Event(enable_timing=True)
             combine_end.record()
             collector.record_combine(
-                combine_start, combine_end, fused_expert_output.shape[0]
+                combine_start, combine_end, self.timing_layer_idx
             )
 
         dbo_switch_to_compute()
