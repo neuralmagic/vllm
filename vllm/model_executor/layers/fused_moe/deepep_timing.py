@@ -53,14 +53,15 @@ class DeepEPTimingCollector:
         self._next_layer_idx = 0
 
     def enable(self, mode: str = ""):
-        self._enabled = True
+        if not self._enabled:
+            self._enabled = True
+            logger.info(
+                "MoE timing enabled (mode=%s). Metrics are only produced "
+                "when CUDA graphs are disabled (--enforce-eager or "
+                "-cc.cudagraph_mode=none).",
+                mode,
+            )
         self._mode = mode
-        logger.info(
-            "MoE timing enabled (mode=%s). Metrics are only produced when "
-            "CUDA graphs are disabled (--enforce-eager or "
-            "-cc.cudagraph_mode=none).",
-            mode,
-        )
 
     @property
     def enabled(self) -> bool:
@@ -126,10 +127,17 @@ class DeepEPTimingCollector:
         if not self._queue:
             return None
 
-        return self._drain_queue()
+        result = self._drain_queue()
+        if result is None and len(self._queue) > 10:
+            logger.warning_once(
+                "MoE timing: event queue has %d undrained batches. "
+                "Events may not be completing (queue never drains).",
+                len(self._queue),
+            )
+        return result
 
     def _drain_queue(self) -> DeepEPStats | None:
-        """Try to read completed event batches from the front of the queue."""
+        """Read completed event batches from the front of the queue."""
         dispatch_times: dict[int, float] = {}
         combine_times: dict[int, float] = {}
         expert_times: dict[int, float] = {}
