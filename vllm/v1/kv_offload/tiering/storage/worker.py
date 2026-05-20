@@ -68,6 +68,7 @@ class StorageHandler:
         return True
 
     def _async_store(self, file_path: Path, block_id: int) -> bool:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = file_path.with_suffix(".tmp")
         with open(tmp_file, mode="w+b") as f:
             self.primary_kv[block_id].tofile(f)
