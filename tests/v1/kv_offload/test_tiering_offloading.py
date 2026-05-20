@@ -23,12 +23,13 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     make_offload_key,
 )
-from vllm.v1.kv_offload.tiering.base import JobMetadata
+from vllm.v1.kv_offload.tiering.base import JobMetadata, PrimaryTierMetadata
 from vllm.v1.kv_offload.tiering.example import ExampleSecondaryTier
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
+from vllm.v1.kv_offload.tiering.storage.storage_tier import StorageSecondaryTier
 
 _CTX = ReqContext(req_id="test")
 _MOCK_VLLM_CONFIG = MagicMock()
@@ -559,6 +560,175 @@ class TestTieringOffloadingWithoutSecondaryTiers:
         manager.complete_store(blocks, _CTX, success=True)
 
         assert count_hits(manager, blocks) == 3
+
+
+class TestTieringOffloadingWithStorageTier:
+    """E2E tests for a GPU <-> CPU <-> Storage tier configuration."""
+
+    @staticmethod
+    def _make_manager(tmp_path, primary_blocks):
+        mock_region = _mock_mmap_region(primary_blocks)
+        primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=primary_blocks, mmap_region=mock_region
+        )
+
+        vllm_config = MagicMock()
+        vllm_config.compute_hash.return_value = "test-storage-tier"
+        kv_cache_config = MagicMock()
+
+        kv_view = primary_tier.get_kv_memoryview()
+        primary_tier_meta = PrimaryTierMetadata(
+            total_bytes=kv_view.nbytes,
+            num_blocks=primary_blocks,
+            kv_view=kv_view,
+        )
+
+        storage_tier = StorageSecondaryTier(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            primary_tier_meta=primary_tier_meta,
+            storage_root_path=str(tmp_path),
+            max_storage_size_gb=1,
+        )
+
+        manager = TieringOffloadingManager(
+            primary_tier=primary_tier,
+            secondary_tiers=[storage_tier],
+        )
+        return manager, primary_tier, storage_tier
+
+    @staticmethod
+    def _wait_and_drain_jobs(
+        manager: TieringOffloadingManager, storage_tier: StorageSecondaryTier
+    ) -> None:
+        job_ids = set(storage_tier.handler.job_meta.keys())
+        if job_ids:
+            storage_tier.handler.wait(job_ids)
+        list(manager.take_events())
+
+    @staticmethod
+    def _install_store_impl(monkeypatch, storage_tier: StorageSecondaryTier) -> None:
+        original_async_store = storage_tier.handler._async_store
+
+        def _store_with_parent_mkdir(file_path, block_id):
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            return original_async_store(file_path, block_id)
+
+        monkeypatch.setattr(
+            storage_tier.handler, "_async_store", _store_with_parent_mkdir
+        )
+
+    def test_storage_tier_hit(self, tmp_path, monkeypatch):
+        manager, primary_tier, storage_tier = self._make_manager(
+            tmp_path, primary_blocks=1
+        )
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        key_a, key_b = to_keys([10, 11])
+
+        # Store key_a in both primary and cascade to secondary.
+        manager.prepare_store([key_a], _CTX)
+        manager.complete_store([key_a], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        # Storing key_b should evict key_a from primary.
+        # But secondary should still have it.
+        manager.prepare_store([key_b], _CTX)
+        manager.complete_store([key_b], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        assert primary_tier.lookup(key_a, _CTX) is False
+        assert storage_tier.lookup(key_a, _CTX) is True
+
+        # Initiate promotion from primary to secondary
+        assert manager.lookup(key_a, _CTX) is None
+        list(manager.take_events())
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        assert manager.lookup(key_a, _CTX) is True
+
+    def test_storage_tier_miss(self, tmp_path, monkeypatch):
+        manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        missing_key = to_keys([999])[0]
+        assert manager.lookup(missing_key, _CTX) is False
+
+    def test_storage_tier_store_fail(self, tmp_path, monkeypatch):
+        manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
+
+        def _always_fail_store(file_path, block_id):
+            raise RuntimeError(f"forced store failure for {file_path} {block_id}")
+
+        monkeypatch.setattr(storage_tier.handler, "_async_store", _always_fail_store)
+
+        key_a, key_b = to_keys([20, 21])
+        manager.prepare_store([key_a], _CTX)
+        manager.complete_store([key_a], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        manager.prepare_store([key_b], _CTX)
+        manager.complete_store([key_b], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        assert storage_tier.lookup(key_a, _CTX) is False
+        assert manager.lookup(key_a, _CTX) is False
+
+    def test_storage_tier_load_fail(self, tmp_path, monkeypatch):
+        manager, primary_tier, storage_tier = self._make_manager(
+            tmp_path, primary_blocks=1
+        )
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        key_a, key_b = to_keys([30, 31])
+        manager.prepare_store([key_a], _CTX)
+        manager.complete_store([key_a], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        manager.prepare_store([key_b], _CTX)
+        manager.complete_store([key_b], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        def _always_fail_load(file_path, block_id):
+            raise RuntimeError(f"forced load failure for {file_path} {block_id}")
+
+        monkeypatch.setattr(storage_tier.handler, "_async_load", _always_fail_load)
+
+        # Trigger promotion - but the promotion will fail.
+        assert manager.lookup(key_a, _CTX) is None
+        list(manager.take_events())
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        assert primary_tier.lookup(key_a, _CTX) is False
+        assert manager.lookup(key_a, _CTX) is not True
+
+    def test_multiple_requests_share_single_storage_promotion(
+        self, tmp_path, monkeypatch
+    ):
+        manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        shared_key, eviction_key = to_keys([40, 41])
+        manager.prepare_store([shared_key], _CTX)
+        manager.complete_store([shared_key], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        manager.prepare_store([eviction_key], _CTX)
+        manager.complete_store([eviction_key], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        storage_tier.submit_load = MagicMock(wraps=storage_tier.submit_load)
+
+        ctx_a = ReqContext(req_id="storage_req_a")
+        ctx_b = ReqContext(req_id="storage_req_b")
+        assert manager.lookup(shared_key, ctx_a) is None
+        assert manager.lookup(shared_key, ctx_b) is None
+
+        list(manager.take_events())
+        storage_tier.submit_load.assert_called_once()
+
+        self._wait_and_drain_jobs(manager, storage_tier)
+        assert manager.lookup(shared_key, ctx_a) is True
 
 
 if __name__ == "__main__":
