@@ -339,8 +339,12 @@ class StorageSecondaryTier(SecondaryTierManager):
             for key in job_meta.keys:
                 block = self.cache_policy.get(key)
                 assert block is not None, f"Block {key!r} not found"
-                assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
-                assert block.ref_cnt != 1, "Multiple Storage loads in progress!"
+                assert block.ref_cnt > 0, (
+                    f"Block {key!r} ref_cnt is already 0! {block.ref_cnt=!r}"
+                )
+                assert block.ref_cnt == 1, (
+                    f"Multiple Storage loads in progress! {block.ref_cnt=!r}"
+                )
                 block.ref_cnt -= 1
         else:
             logger.debug("Storage Job {job_meta} failed!")

@@ -11,6 +11,7 @@ These tests verify:
 5. Eviction coordination between tiers
 """
 
+import threading
 from collections.abc import Iterable
 from unittest.mock import MagicMock
 
@@ -604,6 +605,8 @@ class TestTieringOffloadingWithStorageTier:
         job_ids = set(storage_tier.handler.job_meta.keys())
         if job_ids:
             storage_tier.handler.wait(job_ids)
+
+        manager._process_finished_jobs()
         list(manager.take_events())
 
     @staticmethod
@@ -729,6 +732,158 @@ class TestTieringOffloadingWithStorageTier:
 
         self._wait_and_drain_jobs(manager, storage_tier)
         assert manager.lookup(shared_key, ctx_a) is True
+
+    def test_promotion_returns_false_when_primary_is_full(self, tmp_path, monkeypatch):
+        manager, primary_tier, storage_tier = self._make_manager(
+            tmp_path, primary_blocks=2
+        )
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        promotable_key, pinned_a, pinned_b = to_keys([50, 51, 52])
+
+        # Put promotable_key into storage first.
+        manager.prepare_store([promotable_key], _CTX)
+        manager.complete_store([promotable_key], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        # Fill primary with two other keys so promotable_key gets evicted.
+        manager.prepare_store([pinned_a], _CTX)
+        manager.complete_store([pinned_a], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        manager.prepare_store([pinned_b], _CTX)
+        manager.complete_store([pinned_b], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        assert primary_tier.lookup(promotable_key, _CTX) is False
+        assert storage_tier.lookup(promotable_key, _CTX) is True
+
+        # Pin both primary blocks: no eviction candidate remains.
+        primary_tier.prepare_load([pinned_a, pinned_b], _CTX)
+
+        # Promotion cannot allocate space in primary tier.
+        assert manager.lookup(promotable_key, _CTX) is False
+
+    def test_inflight_promotion_across_steps_submits_once(self, tmp_path, monkeypatch):
+        manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        promoted_key, evictor_key = to_keys([60, 61])
+        manager.prepare_store([promoted_key], _CTX)
+        manager.complete_store([promoted_key], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        manager.prepare_store([evictor_key], _CTX)
+        manager.complete_store([evictor_key], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        gate = threading.Event()
+        original_async_load = storage_tier.handler._async_load
+
+        def _blocking_async_load(file_path, block_id):
+            gate.wait(timeout=2.0)
+            return original_async_load(file_path, block_id)
+
+        monkeypatch.setattr(storage_tier.handler, "_async_load", _blocking_async_load)
+        storage_tier.submit_load = MagicMock(wraps=storage_tier.submit_load)
+
+        assert manager.lookup(promoted_key, _CTX) is None
+        list(manager.take_events())  # submits the first (and only) promotion
+        assert storage_tier.submit_load.call_count == 1
+
+        # Next step lookup sees primary in-flight state and should not resubmit.
+        assert manager.lookup(promoted_key, _CTX) is None
+        list(manager.take_events())
+        assert storage_tier.submit_load.call_count == 1
+
+        gate.set()
+        self._wait_and_drain_jobs(manager, storage_tier)
+        assert manager.lookup(promoted_key, _CTX) is True
+
+    def test_same_req_id_batches_promotions_with_first_context(
+        self, tmp_path, monkeypatch
+    ):
+        manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=2)
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        k1, k2, k3, k4 = to_keys([70, 71, 72, 73])
+
+        for key in (k1, k2, k3, k4):
+            manager.prepare_store([key], _CTX)
+            manager.complete_store([key], _CTX, success=True)
+            self._wait_and_drain_jobs(manager, storage_tier)
+
+        # k1 and k2 are in storage and no longer in primary.
+        storage_tier.submit_load = MagicMock(wraps=storage_tier.submit_load)
+
+        ctx_1 = ReqContext(req_id="same-req-id", kv_transfer_params={"ctx": 1})
+        ctx_2 = ReqContext(req_id="same-req-id", kv_transfer_params={"ctx": 2})
+
+        # Initiate promotion.
+        assert manager.lookup(k1, ctx_1) is None
+        assert manager.lookup(k2, ctx_2) is None
+        list(manager.take_events())
+
+        # Make sure that the loads are batched.
+        storage_tier.submit_load.assert_called_once()
+        jm = storage_tier.submit_load.call_args.args[0]
+        assert set(jm.keys) == {k1, k2}
+        assert jm.req_context is ctx_1
+
+    def test_interleaved_cascade_and_promotion_complete_cleanly(
+        self, tmp_path, monkeypatch
+    ):
+        manager, primary_tier, storage_tier = self._make_manager(
+            tmp_path, primary_blocks=2
+        )
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        promote_key, resident_key, incoming_key = to_keys([80, 81, 82])
+
+        manager.prepare_store([promote_key], _CTX)
+        manager.complete_store([promote_key], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        manager.prepare_store([resident_key], _CTX)
+        manager.complete_store([resident_key], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        # Start a new cascade and a promotion in the same engine step.
+        manager.prepare_store([incoming_key], _CTX)
+        manager.complete_store([incoming_key], _CTX, success=True)
+
+        assert primary_tier.lookup(promote_key, _CTX) is False
+        assert manager.lookup(promote_key, _CTX) is None
+
+        list(manager.take_events())
+        self._wait_and_drain_jobs(manager, storage_tier)
+        assert manager.lookup(promote_key, _CTX) is True
+        assert not manager._transfer_jobs
+
+    def test_multiblock_store_partial_failure_marks_all_failed(
+        self, tmp_path, monkeypatch
+    ):
+        # This is the current expected behavior. There is a TODO to improve this
+        # so we account for each key transfer individually.
+        manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=2)
+        self._install_store_impl(monkeypatch, storage_tier)
+
+        original_async_store = storage_tier.handler._async_store
+
+        def _fail_one_store(file_path, block_id):
+            if block_id == 1:
+                raise RuntimeError("forced partial store failure")
+            return original_async_store(file_path, block_id)
+
+        monkeypatch.setattr(storage_tier.handler, "_async_store", _fail_one_store)
+
+        key_a, key_b = to_keys([90, 91])
+        manager.prepare_store([key_a, key_b], _CTX)
+        manager.complete_store([key_a, key_b], _CTX, success=True)
+        self._wait_and_drain_jobs(manager, storage_tier)
+
+        assert storage_tier.lookup(key_a, _CTX) is False
+        assert storage_tier.lookup(key_b, _CTX) is False
 
 
 if __name__ == "__main__":

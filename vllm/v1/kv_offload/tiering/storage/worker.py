@@ -111,6 +111,14 @@ class StorageHandler:
         else:
             self.load_jobs.pop(job_id)
 
+    def _safe_future_result(self, futures: Collection[Future], job_id: JobId) -> bool:
+        all_success = False
+        try:
+            all_success = all([f.result() for f in futures])
+        except Exception as e:
+            logger.debug("Job %s failed with exception %s", self.job_meta[job_id], e)
+        return all_success
+
     def get_finished(self) -> list[JobResult]:
         """
         Get transfers finished since last call.
@@ -124,13 +132,7 @@ class StorageHandler:
             if not all([f.done() for f in futures]):
                 # not all are done
                 continue
-
-            all_success = False
-            try:
-                all_success = all([f.result() for f in futures])
-            except Exception as e:
-                logger.debug("Job %s failed with exception %s", self.job_meta[jid], e)
-
+            all_success = self._safe_future_result(futures, jid)
             job_results.append(JobResult(jid, all_success))
 
         for jr in job_results:
@@ -147,7 +149,8 @@ class StorageHandler:
 
     def wait(self, job_ids: set[int]) -> None:
         """
-        Wait for jobs to finish (blocking).
+        Wait for jobs to finish (blocking). Note that this just waits for
+        the jobs to finish, but does no cleanup.
         Args:
             job_ids: The set of job IDs to wait for.
         """
@@ -156,13 +159,9 @@ class StorageHandler:
             if meta is None:
                 continue
 
-            futures = (
-                self.store_jobs.get(jid) if meta.is_store else self.load_jobs.get(jid)
-            )
+            futures = self.store_jobs[jid] if meta.is_store else self.load_jobs.get(jid)
             assert futures is not None
             wait(futures, return_when=ALL_COMPLETED)
-
-            self._cleanup_job(jid)
 
     def shutdown(self) -> None:
         """Shutdown the handler and release any resources."""
@@ -172,6 +171,9 @@ class StorageHandler:
                 f.cancel()
         # wait for all jobs to complete
         self.wait(set([jid for jid in self.job_meta]))
+        # clean up state
+        for jid in self.job_meta:
+            self._cleanup_job(jid)
 
         assert len(self.job_meta) == 0
         assert len(self.load_jobs) == 0
