@@ -11,7 +11,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.base import (
+    OffloadingEvent,
+    OffloadKey,
+    PrepareStoreOutput,
+    ReqContext,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -39,6 +45,18 @@ class JobResult:
     success: bool
 
 
+@dataclass
+class PrimaryTierMetadata:
+    total_bytes: int
+    num_blocks: int
+    kv_view: memoryview
+
+    @property
+    def bytes_per_block(self):
+        assert self.total_bytes % self.num_blocks == 0
+        return self.total_bytes // self.num_blocks
+
+
 class SecondaryTierManager(ABC):
     """
     Abstract interface for managing a single non-primary offloading tier.
@@ -53,9 +71,15 @@ class SecondaryTierManager(ABC):
     async jobs; get_finished() polls for completion.
     """
 
-    def __init__(self, vllm_config: "VllmConfig", primary_kv_view: memoryview) -> None:
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        kv_cache_config: KVCacheConfig,
+        primary_tier_meta: PrimaryTierMetadata,
+    ) -> None:
         self._vllm_config = vllm_config
-        self._primary_kv_view: memoryview = primary_kv_view
+        self._kv_cache_config = kv_cache_config
+        self._primary_tier_meta = primary_tier_meta
 
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
@@ -140,6 +164,26 @@ class SecondaryTierManager(ABC):
         """
         pass
 
+    def prepare_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """
+        Prepare storage dataobjects for load.
+        """
+        return
+
+    def prepare_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
+        """
+        Prepare storage dataobjects for store.
+        """
+        return None
+
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Mark blocks as recently used for eviction policy.
@@ -153,6 +197,9 @@ class SecondaryTierManager(ABC):
     def shutdown(self) -> None:
         """Release resources held by this tier (threads, connections, etc.)."""
         return
+
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        return list()
 
     @staticmethod
     @abstractmethod

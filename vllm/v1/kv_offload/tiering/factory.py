@@ -6,7 +6,8 @@ Factory for creating secondary tier implementations.
 
 from typing import TYPE_CHECKING
 
-from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.tiering.base import PrimaryTierMetadata, SecondaryTierManager
 from vllm.v1.kv_offload.tiering.example import ExampleSecondaryTier
 
 if TYPE_CHECKING:
@@ -21,8 +22,9 @@ _TIER_REGISTRY: dict[str, type[SecondaryTierManager]] = {
 
 def create_secondary_tier(
     tier_config: dict,
-    primary_kv_view: memoryview,
+    primary_tier_meta: PrimaryTierMetadata,
     vllm_config: "VllmConfig",
+    kv_cache_config: KVCacheConfig,
 ) -> SecondaryTierManager:
     """
     Create a secondary tier from configuration.
@@ -32,8 +34,9 @@ def create_secondary_tier(
             - type (required): Type of secondary tier (e.g., "example")
             - Additional tier-specific parameters are passed directly
               to the tier constructor
-        primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+        primary_tier_meta: Primary Tier's metadata information.
         vllm_config: Global vLLM configuration.
+        kv_cache_config: Global KV Cache config.
 
     Returns:
         SecondaryTierManager instance
@@ -53,4 +56,9 @@ def create_secondary_tier(
             f"Unknown secondary tier type: {tier_type!r}. "
             f"Supported types: {list(_TIER_REGISTRY)}"
         )
-    return cls(vllm_config=vllm_config, primary_kv_view=primary_kv_view, **config)
+    return cls(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        primary_tier_meta=primary_tier_meta,
+        **config,
+    )

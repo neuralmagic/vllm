@@ -14,11 +14,13 @@ from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobMetadata,
     JobResult,
+    PrimaryTierMetadata,
     SecondaryTierManager,
 )
 
@@ -48,7 +50,8 @@ class ExampleSecondaryTier(SecondaryTierManager):
     def __init__(
         self,
         vllm_config: "VllmConfig",
-        primary_kv_view: memoryview,
+        kv_cache_config: KVCacheConfig,
+        primary_tier_meta: PrimaryTierMetadata,
         max_blocks: int = 1000,
         simulate_async: bool = False,
     ):
@@ -57,12 +60,12 @@ class ExampleSecondaryTier(SecondaryTierManager):
 
         Args:
             vllm_config: Global vLLM configuration.
-            primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+            primary_tier_meta: Primary Tier's metadata information.
             max_blocks: Maximum number of blocks this tier can store
             simulate_async: If True, jobs complete on next get_finished() call.
                           If False, jobs complete immediately.
         """
-        super().__init__(vllm_config, primary_kv_view)
+        super().__init__(vllm_config, kv_cache_config, primary_tier_meta)
         self.max_blocks = max_blocks
         self.simulate_async = simulate_async
 

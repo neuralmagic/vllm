@@ -12,7 +12,11 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
 )
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.common import (
+    CPULoadStoreSpec,
+    prepare_store_blocks,
+)
+from vllm.v1.kv_offload.cpu.offload_block_tracker import OffloadBlockTracker
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
@@ -42,9 +46,7 @@ class CPUOffloadingManager(OffloadingManager):
         max_tracker_size: int = 64_000,
     ):
         self.medium: str = CPULoadStoreSpec.medium()
-        self._num_blocks: int = num_blocks
-        self._num_allocated_blocks: int = 0
-        self._free_list: list[int] = []
+        self.block_tracker: OffloadBlockTracker = OffloadBlockTracker(num_blocks)
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
         policy_cls = _CACHE_POLICIES.get(cache_policy)
         if policy_cls is None:
@@ -61,33 +63,8 @@ class CPUOffloadingManager(OffloadingManager):
             OrderedDict() if store_threshold >= 2 else None
         )
 
-    # --- block pool ---
-
-    def _get_num_free_blocks(self) -> int:
-        return len(self._free_list) + self._num_blocks - self._num_allocated_blocks
-
-    def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
-        num_fresh = min(len(keys), self._num_blocks - self._num_allocated_blocks)
-        num_reused = len(keys) - num_fresh
-        assert len(self._free_list) >= num_reused
-
-        # allocate fresh blocks
-        blocks: list[BlockStatus] = []
-        for _ in range(num_fresh):
-            blocks.append(BlockStatus(self._num_allocated_blocks))
-            self._num_allocated_blocks += 1
-
-        # allocate reused blocks
-        for _ in range(num_reused):
-            blocks.append(BlockStatus(self._free_list.pop()))
-        return blocks
-
-    def _free_block(self, block: BlockStatus) -> None:
-        self._free_list.append(block.block_id)
-
     def _get_load_store_spec(
         self,
-        keys: Iterable[OffloadKey],
         blocks: Iterable[BlockStatus],
     ) -> CPULoadStoreSpec:
         return CPULoadStoreSpec([block.block_id for block in blocks])
@@ -122,7 +99,7 @@ class CPUOffloadingManager(OffloadingManager):
             assert block.is_ready, f"Block {key!r} is not ready for reading"
             block.ref_cnt += 1
             blocks.append(block)
-        return self._get_load_store_spec(keys, blocks)
+        return self._get_load_store_spec(blocks)
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
@@ -143,30 +120,15 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> PrepareStoreOutput | None:
         if self.counts is not None:
             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
-        # filter out blocks that are already stored
-        keys_to_store = [k for k in keys if self._policy.get(k) is None]
 
-        if not keys_to_store:
-            return PrepareStoreOutput(
-                keys_to_store=[],
-                store_spec=self._get_load_store_spec([], []),
-                evicted_keys=[],
-            )
+        prepare_store_blocks_output = prepare_store_blocks(
+            keys, self._policy, self.block_tracker
+        )
+        if prepare_store_blocks_output is None:
+            # Cannot prepare storage blocks
+            return None
 
-        num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
-
-        to_evict: list[OffloadKey] = []
-        if num_blocks_to_evict > 0:
-            # Blocks from the original input are excluded from eviction candidates:
-            # a block that was already stored must remain in the cache after this call.
-            protected = set(keys)
-            evicted = self._policy.evict(num_blocks_to_evict, protected)
-            if evicted is None:
-                return None
-            for key, block in evicted:
-                self._free_block(block)
-                to_evict.append(key)
-
+        to_evict = prepare_store_blocks_output.to_evict
         if to_evict and self.events is not None:
             self.events.append(
                 OffloadingEvent(
@@ -176,19 +138,11 @@ class CPUOffloadingManager(OffloadingManager):
                 )
             )
 
-        blocks = self._allocate_blocks(keys_to_store)
-        assert len(blocks) == len(keys_to_store), (
-            "Block pool did not allocate the expected number of blocks"
-        )
-
-        for key, block in zip(keys_to_store, blocks):
-            self._policy.insert(key, block)
-
         # build store specs for allocated blocks
-        store_spec = self._get_load_store_spec(keys_to_store, blocks)
+        store_spec = self._get_load_store_spec(prepare_store_blocks_output.store_blocks)
 
         return PrepareStoreOutput(
-            keys_to_store=keys_to_store,
+            keys_to_store=prepare_store_blocks_output.store_keys,
             store_spec=store_spec,
             evicted_keys=to_evict,
         )
@@ -212,7 +166,7 @@ class CPUOffloadingManager(OffloadingManager):
                 block = self._policy.get(key)
                 if block is not None and not block.is_ready:
                     self._policy.remove(key)
-                    self._free_block(block)
+                    self.block_tracker.free_block(block)
 
         if stored_keys and self.events is not None:
             self.events.append(

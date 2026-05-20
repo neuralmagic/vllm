@@ -289,6 +289,13 @@ class TieringOffloadingManager(OffloadingManager):
             # rather than retrying indefinitely.
             return False
 
+        if not primary_write_result.keys_to_store:
+            return True
+
+        # Promotion should make sure that the secondary tier has the blocks
+        # and to prevent eviction.
+        tier.prepare_load([key], req_context)
+
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
         # Defer submit_load to take_events(). Group by (tier, request) so each
@@ -497,6 +504,8 @@ class TieringOffloadingManager(OffloadingManager):
             self.events.clear()
 
         yield from self.primary_tier.take_events()
+        for tier in self.secondary_tiers:
+            yield from tier.take_events()
 
     def shutdown(self) -> None:
         """Shutdown all tiers and release resources."""
