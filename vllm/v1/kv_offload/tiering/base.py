@@ -76,6 +76,7 @@ class SecondaryTierManager(ABC):
         vllm_config: "VllmConfig",
         kv_cache_config: KVCacheConfig,
         primary_tier_meta: PrimaryTierMetadata,
+        enable_events: bool,
     ) -> None:
         self._vllm_config = vllm_config
         self._kv_cache_config = kv_cache_config

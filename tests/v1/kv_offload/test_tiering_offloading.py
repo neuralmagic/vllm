@@ -35,6 +35,7 @@ from vllm.v1.kv_offload.tiering.storage.storage_tier import StorageSecondaryTier
 _CTX = ReqContext(req_id="test")
 _MOCK_VLLM_CONFIG = MagicMock()
 _MOCK_KV_CACHE_CONFIG = MagicMock()
+_ENABLE_EVENTS = False
 
 
 def _mock_mmap_region(num_blocks: int, row_bytes: int = 16):
@@ -83,6 +84,7 @@ class TestExampleSecondaryTier:
             vllm_config=_MOCK_VLLM_CONFIG,
             kv_cache_config=_MOCK_KV_CACHE_CONFIG,
             primary_tier_meta=primary_tier_meta,
+            enable_events=_ENABLE_EVENTS,
             max_blocks=max_offload_blocks,
             simulate_async=simulate_async,
         )
@@ -191,6 +193,7 @@ class TestTieringOffloadingManager:
             vllm_config=_MOCK_VLLM_CONFIG,
             kv_cache_config=_MOCK_KV_CACHE_CONFIG,
             primary_tier_meta=primary_tier_meta,
+            enable_events=_ENABLE_EVENTS,
             max_blocks=max_offload_blocks,
         )
 
@@ -608,6 +611,7 @@ class TestTieringOffloadingWithStorageTier:
             vllm_config=vllm_config,
             kv_cache_config=_MOCK_KV_CACHE_CONFIG,
             primary_tier_meta=primary_tier_meta,
+            enable_events=_ENABLE_EVENTS,
             storage_root_path=str(tmp_path),
             max_storage_size_gb=1,
         )

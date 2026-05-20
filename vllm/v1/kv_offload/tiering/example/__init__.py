@@ -52,6 +52,7 @@ class ExampleSecondaryTier(SecondaryTierManager):
         vllm_config: "VllmConfig",
         kv_cache_config: KVCacheConfig,
         primary_tier_meta: PrimaryTierMetadata,
+        enable_events: bool,
         max_blocks: int = 1000,
         simulate_async: bool = False,
     ):
@@ -65,7 +66,7 @@ class ExampleSecondaryTier(SecondaryTierManager):
             simulate_async: If True, jobs complete on next get_finished() call.
                           If False, jobs complete immediately.
         """
-        super().__init__(vllm_config, kv_cache_config, primary_tier_meta)
+        super().__init__(vllm_config, kv_cache_config, primary_tier_meta, enable_events)
         self.max_blocks = max_blocks
         self.simulate_async = simulate_async
 

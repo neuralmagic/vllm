@@ -62,9 +62,9 @@ class StorageSecondaryTier(SecondaryTierManager):
         vllm_config: "VllmConfig",
         kv_cache_config: "KVCacheConfig",
         primary_tier_meta: PrimaryTierMetadata,
+        enable_events: bool,
         storage_root_path: str,
         max_storage_size_gb: int,
-        enable_events: bool = False,
     ):
         """
         Initialize the example secondary tier.
@@ -74,7 +74,7 @@ class StorageSecondaryTier(SecondaryTierManager):
             primary_kv_view: Memoryview of the primary tier's CPU KV cache.
             storage_path: Path to store the offloaded KV cache.
         """
-        super().__init__(vllm_config, kv_cache_config, primary_tier_meta)
+        super().__init__(vllm_config, kv_cache_config, primary_tier_meta, enable_events)
 
         self.medium = StorageLoadStoreSpec.medium()
         self.vllm_config = vllm_config

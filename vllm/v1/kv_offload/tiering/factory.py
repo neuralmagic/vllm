@@ -32,6 +32,7 @@ def create_secondary_tier(
     primary_tier_meta: PrimaryTierMetadata,
     vllm_config: "VllmConfig",
     kv_cache_config: KVCacheConfig,
+    enable_events: bool = False,
 ) -> SecondaryTierManager:
     """
     Create a secondary tier from configuration.
@@ -69,5 +70,6 @@ def create_secondary_tier(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         primary_tier_meta=primary_tier_meta,
+        enable_events=enable_events,
         **config,
     )

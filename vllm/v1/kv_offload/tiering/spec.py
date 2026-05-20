@@ -135,6 +135,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         primary_tier_meta,
                         self.vllm_config,
                         self.kv_cache_config,
+                        enable_events=enable_events,
                     )
                     secondary_tiers.append(tier)
                     logger.info(
