@@ -34,6 +34,7 @@ from vllm.v1.kv_offload.tiering.storage.storage_tier import StorageSecondaryTier
 
 _CTX = ReqContext(req_id="test")
 _MOCK_VLLM_CONFIG = MagicMock()
+_MOCK_KV_CACHE_CONFIG = MagicMock()
 
 
 def _mock_mmap_region(num_blocks: int, row_bytes: int = 16):
@@ -68,11 +69,28 @@ def count_hits(manager, keys: list[OffloadKey]) -> int | None:
 class TestExampleSecondaryTier:
     """Tests for ExampleSecondaryTier implementation."""
 
+    def _make_example_secondary_tier(
+        self, max_cpu_blocks: int, max_offload_blocks: int, simulate_async: bool = False
+    ) -> ExampleSecondaryTier:
+        mock_view = memoryview(
+            torch.zeros((max_cpu_blocks, 16), dtype=torch.int8).numpy()
+        )
+
+        primary_tier_meta = PrimaryTierMetadata(
+            total_bytes=mock_view.nbytes, num_blocks=max_cpu_blocks, kv_view=mock_view
+        )
+        return ExampleSecondaryTier(
+            vllm_config=_MOCK_VLLM_CONFIG,
+            kv_cache_config=_MOCK_KV_CACHE_CONFIG,
+            primary_tier_meta=primary_tier_meta,
+            max_blocks=max_offload_blocks,
+            simulate_async=simulate_async,
+        )
+
     def test_basic_store_and_lookup(self):
         """Test basic store and lookup operations."""
-        mock_view = memoryview(torch.zeros((10, 16), dtype=torch.int8).numpy())
-        tier = ExampleSecondaryTier(
-            vllm_config=_MOCK_VLLM_CONFIG, primary_kv_view=mock_view, max_blocks=10
+        tier = self._make_example_secondary_tier(
+            max_cpu_blocks=10, max_offload_blocks=10
         )
 
         # Initially empty
@@ -92,10 +110,7 @@ class TestExampleSecondaryTier:
 
     def test_lru_eviction(self):
         """Test LRU eviction policy."""
-        mock_view = memoryview(torch.zeros((4, 16), dtype=torch.int8).numpy())
-        tier = ExampleSecondaryTier(
-            vllm_config=_MOCK_VLLM_CONFIG, primary_kv_view=mock_view, max_blocks=3
-        )
+        tier = self._make_example_secondary_tier(max_cpu_blocks=4, max_offload_blocks=3)
 
         # Fill tier to capacity
         blocks = to_keys(range(3))
@@ -132,12 +147,8 @@ class TestExampleSecondaryTier:
 
     def test_async_simulation(self):
         """Test simulated async behavior."""
-        mock_view = memoryview(torch.zeros((10, 16), dtype=torch.int8).numpy())
-        tier = ExampleSecondaryTier(
-            vllm_config=_MOCK_VLLM_CONFIG,
-            primary_kv_view=mock_view,
-            max_blocks=10,
-            simulate_async=True,
+        tier = self._make_example_secondary_tier(
+            max_cpu_blocks=10, max_offload_blocks=10, simulate_async=True
         )
 
         blocks = to_keys(range(2))
@@ -169,22 +180,37 @@ class TestExampleSecondaryTier:
 class TestTieringOffloadingManager:
     """Tests for TieringOffloadingManager."""
 
+    def _make_example_secondary_tier(
+        self, max_cpu_blocks: int, max_offload_blocks: int, mock_view: memoryview
+    ) -> ExampleSecondaryTier:
+        primary_tier_meta = PrimaryTierMetadata(
+            total_bytes=mock_view.nbytes, num_blocks=max_cpu_blocks, kv_view=mock_view
+        )
+
+        return ExampleSecondaryTier(
+            vllm_config=_MOCK_VLLM_CONFIG,
+            kv_cache_config=_MOCK_KV_CACHE_CONFIG,
+            primary_tier_meta=primary_tier_meta,
+            max_blocks=max_offload_blocks,
+        )
+
     @pytest.fixture
     def manager_setup(self):
+        max_cpu_blocks = 5
         # Create primary tier (CPU-based)
-        mock_region = _mock_mmap_region(5)
+        mock_region = _mock_mmap_region(max_cpu_blocks)
         self.primary_tier = CPUPrimaryTierOffloadingManager(
-            num_blocks=5, mmap_region=mock_region
+            num_blocks=max_cpu_blocks, mmap_region=mock_region
         )
 
         mock_view = mock_region.create_kv_memoryview()
 
         # Create secondary tiers with the primary view
-        self.secondary_tier1 = ExampleSecondaryTier(
-            vllm_config=_MOCK_VLLM_CONFIG, primary_kv_view=mock_view, max_blocks=10
+        self.secondary_tier1 = self._make_example_secondary_tier(
+            max_cpu_blocks=max_cpu_blocks, max_offload_blocks=10, mock_view=mock_view
         )
-        self.secondary_tier2 = ExampleSecondaryTier(
-            vllm_config=_MOCK_VLLM_CONFIG, primary_kv_view=mock_view, max_blocks=10
+        self.secondary_tier2 = self._make_example_secondary_tier(
+            max_cpu_blocks=max_cpu_blocks, max_offload_blocks=10, mock_view=mock_view
         )
 
         # Create tiered manager
@@ -404,17 +430,12 @@ class TestTieringOffloadingManager:
         mock_view = mock_region.create_kv_memoryview()
 
         # Create tier with small capacity
-        small_tier = ExampleSecondaryTier(
-            vllm_config=_MOCK_VLLM_CONFIG,
-            primary_kv_view=mock_view,
-            max_blocks=5,
-            simulate_async=False,
+        small_tier = self._make_example_secondary_tier(
+            max_cpu_blocks=10, max_offload_blocks=5, mock_view=mock_view
         )
-        large_tier = ExampleSecondaryTier(
-            vllm_config=_MOCK_VLLM_CONFIG,
-            primary_kv_view=mock_view,
-            max_blocks=10,
-            simulate_async=False,
+        # Create another tier with large capacity
+        large_tier = self._make_example_secondary_tier(
+            max_cpu_blocks=10, max_offload_blocks=10, mock_view=mock_view
         )
 
         # Create a fresh primary tier for this test
@@ -575,7 +596,6 @@ class TestTieringOffloadingWithStorageTier:
 
         vllm_config = MagicMock()
         vllm_config.compute_hash.return_value = "test-storage-tier"
-        kv_cache_config = MagicMock()
 
         kv_view = primary_tier.get_kv_memoryview()
         primary_tier_meta = PrimaryTierMetadata(
@@ -586,7 +606,7 @@ class TestTieringOffloadingWithStorageTier:
 
         storage_tier = StorageSecondaryTier(
             vllm_config=vllm_config,
-            kv_cache_config=kv_cache_config,
+            kv_cache_config=_MOCK_KV_CACHE_CONFIG,
             primary_tier_meta=primary_tier_meta,
             storage_root_path=str(tmp_path),
             max_storage_size_gb=1,
