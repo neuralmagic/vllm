@@ -13,6 +13,7 @@ Gated by VLLM_MOE_TIMING_ENABLED.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 import torch
@@ -34,6 +35,10 @@ class _EventRecord:
 class DeepEPTimingCollector:
     """Collects per-layer CUDA event pairs and computes elapsed times.
 
+    Events are read with a one-step delay to avoid GPU synchronization:
+    each finish_step() enqueues the current step's events and attempts to
+    drain older entries whose GPU work has already completed.
+
     Usage:
         1. In layer __init__: call enable() and register_layer()
         2. In forward: call get_event_pair(), record start/end, then record_*()
@@ -42,6 +47,7 @@ class DeepEPTimingCollector:
 
     def __init__(self):
         self._pending_events: list[_EventRecord] = []
+        self._queue: deque[list[_EventRecord]] = deque()
         self._enabled = False
         self._mode = ""
         self._next_layer_idx = 0
@@ -105,31 +111,71 @@ class DeepEPTimingCollector:
             )
 
     def finish_step(self) -> DeepEPStats | None:
-        """Read event timings and return per-layer stats.
+        """Enqueue current step's events and drain completed entries.
 
-        Returns None if disabled or no events were recorded this step
-        (e.g. during CUDA graph replay).
+        Returns aggregated stats from all queue entries whose GPU events
+        are ready, or None if nothing is ready yet.
         """
         if not self._enabled:
             return None
 
-        if not self._pending_events:
+        if self._pending_events:
+            self._queue.append(self._pending_events)
+            self._pending_events = []
+
+        if not self._queue:
             return None
 
-        events = self._pending_events
-        self._pending_events = []
-        return self._read_events(events)
+        return self._drain_queue()
 
-    def _read_events(self, events: list[_EventRecord]) -> DeepEPStats | None:
+    def _drain_queue(self) -> DeepEPStats | None:
+        """Try to read completed event batches from the front of the queue."""
         dispatch_times: dict[int, float] = {}
         combine_times: dict[int, float] = {}
         expert_times: dict[int, float] = {}
+        drained_any = False
+
+        while self._queue:
+            batch = self._queue[0]
+            if not self._try_read_batch(
+                batch, dispatch_times, combine_times, expert_times
+            ):
+                break
+            self._queue.popleft()
+            drained_any = True
+
+        if not drained_any:
+            return None
+
+        return DeepEPStats(
+            dispatch_times_s=dispatch_times,
+            combine_times_s=combine_times,
+            expert_compute_times_s=expert_times,
+            mode=self._mode,
+        )
+
+    def _try_read_batch(
+        self,
+        events: list[_EventRecord],
+        dispatch_times: dict[int, float],
+        combine_times: dict[int, float],
+        expert_times: dict[int, float],
+    ) -> bool:
+        """Attempt to read all events in a batch. Returns False if not ready."""
+        # Check the last event in the batch — if it's done, all prior are too
+        # (same stream ordering).
+        if not events[-1].end.query():
+            return False
 
         for rec in events:
             try:
                 ms = rec.start.elapsed_time(rec.end)
             except RuntimeError:
-                return None
+                logger.warning_once(
+                    "MoE timing: elapsed_time() failed — GPU events not "
+                    "ready. Are CUDA graphs active?"
+                )
+                return False
             elapsed_s = ms / 1000.0
             if rec.phase == "dispatch":
                 dispatch_times[rec.layer_idx] = (
@@ -143,13 +189,7 @@ class DeepEPTimingCollector:
                 expert_times[rec.layer_idx] = (
                     expert_times.get(rec.layer_idx, 0.0) + elapsed_s
                 )
-
-        return DeepEPStats(
-            dispatch_times_s=dispatch_times,
-            combine_times_s=combine_times,
-            expert_compute_times_s=expert_times,
-            mode=self._mode,
-        )
+        return True
 
 
 _collector: DeepEPTimingCollector | None = None

@@ -1269,7 +1269,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))
     ),
     # Enable per-layer MoE timing metrics (DeepEP dispatch/combine + expert
-    # compute). Works with CUDA graphs via CU_EVENT_RECORD_EXTERNAL.
+    # compute). Requires --enforce-eager (CUDA graph replays bypass Python).
     "VLLM_MOE_TIMING_ENABLED": lambda: bool(
         int(os.getenv("VLLM_MOE_TIMING_ENABLED", "0"))
     ),
