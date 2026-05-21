@@ -40,6 +40,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobMetadata,
+    JobResult,
     SecondaryTierManager,
 )
 
@@ -157,6 +158,7 @@ class TieringOffloadingManager(OffloadingManager):
         # Gate for once-per-step execution of _maybe_process_finished_jobs().
         # Reset at the end of each step in take_events().
         self._processed_jobs_this_step: bool = False
+        self._transfer_stats_data: dict[str, list[dict[str, int | float]]] = {}
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
@@ -211,6 +213,21 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+
+                # Record transfer stats
+                self._record_transfer_stats(completed_job)
+
+    def _record_transfer_stats(self, result: JobResult) -> None:
+        stats = result.transfer_stats
+        if stats is not None:
+            src, dst = stats.transfer_type
+            transfer_type_key = f"{src}_to_{dst}"
+            self._transfer_stats_data.setdefault(transfer_type_key, []).append(
+                {
+                    "op_size": stats.transfer_size,
+                    "op_time": stats.transfer_time,
+                }
+            )
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         """
@@ -512,3 +529,12 @@ class TieringOffloadingManager(OffloadingManager):
         for tier in self.secondary_tiers:
             tier.shutdown()
         self.primary_tier.shutdown()
+
+    def get_transfer_stats_data(self) -> dict[str, list[dict[str, int | float]]] | None:
+        # Poll once before exporting to include finished secondary-tier jobs.
+        self._process_finished_jobs()
+        if not self._transfer_stats_data:
+            return None
+        data = self._transfer_stats_data
+        self._transfer_stats_data = {}
+        return data

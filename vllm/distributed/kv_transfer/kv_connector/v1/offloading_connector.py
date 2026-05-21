@@ -175,9 +175,13 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         return "HND"
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if self.connector_worker is None:
-            return None  # We only emit stats from the worker-side
-        return self.connector_worker.get_kv_connector_stats()
+        # OffloadingConnector is role-scoped: a process owns exactly one side.
+        if self.connector_worker is not None:
+            assert self.connector_scheduler is None
+            return self.connector_worker.get_kv_connector_stats()
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.get_kv_connector_stats()
+        return None
 
     @classmethod
     def build_kv_connector_stats(

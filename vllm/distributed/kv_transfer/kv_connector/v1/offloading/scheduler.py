@@ -8,11 +8,15 @@ from typing import Any, NamedTuple
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
     TransferJob,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -884,3 +888,9 @@ class OffloadingConnectorScheduler:
 
     def shutdown(self) -> None:
         self.manager.shutdown()
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        transfer_stats_data = self.manager.get_transfer_stats_data()
+        if not transfer_stats_data:
+            return None
+        return OffloadingConnectorStats(data=transfer_stats_data)

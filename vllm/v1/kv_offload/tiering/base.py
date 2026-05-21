@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 # Type alias for job IDs used in async transfer tracking
 JobId = int
+TransferType = tuple[str, str]
 
 
 @dataclass
@@ -38,11 +39,19 @@ class JobMetadata:
 
 
 @dataclass
+class JobTransferStats:
+    transfer_size: int
+    transfer_time: float
+    transfer_type: TransferType
+
+
+@dataclass
 class JobResult:
     """Result of an async transfer job (successful or failed)."""
 
     job_id: JobId
     success: bool
+    transfer_stats: JobTransferStats | None = None
 
 
 @dataclass

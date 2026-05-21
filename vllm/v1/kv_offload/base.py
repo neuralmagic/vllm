@@ -218,6 +218,10 @@ class OffloadingManager(ABC):
         """
         return ()
 
+    def get_transfer_stats_data(self) -> dict[str, list[dict[str, int | float]]] | None:
+        """Return connector transfer stats payload since last call, if any."""
+        return None
+
     def shutdown(self) -> None:
         """Shutdown the manager and release any resources."""
         return
