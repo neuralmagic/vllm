@@ -15,6 +15,12 @@ from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobResult,
+    JobTransferStats,
+    TransferType,
+)
+from vllm.v1.kv_offload.tiering.storage.common import TransferResult
+from vllm.v1.kv_offload.tiering.storage.simple_transfer_engine import (
+    SimpleTransferEngine,
 )
 
 logger = init_logger(__name__)
@@ -36,6 +42,11 @@ class StorageJobMetadata:
             f" != #storage_paths({len(self.storage_paths)}). Need a 1-to-1 mapping."
         )
 
+    def transfer_type(
+        self,
+    ) -> TransferType:
+        return ("CPU", "STORAGE") if self.is_store else ("STORAGE", "CPU")
+
 
 class StorageHandler:
     # TODO (varun) : plumb num_threads
@@ -52,56 +63,42 @@ class StorageHandler:
         self.total_bytes_per_block = total_bytes_per_block
         self.num_threads = num_threads
 
+        self.transfer_engine = SimpleTransferEngine(self.primary_kv)
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.num_threads
         )
         self.job_meta: dict[JobId, StorageJobMetadata] = {}
-        self.load_jobs: dict[JobId, list[Future]] = {}
-        self.store_jobs: dict[JobId, list[Future]] = {}
-
-    def _async_load(self, file_path: Path, block_id: int) -> bool:
-        with open(str(file_path), "rb") as f:
-            bytes_read = f.readinto(self.primary_kv[block_id])
-            assert bytes_read == self.total_bytes_per_block, (
-                f"{bytes_read=} != {self.total_bytes_per_block=}"
-            )
-        return True
-
-    def _async_store(self, file_path: Path, block_id: int) -> bool:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_file = file_path.with_suffix(".tmp")
-        with open(tmp_file, mode="w+b") as f:
-            self.primary_kv[block_id].tofile(f)
-        tmp_file.rename(file_path)
-        return True
+        self.load_jobs: dict[JobId, Future] = {}
+        self.store_jobs: dict[JobId, Future] = {}
 
     def transfer_async(self, storage_job_metadata: StorageJobMetadata):
         """
         Initiates an asynchronous transfer of KV data.
 
         Args:
-            # TODO (Varun)
+            storage_job_metadata: Job metadata with information about all
+             the transfer ops to be scheduled.
 
         Returns:
             True if transfer was submitted successfully.
         """
         job_id: JobId = storage_job_metadata.job_id
-        is_load = not storage_job_metadata.is_store
-
-        job_fn = self._async_load if is_load else self._async_store
-        job_records = self.load_jobs if is_load else self.store_jobs
-
         self.job_meta[job_id] = storage_job_metadata
 
-        if job_records.get(job_id, None) is None:
-            job_records[job_id] = []
-        job_list = job_records[job_id]
+        is_load = not storage_job_metadata.is_store
 
-        block_ids = storage_job_metadata.block_ids
-        storage_paths = storage_job_metadata.storage_paths
-        for b, storage_path in zip(block_ids, storage_paths):
-            f = self.executor.submit(job_fn, storage_path, b)
-            job_list.append(f)
+        # fetch load/store job_fn
+        job_fn = self.transfer_engine.load if is_load else self.transfer_engine.store
+        f = self.executor.submit(
+            job_fn,
+            job_id,
+            storage_job_metadata.storage_paths,
+            storage_job_metadata.block_ids,
+        )
+
+        # fetch load/store job record
+        job_records = self.load_jobs if is_load else self.store_jobs
+        job_records[job_id] = f
 
     def _cleanup_job(self, job_id: int) -> None:
         meta = self.job_meta.pop(job_id, None)
@@ -112,13 +109,13 @@ class StorageHandler:
         else:
             self.load_jobs.pop(job_id)
 
-    def _safe_future_result(self, futures: Collection[Future], job_id: JobId) -> bool:
-        all_success = False
+    def _safe_future_result(self, future: Future, job_id: JobId) -> TransferResult:
         try:
-            all_success = all([f.result() for f in futures])
+            return future.result()
         except Exception as e:
             logger.debug("Job %s failed with exception %s", self.job_meta[job_id], e)
-        return all_success
+        # Default, failure transfer result
+        return TransferResult()
 
     def get_finished(self) -> list[JobResult]:
         """
@@ -129,12 +126,23 @@ class StorageHandler:
         """
         job_results: list[JobResult] = []
 
-        for jid, futures in chain(self.load_jobs.items(), self.store_jobs.items()):
-            if not all([f.done() for f in futures]):
+        for jid, future in chain(self.load_jobs.items(), self.store_jobs.items()):
+            if not future.done():
                 # not all are done
                 continue
-            all_success = self._safe_future_result(futures, jid)
-            job_results.append(JobResult(jid, all_success))
+            result = self._safe_future_result(future, jid)
+            job_meta = self.job_meta[jid]
+            job_results.append(
+                JobResult(
+                    job_id=jid,
+                    success=result.success,
+                    transfer_stats=JobTransferStats(
+                        transfer_size=result.transfer_size,
+                        transfer_time=result.transfer_time,
+                        transfer_type=job_meta.transfer_type(),
+                    ),
+                )
+            )
 
         for jr in job_results:
             self._cleanup_job(jr.job_id)
@@ -160,20 +168,21 @@ class StorageHandler:
             if meta is None:
                 continue
 
-            futures = self.store_jobs[jid] if meta.is_store else self.load_jobs.get(jid)
-            assert futures is not None
-            wait(futures, return_when=ALL_COMPLETED)
+            future = self.store_jobs[jid] if meta.is_store else self.load_jobs.get(jid)
+            assert future is not None
+            wait([future], return_when=ALL_COMPLETED)
 
     def shutdown(self) -> None:
         """Shutdown the handler and release any resources."""
         # cancel all on going jobs
-        for _, futures in chain(self.load_jobs.items(), self.store_jobs.items()):
-            for f in futures:
-                f.cancel()
+        for _, future in chain(self.load_jobs.items(), self.store_jobs.items()):
+            future.cancel()
+
         # wait for all jobs to complete
         self.wait(set([jid for jid in self.job_meta]))
+
         # clean up state
-        for jid in self.job_meta:
+        for jid in list(self.job_meta):
             self._cleanup_job(jid)
 
         assert len(self.job_meta) == 0
