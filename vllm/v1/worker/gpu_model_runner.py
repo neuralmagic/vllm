@@ -231,29 +231,11 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
-_drain_deepep_stats_calls = 0
-
-
 def _drain_deepep_stats():
     """Drain timing stats from the DeepEP collector (returns None if disabled)."""
-    global _drain_deepep_stats_calls
     collector = get_deepep_timing_collector()
     if collector.enabled:
-        result = collector.finish_step()
-        _drain_deepep_stats_calls += 1
-        if _drain_deepep_stats_calls == 1:
-            logger.info(
-                "MoE timing: _drain_deepep_stats first call (collector.enabled=%s)",
-                collector.enabled,
-            )
-        if result is not None and _drain_deepep_stats_calls <= 3:
-            logger.info(
-                "MoE timing: _drain_deepep_stats returning non-None "
-                "(call #%d, dispatch_layers=%d)",
-                _drain_deepep_stats_calls,
-                len(result.dispatch_times_s),
-            )
-        return result
+        return collector.finish_step()
     return None
 
 

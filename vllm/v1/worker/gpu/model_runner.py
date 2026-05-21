@@ -37,6 +37,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.deepep_timing import (
+    get_deepep_timing_collector,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1230,6 +1233,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_prefill_tokens,
         )
 
+        # Drain DeepEP timing stats if enabled.
+        collector = get_deepep_timing_collector()
+        deepep_stats = collector.finish_step() if collector.enabled else None
+
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,
@@ -1239,6 +1246,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             kv_connector_output=kv_connector_output,
+            deepep_stats=deepep_stats,
         )
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,

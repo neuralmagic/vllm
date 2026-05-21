@@ -51,10 +51,6 @@ class DeepEPTimingCollector:
         self._enabled = False
         self._mode = ""
         self._next_layer_idx = 0
-        self._empty_steps = 0
-        self._total_steps = 0
-        self._total_drained = 0
-        self._total_events_recorded = 0
 
     def enable(self, mode: str = ""):
         if not self._enabled:
@@ -124,56 +120,14 @@ class DeepEPTimingCollector:
         if not self._enabled:
             return None
 
-        self._total_steps += 1
-
         if self._pending_events:
-            self._total_events_recorded += len(self._pending_events)
             self._queue.append(self._pending_events)
             self._pending_events = []
-            self._empty_steps = 0
-        else:
-            self._empty_steps += 1
-            if self._empty_steps == 50:
-                logger.warning(
-                    "MoE timing: no events recorded for %d consecutive "
-                    "steps (total_steps=%d, total_events_ever=%d). "
-                    "Timing instrumentation may not be in the "
-                    "active code path.",
-                    self._empty_steps,
-                    self._total_steps,
-                    self._total_events_recorded,
-                )
 
         if not self._queue:
             return None
 
-        result = self._drain_queue()
-        if result is not None:
-            self._total_drained += 1
-        if result is None and len(self._queue) > 10:
-            logger.warning_once(
-                "MoE timing: event queue has %d undrained batches "
-                "(total_steps=%d, events_recorded=%d, drained=%d). "
-                "Events may not be completing.",
-                len(self._queue),
-                self._total_steps,
-                self._total_events_recorded,
-                self._total_drained,
-            )
-
-        # Periodic progress log (every 100 steps)
-        if self._total_steps % 100 == 0:
-            logger.info(
-                "MoE timing progress: steps=%d, events_recorded=%d, "
-                "queue_size=%d, drained_count=%d, mode=%s",
-                self._total_steps,
-                self._total_events_recorded,
-                len(self._queue),
-                self._total_drained,
-                self._mode,
-            )
-
-        return result
+        return self._drain_queue()
 
     def _drain_queue(self) -> DeepEPStats | None:
         """Read completed event batches from the front of the queue."""
@@ -194,27 +148,12 @@ class DeepEPTimingCollector:
         if not drained_any:
             return None
 
-        stats = DeepEPStats(
+        return DeepEPStats(
             dispatch_times_s=dispatch_times,
             combine_times_s=combine_times,
             expert_compute_times_s=expert_times,
             mode=self._mode,
         )
-
-        if self._total_drained == 0:
-            logger.info(
-                "MoE timing: first successful drain at step %d. "
-                "dispatch_layers=%d, combine_layers=%d, expert_layers=%d, "
-                "sample dispatch_ms=%.3f, sample expert_ms=%.3f",
-                self._total_steps,
-                len(dispatch_times),
-                len(combine_times),
-                len(expert_times),
-                next(iter(dispatch_times.values()), 0.0) * 1000,
-                next(iter(expert_times.values()), 0.0) * 1000,
-            )
-
-        return stats
 
     def _try_read_batch(
         self,
@@ -224,20 +163,7 @@ class DeepEPTimingCollector:
         expert_times: dict[int, float],
     ) -> bool:
         """Attempt to read all events in a batch. Returns False if not ready."""
-        # Check the last event in the batch — if it's done, all prior are too
-        # (same stream ordering).
         if not events[-1].end.query():
-            if self._total_drained == 0 and self._total_steps % 50 == 0:
-                logger.info(
-                    "MoE timing: query() returned False for last event "
-                    "(batch_size=%d, phase=%s, layer=%d, step=%d, "
-                    "queue_len=%d)",
-                    len(events),
-                    events[-1].phase,
-                    events[-1].layer_idx,
-                    self._total_steps,
-                    len(self._queue),
-                )
             return False
 
         for rec in events:
