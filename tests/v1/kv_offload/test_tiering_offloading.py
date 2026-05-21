@@ -633,23 +633,10 @@ class TestTieringOffloadingWithStorageTier:
         manager._process_finished_jobs()
         list(manager.take_events())
 
-    @staticmethod
-    def _install_store_impl(monkeypatch, storage_tier: StorageSecondaryTier) -> None:
-        original_async_store = storage_tier.handler._async_store
-
-        def _store_with_parent_mkdir(file_path, block_id):
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            return original_async_store(file_path, block_id)
-
-        monkeypatch.setattr(
-            storage_tier.handler, "_async_store", _store_with_parent_mkdir
-        )
-
     def test_storage_tier_hit(self, tmp_path, monkeypatch):
         manager, primary_tier, storage_tier = self._make_manager(
             tmp_path, primary_blocks=1
         )
-        self._install_store_impl(monkeypatch, storage_tier)
 
         key_a, key_b = to_keys([10, 11])
 
@@ -676,7 +663,6 @@ class TestTieringOffloadingWithStorageTier:
 
     def test_storage_tier_miss(self, tmp_path, monkeypatch):
         manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
-        self._install_store_impl(monkeypatch, storage_tier)
 
         missing_key = to_keys([999])[0]
         assert manager.lookup(missing_key, _CTX) is False
@@ -684,10 +670,12 @@ class TestTieringOffloadingWithStorageTier:
     def test_storage_tier_store_fail(self, tmp_path, monkeypatch):
         manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
 
-        def _always_fail_store(file_path, block_id):
-            raise RuntimeError(f"forced store failure for {file_path} {block_id}")
+        def _always_fail_store(job_id, file_paths, block_ids):
+            raise RuntimeError(f"forced store failure for {file_paths} {block_ids}")
 
-        monkeypatch.setattr(storage_tier.handler, "_async_store", _always_fail_store)
+        monkeypatch.setattr(
+            storage_tier.handler.transfer_engine, "store", _always_fail_store
+        )
 
         key_a, key_b = to_keys([20, 21])
         manager.prepare_store([key_a], _CTX)
@@ -705,7 +693,6 @@ class TestTieringOffloadingWithStorageTier:
         manager, primary_tier, storage_tier = self._make_manager(
             tmp_path, primary_blocks=1
         )
-        self._install_store_impl(monkeypatch, storage_tier)
 
         key_a, key_b = to_keys([30, 31])
         manager.prepare_store([key_a], _CTX)
@@ -716,10 +703,12 @@ class TestTieringOffloadingWithStorageTier:
         manager.complete_store([key_b], _CTX, success=True)
         self._wait_and_drain_jobs(manager, storage_tier)
 
-        def _always_fail_load(file_path, block_id):
-            raise RuntimeError(f"forced load failure for {file_path} {block_id}")
+        def _always_fail_load(job_id, file_paths, block_ids):
+            raise RuntimeError(f"forced load failure for {file_paths} {block_ids}")
 
-        monkeypatch.setattr(storage_tier.handler, "_async_load", _always_fail_load)
+        monkeypatch.setattr(
+            storage_tier.handler.transfer_engine, "load", _always_fail_load
+        )
 
         # Trigger promotion - but the promotion will fail.
         assert manager.lookup(key_a, _CTX) is None
@@ -733,7 +722,6 @@ class TestTieringOffloadingWithStorageTier:
         self, tmp_path, monkeypatch
     ):
         manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
-        self._install_store_impl(monkeypatch, storage_tier)
 
         shared_key, eviction_key = to_keys([40, 41])
         manager.prepare_store([shared_key], _CTX)
@@ -761,7 +749,6 @@ class TestTieringOffloadingWithStorageTier:
         manager, primary_tier, storage_tier = self._make_manager(
             tmp_path, primary_blocks=2
         )
-        self._install_store_impl(monkeypatch, storage_tier)
 
         promotable_key, pinned_a, pinned_b = to_keys([50, 51, 52])
 
@@ -790,7 +777,6 @@ class TestTieringOffloadingWithStorageTier:
 
     def test_inflight_promotion_across_steps_submits_once(self, tmp_path, monkeypatch):
         manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=1)
-        self._install_store_impl(monkeypatch, storage_tier)
 
         promoted_key, evictor_key = to_keys([60, 61])
         manager.prepare_store([promoted_key], _CTX)
@@ -802,13 +788,15 @@ class TestTieringOffloadingWithStorageTier:
         self._wait_and_drain_jobs(manager, storage_tier)
 
         gate = threading.Event()
-        original_async_load = storage_tier.handler._async_load
+        original_async_load = storage_tier.handler.transfer_engine.load
 
-        def _blocking_async_load(file_path, block_id):
+        def _blocking_async_load(job_id, file_paths, block_ids):
             gate.wait(timeout=2.0)
-            return original_async_load(file_path, block_id)
+            return original_async_load(job_id, file_paths, block_ids)
 
-        monkeypatch.setattr(storage_tier.handler, "_async_load", _blocking_async_load)
+        monkeypatch.setattr(
+            storage_tier.handler.transfer_engine, "load", _blocking_async_load
+        )
         storage_tier.submit_load = MagicMock(wraps=storage_tier.submit_load)
 
         assert manager.lookup(promoted_key, _CTX) is None
@@ -828,7 +816,6 @@ class TestTieringOffloadingWithStorageTier:
         self, tmp_path, monkeypatch
     ):
         manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=2)
-        self._install_store_impl(monkeypatch, storage_tier)
 
         k1, k2, k3, k4 = to_keys([70, 71, 72, 73])
 
@@ -860,7 +847,6 @@ class TestTieringOffloadingWithStorageTier:
         manager, primary_tier, storage_tier = self._make_manager(
             tmp_path, primary_blocks=2
         )
-        self._install_store_impl(monkeypatch, storage_tier)
 
         promote_key, resident_key, incoming_key = to_keys([80, 81, 82])
 
@@ -890,16 +876,17 @@ class TestTieringOffloadingWithStorageTier:
         # This is the current expected behavior. There is a TODO to improve this
         # so we account for each key transfer individually.
         manager, _, storage_tier = self._make_manager(tmp_path, primary_blocks=2)
-        self._install_store_impl(monkeypatch, storage_tier)
 
-        original_async_store = storage_tier.handler._async_store
+        original_async_store = storage_tier.handler.transfer_engine._file_write
 
         def _fail_one_store(file_path, block_id):
             if block_id == 1:
                 raise RuntimeError("forced partial store failure")
             return original_async_store(file_path, block_id)
 
-        monkeypatch.setattr(storage_tier.handler, "_async_store", _fail_one_store)
+        monkeypatch.setattr(
+            storage_tier.handler.transfer_engine, "_file_write", _fail_one_store
+        )
 
         key_a, key_b = to_keys([90, 91])
         manager.prepare_store([key_a, key_b], _CTX)
