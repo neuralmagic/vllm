@@ -54,7 +54,7 @@ class StorageHandler:
         self,
         primary_kv_view: memoryview,
         total_bytes_per_block: int,
-        num_threads: int = 4,
+        num_threads: int = 16,
     ):
         self.primary_kv_view = primary_kv_view
         self.primary_kv = np.frombuffer(self.primary_kv_view, dtype=np.uint8).reshape(

@@ -52,7 +52,7 @@ _RESET_CACHE_TIMEOUT = 30 if current_platform.is_rocm() else 10
 # ZMQ poll timeout (ms) for the first event.
 _FIRST_EVENT_POLL_MS = 10_000 if current_platform.is_rocm() else 1000
 
-# Hard ceiling (seconds) on how long get_new_cpu_stored_events may loop,
+# Hard ceiling (seconds) on how long get_new_stored_events may loop,
 # to prevent hangs if non-CPU events keep arriving indefinitely.
 _EVENT_DRAIN_TIMEOUT = 60
 
@@ -75,8 +75,8 @@ class MockSubscriber:
 
         self.decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
 
-    def get_new_cpu_stored_events(self) -> list[BlockStored]:
-        cpu_stored_events: list[BlockStored] = []
+    def get_new_stored_events(self, medium: str) -> list[BlockStored]:
+        stored_events: list[BlockStored] = []
 
         poller = zmq.Poller()
         poller.register(self.sub, zmq.POLLIN)
@@ -87,7 +87,7 @@ class MockSubscriber:
             events = dict(poller.poll(poll_ms))
 
             if events.get(self.sub) != zmq.POLLIN:
-                return cpu_stored_events
+                return stored_events
 
             topic_bytes, _, payload = self.sub.recv_multipart()
 
@@ -96,15 +96,23 @@ class MockSubscriber:
             event_batch = self.decoder.decode(payload)
             assert isinstance(event_batch, KVEventBatch)
             for event in event_batch.events:
-                if isinstance(event, BlockStored) and event.medium == "CPU":
-                    cpu_stored_events.append(event)
+                if isinstance(event, BlockStored) and event.medium == medium:
+                    stored_events.append(event)
                     poll_ms = 100
 
-        return cpu_stored_events
+        return stored_events
 
     def close(self):
         """Clean up resources"""
         self.sub.close()
+
+
+def _dummy_engine_step(llm: LLM):
+    llm.generate(
+        [TokensPrompt(prompt_token_ids=[0])],
+        SamplingParams(max_tokens=1),
+        use_tqdm=False,
+    )
 
 
 def _wait_for_prefix_cache_reset(llm: LLM) -> None:
@@ -126,21 +134,73 @@ def _wait_for_prefix_cache_reset(llm: LLM) -> None:
             )
         # Force an engine step so the scheduler polls get_finished()
         # and releases GPU blocks held by in-flight async stores.
-        llm.generate(
-            [TokensPrompt(prompt_token_ids=[0])],
-            _dummy_params,
-            use_tqdm=False,
+        _dummy_engine_step(llm)
+
+
+def _prepare_load_from_secondary_tier(llm: LLM):
+    # Remove GPU cache
+    _wait_for_prefix_cache_reset(llm)
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+    from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+    from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+    def get_tiering_manager():
+        scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+        connector = scheduler.connector
+        assert isinstance(connector, OffloadingConnector)
+        manager = connector.connector_scheduler.manager
+        assert isinstance(manager, TieringOffloadingManager)
+        return manager
+
+    def _evict_all_cpu_blocks(manager: TieringOffloadingManager) -> None:
+        """Remove all evictable blocks from CPU primary tier only."""
+        manager._maybe_process_finished_jobs()  # finish in-flight tier jobs first
+        primary = manager.primary_tier
+        assert isinstance(primary, CPUOffloadingManager)
+        for key, block in list(primary._policy.blocks.items()):
+            if block.ref_cnt == 0:
+                primary._policy.remove(key)
+                primary.block_tracker.free_block(block)
+        assert (
+            primary.block_tracker.get_num_free_blocks()
+            == primary.block_tracker.num_blocks
+        )
+        list(manager.take_events())
+
+    # Clear all CPU cache
+    _evict_all_cpu_blocks(get_tiering_manager())
+
+
+def _verify_kv_stores(subscriber: MockSubscriber | None, medium: str):
+    if subscriber is not None:
+        assert subscriber.get_new_stored_events(medium), (
+            f"No {medium} stored events received."
+            "async offload may not have completed in time"
         )
 
 
-def _latency_test(llm: LLM, subscriber: MockSubscriber | None):
+def _latency_test(
+    llm: LLM,
+    subscriber: MockSubscriber | None,
+    is_tiered_storage_offloader: bool = False,
+):
     sampling_params = SamplingParams(max_tokens=1)
 
+    def _generate_time(prompts) -> float:
+        start_time = time.time()
+        llm.generate(prompts, sampling_params, use_tqdm=False)
+        return time.time() - start_time
+
     num_times_cpu_better_than_cold = 0
+    num_times_secondary_tier_better_than_cold = 0
     num_tests = 10
     total_cold_time = 0.0
     total_gpu_hit_time = 0.0
     total_cpu_hit_time = 0.0
+    total_secondary_tier_hit_time = 0.0
     max_model_len = llm.llm_engine.vllm_config.model_config.max_model_len
     # Use a long prompt that fits within the model's context window.
     prompt_len = min(10001, max_model_len - 1)
@@ -150,16 +210,11 @@ def _latency_test(llm: LLM, subscriber: MockSubscriber | None):
         prompts = [TokensPrompt(prompt_token_ids=prompt_token_ids)]
 
         # run generation - this should trigger saving KV cache
-        start_time = time.time()
-        llm.generate(prompts, sampling_params, use_tqdm=False)
-        cold_time = time.time() - start_time
+        cold_time = _generate_time(prompts)
         total_cold_time += cold_time
 
         # run generation again - should hit the GPU prefix cache
-        start_time = time.time()
-        llm.generate(prompts, sampling_params, use_tqdm=False)
-        gpu_hit_time = time.time() - start_time
-        total_gpu_hit_time += gpu_hit_time
+        total_gpu_hit_time += _generate_time(prompts)
 
         # Wait for the async CPU offload to finish, then reset prefix cache
         # so the next generate() must reload from CPU rather than GPU.
@@ -167,17 +222,19 @@ def _latency_test(llm: LLM, subscriber: MockSubscriber | None):
 
         # Verify CPU stored events arrived (offload is done before we
         # attempt to load from CPU).
-        if subscriber is not None:
-            assert subscriber.get_new_cpu_stored_events(), (
-                f"No CPU stored events received on iteration {i}; "
-                "async offload may not have completed in time"
-            )
+        _verify_kv_stores(subscriber, "CPU")
 
         # run generation again - this should trigger loading from CPU
-        start_time = time.time()
-        llm.generate(prompts, sampling_params, use_tqdm=False)
-        cpu_hit_time = time.time() - start_time
-        total_cpu_hit_time += cpu_hit_time
+        cpu_hit_time = _generate_time(prompts)
+        total_cpu_hit_time += _generate_time(prompts)
+
+        if is_tiered_storage_offloader:
+            _verify_kv_stores(subscriber, "STORAGE")
+            _prepare_load_from_secondary_tier(llm)
+            secondary_tier_hit_time = _generate_time(prompts)
+            total_secondary_tier_hit_time += secondary_tier_hit_time
+            if secondary_tier_hit_time < cold_time:
+                num_times_secondary_tier_better_than_cold += 1
 
         if cpu_hit_time < cold_time:
             num_times_cpu_better_than_cold += 1
@@ -186,11 +243,21 @@ def _latency_test(llm: LLM, subscriber: MockSubscriber | None):
     print(f"    Cold: {total_cold_time * 1000 / num_tests:.2f}ms")
     print(f"    GPU hit: {total_gpu_hit_time * 1000 / num_tests:.2f}ms")
     print(f"    CPU hit: {total_cpu_hit_time * 1000 / num_tests:.2f}ms")
+    if is_tiered_storage_offloader:
+        avg_hit_time = total_secondary_tier_hit_time * 1000 / num_tests
+        print(f"    Secondary Tier hit: {avg_hit_time:.2f}ms")
 
     assert num_times_cpu_better_than_cold >= 0.8 * num_tests
+    # Loading from storage tier is typically very slow.
+    # if is_tiered_storage_offloader:
+    #    assert num_times_secondary_tier_better_than_cold >= 0.8 * num_tests
 
 
-def _accuracy_test(llm: LLM, subscriber: MockSubscriber | None):
+def _accuracy_test(
+    llm: LLM,
+    subscriber: MockSubscriber | None,
+    is_tiered_storage_offloader: bool = False,
+):
     sampling_params = SamplingParams(max_tokens=1)
     extra_config = (
         llm.llm_engine.vllm_config.kv_transfer_config.kv_connector_extra_config
@@ -201,8 +268,9 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber | None):
         # Use the hash block_size (cache_config.block_size) for alignment.
         cpu_block_size = llm.llm_engine.vllm_config.cache_config.block_size
 
+    # Clear out any pending CPU store events.
     if subscriber is not None:
-        subscriber.get_new_cpu_stored_events()
+        subscriber.get_new_stored_events("CPU")
 
     # Pad prompt so its token count is a multiple of cpu_block_size.
     # Use the tokenizer directly to avoid expensive llm.generate() calls.
@@ -214,13 +282,28 @@ def _accuracy_test(llm: LLM, subscriber: MockSubscriber | None):
     # Seed the CPU cache with the prompt.
     llm.generate(prompt, sampling_params, use_tqdm=False)
 
-    if subscriber is not None:
-        assert subscriber.get_new_cpu_stored_events()
+    def _test():
+        test_count = 20
+        results = llm.generate([prompt] * test_count, sampling_params, use_tqdm=False)
+        success_count = sum(1 for r in results if r.outputs[0].text == " five")
+        assert success_count >= 0.5 * test_count
 
-    test_count = 20
-    results = llm.generate([prompt] * test_count, sampling_params, use_tqdm=False)
-    success_count = sum(1 for r in results if r.outputs[0].text == " five")
-    assert success_count >= 0.5 * test_count
+    # Dummy engine step for force get_finished polling
+    _dummy_engine_step(llm)
+
+    # Wait for the async CPU offload to finish, then reset prefix cache
+    # so the next generate() must reload from CPU rather than GPU.
+    _wait_for_prefix_cache_reset(llm)
+    _verify_kv_stores(subscriber, "CPU")
+    _test()
+
+    # Dummy engine step for force get_finished polling
+    _dummy_engine_step(llm)
+
+    if is_tiered_storage_offloader:
+        _verify_kv_stores(subscriber, "STORAGE")
+        _prepare_load_from_secondary_tier(llm)
+        _test()
 
 
 @pytest.mark.parametrize("model, attn_backend, cpu_block_size, uses_hma", MODEL_PARAMS)
@@ -291,6 +374,90 @@ def test_cpu_offloading(
     finally:
         if subscriber is not None:
             subscriber.close()
+        del llm
+
+
+@pytest.mark.parametrize("model, attn_backend, cpu_block_size, uses_hma", MODEL_PARAMS)
+def test_tiered_storage_offloading(
+    model: str,
+    attn_backend: str | None,
+    cpu_block_size: int | None,
+    uses_hma: bool,
+    tmp_path,  # tmp_path generated by pytest
+    monkeypatch,
+) -> None:
+    # To be able to reach into the engine_core to get the tiering manager.
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    # KV events are incompatible with HMA (setting kv_events_config
+    # would force HMA off), so only enable them for non-HMA models.
+    subscriber: MockSubscriber | None = None
+    kv_events_config: KVEventsConfig | None = None
+    if not uses_hma:
+        port: int
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("0.0.0.0", 0))
+            port = s.getsockname()[1]
+
+        events_endpoint = f"tcp://*:{port}"
+        kv_events_config = KVEventsConfig(
+            enable_kv_cache_events=True,
+            publisher="zmq",
+            endpoint=events_endpoint,
+            topic="test",
+        )
+
+    # Attention-free / hybrid models disable prefix caching by default
+    # (ModelConfig.is_prefix_caching_supported returns False).  Without it,
+    # mamba_block_size falls back to max_model_len, making GPU blocks too
+    # large for any reasonable offloaded block_size.  Force-enable it.
+    force_prefix_caching = uses_hma
+
+    extra_config: dict = {
+        "spec_name": "TieringOffloadingSpec",
+        "cpu_bytes_to_use": 500 << 20,  # ~500MB
+        "secondary_tiers": [
+            {
+                "type": "STORAGE",
+                "storage_root_path": str(tmp_path),
+                "max_storage_size_gb": 1,
+            }
+        ],
+    }
+    if cpu_block_size is not None:
+        extra_config["block_size"] = cpu_block_size
+
+    kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config=extra_config,
+    )
+
+    llm = LLM(
+        model=model,
+        max_model_len=4096,
+        gpu_memory_utilization=0.5,
+        kv_events_config=kv_events_config,
+        kv_transfer_config=kv_transfer_config,
+        **({"attention_config": {"backend": attn_backend}} if attn_backend else {}),
+        # HMA models need explicit opt-in when kv_transfer_config is set
+        **({"disable_hybrid_kv_cache_manager": False} if uses_hma else {}),
+        **({"enable_prefix_caching": True} if force_prefix_caching else {}),
+        # ROCm: batch size 1 to reduce variability
+        **({"max_num_seqs": 1} if current_platform.is_rocm() else {}),
+    )
+
+    if kv_events_config is not None:
+        events_endpoint = events_endpoint.replace("*", "127.0.0.1")
+        subscriber = MockSubscriber(events_endpoint, topic=kv_events_config.topic)
+
+    try:
+        _latency_test(llm, subscriber, is_tiered_storage_offloader=True)
+        _accuracy_test(llm, subscriber, is_tiered_storage_offloader=True)
+    finally:
+        if subscriber is not None:
+            subscriber.close()
+        llm.llm_engine.engine_core.shutdown()
         del llm
 
 

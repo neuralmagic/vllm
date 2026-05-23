@@ -75,6 +75,9 @@ class StorageSecondaryTier(SecondaryTierManager):
             storage_path: Path to store the offloaded KV cache.
         """
         super().__init__(vllm_config, kv_cache_config, primary_tier_meta, enable_events)
+        assert max_storage_size_gb > 0, (
+            f"max_storage_size_gb must be > 0; got {max_storage_size_gb=}"
+        )
 
         self.medium = StorageLoadStoreSpec.medium()
         self.vllm_config = vllm_config
