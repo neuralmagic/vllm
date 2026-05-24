@@ -54,7 +54,7 @@ class StorageHandler:
         self,
         primary_kv_view: memoryview,
         total_bytes_per_block: int,
-        num_threads: int = 16,
+        num_threads: int = 8,
     ):
         self.primary_kv_view = primary_kv_view
         self.primary_kv = np.frombuffer(self.primary_kv_view, dtype=np.uint8).reshape(
@@ -63,7 +63,8 @@ class StorageHandler:
         self.total_bytes_per_block = total_bytes_per_block
         self.num_threads = num_threads
 
-        self.transfer_engine = SimpleTransferEngine(self.primary_kv)
+        # Parametrize num_threads for SimpleTransferEngine
+        self.transfer_engine = SimpleTransferEngine(self.primary_kv, num_threads=16)
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.num_threads
         )
@@ -142,6 +143,16 @@ class StorageHandler:
                         transfer_type=job_meta.transfer_type(),
                     ),
                 )
+            )
+
+        for jr in job_results:
+            assert jr.transfer_stats is not None
+            print(
+                f"{jr.job_id=} | {len(self.job_meta[jr.job_id].keys)=} | "
+                f"{jr.transfer_stats.transfer_size=} "
+                f"{jr.transfer_stats.transfer_type=} "
+                f"{jr.transfer_stats.transfer_time} ",
+                flush=True,
             )
 
         for jr in job_results:

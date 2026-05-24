@@ -3,6 +3,7 @@
 
 import time
 from collections.abc import Callable, Collection
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +18,10 @@ logger = init_logger(__name__)
 
 
 class SimpleTransferEngine:
-    def __init__(self, primary_kv: np.ndarray):
+    def __init__(self, primary_kv: np.ndarray, num_threads: int):
         self.primary_kv = primary_kv
+        self.num_threads = num_threads
+        self._executor = ThreadPoolExecutor(max_workers=num_threads)
 
     @staticmethod
     def _file_write(file_path: Path, np_arr: np.ndarray) -> bool:
@@ -48,13 +51,16 @@ class SimpleTransferEngine:
         start = time.perf_counter()
 
         results = []
-        for file_path, block_id in zip(file_paths, block_ids):
-            try:
-                results.append(op(file_path, self.primary_kv[block_id]))
-            except Exception as e:
-                logger.debug("Job %s failed with exception %s", job_id, e)
-                # Return default fail result.
-                return TransferResult()
+        try:
+            futures = [
+                self._executor.submit(op, fp, self.primary_kv[bid])
+                for fp, bid in zip(file_paths, block_ids)
+            ]
+            wait(futures, return_when=ALL_COMPLETED)
+            results = [f.result() for f in futures]
+        except Exception as e:
+            logger.info("Job %s failed: %s", job_id, e)
+            return TransferResult()
 
         return TransferResult(
             success=all(results),

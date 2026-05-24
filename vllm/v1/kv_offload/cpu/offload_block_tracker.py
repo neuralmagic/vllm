@@ -17,7 +17,8 @@ class OffloadBlockTracker:
         self.free_list: list[int] = []
 
     def get_num_free_blocks(self) -> int:
-        return len(self.free_list) + self.num_blocks - self.num_allocated_blocks
+        num_fresh_blocks = max(0, self.num_blocks - self.num_allocated_blocks)
+        return len(self.free_list) + num_fresh_blocks
 
     def allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
         num_fresh = min(len(keys), self.num_blocks - self.num_allocated_blocks)
@@ -29,6 +30,9 @@ class OffloadBlockTracker:
         for _ in range(num_fresh):
             blocks.append(BlockStatus(self.num_allocated_blocks))
             self.num_allocated_blocks += 1
+        assert self.num_allocated_blocks <= self.num_blocks, (
+            f" {self.num_blocks=}, {self.num_allocated_blocks=}"
+        )
 
         # allocate reused blocks
         for _ in range(num_reused):
