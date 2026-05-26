@@ -139,9 +139,9 @@ class DistributionBasedRouting(RoutingStrategy):
             probs = torch.ones(
                 num_tokens, num_experts, device=device, dtype=torch.float32
             )
-            return torch.multinomial(
-                probs, num_samples=top_k, replacement=False
-            ).to(dtype=indices_type)
+            return torch.multinomial(probs, num_samples=top_k, replacement=False).to(
+                dtype=indices_type
+            )
 
         elif self.distribution == "normal":
             mean = self.distribution_params["mean"]
@@ -151,17 +151,13 @@ class DistributionBasedRouting(RoutingStrategy):
             expert_indices = torch.arange(
                 num_experts, device=device, dtype=torch.float32
             )
-            logits = -(
-                (expert_indices - mean) ** 2 / (2 * std**2)
-            )
+            logits = -((expert_indices - mean) ** 2 / (2 * std**2))
             # Expand to [num_tokens, num_experts] and convert to
             # probabilities via softmax.
-            probs = torch.softmax(logits, dim=-1).unsqueeze(0).expand(
-                num_tokens, -1
+            probs = torch.softmax(logits, dim=-1).unsqueeze(0).expand(num_tokens, -1)
+            return torch.multinomial(probs, num_samples=top_k, replacement=False).to(
+                dtype=indices_type
             )
-            return torch.multinomial(
-                probs, num_samples=top_k, replacement=False
-            ).to(dtype=indices_type)
 
         else:
             raise ValueError(f"Unsupported distribution: {self.distribution}")
@@ -181,8 +177,7 @@ class DistributionBasedRouting(RoutingStrategy):
         elif self.distribution == "normal":
             mean = self.distribution_params["mean"]
             std = self.distribution_params["std"]
-            raw = torch.normal(mean, std, size=(num_tokens, top_k),
-                               device=device)
+            raw = torch.normal(mean, std, size=(num_tokens, top_k), device=device)
             weights = torch.abs(raw)
             weights = weights / weights.sum(dim=-1, keepdim=True)
             return weights
@@ -291,15 +286,13 @@ class RoutingSimulatorRouter(BaseRouter):
         self,
         top_k: int,
         global_num_experts: int,
-        eplb_state: EplbLayerState,
-        enable_eplb: bool = False,
+        eplb_state: EplbLayerState | None = None,
         indices_type_getter: Callable[[], torch.dtype | None] | None = None,
     ):
         super().__init__(
             top_k=top_k,
             global_num_experts=global_num_experts,
             eplb_state=eplb_state,
-            enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
         )
 
