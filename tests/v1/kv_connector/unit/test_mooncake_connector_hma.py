@@ -221,14 +221,9 @@ async def test_build_transfer_params_multi_group_trimming(monkeypatch):
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector", kv_role="kv_producer"
     )
-    kv_cache_config = make_kv_cache_config(
-        block_size=vllm_config.cache_config.block_size, swa_enabled=True
-    )
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
-        connector = MooncakeConnector(
-            vllm_config, KVConnectorRole.WORKER, kv_cache_config
-        )
+        connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         worker = connector.connector_worker
 
         block_len = 4096
@@ -309,14 +304,9 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector", kv_role="kv_producer"
     )
-    kv_cache_config = make_kv_cache_config(
-        block_size=vllm_config.cache_config.block_size, swa_enabled=True
-    )
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
-        connector = MooncakeConnector(
-            vllm_config, KVConnectorRole.WORKER, kv_cache_config
-        )
+        connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         worker = connector.connector_worker
 
         block_len = 4096

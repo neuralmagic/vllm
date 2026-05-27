@@ -3,36 +3,46 @@
 """Tests whether gptq models with dynamic quantized can be loaded.
 
 Run `pytest tests/quantization/test_gptq_dynamic.py --forked`.
-
-Note: Only symmetric GPTQ models are supported after consolidation to Marlin.
 """
 
 import pytest
 import torch
 
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQLinearMethod
+from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinLinearMethod
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_dynamic_override,
 )
+from vllm.platforms import current_platform
 
 PROMPT = "On the surface of Mars, we found"
 
 # The first layer is quantized using bits=4, group_size=128
 # The second layer is quantized using bits=8, group_size=32
 # All other layers (layer index >= 2) are not quantized
-# Note: Only symmetric models are supported with Marlin kernels
-MODELS = [
-    "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue",
+MODEL_QUANT = [
+    (
+        "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue",
+        current_platform.is_cuda(),
+    ),
+    (
+        "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse",
+        False,
+    ),
 ]
 
 
-@pytest.mark.parametrize("model_id", MODELS)
-def test_gptq_with_dynamic(vllm_runner, model_id: str, monkeypatch):
+@pytest.mark.parametrize("model_id, use_marlin_kernel", MODEL_QUANT)
+def test_gptq_with_dynamic(
+    vllm_runner, model_id: str, use_marlin_kernel: bool, monkeypatch
+):
     # `LLM.apply_model` requires pickling a function.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-    linear_method_cls = AutoGPTQLinearMethod
+    linear_method_cls = (
+        GPTQMarlinLinearMethod if use_marlin_kernel else (GPTQLinearMethod)
+    )
 
     with vllm_runner(
         model_id, dtype=torch.float16, max_model_len=2048, enforce_eager=True

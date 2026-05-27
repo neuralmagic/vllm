@@ -66,10 +66,7 @@ def test_kv_connector(
 
 
 def _build_config(
-    *,
-    kv_connector: str | None,
-    enable_sleep_mode: bool = False,
-    enable_cumem_allocator: bool = False,
+    *, kv_connector: str | None, enable_sleep_mode: bool = False
 ) -> VllmConfig:
     """Build a VllmConfig that exercises _verify_kv_transfer_compat without
     requiring a real model (avoids HF downloads in CI)."""
@@ -82,10 +79,7 @@ def _build_config(
     )
     cfg = VllmConfig.__new__(VllmConfig)
     cfg.kv_transfer_config = kv_transfer_config
-    cfg.model_config = SimpleNamespace(
-        enable_sleep_mode=enable_sleep_mode,
-        enable_cumem_allocator=(enable_cumem_allocator or enable_sleep_mode),
-    )
+    cfg.model_config = SimpleNamespace(enable_sleep_mode=enable_sleep_mode)
     cfg._verify_kv_transfer_compat()
     return cfg
 
@@ -109,14 +103,6 @@ def test_kv_connector_allows_expandable_segments_with_sleep_mode(monkeypatch):
     auto-disables expandable_segments (see #40812)."""
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     _build_config(kv_connector="NixlConnector", enable_sleep_mode=True)
-
-
-def test_kv_connector_allows_expandable_segments_with_cumem_allocator(
-    monkeypatch,
-):
-    """Manual CuMem allocation must also bypass expandable_segments."""
-    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    _build_config(kv_connector="NixlConnector", enable_cumem_allocator=True)
 
 
 def test_kv_connector_allows_other_alloc_conf(monkeypatch):

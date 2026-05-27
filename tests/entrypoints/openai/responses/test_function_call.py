@@ -325,12 +325,8 @@ async def test_function_calling_with_streaming_expected_arguments(
     "tool_choice",
     ["auto", "required", {"type": "function", "name": "get_current_weather"}],
 )
-@pytest.mark.parametrize(
-    "enable_thinking",
-    [True, False],
-)
 async def test_function_calling_with_streaming_types(
-    client: openai.AsyncOpenAI, model_name: str, tool_choice, enable_thinking: bool
+    client: openai.AsyncOpenAI, model_name: str, tool_choice
 ):
     # this links the "done" type with the "start" type
     # so every "done" type should have a corresponding "start" type
@@ -440,7 +436,6 @@ async def test_function_calling_with_streaming_types(
         input=input_list,
         tools=tools,
         tool_choice=tool_choice,
-        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
         stream=True,
     )
 

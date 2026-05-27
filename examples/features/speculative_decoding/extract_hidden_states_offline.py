@@ -2,15 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import tempfile
 
-from vllm import LLM, SamplingParams
-from vllm.config.kv_transfer import KVTransferConfig
-from vllm.distributed.kv_transfer.kv_connector.v1 import (
-    example_hidden_states_connector,
-)
+from safetensors import safe_open
 
-# NOTE: If changing the interface of the ExampleHiddenStatesConnector, please also
-# update the benchmark in benchmarks/benchmark_hidden_state_extraction.py
-# and the docs in docs/features/speculative_decoding/extract_hidden_states.md
+from vllm import LLM, SamplingParams
 
 # Example: Using the custom "extract_hidden_states" speculator method and
 # ExampleHiddenStatesConnector to extract and save hidden states from vllm
@@ -18,7 +12,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 with tempfile.TemporaryDirectory() as tmpdirname:
     llm = LLM(
         model="Qwen/Qwen3-8B",  # Your target model
-        enable_chunked_prefill=False,  # required
         speculative_config={
             "method": "extract_hidden_states",
             "num_speculative_tokens": 1,
@@ -30,16 +23,16 @@ with tempfile.TemporaryDirectory() as tmpdirname:
                         3,
                         4,
                     ],
-                },
+                }
             },
         },
-        kv_transfer_config=KVTransferConfig(
-            kv_connector="ExampleHiddenStatesConnector",
-            kv_role="kv_producer",
-            kv_connector_extra_config={
+        kv_transfer_config={
+            "kv_connector": "ExampleHiddenStatesConnector",
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {
                 "shared_storage_path": tmpdirname,
             },
-        ),
+        },
     )
 
     prompts = ["Generate a sentence with hidden states", "Write a python function"]
@@ -54,14 +47,12 @@ with tempfile.TemporaryDirectory() as tmpdirname:
         assert hidden_states_path is not None
         print("Prompt hidden states path:", hidden_states_path)
 
-        obj = example_hidden_states_connector.load_hidden_states(hidden_states_path)
-        token_ids = obj["token_ids"]
-        hidden_states = obj["hidden_states"]
+        with safe_open(hidden_states_path, "pt") as f:
+            token_ids = f.get_tensor("token_ids")
+            hidden_states = f.get_tensor("hidden_states")
 
-        print("Extracted token ids:", token_ids)  # Matches prompt token ids
-        print(
-            "Extracted hidden states shape:", hidden_states.shape
-        )  # [prompt_len, num_extracted_layers, hidden_size]
-        print("Extracted hidden states:", hidden_states)
-
-        example_hidden_states_connector.cleanup_hidden_states(hidden_states_path)
+            print("Extracted token ids:", token_ids)  # Matches prompt token ids
+            print(
+                "Extracted hidden states shape:", hidden_states.shape
+            )  # [prompt len, num_hidden_layers, hidden size]
+            print("Extracted hidden states:", hidden_states)

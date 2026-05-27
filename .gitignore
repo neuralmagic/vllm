@@ -26,9 +26,6 @@ __pycache__/
 # C extensions
 *.so
 
-# Rust binaries
-vllm/vllm-rs
-
 # Distribution / packaging
 .Python
 build/

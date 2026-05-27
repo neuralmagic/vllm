@@ -186,10 +186,6 @@ _TOOL_PARSERS_TO_REGISTER = {
         "gemma4_tool_parser",
         "Gemma4ToolParser",
     ),
-    "apertus": (
-        "apertus_tool_parser",
-        "ApertusToolParser",
-    ),
 }
 
 

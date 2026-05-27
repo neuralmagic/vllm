@@ -278,15 +278,15 @@ def create_qwen2_5_omni_thinker_field_factory(
             image_embeds=MultiModalFieldConfig.flat_from_sizes(
                 "image", image_embed_grid_sizes
             ),
-            image_grid_thw=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
+            image_grid_thw=MultiModalFieldConfig.batched("image"),
             pixel_values_videos=MultiModalFieldConfig.flat_from_sizes(
                 "video", video_grid_sizes
             ),
             video_embeds=MultiModalFieldConfig.flat_from_sizes(
                 "video", video_embed_grid_sizes
             ),
-            video_grid_thw=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
-            second_per_grid_ts=MultiModalFieldConfig.batched("video", keep_on_cpu=True),
+            video_grid_thw=MultiModalFieldConfig.batched("video"),
+            second_per_grid_ts=MultiModalFieldConfig.batched("video"),
             use_audio_in_video=MultiModalFieldConfig.shared("video", num_videos),
         )
 

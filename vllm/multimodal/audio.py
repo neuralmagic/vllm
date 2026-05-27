@@ -230,19 +230,11 @@ def resample_audio_scipy(
     orig_sr: float,
     target_sr: float,
 ) -> npt.NDArray[np.floating]:
-    orig_sr_int = int(round(orig_sr))
-    target_sr_int = int(round(target_sr))
-
-    if orig_sr_int == target_sr_int:
-        return audio
-
-    gcd = math.gcd(orig_sr_int, target_sr_int)
-    return scipy_signal.resample_poly(
-        audio,
-        target_sr_int // gcd,
-        orig_sr_int // gcd,
-        axis=-1,
-    )
+    if orig_sr > target_sr:
+        return scipy_signal.resample_poly(audio, 1, orig_sr // target_sr)
+    elif orig_sr < target_sr:
+        return scipy_signal.resample_poly(audio, target_sr // orig_sr, 1)
+    return audio
 
 
 class AudioResampler:

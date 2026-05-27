@@ -121,9 +121,7 @@ class OpenAIServingModels:
             return
         for lora in self.static_lora_modules:
             load_request = LoadLoRAAdapterRequest(
-                lora_path=lora.path,
-                lora_name=lora.name,
-                is_3d_lora_weight=lora.is_3d_lora_weight,
+                lora_path=lora.path, lora_name=lora.name
             )
             load_result = await self.load_lora_adapter(
                 request=load_request, base_model_name=lora.base_model_name
@@ -179,7 +177,6 @@ class OpenAIServingModels:
                 lora_int_id=lora_int_id,
                 lora_path=lora_path,
                 load_inplace=request.load_inplace,
-                is_3d_lora_weight=request.is_3d_lora_weight,
             )
             if base_model_name is not None and self.is_base_model(base_model_name):
                 lora_request.base_model_name = base_model_name

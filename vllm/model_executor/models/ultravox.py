@@ -566,7 +566,7 @@ class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
             self.secondary_weights.append(
                 DefaultModelLoader.Source(
                     model_or_path=config.audio_model_id,
-                    revision=vllm_config.model_config.revision,
+                    revision=None,
                     prefix="audio_tower.",
                 )
             )
@@ -576,7 +576,7 @@ class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
             self.secondary_weights.append(
                 DefaultModelLoader.Source(
                     model_or_path=config.text_model_id,
-                    revision=vllm_config.model_config.revision,
+                    revision=None,
                     prefix="language_model.",
                 )
             )

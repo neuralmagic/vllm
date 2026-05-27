@@ -8,17 +8,13 @@ from typing import Any
 import torch
 import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
-from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
 import vllm.ir.ops
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
@@ -30,10 +26,6 @@ from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 from .matcher_utils import MatcherQuantFP8
 
 logger = init_logger(__name__)
-
-if hasattr(torch.ops._C, "scaled_fp4_quant"):
-    SCALED_FP4_QUANT_OUT_OVERLOAD = torch.ops._C.scaled_fp4_quant.out
-    SCALED_FP4_QUANT_DEFAULT_OVERLOAD = torch.ops._C.scaled_fp4_quant.default
 
 # Min hidden size per device capability for sequence parallelism
 # Only apply sequence parallelism for models with hidden_size >= threshold
@@ -125,7 +117,6 @@ class _SequenceParallelPatternHelper:
         self.device = device
         self.tp_group = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
 
     def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         return tensor_model_parallel_all_reduce(x)
@@ -213,35 +204,17 @@ class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             mm_1: torch.Tensor,
             rms_norm_weights: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            # The pattern matcher replaces from the end of the graph
-            # (last layer first). At the time each match is replaced,
-            # the preceding layer has NOT been replaced yet, so
-            # `residual` is still full-size and the slice below is
-            # correct. Once the preceding layer IS replaced, its
-            # residual output shrinks to [local_len, H], and this
-            # slice becomes semantically incorrect (e.g. for rank > 0,
-            # the indices would be out of bounds). However, since the
-            # symbolic output shape equals the input shape,
-            # NoOpEliminationPass (called at the end of
-            # SequenceParallelismPass.__call__) removes these slices
-            # before the graph is ever executed or compiled.
+            # pattern matcher replaces from top-to-bottom,
+            # so residual is still the full size here.
+            # once the seqpar pattern with the previous rmsnorm is replaced
             reduce_scatter = self._reduce_scatter(mm_1)
-            local_len = reduce_scatter.size(0)
-            # when the preceding VocabParallelEmbedding is excluded
-            # from the FX graph (e.g., passing `inputs_embeds` directly in VLMs),
-            # the FirstAllReduceRMSNorm pattern is never matched. we must
-            # perform a proper TP-aware slice here. simply using `[0:local_len]`
-            # would incorrectly cause all ranks to process rank 0's chunk.
-            residual = residual[
-                self.tp_rank * local_len : self.tp_rank * local_len + local_len, ...
-            ]
+            residual = residual[0 : reduce_scatter.size(0), ...]
             rmsnorm = vllm.ir.ops.fused_add_rms_norm(
                 reduce_scatter, residual, rms_norm_weights, self.epsilon
             )
             all_gather = self._all_gather(rmsnorm[0])
-            # residual output is now [local_len, H]; the next layer's
-            # slice on it is semantically incorrect until
-            # NoOpEliminationPass removes it.
+            # shape of residual changes but that's fine,
+            # next node is already slicing it, now becomes a noop
             return all_gather, rmsnorm[1]
 
         pm.register_replacement(
@@ -331,29 +304,19 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             rms_norm_weights: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            # See MiddleAllReduceRMSNormPattern.replacement for a
-            # detailed explanation of the temporary slice below:
-            # it is correct when first inserted, becomes semantically
-            # incorrect after the preceding layer is replaced, and is
-            # removed by NoOpEliminationPass before the graph is compiled.
+            # pattern matcher replaces from top-to-bottom,
+            # so residual is still the full size here.
+            # add a temporary slice which will become a noop
+            # once the seqpar pattern with the previous rmsnorm is replaced
             reduce_scatter = self._reduce_scatter(mm_1)
-            local_len = reduce_scatter.size(0)
-            # when the preceding VocabParallelEmbedding is excluded
-            # from the FX graph (e.g., passing `inputs_embeds` directly in VLMs),
-            # the FirstAllReduceRMSNorm pattern is never matched. we must
-            # perform a proper TP-aware slice here. simply using `[0:local_len]`
-            # would incorrectly cause all ranks to process rank 0's chunk.
-            residual = residual[
-                self.tp_rank * local_len : self.tp_rank * local_len + local_len, ...
-            ]
+            residual = residual[0 : reduce_scatter.size(0), ...]
             rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
                 reduce_scatter, residual, rms_norm_weights, self.epsilon
             )
             quant, _ = self.quant_matcher(rms, scale)
             all_gather = self._all_gather(quant)
-            # residual output is now [local_len, H]; the next layer's
-            # slice on it is semantically incorrect until
-            # NoOpEliminationPass removes it.
+            # shape of residual changes but that's fine,
+            # next node is already slicing it, now becomes a noop
             return all_gather, residual_out
 
         pm.register_replacement(
@@ -366,129 +329,6 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
-        )
-
-
-class FirstAllReduceRMSNormStaticNVFP4Pattern(_SequenceParallelPatternHelper):
-    def get_inputs(self) -> list[torch.Tensor]:
-        input = self.empty([8, 16])
-        weight = self.empty([16])
-        input_global_scale = self.empty_f32([1, 1])
-        quant_output = torch.empty([8, 8], device=self.device, dtype=torch.uint8)
-        output_scale = torch.empty([128, 4], device=self.device, dtype=torch.int32)
-        return [input, weight, input_global_scale, quant_output, output_scale]
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            input_global_scale: torch.Tensor,
-            quant_output: torch.Tensor,
-            output_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            all_reduce = self._all_reduce(input)
-            rms = vllm.ir.ops.rms_norm(all_reduce, weight, self.epsilon)
-            quant = auto_functionalized(
-                SCALED_FP4_QUANT_OUT_OVERLOAD,
-                input=rms,
-                input_scale=input_global_scale,
-                is_sf_swizzled_layout=True,
-                output=quant_output,
-                output_scale=output_scale,
-            )
-            return quant[1], all_reduce, quant[2]
-
-        def replacement(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            input_global_scale: torch.Tensor,
-            quant_output: torch.Tensor,
-            output_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            reduce_scatter = self._reduce_scatter(input)
-            rms = vllm.ir.ops.rms_norm(reduce_scatter, weight, self.epsilon)
-            rms = torch.ops.aten.view.default(rms, [-1, rms.shape[-1]])
-            quant = SCALED_FP4_QUANT_DEFAULT_OVERLOAD(
-                rms,
-                input_global_scale,
-                True,
-            )
-            return (
-                self._all_gather(quant[0]),
-                reduce_scatter,
-                self._all_gather(quant[1]),
-            )
-
-        pm.register_replacement(
-            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
-        )
-
-
-class MiddleAllReduceRMSNormStaticNVFP4Pattern(_SequenceParallelPatternHelper):
-    def get_inputs(self) -> list[torch.Tensor]:
-        mm_1 = self.empty([8, 16])
-        residual = self.empty([8, 16])
-        rms_norm_weights = self.empty([16])
-        input_global_scale = self.empty_f32([1, 1])
-        quant_output = torch.empty([8, 8], device=self.device, dtype=torch.uint8)
-        output_scale = torch.empty([128, 4], device=self.device, dtype=torch.int32)
-        return [
-            residual,
-            mm_1,
-            rms_norm_weights,
-            input_global_scale,
-            quant_output,
-            output_scale,
-        ]
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            residual: torch.Tensor,
-            mm_1: torch.Tensor,
-            rms_norm_weights: torch.Tensor,
-            input_global_scale: torch.Tensor,
-            quant_output: torch.Tensor,
-            output_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            all_reduce = self._all_reduce(mm_1)
-            rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
-                all_reduce, residual, rms_norm_weights, self.epsilon
-            )
-            quant = auto_functionalized(
-                SCALED_FP4_QUANT_OUT_OVERLOAD,
-                input=rms,
-                input_scale=input_global_scale,
-                is_sf_swizzled_layout=True,
-                output=quant_output,
-                output_scale=output_scale,
-            )
-            return quant[1], residual_out, quant[2]
-
-        def replacement(
-            residual: torch.Tensor,
-            mm_1: torch.Tensor,
-            rms_norm_weights: torch.Tensor,
-            input_global_scale: torch.Tensor,
-            quant_output: torch.Tensor,
-            output_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            # Keep this slice in sync with the non-quantized SP replacement:
-            # once the previous SP pattern fires, it becomes a no-op.
-            reduce_scatter = self._reduce_scatter(mm_1)
-            residual = residual[0 : reduce_scatter.size(0), ...]
-            rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
-                reduce_scatter, residual, rms_norm_weights, self.epsilon
-            )
-            rms = torch.ops.aten.view.default(rms, [-1, rms.shape[-1]])
-            quant = SCALED_FP4_QUANT_DEFAULT_OVERLOAD(
-                rms,
-                input_global_scale,
-                True,
-            )
-            return self._all_gather(quant[0]), residual_out, self._all_gather(quant[1])
-
-        pm.register_replacement(
-            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
 
 
@@ -517,15 +357,12 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
     gets split across TP ranks, causing size mismatches at subgraph
     boundaries.
 
-    This pass splits up the residual tensor across TP ranks and hence divides
-    its size. The pattern matcher starts at the end of the graph (last layer
-    first), so when each replacement inserts a residual slice, the preceding
-    layer has not been replaced yet and the slice is correct. Once the
-    preceding layer IS replaced, its residual output shrinks and the slice
-    becomes semantically incorrect (out-of-bounds indices for rank > 0).
-    The graph is never executed in this intermediate state —
-    NoOpEliminationPass removes these slices based on symbolic shape equality
-    (input shape == output shape) before the graph is compiled.
+    This pass splits up the residual tensor across TP ranks and hence
+    divides its size. Because the pattern matcher starts at the end of
+    the graph, the replacement contains a slice that temporarily conforms
+    the input residual to the correct size. After all patterns have been
+    matched, we use a NoOpEliminationPass to clean up what have now
+    become no-op slices.
     """
 
     @enable_fake_mode
@@ -566,14 +403,6 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
             MiddleAllReduceRMSNormStaticFP8Pattern(
                 epsilon, self.model_dtype, self.device
             ).register(self.patterns)
-
-            if "SCALED_FP4_QUANT_OUT_OVERLOAD" in globals():
-                FirstAllReduceRMSNormStaticNVFP4Pattern(
-                    epsilon, self.model_dtype, self.device
-                ).register(self.patterns)
-                MiddleAllReduceRMSNormStaticNVFP4Pattern(
-                    epsilon, self.model_dtype, self.device
-                ).register(self.patterns)
 
             # Normal RMSNorm patterns
             FirstAllReduceRMSNormPattern(

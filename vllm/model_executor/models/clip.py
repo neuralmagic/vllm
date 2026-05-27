@@ -397,12 +397,20 @@ class CLIPAttention(nn.Module):
         )
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
-        self.attn = attn_cls(
-            self.num_heads_per_partition,
-            self.head_dim,
-            self.scale,
-            prefix=f"{prefix}.attn",
-        )
+        if attn_cls == MMEncoderAttention:
+            self.attn = attn_cls(
+                self.num_heads_per_partition,
+                self.head_dim,
+                self.scale,
+                prefix=f"{prefix}.attn",
+            )
+        else:
+            self.attn = attn_cls(
+                self.num_heads_per_partition,
+                self.head_dim,
+                self.scale,
+                prefix=f"{prefix}.attn",
+            )
 
     def forward(
         self,
@@ -769,7 +777,7 @@ class CLIPVisionModel(nn.Module):
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override,
             require_post_norm=require_post_norm,
-            prefix=maybe_prefix(prefix, "vision_model"),
+            prefix=f"{prefix}.vision_model",
         )
 
     def forward(

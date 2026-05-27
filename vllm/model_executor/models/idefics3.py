@@ -355,7 +355,7 @@ class Idefics3MultiModalProcessor(BaseMultiModalProcessor[Idefics3ProcessingInfo
                 "image", num_patches
             ),
             image_embeds=MultiModalFieldConfig.batched("image"),
-            num_patches=MultiModalFieldConfig.batched("image", keep_on_cpu=True),
+            num_patches=MultiModalFieldConfig.batched("image"),
         )
 
     def _get_prompt_updates(

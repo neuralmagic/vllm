@@ -1034,7 +1034,7 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
             self.vision_encoder = Phi4MMImageEncoder(
                 config,
                 quant_config,
-                prefix=maybe_prefix(prefix, "model.vision_embed_tokens"),
+                prefix="model.vision_embed_tokens",
                 model_dir=config._name_or_path,
             )
 

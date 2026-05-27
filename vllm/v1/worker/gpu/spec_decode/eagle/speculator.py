@@ -63,7 +63,6 @@ class EagleSpeculator:
         self.hidden_size = self.hidden_size * hc_mult
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
-        self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -107,7 +106,7 @@ class EagleSpeculator:
             )
 
         self.draft_logits: torch.Tensor | None = None
-        if self.speculative_config.draft_sample_method == "probabilistic":
+        if self.speculative_config.draft_sample_method == "gumbel":
             self.draft_logits = torch.zeros(
                 self.max_num_reqs,
                 self.num_speculative_steps,
@@ -173,7 +172,7 @@ class EagleSpeculator:
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
-        _, self.attn_groups, _, _ = init_attn_backend(
+        _, self.attn_groups, _ = init_attn_backend(
             kv_cache_config,
             self.vllm_config,
             self.device,
@@ -248,7 +247,6 @@ class EagleSpeculator:
                 apply_temperature=True,
                 output_processed_logits=draft_logits,
                 output_processed_logits_col=draft_step,
-                use_fp64=self.use_fp64_gumbel,
             )
         else:
             return logits.argmax(dim=-1)

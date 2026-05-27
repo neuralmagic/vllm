@@ -25,7 +25,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
 
 
@@ -224,8 +223,8 @@ class ShortConv(MambaBase, CustomOp):
         )
 
     @property
-    def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.SHORT_CONV
+    def mamba_type(self) -> str:
+        return "short_conv"
 
 
 def short_conv(

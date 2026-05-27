@@ -17,10 +17,6 @@ from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     DeltaToolCall,
 )
-from vllm.entrypoints.openai.parser.harmony_utils import (
-    extract_function_from_recipient,
-    is_function_recipient,
-)
 
 
 class TokenState(NamedTuple):
@@ -83,12 +79,16 @@ def extract_harmony_streaming_delta(
     # This counts completed tool calls in messages
     base_index = 0
     for msg in harmony_parser.messages:
-        if msg.recipient and is_function_recipient(msg.recipient):
+        if (
+            (msg.channel == "commentary" or msg.channel == "analysis")
+            and msg.recipient
+            and msg.recipient.startswith("functions.")
+        ):
             base_index += 1
 
     # If there's an ongoing tool call from previous chunk,
     # the next new tool call starts at base_index + 1
-    if prev_recipient and is_function_recipient(prev_recipient):
+    if prev_recipient and prev_recipient.startswith("functions."):
         next_tool_index = base_index + 1
         # Ongoing call is at base_index
         ongoing_tool_index = base_index
@@ -101,11 +101,15 @@ def extract_harmony_streaming_delta(
         if group.channel == "final":
             combined_content += group.text
             content_encountered = True
-        elif group.recipient and is_function_recipient(group.recipient):
+        elif (
+            (group.channel == "commentary" or group.channel == "analysis")
+            and group.recipient
+            and group.recipient.startswith("functions.")
+        ):
             opened_new_call = False
             if prev_recipient != group.recipient:
                 # New tool call - emit the opening message
-                tool_name = extract_function_from_recipient(group.recipient)
+                tool_name = group.recipient.split("functions.", 1)[1]
                 tool_messages.append(
                     DeltaToolCall(
                         id=make_tool_call_id(),

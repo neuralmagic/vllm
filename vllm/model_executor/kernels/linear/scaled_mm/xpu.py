@@ -46,21 +46,7 @@ class XPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         self.layer_param_names = layer_param_names
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # fp8_gemm_w8a16 expects weight in [in, out] layout.
-        # Transpose if weight is still in [out, in] layout.
-        # For square matrices, use contiguity as tie-breaker:
-        # checkpoint weights are contiguous, .t() views are not.
-        weight = layer.weight
-        out_features, in_features = self.config.weight_shape
-
-        if weight.shape == (out_features, in_features) and (
-            in_features != out_features or weight.is_contiguous()
-        ):
-            replace_parameter(layer, "weight", weight.data.t())
-        # else: already in [in, out] layout — no-op
-
-        weight_scale = layer.weight_scale.t().contiguous()
-        replace_parameter(layer, "weight_scale", weight_scale.data)
+        replace_parameter(layer, "weight", layer.weight.data.t())
 
     def apply_weights(
         self,

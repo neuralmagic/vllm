@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.utils.torch_utils import async_tensor_h2d
-
 if TYPE_CHECKING:
     # avoid circuit import
     from vllm.lora.layers import LoRAMapping
@@ -112,8 +110,8 @@ def convert_mapping(
         embedding_indices,
     ]
 
-    indices = async_tensor_h2d(indices_list, dtype=torch.long, device=device)
-    prompt_mapping_tensor = async_tensor_h2d(
+    indices = torch.tensor(indices_list, dtype=torch.long, device=device)
+    prompt_mapping_tensor = torch.tensor(
         prompt_mapping, dtype=torch.long, device=device
     )
     embeddings_indices = torch.stack(

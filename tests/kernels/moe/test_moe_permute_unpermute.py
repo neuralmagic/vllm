@@ -10,9 +10,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe import fused_topk
-from vllm.model_executor.layers.fused_moe.expert_map_manager import (
-    determine_expert_map,
-)
+from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     moe_permute,
     moe_permute_unpermute_supported,

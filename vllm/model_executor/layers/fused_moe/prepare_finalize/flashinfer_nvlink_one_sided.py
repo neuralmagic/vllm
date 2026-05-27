@@ -67,7 +67,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         return self.num_dispatchers_
 
     def output_is_reduced(self) -> bool:
-        return True
+        return False
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int32

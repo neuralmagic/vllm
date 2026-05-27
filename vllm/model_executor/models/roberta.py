@@ -203,7 +203,7 @@ class BgeM3EmbeddingModel(RobertaEmbeddingModel):
         self.secondary_weights = [
             DefaultModelLoader.Source(
                 model_or_path=vllm_config.model_config.model,
-                revision=vllm_config.model_config.revision,
+                revision=None,
                 prefix=prefix,
                 allow_patterns_overrides=[filename],
             )

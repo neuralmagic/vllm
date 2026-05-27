@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdlib>
 #include <string>
+#include <cctype>
 
 namespace vllm {
 

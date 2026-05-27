@@ -92,7 +92,7 @@ class ExampleConnector(KVConnectorBase_V1):
         self,
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: "KVCacheConfig | None" = None,
     ):
         super().__init__(
             vllm_config=vllm_config,
@@ -188,9 +188,7 @@ class ExampleConnector(KVConnectorBase_V1):
                 filename = self._generate_filename_debug(
                     layer_name, request.token_ids, request.mm_hashes
                 )
-                kv_cache = safetensors.torch.load_file(
-                    filename, device=str(kv_cache_layer.device)
-                )["kv_cache"]
+                kv_cache = safetensors.torch.load_file(filename)["kv_cache"].cuda()
                 if isinstance(attn_metadata, dict):
                     inject_kv_into_layer(
                         kv_cache_layer,

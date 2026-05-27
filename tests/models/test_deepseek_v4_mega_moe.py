@@ -6,11 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.models.deepseek_v4.nvidia.model import (
+from vllm.model_executor.models.deepseek_v4 import (
     DeepseekV4MegaMoEExperts,
+    _stage_deepseek_v4_mega_moe_inputs,
     make_deepseek_v4_expert_params_mapping,
 )
-from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -164,7 +164,7 @@ def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
     fused_topk_idx = torch.empty_like(ref_topk_idx)
     fused_topk_weights = torch.empty_like(ref_topk_weights)
 
-    prepare_megamoe_inputs(
+    _stage_deepseek_v4_mega_moe_inputs(
         hidden_states,
         topk_weights,
         topk_ids,

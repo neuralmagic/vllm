@@ -14,7 +14,6 @@ import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
@@ -201,8 +200,7 @@ def initialize_mamba_ssu_backend(
     """
     if not any(
         isinstance(g.kv_cache_spec, MambaSpec)
-        and g.kv_cache_spec.mamba_type
-        in (MambaAttentionBackendEnum.MAMBA1, MambaAttentionBackendEnum.MAMBA2)
+        and g.kv_cache_spec.mamba_type in ("mamba1", "mamba2")
         for g in kv_cache_config.kv_cache_groups
     ):
         return

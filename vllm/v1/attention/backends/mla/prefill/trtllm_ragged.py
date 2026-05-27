@@ -61,12 +61,15 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             v_head_dim=v_head_dim,
             vllm_config=vllm_config,
         )
-        (self._workspace_buffer,) = current_workspace_manager().get_simultaneous(
+
+    def _get_workspace_buffer(self) -> torch.Tensor:
+        (workspace_buffer,) = current_workspace_manager().get_simultaneous(
             (
                 (envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,),
                 torch.uint8,
             ),
         )
+        return workspace_buffer
 
     def prepare_metadata(
         self,
@@ -86,6 +89,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
+        workspace_buffer = self._get_workspace_buffer()
         out = torch.empty(
             q.shape[0],
             q.shape[1],
@@ -98,7 +102,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             query=q,
             key=k,
             value=v,
-            workspace_buffer=self._workspace_buffer,
+            workspace_buffer=workspace_buffer,
             seq_lens=self._query_seq_lens,
             max_q_len=self._prefill_metadata.max_query_len,
             max_kv_len=self._prefill_metadata.max_query_len,
@@ -131,6 +135,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
 
         assert self._prefill_metadata.chunked_context is not None
         assert self._prefill_metadata.chunked_context.seq_lens[chunk_idx] is not None
+        workspace_buffer = self._get_workspace_buffer()
 
         out = torch.empty(
             q.shape[0],
@@ -144,7 +149,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             query=q,
             key=k,
             value=v,
-            workspace_buffer=self._workspace_buffer,
+            workspace_buffer=workspace_buffer,
             seq_lens=self._prefill_metadata.chunked_context.seq_lens[chunk_idx],
             max_q_len=self._prefill_metadata.max_query_len,
             max_kv_len=self._prefill_metadata.chunked_context.max_seq_lens[chunk_idx],

@@ -39,17 +39,11 @@ fi
 
 set -x # avoid printing secrets above
 
-# install uv if not already available
-if ! command -v uv &> /dev/null; then
-  curl -LsSf https://astral.sh/uv/install.sh | UV_VERSION=0.11.14 sh
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-
-# install twine and sdist build prerequisites using uv with Python 3.12
-uv venv --python 3.12 /tmp/vllm-release-env
+# install twine and sdist build prerequisites from pypi
+python3 -m venv /tmp/vllm-release-env
 source /tmp/vllm-release-env/bin/activate
-uv pip install twine
-uv pip install -r requirements/build/cuda.txt
+pip install twine
+pip install -r requirements/build/cuda.txt
 python3 -m twine --version
 
 # copy release wheels to local directory

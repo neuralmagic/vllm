@@ -15,17 +15,8 @@
 #include <torch/all.h>
 namespace vec_op {
 
-// FP8 KV cache is not supported on RISC-V. These tag types and the
-// corresponding BF16Vec32 stub constructors below exist solely so that
-// templates referencing vec_op::fp8_*_tag in their bodies (e.g. in
-// cpu_attn_vec.hpp) compile under GCC's -Wtemplate-body lookup. The
-// stubs are never instantiated by CPU_ATTN_DISPATCH on __riscv.
-struct fp8_e4m3_tag {};
-struct fp8_e5m2_tag {};
-
-// BFloat16 is always supported on RISC-V: natively when __riscv_zvfbfmin
-// is defined (compiler-provided when -march includes zvfbfmin), otherwise
-// via the FP32-simulation fallback path.
+// BFloat16 is always supported on RISC-V: natively when RISCV_BF16_SUPPORT
+// is defined, otherwise via the FP32-simulation fallback path.
 #define VLLM_DISPATCH_CASE_FLOATING_TYPES(...)         \
   AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
   AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
@@ -115,7 +106,7 @@ struct FP16Vec16 : public Vec<FP16Vec16> {
 // BF16 Implementation
 // ============================================================================
 
-#ifdef __riscv_zvfbfmin
+#ifdef RISCV_BF16_SUPPORT
 
 FORCE_INLINE fixed_u16x8_t bf16_to_u16(fixed_bf16x8_t v) {
   return RVVI4(__riscv_vreinterpret_v_bf16, LMUL_128, _u16, LMUL_128)(v);
@@ -193,13 +184,6 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
             reinterpret_cast<const uint16_t*>(ptr), VEC_ELEM_NUM))) {};
 
   explicit BF16Vec32(fixed_bf16x32_t data) : reg(data) {};
-
-  // FP8 KV cache stubs: never instantiated on RISC-V (CPU_ATTN_DISPATCH
-  // omits FP8 cases on __riscv); exist only so name lookup succeeds.
-  explicit BF16Vec32(const uint8_t* ptr, fp8_e4m3_tag)
-      : BF16Vec32(static_cast<const void*>(ptr)) {}
-  explicit BF16Vec32(const uint8_t* ptr, fp8_e5m2_tag)
-      : BF16Vec32(static_cast<const void*>(ptr)) {}
 
   explicit BF16Vec32(const BF16Vec8& v) {
     fixed_u16x8_t u16_val = bf16_to_u16(v.reg);
@@ -339,13 +323,6 @@ struct BF16Vec32 : public Vec<BF16Vec32> {
     reg_fp32 = RVVI(__riscv_vle32_v_f32, LMUL_1024)(tmp, 32);
   }
 
-  // FP8 KV cache stubs: never instantiated on RISC-V (CPU_ATTN_DISPATCH
-  // omits FP8 cases on __riscv); exist only so name lookup succeeds.
-  explicit BF16Vec32(const uint8_t* ptr, fp8_e4m3_tag)
-      : BF16Vec32(static_cast<const void*>(ptr)) {}
-  explicit BF16Vec32(const uint8_t* ptr, fp8_e5m2_tag)
-      : BF16Vec32(static_cast<const void*>(ptr)) {}
-
   explicit BF16Vec32(const BF16Vec8& v) {
     float tmp_small[8];
     RVVI(__riscv_vse32_v_f32, LMUL_256)(tmp_small, v.reg_fp32, 8);
@@ -433,7 +410,7 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
   explicit FP32Vec8(fixed_fp16x8_t v)
       : reg(RVVI(__riscv_vfwcvt_f_f_v_f32, LMUL_256)(v, VEC_ELEM_NUM)) {};
 
-#ifdef __riscv_zvfbfmin
+#ifdef RISCV_BF16_SUPPORT
   explicit FP32Vec8(fixed_bf16x8_t v)
       : reg(RVVI(__riscv_vfwcvtbf16_f_f_v_f32, LMUL_256)(v, VEC_ELEM_NUM)) {};
   explicit FP32Vec8(const BF16Vec8& v)
@@ -631,7 +608,7 @@ struct FP32Vec16 : public Vec<FP32Vec16> {
   explicit FP32Vec16(const FP32Vec16& data) : reg(data.reg) {};
   explicit FP32Vec16(const FP16Vec16& v);
 
-#ifdef __riscv_zvfbfmin
+#ifdef RISCV_BF16_SUPPORT
   explicit FP32Vec16(fixed_bf16x16_t v)
       : reg(RVVI(__riscv_vfwcvtbf16_f_f_v_f32, LMUL_512)(v, VEC_ELEM_NUM)) {};
   explicit FP32Vec16(const BF16Vec16& v)
@@ -891,7 +868,7 @@ inline void fma(FP32Vec16& acc, const FP32Vec16& a, const FP32Vec16& b) {
   acc = acc.fma(a, b);
 }
 
-#ifdef __riscv_zvfbfmin
+#ifdef RISCV_BF16_SUPPORT
 template <>
 inline void storeFP32<c10::BFloat16>(float v, c10::BFloat16* ptr) {
   *ptr = static_cast<__bf16>(v);

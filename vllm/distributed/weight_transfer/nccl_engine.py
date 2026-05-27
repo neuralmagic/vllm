@@ -21,7 +21,7 @@ from vllm.distributed.weight_transfer.base import (
 from vllm.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     DEFAULT_PACKED_NUM_BUFFERS,
-    packed_nccl_broadcast_consumer,
+    packed_broadcast_consumer,
 )
 
 
@@ -109,10 +109,7 @@ class NCCLWeightTransferEngine(
     update_info_cls = NCCLWeightTransferUpdateInfo
 
     def __init__(
-        self,
-        config: WeightTransferConfig,
-        parallel_config: ParallelConfig,
-        model: torch.nn.Module,
+        self, config: WeightTransferConfig, parallel_config: ParallelConfig
     ) -> None:
         """
         Initialize the NCCL weight transfer engine.
@@ -120,9 +117,8 @@ class NCCLWeightTransferEngine(
         Args:
             config: The configuration for the weight transfer engine
             parallel_config: The configuration for the parallel setup
-            model: The local model instance which will receive the weights
         """
-        super().__init__(config, parallel_config, model)
+        super().__init__(config, parallel_config)
         self.model_update_group: PyNcclCommunicator | None = None
 
     def init_transfer_engine(self, init_info: NCCLWeightTransferInitInfo) -> None:
@@ -188,7 +184,7 @@ class NCCLWeightTransferEngine(
                     dtype = getattr(torch, dtype_name)
                     yield (name, (shape, dtype))
 
-            packed_nccl_broadcast_consumer(
+            packed_broadcast_consumer(
                 iterator=state_dict_info_iterator(),
                 group=self.model_update_group,
                 src=0,
@@ -251,10 +247,10 @@ class NCCLWeightTransferEngine(
         if args.packed:
             # Use packed tensor broadcasting for efficiency
             from vllm.distributed.weight_transfer.packed_tensor import (
-                packed_nccl_broadcast_producer,
+                packed_broadcast_producer,
             )
 
-            packed_nccl_broadcast_producer(
+            packed_broadcast_producer(
                 iterator=iterator,
                 group=args.group,
                 src=args.src,

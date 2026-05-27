@@ -247,10 +247,8 @@ class DFlashQwen3Model(nn.Module):
             [
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
-                    config=self.config,
-                    cache_config=current_vllm_config.cache_config,
-                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                    config=self.config,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -512,7 +510,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.config.target_layer_count = target_layer_num
         self.model = DFlashQwen3Model(
             vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix="model",
             start_layer_id=target_layer_num,
         )
 

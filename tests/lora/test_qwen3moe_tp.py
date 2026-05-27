@@ -77,7 +77,6 @@ def test_qwen3moe_lora(qwen3moe_lora_files):
         enforce_eager=True,
         trust_remote_code=True,
         enable_chunked_prefill=True,
-        enable_mixed_moe_lora_format=True,
     )
 
     generate_and_test(llm, qwen3moe_lora_files, lora_id=1)
@@ -86,8 +85,7 @@ def test_qwen3moe_lora(qwen3moe_lora_files):
 
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize("ep", [False, True])
-@pytest.mark.parametrize("enable_mixed_moe_lora_format", [False, True])
-def test_qwen3moe_lora_tp2(ep, qwen3moe_lora_files, enable_mixed_moe_lora_format):
+def test_qwen3moe_lora_tp2(ep, qwen3moe_lora_files):
     llm = vllm.LLM(
         MODEL_PATH,
         max_model_len=1024,
@@ -96,7 +94,6 @@ def test_qwen3moe_lora_tp2(ep, qwen3moe_lora_files, enable_mixed_moe_lora_format
         trust_remote_code=True,
         enable_expert_parallel=ep,
         tensor_parallel_size=2,
-        enable_mixed_moe_lora_format=enable_mixed_moe_lora_format,
     )
 
     generate_and_test(llm, qwen3moe_lora_files, lora_id=1)
@@ -105,8 +102,7 @@ def test_qwen3moe_lora_tp2(ep, qwen3moe_lora_files, enable_mixed_moe_lora_format
 
 @multi_gpu_test(num_gpus=4)
 @pytest.mark.parametrize("ep", [False, True])
-@pytest.mark.parametrize("enable_mixed_moe_lora_format", [False, True])
-def test_qwen3moe_lora_tp4(ep, qwen3moe_lora_files, enable_mixed_moe_lora_format):
+def test_qwen3moe_lora_tp4(ep, qwen3moe_lora_files):
     llm = vllm.LLM(
         MODEL_PATH,
         max_model_len=1024,
@@ -115,7 +111,6 @@ def test_qwen3moe_lora_tp4(ep, qwen3moe_lora_files, enable_mixed_moe_lora_format
         trust_remote_code=True,
         enable_expert_parallel=ep,
         tensor_parallel_size=4,
-        enable_mixed_moe_lora_format=enable_mixed_moe_lora_format,
     )
 
     generate_and_test(llm, qwen3moe_lora_files, lora_id=1)

@@ -9,8 +9,6 @@
 
 #ifdef USE_ROCM
   #include <hip/hip_runtime.h>
-  #include <hip/hip_bf16.h>
-  #include <hip/hip_fp16.h>
 #else
   #include <cuda_bf16.h>
   #include <cuda_fp16.h>

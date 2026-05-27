@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TypeAlias, cast
+import json
+from collections.abc import Callable
+from functools import partial
+from typing import Literal, TypeAlias, cast
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from typing_extensions import assert_never
 
+from vllm.entrypoints.openai.engine.protocol import UsageInfo
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.utils.serial_utils import EmbedDType, Endianness
@@ -12,14 +16,11 @@ from vllm.utils.serial_utils import EmbedDType, Endianness
 from ..base.serving import PoolingServing
 from ..typing import PoolingServeContext
 from ..utils import (
-    BytesEncodingFormat,
-    JsonEncodingFormat,
-    build_pooling_bytes_streaming_response,
+    encode_pooling_bytes,
+    encode_pooling_output_base64,
     encode_pooling_output_float,
     encode_pooling_output_float_or_ndarray,
     get_json_response_cls,
-    get_pooling_output_encoder,
-    get_pooling_usage,
 )
 from .io_processor import EmbedIOProcessor
 from .protocol import (
@@ -27,6 +28,7 @@ from .protocol import (
     CohereEmbedRequest,
     CohereEmbedResponse,
     CohereMeta,
+    EmbeddingBytesResponse,
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingResponseData,
@@ -99,7 +101,7 @@ class ServingEmbedding(PoolingServing):
         request_id: str,
         created_time: int,
         model_name: str,
-        encoding_format: JsonEncodingFormat,
+        encoding_format: Literal["float", "base64"],
         embed_dtype: EmbedDType,
         endianness: Endianness,
     ) -> JSONResponse:
@@ -109,6 +111,7 @@ class ServingEmbedding(PoolingServing):
         )
         if use_ndarray_response:
             ndarray_items: list[dict[str, object]] = []
+            ndarray_num_tokens = 0
 
             for idx, final_res in enumerate(final_res_batch):
                 item_dict = EmbeddingResponseData(
@@ -119,39 +122,60 @@ class ServingEmbedding(PoolingServing):
                     final_res
                 )
                 ndarray_items.append(item_dict)
+                ndarray_num_tokens += len(final_res.prompt_token_ids)
+
+            ndarray_usage = UsageInfo(
+                prompt_tokens=ndarray_num_tokens,
+                total_tokens=ndarray_num_tokens,
+            )
             ndarray_response = EmbeddingResponse(
                 id=request_id,
                 created=created_time,
                 model=model_name,
                 data=[],  # type: ignore[arg-type]
-                usage=get_pooling_usage(final_res_batch),
+                usage=ndarray_usage,
             ).model_dump()
             ndarray_response["data"] = ndarray_items
 
             return self.json_response_cls(content=ndarray_response)
 
-        encode_fn = get_pooling_output_encoder(
-            encoding_format=encoding_format,
-            embed_dtype=embed_dtype,
-            endianness=endianness,
+        encode_fn = cast(
+            Callable[[PoolingRequestOutput], list[float] | str],
+            (
+                encode_pooling_output_float
+                if encoding_format == "float"
+                else partial(
+                    encode_pooling_output_base64,
+                    embed_dtype=embed_dtype,
+                    endianness=endianness,
+                )
+            ),
         )
 
         items: list[EmbeddingResponseData] = []
+        num_prompt_tokens = 0
 
         for idx, final_res in enumerate(final_res_batch):
             item = EmbeddingResponseData(
                 index=idx,
-                embedding=cast(list[float] | str, encode_fn(final_res)),
+                embedding=encode_fn(final_res),
             )
+            prompt_token_ids = final_res.prompt_token_ids
 
             items.append(item)
+            num_prompt_tokens += len(prompt_token_ids)
+
+        usage = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            total_tokens=num_prompt_tokens,
+        )
 
         response = EmbeddingResponse(
             id=request_id,
             created=created_time,
             model=model_name,
             data=items,
-            usage=get_pooling_usage(final_res_batch),
+            usage=usage,
         )
         return self.json_response_cls(content=response.model_dump())
 
@@ -161,18 +185,37 @@ class ServingEmbedding(PoolingServing):
         request_id: str,
         created_time: int,
         model_name: str,
-        encoding_format: BytesEncodingFormat,
+        encoding_format: Literal["bytes", "bytes_only"],
         embed_dtype: EmbedDType,
         endianness: Endianness,
     ) -> StreamingResponse:
-        return build_pooling_bytes_streaming_response(
+        content, items, usage = encode_pooling_bytes(
             pooling_outputs=final_res_batch,
-            request_id=request_id,
-            created_time=created_time,
-            model_name=model_name,
-            encoding_format=encoding_format,
             embed_dtype=embed_dtype,
             endianness=endianness,
+        )
+
+        headers = (
+            None
+            if encoding_format == "bytes_only"
+            else {
+                "metadata": json.dumps(
+                    {
+                        "id": request_id,
+                        "created": created_time,
+                        "model": model_name,
+                        "data": items,
+                        "usage": usage,
+                    }
+                )
+            }
+        )
+
+        response = EmbeddingBytesResponse(content=content, headers=headers)
+        return StreamingResponse(
+            content=response.content,
+            headers=response.headers,
+            media_type=response.media_type,
         )
 
     def _build_cohere_response_from_ctx(
@@ -182,11 +225,8 @@ class ServingEmbedding(PoolingServing):
         request = ctx.request
         assert isinstance(request, CohereEmbedRequest)
 
-        all_floats = [
-            cast(list[float], encode_pooling_output_float(out))
-            for out in ctx.final_res_batch
-        ]
-        total_tokens = get_pooling_usage(ctx.final_res_batch).prompt_tokens
+        all_floats = [encode_pooling_output_float(out) for out in ctx.final_res_batch]
+        total_tokens = sum(len(out.prompt_token_ids) for out in ctx.final_res_batch)
 
         image_tokens = total_tokens if request.images is not None else 0
         texts_echo = request.texts

@@ -218,6 +218,8 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         ``check_batch_mode`` validator, so neither needs to be handled here.
         """
         created_time = int(time.time())
+        role = self.get_chat_request_role(request)  # type: ignore[arg-type]
+
         final_results: dict[int, RequestOutput] = {}
         try:
             async for prompt_idx, res in merge_async_iterators(*generators):
@@ -272,12 +274,6 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 else:
                     reasoning = None
                     content = output.text
-
-                role = (
-                    self.response_role
-                    if request.add_generation_prompt
-                    else request.messages[prompt_idx][-1]["role"]
-                )
 
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
 

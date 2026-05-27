@@ -21,12 +21,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
-from vllm.model_executor.layers.fused_moe.deepep_timing import (
-    get_deepep_timing_collector,
-)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
+)
+from vllm.model_executor.layers.fused_moe.deepep_timing import (
+    get_deepep_timing_collector,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
@@ -248,13 +248,6 @@ class FusedMoEPrepareAndFinalize(ABC):
         finalize_async.
         """
         return False
-
-    def on_commit(self) -> None:
-        """
-        Runs after this prepare/finalize has been committed to the active
-        MoE kernel.
-        """
-        return
 
 
 # TODO: pass FusedMoEParallelConfig in as ctor parameter?
@@ -1028,10 +1021,17 @@ class FusedMoEKernelModularImpl:
         self,
         prepare_finalize: FusedMoEPrepareAndFinalizeModular,
         fused_experts: FusedMoEExpertsModular,
+        shared_experts: SharedExperts | None,
         inplace: bool = False,
     ):
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
+        # Only accept shared experts if they can be run w/async.
+        # The MoERunner/SharedExperts class will coordinate with the MK to ensure
+        # that the SharedExperts are executed only once.
+        self.shared_experts = (
+            shared_experts if prepare_finalize.supports_async() else None
+        )
         self.inplace = inplace
         moe_parallel_config = fused_experts.moe_config.moe_parallel_config
         self.moe_parallel_config = moe_parallel_config
@@ -1106,12 +1106,11 @@ class FusedMoEKernelModularImpl:
 
     def _maybe_apply_shared_experts(
         self,
-        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ):
-        if shared_experts is not None:
+        if self.shared_experts is not None:
             assert shared_experts_input is not None
-            shared_experts.apply(
+            self.shared_experts.apply(
                 shared_experts_input,
                 SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
             )
@@ -1293,7 +1292,6 @@ class FusedMoEKernelModularImpl:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
-        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         """
@@ -1301,7 +1299,6 @@ class FusedMoEKernelModularImpl:
         that handles DBO, async and shared expert overlap.
 
         Args:
-            shared_experts: SharedExperts | None. The shared experts if any.
             shared_experts_input: Optional separate input for shared experts.
                 When latent MoE is used, hidden_states is the latent-projected
                 tensor (smaller dimension) used by routed experts, while
@@ -1328,7 +1325,7 @@ class FusedMoEKernelModularImpl:
                 apply_router_weight_on_input,
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
-            self._maybe_apply_shared_experts(shared_experts, shared_experts_input)
+            self._maybe_apply_shared_experts(shared_experts_input)
 
             # TODO(lucas): refactor this in the alternative schedules followup
             # currently unpack if we have hook + receiver pair or just
@@ -1364,7 +1361,6 @@ class FusedMoEKernelModularImpl:
         global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
-        shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
@@ -1387,7 +1383,6 @@ class FusedMoEKernelModularImpl:
         - apply_router_weight_on_input (bool): When true, the topk weights are
           applied directly on the inputs. This is only applicable when topk is
           1.
-        - shared_experts: SharedExperts | None. The shared experts if any.
         - shared_experts_input (Optional[torch.Tensor]): Optional separate
           input for shared experts. For latent MoE, this is the original
           hidden_states before latent projection.
@@ -1396,7 +1391,7 @@ class FusedMoEKernelModularImpl:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
         if self.inplace:
-            assert shared_experts is None
+            assert self.shared_experts is None
             assert not disable_inplace()
             output = hidden_states
         else:
@@ -1439,12 +1434,10 @@ class FusedMoEKernelModularImpl:
         )
 
         if expert_start is not None:
-            assert expert_end is not None
             expert_end.record()
             collector.record_expert_compute(
-                expert_start,
-                expert_end,
-                getattr(self.prepare_finalize, "timing_layer_idx", -1),
+                expert_start, expert_end,
+                self.prepare_finalize.timing_layer_idx,
             )
 
         return self._finalize(
@@ -1454,7 +1447,6 @@ class FusedMoEKernelModularImpl:
             topk_weights,
             topk_ids,
             apply_router_weight_on_input,
-            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
 
@@ -1527,6 +1519,7 @@ class FusedMoEKernel:
         self,
         prepare_finalize: FusedMoEPrepareAndFinalize,
         fused_experts: FusedMoEExperts,
+        shared_experts: SharedExperts | None = None,
         inplace: bool = False,
     ):
         super().__init__()
@@ -1539,6 +1532,7 @@ class FusedMoEKernel:
             self.impl = FusedMoEKernelModularImpl(
                 prepare_finalize,
                 fused_experts,
+                shared_experts,
                 inplace,
             )
 
@@ -1561,17 +1555,11 @@ class FusedMoEKernel:
         self._post_init_setup()
 
     @property
-    def can_overlap_shared_experts(self) -> bool:
+    def owns_shared_experts(self) -> bool:
         if isinstance(self.impl, FusedMoEKernelModularImpl):
-            return self.impl.prepare_finalize.supports_async()
+            return self.impl.shared_experts is not None
         else:
             return False
-
-    @property
-    def inplace(self) -> bool:
-        if isinstance(self.impl, FusedMoEKernelModularImpl):
-            return self.impl.inplace
-        return False
 
     @property
     def is_monolithic(self) -> bool:
@@ -1584,10 +1572,6 @@ class FusedMoEKernel:
     @property
     def fused_experts(self) -> FusedMoEExperts:
         return self.impl.fused_experts
-
-    @property
-    def moe_config(self) -> FusedMoEConfig:
-        return self.fused_experts.moe_config
 
     def supports_lora(self) -> bool:
         return self.fused_experts.supports_lora()
@@ -1659,7 +1643,6 @@ class FusedMoEKernel:
         global_num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
-        shared_experts: SharedExperts | None = None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
@@ -1673,6 +1656,5 @@ class FusedMoEKernel:
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )

@@ -64,7 +64,6 @@ from vllm.model_executor.models.bailing_moe import BailingMLP
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .interfaces import HasInnerState, IsHybrid, SupportsPP
 from .utils import (
@@ -445,8 +444,8 @@ class BailingMoELinearAttention(PluggableLayer, MambaBase):
     # --8<-- [end:bailing_moe_linear_attention]
 
     @property
-    def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.LINEAR
+    def mamba_type(self) -> str:
+        return "linear_attention"
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         """Return state shape for linear attention cache.

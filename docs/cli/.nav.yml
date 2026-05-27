@@ -6,5 +6,3 @@ nav:
   - run-batch.md
   - vllm bench:
     - bench/**/*.md
-  - vllm launch:
-    - launch/**/*.md

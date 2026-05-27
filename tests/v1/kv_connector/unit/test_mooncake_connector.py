@@ -26,14 +26,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
 )
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
-from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import RequestStatus
 
 from .utils import create_request, create_scheduler, create_vllm_config
-
-
-def _make_test_kv_cache_config() -> KVCacheConfig:
-    return KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
 
 
 class FakeMooncakeWrapper:
@@ -326,11 +321,7 @@ async def test_kv_producer(monkeypatch):
     )
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
-        prefill_connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
+        prefill_connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         prefill_worker = prefill_connector.connector_worker
         prefill_worker.kv_caches_base_addr = [0x1000]
         block_len = 4096
@@ -482,11 +473,7 @@ async def test_kv_consumuer(monkeypatch):
     )
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies() as mocks:
-        decode_connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
+        decode_connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         decode_worker = decode_connector.connector_worker
         decode_worker.kv_caches_base_addr = [0x1000]
         decode_worker.rpc_port = 54321
@@ -546,11 +533,7 @@ async def test_worker_get_finished_timeout(monkeypatch):
         kv_connector="MooncakeConnector", kv_role="kv_producer"
     )
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
-        prefill_connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
+        prefill_connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         prefill_worker = prefill_connector.connector_worker
 
         # Add an expired request (expire_time is in the past).
@@ -596,11 +579,7 @@ def test_register_kv_caches():
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.threading.Thread"
         ) as mock_thread,
     ):
-        connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
+        connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         worker = connector.connector_worker
         mock_thread.return_value.is_alive.return_value = False
 
@@ -649,11 +628,7 @@ def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.threading.Thread"
         ) as mock_thread,
     ):
-        connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
+        connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         worker = connector.connector_worker
         mock_thread.return_value.is_alive.return_value = False
 
@@ -713,11 +688,7 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
     )
 
     with set_current_vllm_config(vllm_config), patch_worker_dependencies():
-        prefill_connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
+        prefill_connector = MooncakeConnector(vllm_config, KVConnectorRole.WORKER)
         prefill_worker = prefill_connector.connector_worker
 
         # Override TP rank/size to simulate P TP=2

@@ -36,11 +36,9 @@ TOP_KS = [2, 4, 6]
 NUM_EXPERTS = [8, 16, 64]
 
 
-def setup_eplb_state(
-    enable_eplb: bool, global_num_experts: int
-) -> EplbLayerState | None:
+def setup_eplb_state(enable_eplb: bool, global_num_experts: int) -> EplbLayerState:
     if not enable_eplb:
-        return None
+        return EplbLayerState()
 
     # Initialize EPLB state with proper tensors for testing
     # For testing purposes, we use a simple 1:1 mapping (no redundant experts)
@@ -351,6 +349,7 @@ def test_fused_topk(
         top_k=top_k,
         global_num_experts=global_num_experts,
         renormalize=renormalize,
+        enable_eplb=enable_eplb,
         eplb_state=eplb_state,
     )
 
@@ -401,6 +400,7 @@ def test_fused_topk_bias(
         top_k=top_k,
         global_num_experts=global_num_experts,
         renormalize=renormalize,
+        enable_eplb=enable_eplb,
         eplb_state=eplb_state,
     )
 
@@ -469,6 +469,7 @@ def test_grouped_topk(
         top_k=top_k,
         global_num_experts=global_num_experts,
         renormalize=renormalize,
+        enable_eplb=enable_eplb,
         eplb_state=eplb_state,
     )
 
@@ -539,6 +540,7 @@ def test_custom(
         global_num_experts=global_num_experts,
         custom_routing_function=custom_routing_function,
         renormalize=renormalize,
+        enable_eplb=enable_eplb,
         eplb_state=eplb_state,
     )
 
@@ -578,6 +580,7 @@ def test_custom(
 #     router = create_fused_moe_router(
 #         top_k=top_k,
 #         global_num_experts=global_num_experts,
+#         enable_eplb=enable_eplb,
 #         eplb_state=eplb_state,
 #     )
 

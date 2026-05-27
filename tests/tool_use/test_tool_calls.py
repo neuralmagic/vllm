@@ -12,22 +12,17 @@ from .utils import (
     SEARCH_TOOL,
     SEED,
     WEATHER_TOOL,
-    ServerConfig,
-    ensure_system_prompt,
 )
 
 
 # test: request a chat completion that should return tool calls, so we know they
 # are parsable
 @pytest.mark.asyncio
-async def test_tool_call_and_choice(
-    client: openai.AsyncOpenAI, server_config: ServerConfig
-):
+async def test_tool_call_and_choice(client: openai.AsyncOpenAI):
     models = await client.models.list()
     model_name: str = models.data[0].id
-    messages = ensure_system_prompt(MESSAGES_ASKING_FOR_TOOLS, server_config)
     chat_completion = await client.chat.completions.create(
-        messages=messages,
+        messages=MESSAGES_ASKING_FOR_TOOLS,
         temperature=0,
         max_completion_tokens=100,
         model=model_name,
@@ -73,7 +68,7 @@ async def test_tool_call_and_choice(
     # make the same request, streaming
     stream = await client.chat.completions.create(
         model=model_name,
-        messages=messages,
+        messages=MESSAGES_ASKING_FOR_TOOLS,
         temperature=0,
         max_completion_tokens=100,
         tools=[WEATHER_TOOL, SEARCH_TOOL],

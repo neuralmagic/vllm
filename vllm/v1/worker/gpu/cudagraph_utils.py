@@ -216,6 +216,7 @@ class CudaGraphManager:
                 for desc in descs:
                     # Prepare inputs and get forward function
                     forward_fn, attn_state = create_forward_fn(desc)
+                    captured_attn_states[desc] = attn_state
 
                     # Warmup
                     forward_fn(CUDAGraphMode.NONE)
@@ -225,15 +226,8 @@ class CudaGraphManager:
                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
                     )
                     if desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                        captured_attn_states[desc] = attn_state
                         forward_fn(CUDAGraphMode.PIECEWISE)
                     else:
-                        # Capture with fresh attention state. The warmup
-                        # attention state is discarded because some backends
-                        # (e.g. FlashMLA) perform lazy initializations that
-                        # must be captured in the graph.
-                        forward_fn, attn_state = create_forward_fn(desc)
-                        captured_attn_states[desc] = attn_state
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
@@ -358,9 +352,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 batch_descriptor = None
                 if cg_mode == CUDAGraphMode.PIECEWISE:
                     assert attn_metadata is None
-                    batch_descriptor = BatchDescriptor(
-                        num_tokens=num_tokens, has_lora=has_lora
-                    )
+                    batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
                 with set_forward_context(
                     attn_metadata,
                     self.vllm_config,

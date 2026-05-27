@@ -61,53 +61,17 @@ class XPUwNa16LinearKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        # Default names since marlin requires empty parameters for these,
-        # TODO: remove this requirement from marlin (allow optional tensors)
-        if self.w_gidx_name is None:
-            self.w_gidx_name = "g_idx"
-        if self.w_zp_name is None:
-            self.w_zp_name = "w_zp"
-
-        need_transpose = False
-        qweight_shape = getattr(layer, self.w_q_name).shape
-        scale_shape = getattr(layer, self.w_s_name).shape
-        # gptq marlin and compressed tensors wna16 expect different default
-        # layouts for weight and scale, so we check the shapes to determine
-        # if we need to transpose
-        if qweight_shape[0] != scale_shape[0]:
-            need_transpose = True
-
-        if need_transpose:
-            getattr(layer, self.w_q_name).data = (
-                getattr(layer, self.w_q_name).data.t().contiguous()
-            )
-            getattr(layer, self.w_s_name).data = getattr(layer, self.w_s_name).data
-        else:
-            getattr(layer, self.w_s_name).data = (
-                getattr(layer, self.w_s_name).data.t().contiguous()
-            )
+        layer.weight_scale.data = layer.weight_scale.t().contiguous()
 
         if self.config.zero_points:
-            # (FIXME): maybe zero points should also be transposed.
-            getattr(layer, self.w_zp_name).data = (
-                getattr(layer, self.w_zp_name).data.t().contiguous()
-            )
+            layer.weight_zero_point.data = layer.weight_zero_point.t().contiguous()
         else:
             weight_zero_point = torch.Tensor([8]).to(torch.int8).to("xpu")
-            setattr(
-                layer, self.w_zp_name, Parameter(weight_zero_point, requires_grad=False)
-            )
+            layer.weight_zero_point = Parameter(weight_zero_point, requires_grad=False)
         if self.config.has_g_idx:
-            setattr(
-                layer,
-                self.w_gidx_name,
-                Parameter(
-                    getattr(layer, self.w_gidx_name).data.t().contiguous(),
-                    requires_grad=False,
-                ),
-            )
+            layer.g_idx.data = layer.g_idx.t().contiguous()
         else:
-            setattr(layer, self.w_gidx_name, None)
+            layer.g_idx = None
 
     def apply_weights(
         self,
@@ -116,15 +80,14 @@ class XPUwNa16LinearKernel(MPLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         reshaped_x = x.reshape(-1, x.shape[-1])
-        w_q, w_s, w_zp, w_gidx = self._get_weight_params(layer)
         out = torch.ops._xpu_C.int4_gemm_w4a16(
             reshaped_x,
-            w_q.t(),
-            bias if bias is not None else None,
-            w_s,
-            w_zp,
+            layer.weight_packed.t(),
+            bias,
+            layer.weight_scale,
+            layer.weight_zero_point,
             self.config.group_size,
-            w_gidx,
+            layer.g_idx,
         )
         return out
 

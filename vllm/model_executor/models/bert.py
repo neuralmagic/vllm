@@ -559,10 +559,13 @@ def _encode_token_type_ids(
 
 
 def _decode_token_type_ids(input_ids: torch.Tensor) -> torch.Tensor:
-    ids_mask = 1 << TOKEN_TYPE_SHIFT
-    tokens_mask = ~ids_mask
+    ids_mask = (
+        torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
+        << TOKEN_TYPE_SHIFT
+    )
+    tokens_mask = ids_mask.bitwise_not()
 
-    token_type_ids = (input_ids & ids_mask) >> TOKEN_TYPE_SHIFT
+    token_type_ids = input_ids.bitwise_and(ids_mask) >> TOKEN_TYPE_SHIFT
 
     input_ids.bitwise_and_(tokens_mask)
 

@@ -6,12 +6,13 @@ from typing import Any, Union
 import torch
 from packaging import version
 
-from vllm.model_executor.layers.fused_moe import (
+from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
-    FusedMoEMethodBase,
     FusedMoEQuantConfig,
-    RoutedExperts,
-    SharedExperts,
+)
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    FusedMoEMethodBase,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -163,7 +164,7 @@ class BitsAndBytesConfig(QuantizationConfig):
             if is_layer_skipped_bnb(prefix, self.llm_int8_skip_modules):
                 return UnquantizedLinearMethod()
             return BitsAndBytesLinearMethod(self)
-        elif isinstance(layer, RoutedExperts):
+        elif isinstance(layer, FusedMoE):
             return BitsAndBytesMoEMethod(self, layer.moe_config)
         return None
 
@@ -450,7 +451,7 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
 
     def create_weights(
         self,
-        layer: RoutedExperts,
+        layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
@@ -471,17 +472,16 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         )
 
     def get_fused_moe_quant_config(
-        self, layer: RoutedExperts
+        self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
         return None
 
     def apply(
         self,
-        layer: RoutedExperts,
+        layer: FusedMoE,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts

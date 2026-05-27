@@ -17,7 +17,6 @@ from vllm.entrypoints.pooling.scoring.protocol import RerankResponse
 os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
 
 TEMPLATE_DIR = str(VLLM_PATH / "examples/pooling/score/template")
-ExpectedPromptTokens = int | tuple[int, ...]
 
 long_query = "What is the capital of France?" * 20
 long_doc = "The capital of France is Paris. " * 20
@@ -27,10 +26,10 @@ long_doc = "The capital of France is Paris. " * 20
 class TestConfig:
     model: str
     args: list[str]
-    without_truncated_prompt_tokens: ExpectedPromptTokens
-    with_max_tokens_per_query_prompt_tokens: ExpectedPromptTokens
-    with_max_tokens_per_doc_prompt_tokens: ExpectedPromptTokens
-    with_max_tokens_per_query_and_doc_prompt_tokens: ExpectedPromptTokens
+    without_truncated_prompt_tokens: int
+    with_max_tokens_per_query_prompt_tokens: int
+    with_max_tokens_per_doc_prompt_tokens: int
+    with_max_tokens_per_query_and_doc_prompt_tokens: int
 
 
 RERANK_CONFIGS = [
@@ -80,10 +79,8 @@ RERANK_CONFIGS = [
             "512",
             "--trust-remote-code",
         ],
-        # This model has produced both prompt-token totals in CI/local cache;
-        # keep truncation checks exact while tolerating the boundary delta.
-        without_truncated_prompt_tokens=(285, 286),
-        with_max_tokens_per_query_prompt_tokens=(155, 156),
+        without_truncated_prompt_tokens=286,
+        with_max_tokens_per_query_prompt_tokens=156,
         with_max_tokens_per_doc_prompt_tokens=155,
         with_max_tokens_per_query_and_doc_prompt_tokens=25,
     ),
@@ -118,13 +115,6 @@ RERANK_CONFIGS = [
 ]
 
 
-def assert_prompt_tokens(actual: int, expected: ExpectedPromptTokens) -> None:
-    if isinstance(expected, int):
-        assert actual == expected
-    else:
-        assert actual in expected
-
-
 @pytest.fixture(scope="module", params=RERANK_CONFIGS, ids=lambda c: c.model)
 def server(request):
     config: TestConfig = request.param
@@ -146,10 +136,7 @@ def test_without_truncated(server):
     assert rerank.id is not None
     assert rerank.results is not None
     assert len(rerank.results) == 1
-    assert_prompt_tokens(
-        rerank.usage.prompt_tokens,
-        config.without_truncated_prompt_tokens,
-    )
+    assert rerank.usage.prompt_tokens == config.without_truncated_prompt_tokens
 
 
 def test_max_tokens_per_query(server):
@@ -171,10 +158,7 @@ def test_max_tokens_per_query(server):
     assert rerank.id is not None
     assert rerank.results is not None
     assert len(rerank.results) == 1
-    assert_prompt_tokens(
-        rerank.usage.prompt_tokens,
-        config.with_max_tokens_per_query_prompt_tokens,
-    )
+    assert rerank.usage.prompt_tokens == config.with_max_tokens_per_query_prompt_tokens
 
 
 def test_max_tokens_per_doc(server):
@@ -196,10 +180,7 @@ def test_max_tokens_per_doc(server):
     assert rerank.id is not None
     assert rerank.results is not None
     assert len(rerank.results) == 1
-    assert_prompt_tokens(
-        rerank.usage.prompt_tokens,
-        config.with_max_tokens_per_doc_prompt_tokens,
-    )
+    assert rerank.usage.prompt_tokens == config.with_max_tokens_per_doc_prompt_tokens
 
 
 def test_max_tokens_per_query_and_doc(server):
@@ -222,7 +203,7 @@ def test_max_tokens_per_query_and_doc(server):
     assert rerank.id is not None
     assert rerank.results is not None
     assert len(rerank.results) == 1
-    assert_prompt_tokens(
-        rerank.usage.prompt_tokens,
-        config.with_max_tokens_per_query_and_doc_prompt_tokens,
+    assert (
+        rerank.usage.prompt_tokens
+        == config.with_max_tokens_per_query_and_doc_prompt_tokens
     )

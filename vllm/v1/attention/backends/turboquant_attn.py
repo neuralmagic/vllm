@@ -454,7 +454,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
         else:
             # Mixed batch: decodes first (guaranteed by reorder_batch).
-            attn_out = torch.empty(
+            attn_out = torch.zeros(
                 N, self.num_heads, self.head_size, device=device, dtype=q.dtype
             )
 

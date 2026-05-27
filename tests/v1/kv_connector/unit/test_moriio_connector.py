@@ -37,14 +37,8 @@ from vllm.utils.network_utils import (
     get_ip,
     make_zmq_path,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from .utils import create_request, create_scheduler
-
-
-def _make_test_kv_cache_config() -> KVCacheConfig:
-    return KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
-
 
 aiter_available = importlib.util.find_spec("aiter") is not None
 mori_available = importlib.util.find_spec("mori") is not None
@@ -468,11 +462,7 @@ def test_register_kv_caches(mock_parallel_groups):
         )
 
         with set_current_vllm_config(vllm_config):
-            connector = MoRIIOConnector(
-                vllm_config,
-                KVConnectorRole.WORKER,
-                _make_test_kv_cache_config(),
-            )
+            connector = MoRIIOConnector(vllm_config, KVConnectorRole.WORKER)
             connector.connector_worker = FakeMoRIIOConnectorWorker(
                 vllm_config, connector.engine_id, hand_shake_latency=0
             )
@@ -564,11 +554,7 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
             }
         )
         with set_current_vllm_config(vllm_config):
-            connector = MoRIIOConnector(
-                vllm_config,
-                KVConnectorRole.WORKER,
-                _make_test_kv_cache_config(),
-            )
+            connector = MoRIIOConnector(vllm_config, KVConnectorRole.WORKER)
 
         # Execute register_kv_caches
         connector.register_kv_caches(kv_caches)

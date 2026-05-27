@@ -131,10 +131,7 @@ class SpeculatorsConfig(PretrainedConfig):
             )
 
         # Build base vLLM speculative configuration
-        result = {
+        return {
             "method": config_dict.get("speculators_model_type"),
             "num_speculative_tokens": num_speculative_tokens,
         }
-        if result["method"] == "peagle":
-            result.update({"method": "eagle3", "parallel_drafting": True})
-        return result

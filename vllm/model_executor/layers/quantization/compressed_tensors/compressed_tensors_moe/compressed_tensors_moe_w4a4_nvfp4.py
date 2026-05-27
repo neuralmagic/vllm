@@ -7,9 +7,8 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
     FusedMoeWeightScaleSupported,
-    RoutedExperts,
-    SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -168,7 +167,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         )
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
-    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+    def process_weights_after_loading(self, layer: FusedMoE) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
@@ -236,7 +235,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             experts_cls=self.experts_cls,
-            routing_tables=layer._expert_routing_tables(),
+            shared_experts=layer.shared_experts,
+            routing_tables=layer._maybe_init_expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
@@ -258,12 +258,11 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             w2_scale_2=layer.w2_weight_scale_2,
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
-            swiglu_limit=getattr(layer, "swiglu_limit", None),
         )
 
     def apply_monolithic(
         self,
-        layer: RoutedExperts,
+        layer: FusedMoE,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
@@ -287,11 +286,10 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
     def apply(
         self,
-        layer: RoutedExperts,
+        layer: FusedMoE,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
@@ -305,6 +303,5 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )

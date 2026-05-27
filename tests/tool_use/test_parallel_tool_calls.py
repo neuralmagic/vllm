@@ -13,17 +13,7 @@ from .utils import (
     SEED,
     WEATHER_TOOL,
     ServerConfig,
-    ensure_system_prompt,
 )
-
-
-def apply_parallel_tool_system_prompt(
-    messages,
-    server_config: ServerConfig,
-):
-    if server_config["model"] == "ibm-granite/granite-3.0-8b-instruct":
-        return ensure_system_prompt(messages, server_config)
-    return messages
 
 
 # test: getting the model to generate parallel tool calls (streaming/not)
@@ -43,11 +33,8 @@ async def test_parallel_tool_calls(
 
     models = await client.models.list()
     model_name: str = models.data[0].id
-    messages = apply_parallel_tool_system_prompt(
-        MESSAGES_ASKING_FOR_PARALLEL_TOOLS, server_config
-    )
     chat_completion = await client.chat.completions.create(
-        messages=messages,
+        messages=MESSAGES_ASKING_FOR_PARALLEL_TOOLS,
         temperature=0,
         max_completion_tokens=200,
         model=model_name,
@@ -86,7 +73,7 @@ async def test_parallel_tool_calls(
     # make the same request, streaming
     stream = await client.chat.completions.create(
         model=model_name,
-        messages=messages,
+        messages=MESSAGES_ASKING_FOR_PARALLEL_TOOLS,
         temperature=0,
         max_completion_tokens=200,
         tools=[WEATHER_TOOL, SEARCH_TOOL],
@@ -175,11 +162,8 @@ async def test_parallel_tool_calls_with_results(
 
     models = await client.models.list()
     model_name: str = models.data[0].id
-    messages = apply_parallel_tool_system_prompt(
-        MESSAGES_WITH_PARALLEL_TOOL_RESPONSE, server_config
-    )
     chat_completion = await client.chat.completions.create(
-        messages=messages,
+        messages=MESSAGES_WITH_PARALLEL_TOOL_RESPONSE,
         temperature=0,
         max_completion_tokens=200,
         model=model_name,
@@ -198,7 +182,7 @@ async def test_parallel_tool_calls_with_results(
     assert "78" in choice.message.content  # Orlando temp in tool response
 
     stream = await client.chat.completions.create(
-        messages=messages,
+        messages=MESSAGES_WITH_PARALLEL_TOOL_RESPONSE,
         temperature=0,
         max_completion_tokens=200,
         model=model_name,
@@ -236,20 +220,15 @@ async def test_parallel_tool_calls_with_results(
 
 
 @pytest.mark.asyncio
-async def test_parallel_tool_calls_false(
-    client: openai.AsyncOpenAI, server_config: ServerConfig
-):
+async def test_parallel_tool_calls_false(client: openai.AsyncOpenAI):
     """
     Ensure only one tool call is returned when parallel_tool_calls is False.
     """
 
     models = await client.models.list()
     model_name: str = models.data[0].id
-    messages = apply_parallel_tool_system_prompt(
-        MESSAGES_ASKING_FOR_PARALLEL_TOOLS, server_config
-    )
     chat_completion = await client.chat.completions.create(
-        messages=messages,
+        messages=MESSAGES_ASKING_FOR_PARALLEL_TOOLS,
         temperature=0,
         max_completion_tokens=200,
         model=model_name,
@@ -269,7 +248,7 @@ async def test_parallel_tool_calls_false(
     # make the same request, streaming
     stream = await client.chat.completions.create(
         model=model_name,
-        messages=messages,
+        messages=MESSAGES_ASKING_FOR_PARALLEL_TOOLS,
         temperature=0,
         max_completion_tokens=200,
         tools=[WEATHER_TOOL, SEARCH_TOOL],

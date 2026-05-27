@@ -62,10 +62,6 @@ from openai_harmony import Message as HarmonyMessage
 
 from vllm.entrypoints.mcp.tool_server import ToolServer
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
-from vllm.entrypoints.openai.parser.harmony_utils import (
-    extract_function_from_recipient,
-    is_function_recipient,
-)
 from vllm.entrypoints.openai.responses.context import StreamingHarmonyContext
 from vllm.entrypoints.openai.responses.protocol import (
     ResponseReasoningPartAddedEvent,
@@ -115,19 +111,19 @@ class StreamingState:
         self.current_call_id = ""
 
 
-def is_mcp_tool_by_namespace(
-    recipient: str | None,
-    allowed_function_tool_names: frozenset[str] | None = None,
-) -> bool:
+def is_mcp_tool_by_namespace(recipient: str | None) -> bool:
     """
     Determine if a tool call is an MCP tool based on recipient prefix.
 
-    Inverse of :func:`is_function_recipient` — everything that is not
-    a function call is an MCP tool.
+    - Tools starting with "functions." are function calls
+    - Everything else is an MCP tool
     """
     if recipient is None:
         return False
-    return not is_function_recipient(recipient, allowed_function_tool_names)
+
+    # Function calls have "functions." prefix
+    # Everything else is an MCP tool
+    return not recipient.startswith("functions.")
 
 
 # =====================================================================
@@ -579,16 +575,16 @@ def emit_content_delta_events(
         return emit_text_delta_events(delta, state)
     elif channel == "analysis" and recipient is None:
         return emit_reasoning_delta_events(delta, state)
-    elif recipient is not None:
-        fn_names = ctx.function_tool_names
-        if is_function_recipient(recipient, fn_names):
-            function_name = extract_function_from_recipient(recipient)
+    # built-in tools will be triggered on the analysis channel
+    # However, occasionally built-in tools will
+    # still be output to commentary.
+    elif channel in ("commentary", "analysis") and recipient is not None:
+        if recipient.startswith("functions."):
+            function_name = recipient[len("functions.") :]
             return emit_function_call_delta_events(delta, function_name, state)
         elif recipient == "python":
             return emit_code_interpreter_delta_events(delta, state)
-        elif recipient.startswith("mcp.") or is_mcp_tool_by_namespace(
-            recipient, fn_names
-        ):
+        elif recipient.startswith("mcp.") or is_mcp_tool_by_namespace(recipient):
             return emit_mcp_delta_events(delta, state, recipient)
 
     return []
@@ -597,7 +593,6 @@ def emit_content_delta_events(
 def emit_previous_item_done_events(
     previous_item: HarmonyMessage,
     state: StreamingState,
-    function_tool_names: frozenset[str] | None = None,
 ) -> list[StreamingResponsesResponse]:
     """Emit done events for the previous item when expecting a new start.
 
@@ -607,13 +602,13 @@ def emit_previous_item_done_events(
     text = previous_item.content[0].text
     if previous_item.recipient is not None:
         # Deal with tool call
-        if is_function_recipient(previous_item.recipient, function_tool_names):
-            function_name = extract_function_from_recipient(previous_item.recipient)
+        if previous_item.recipient.startswith("functions."):
+            function_name = previous_item.recipient[len("functions.") :]
             return emit_function_call_done_events(function_name, text, state)
         elif previous_item.recipient == "python":
             return emit_code_interpreter_completion_events(previous_item, state)
         elif (
-            is_mcp_tool_by_namespace(previous_item.recipient, function_tool_names)
+            is_mcp_tool_by_namespace(previous_item.recipient)
             and state.current_item_id is not None
             and state.current_item_id.startswith("mcp_")
         ):
@@ -797,12 +792,9 @@ def emit_tool_action_events(
         and state.sent_output_item_added
     ):
         recipient = previous_item.recipient
-        fn_names = ctx.function_tool_names
         if recipient == "python":
             events.extend(emit_code_interpreter_completion_events(previous_item, state))
-        elif recipient.startswith("mcp.") or is_mcp_tool_by_namespace(
-            recipient, fn_names
-        ):
+        elif recipient.startswith("mcp.") or is_mcp_tool_by_namespace(recipient):
             events.extend(
                 emit_mcp_completion_events(
                     recipient, previous_item.content[0].text, state
