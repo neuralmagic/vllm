@@ -206,13 +206,13 @@ class EplbModelState:
     the async worker.
     """
 
-    latest_tokens_per_rank: list[list[float]] | None = None
+    latest_my_tokens_per_layer: list[float] | None = None
     """
-    Most recent per-(layer, rank) token counts (outer list indexed by MoE
-    layer, inner list indexed by EP rank), updated every
-    ``log_balancedness_interval`` steps. None until the first sample is taken.
-    Read by the worker each step to populate ModelRunnerOutput. Balancedness
-    is derivable in PromQL via ``avg by (...) / max by (...)``.
+    Most recent per-layer token counts for *this rank only* (pre-AR slice),
+    one float per MoE layer, updated every ``log_balancedness_interval``
+    steps. None until the first sample is taken. Each rank publishes its own
+    slice to Prometheus with a ``rank`` label; balancedness is derivable in
+    PromQL via ``avg by (model, layer) (...) / max by (model, layer) (...)``.
     """
 
 
@@ -520,44 +520,45 @@ class EplbState:
             % self.parallel_config.eplb_config.log_balancedness_interval
             == 0
         ):
-            # Sync the expert load pass for each model (main and drafter).
-            # expert_load_pass: (num_moe_layers, num_physical_experts)
-            expert_load_pass_list = self._sync_load_pass()
-            ep_group = get_ep_group().device_group
-            for expert_load_pass, eplb_model_state in zip(
-                expert_load_pass_list, self.model_states.values()
-            ):
-                # num_tokens_per_rank: (num_moe_layers, num_ranks)
-                num_tokens_per_rank = (
-                    expert_load_pass.reshape(
-                        expert_load_pass.shape[0], ep_group.size(), -1
-                    )
+            ep_size = ep_group.size()
+            my_rank = ep_group.rank()
+
+            # Pre-AR snapshot: each rank reads its own column of
+            # ``expert_load_pass`` and publishes only its slice. No
+            # collective involved; the gauge stitches across ranks via the
+            # ``rank`` label at scrape time.
+            for eplb_model_state in self.model_states.values():
+                local = eplb_model_state.expert_load_pass
+                # local: (num_moe_layers, num_physical_experts)
+                # Reshape to (num_layers, ep_size, experts_per_rank) and slice
+                # to my_rank's column, then sum across that rank's experts.
+                my_tokens_per_layer_tensor = (
+                    local.reshape(local.shape[0], ep_size, -1)[:, my_rank, :]
                     .sum(dim=-1)
                     .float()
                 )
+                eplb_model_state.latest_my_tokens_per_layer = (
+                    my_tokens_per_layer_tensor.tolist()
+                )
 
-                # Single D2H: materialize the full per-(layer, rank) load
-                # so operators can derive any aggregation (balancedness,
-                # totals, hot-rank/hot-layer) in PromQL.
-                tokens_per_layer: list[list[float]] = num_tokens_per_rank.tolist()
-                eplb_model_state.latest_tokens_per_rank = tokens_per_layer
+            expert_load_pass_list = self._sync_load_pass()
+            for expert_load_pass, eplb_model_state in zip(
+                expert_load_pass_list, self.model_states.values()
+            ):
+                num_tokens_per_rank = (
+                    expert_load_pass.reshape(expert_load_pass.shape[0], ep_size, -1)
+                    .sum(dim=-1)
+                    .float()
+                )
+                avg_tokens_tensor = num_tokens_per_rank.mean(dim=0).sum(dim=0)
+                max_tokens_tensor = num_tokens_per_rank.max(dim=0).values.sum(dim=0)
+                tokens_tensors: list[float] = torch.stack(
+                    [avg_tokens_tensor, max_tokens_tensor]
+                ).tolist()
+                avg_tokens, max_tokens = tokens_tensors
+                balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
 
-                if ep_group.rank() == 0:
-                    # Aggregate the same way the original log line did:
-                    # avg = sum_over_ranks(mean_over_layers(tokens))
-                    # max = sum_over_ranks(max_over_layers(tokens))
-                    num_layers = len(tokens_per_layer)
-                    if num_layers > 0:
-                        total = sum(t for row in tokens_per_layer for t in row)
-                        avg_tokens = total / num_layers
-                        max_tokens = sum(
-                            max(rank_col) for rank_col in zip(*tokens_per_layer)
-                        )
-                    else:
-                        avg_tokens = 0.0
-                        max_tokens = 0.0
-                    balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
-
+                if my_rank == 0:
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
                         "max_tokens=%d, balancedness=%.4f, "
@@ -650,12 +651,15 @@ class EplbState:
                 self._should_record_current_step(log_stats=log_stats)
             )
 
-    def get_latest_tokens_per_rank(self) -> dict[str, list[list[float]]]:
-        """Return the latest per-(layer, rank) token counts per model."""
+    def get_latest_my_tokens_per_layer(self) -> dict[str, list[float]]:
+        """Return the latest per-layer token counts for *this rank only*,
+        keyed by model name. The ``rank`` label on the Prometheus gauge
+        identifies which rank each series came from at scrape time.
+        """
         return {
-            state.model_name: state.latest_tokens_per_rank
+            state.model_name: state.latest_my_tokens_per_layer
             for state in self.model_states.values()
-            if state.latest_tokens_per_rank is not None
+            if state.latest_my_tokens_per_layer is not None
         }
 
     def _init_should_record_tensor(self, model: "MixtureOfExperts") -> None:  # type: ignore[name-defined]

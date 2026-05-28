@@ -172,14 +172,17 @@ class EplbMetrics:
     """
     Stores EPLB metrics.
 
-    - `tokens_per_rank_per_model`: For each model, a 2D list of token counts
-      indexed by ``[layer][rank]``. Balancedness and other aggregations
-      (totals, hot-rank/hot-layer) are derivable in PromQL.
+    - `ep_rank`: The EP rank of the worker that produced this sample. Used
+      as the ``rank`` label on the Prometheus gauge so series from different
+      ranks (across engines) stitch together at scrape time.
+    - `tokens_per_layer_per_model`: For each model, a list of per-layer
+      token counts for *this rank only* (pre-AR slice). Balancedness and
+      other aggregations are derivable in PromQL via
+      ``avg by (model, layer) (...) / max by (model, layer) (...)``.
     """
 
-    tokens_per_rank_per_model: dict[str, list[list[float]]] = field(
-        default_factory=dict
-    )
+    ep_rank: int = 0
+    tokens_per_layer_per_model: dict[str, list[float]] = field(default_factory=dict)
 
 
 @dataclass

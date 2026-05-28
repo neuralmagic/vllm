@@ -1127,19 +1127,19 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             if scheduler_stats.eplb_metrics is not None:
                 model_name, engine = self.per_engine_labelvalues[engine_idx]
+                rank = str(scheduler_stats.eplb_metrics.ep_rank)
                 for (
                     model,
                     tokens_per_layer,
-                ) in scheduler_stats.eplb_metrics.tokens_per_rank_per_model.items():
-                    for layer_idx, tokens_per_rank in enumerate(tokens_per_layer):
-                        for rank_idx, tokens in enumerate(tokens_per_rank):
-                            self.gauge_eplb_tokens_per_rank.labels(
-                                model_name=model_name,
-                                engine=engine,
-                                model=model,
-                                layer=str(layer_idx),
-                                rank=str(rank_idx),
-                            ).set(tokens)
+                ) in scheduler_stats.eplb_metrics.tokens_per_layer_per_model.items():
+                    for layer_idx, tokens in enumerate(tokens_per_layer):
+                        self.gauge_eplb_tokens_per_rank.labels(
+                            model_name=model_name,
+                            engine=engine,
+                            model=model,
+                            layer=str(layer_idx),
+                            rank=rank,
+                        ).set(tokens)
 
             if (
                 self.kv_cache_metrics_enabled
