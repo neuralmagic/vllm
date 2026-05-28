@@ -403,9 +403,30 @@ class PerEngineStatLoggerAdapter(AggregateStatLoggerBase):
 
 
 class DeepEPMetricsProm:
-    """Per-layer Prometheus counters for DeepEP dispatch/combine and expert compute."""
+    """Per-layer Prometheus histograms for DeepEP dispatch/combine and expert
+    compute. Each step's duration is observed so that no data is lost between
+    scrapes. Use histogram_quantile() for percentiles or rate(_sum) for
+    average duration per second.
+    """
 
-    _counter_cls = Counter
+    _histogram_cls = Histogram
+
+    # Buckets tuned for sub-millisecond to ~100ms GPU kernel durations.
+    _buckets = (
+        0.0001,
+        0.00025,
+        0.0005,
+        0.001,
+        0.0025,
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+    )
 
     def __init__(
         self,
@@ -414,20 +435,23 @@ class DeepEPMetricsProm:
     ):
         deepep_labelnames = [*labelnames, "mode", "layer"]
 
-        self.counter_dispatch = self._counter_cls(
-            name="vllm:deepep_dispatch_duration_seconds_total",
-            documentation="Per-layer DeepEP dispatch duration.",
+        self.hist_dispatch = self._histogram_cls(
+            name="vllm:deepep_dispatch_duration_seconds",
+            documentation="Per-layer DeepEP dispatch duration per step.",
             labelnames=deepep_labelnames,
+            buckets=self._buckets,
         )
-        self.counter_combine = self._counter_cls(
-            name="vllm:deepep_combine_duration_seconds_total",
-            documentation="Per-layer DeepEP combine duration.",
+        self.hist_combine = self._histogram_cls(
+            name="vllm:deepep_combine_duration_seconds",
+            documentation="Per-layer DeepEP combine duration per step.",
             labelnames=deepep_labelnames,
+            buckets=self._buckets,
         )
-        self.counter_expert_compute = self._counter_cls(
-            name="vllm:moe_expert_compute_duration_seconds_total",
-            documentation="Per-layer MoE expert compute duration.",
+        self.hist_expert_compute = self._histogram_cls(
+            name="vllm:moe_expert_compute_duration_seconds",
+            documentation="Per-layer MoE expert compute duration per step.",
             labelnames=deepep_labelnames,
+            buckets=self._buckets,
         )
         self._per_engine_labelvalues = per_engine_labelvalues
 
@@ -435,13 +459,11 @@ class DeepEPMetricsProm:
         lv = self._per_engine_labelvalues[engine_idx]
         mode = deepep_stats.mode
         for layer_idx, t in deepep_stats.dispatch_times_s.items():
-            self.counter_dispatch.labels(*lv, mode, str(layer_idx)).inc(t)
+            self.hist_dispatch.labels(*lv, mode, str(layer_idx)).observe(t)
         for layer_idx, t in deepep_stats.combine_times_s.items():
-            self.counter_combine.labels(*lv, mode, str(layer_idx)).inc(t)
+            self.hist_combine.labels(*lv, mode, str(layer_idx)).observe(t)
         for layer_idx, t in deepep_stats.expert_compute_times_s.items():
-            self.counter_expert_compute.labels(
-                *lv, mode, str(layer_idx)
-            ).inc(t)
+            self.hist_expert_compute.labels(*lv, mode, str(layer_idx)).observe(t)
 
 
 class PrometheusStatLogger(AggregateStatLoggerBase):
@@ -487,9 +509,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
         )
-        self.deepep_metrics_prom = DeepEPMetricsProm(
-            labelnames, per_engine_labelvalues
-        )
+        self.deepep_metrics_prom = DeepEPMetricsProm(labelnames, per_engine_labelvalues)
 
         #
         # Scheduler state
