@@ -170,11 +170,16 @@ class KVCacheEvictionEvent:
 @dataclass
 class EplbMetrics:
     """
-    Stores EPLB metrics
-    - `balancedness_per_model`: Per-model balancedness score
+    Stores EPLB metrics.
+
+    - `tokens_per_rank_per_model`: For each model, a 2D list of token counts
+      indexed by ``[layer][rank]``. Balancedness and other aggregations
+      (totals, hot-rank/hot-layer) are derivable in PromQL.
     """
 
-    balancedness_per_model: dict[str, float] = field(default_factory=dict)
+    tokens_per_rank_per_model: dict[str, list[list[float]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass

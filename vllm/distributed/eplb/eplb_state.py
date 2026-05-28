@@ -206,11 +206,13 @@ class EplbModelState:
     the async worker.
     """
 
-    latest_balancedness: float | None = None
+    latest_tokens_per_rank: list[list[float]] | None = None
     """
-    Most recent balancedness ratio (avg_tokens / max_tokens), updated every
+    Most recent per-(layer, rank) token counts (outer list indexed by MoE
+    layer, inner list indexed by EP rank), updated every
     ``log_balancedness_interval`` steps. None until the first sample is taken.
-    Read by the worker each step to populate ModelRunnerOutput.
+    Read by the worker each step to populate ModelRunnerOutput. Balancedness
+    is derivable in PromQL via ``avg by (...) / max by (...)``.
     """
 
 
@@ -534,21 +536,28 @@ class EplbState:
                     .float()
                 )
 
-                # Compute balancedness ratio:
-                # for each layer:
-                #   (mean load across ranks) / (max load across ranks)
-                avg_tokens_tensor = num_tokens_per_rank.mean(dim=0).sum(dim=0)
-                max_tokens_tensor = num_tokens_per_rank.max(dim=0).values.sum(dim=0)
-
-                # Just to make type checker happy
-                tokens_tensors: list[float] = torch.stack(
-                    [avg_tokens_tensor, max_tokens_tensor]
-                ).tolist()
-                avg_tokens, max_tokens = tokens_tensors
-                balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
-                eplb_model_state.latest_balancedness = balancedness
+                # Single D2H: materialize the full per-(layer, rank) load
+                # so operators can derive any aggregation (balancedness,
+                # totals, hot-rank/hot-layer) in PromQL.
+                tokens_per_layer: list[list[float]] = num_tokens_per_rank.tolist()
+                eplb_model_state.latest_tokens_per_rank = tokens_per_layer
 
                 if ep_group.rank() == 0:
+                    # Aggregate the same way the original log line did:
+                    # avg = sum_over_ranks(mean_over_layers(tokens))
+                    # max = sum_over_ranks(max_over_layers(tokens))
+                    num_layers = len(tokens_per_layer)
+                    if num_layers > 0:
+                        total = sum(t for row in tokens_per_layer for t in row)
+                        avg_tokens = total / num_layers
+                        max_tokens = sum(
+                            max(rank_col) for rank_col in zip(*tokens_per_layer)
+                        )
+                    else:
+                        avg_tokens = 0.0
+                        max_tokens = 0.0
+                    balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
+
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
                         "max_tokens=%d, balancedness=%.4f, "
@@ -641,12 +650,12 @@ class EplbState:
                 self._should_record_current_step(log_stats=log_stats)
             )
 
-    def get_latest_balancedness(self) -> dict[str, float]:
-        """Return the latest balancedness ratio per model."""
+    def get_latest_tokens_per_rank(self) -> dict[str, list[list[float]]]:
+        """Return the latest per-(layer, rank) token counts per model."""
         return {
-            state.model_name: state.latest_balancedness
+            state.model_name: state.latest_tokens_per_rank
             for state in self.model_states.values()
-            if state.latest_balancedness is not None
+            if state.latest_tokens_per_rank is not None
         }
 
     def _init_should_record_tensor(self, model: "MixtureOfExperts") -> None:  # type: ignore[name-defined]

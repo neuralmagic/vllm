@@ -4511,10 +4511,10 @@ class GPUModelRunner(
 
         eplb_metrics: EplbMetrics | None = None
         if self.eplb_state is not None:
-            balancedness_per_model = self.eplb_state.get_latest_balancedness()
-            if balancedness_per_model:
+            tokens_per_rank_per_model = self.eplb_state.get_latest_tokens_per_rank()
+            if tokens_per_rank_per_model:
                 eplb_metrics = EplbMetrics(
-                    balancedness_per_model=balancedness_per_model
+                    tokens_per_rank_per_model=tokens_per_rank_per_model
                 )
 
         # self.kv_connector_output may be modified during drafting
