@@ -15,7 +15,6 @@ import signal
 import threading
 import time
 import uuid
-from collections import deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +33,13 @@ class DiskUsage:
     used_bytes: int
     available_bytes: int
     usage_percent: float
+
+
+@dataclass(frozen=True)
+class EvictorRuntimeConfig:
+    access_time_threshold_s: int = ACCESS_TIME_THRESHOLD_S
+    max_delete_queue_size: int = 1000
+    delete_check_interval_s: int = DISCOVERY_TIMEOUT_S
 
 
 def get_disk_usage_from_statvfs(mount_path: str) -> DiskUsage | None:
@@ -160,29 +166,6 @@ def unregister_evictor_process(process_file_path: str, fd: int):
     assert not os.path.exists(process_file_path)
 
 
-def monitor_delete(
-    mount_path: str,
-    storage_threshold_pct: int,
-    delete_queue: deque,
-    delete_queue_lock: threading.Lock,
-):
-    while True:
-        disk_usage = get_disk_usage_from_statvfs(mount_path)
-        if disk_usage is None:
-            time.sleep(10)  # TODO: define a constant
-            continue
-
-        if disk_usage.usage_percent > storage_threshold_pct:
-            # empty the delete queue
-            with delete_queue_lock:
-                while delete_queue:
-                    item = delete_queue.pop()
-                    safe_remove(item)
-
-        # wait before checking again
-        time.sleep(5)
-
-
 class EvictorProcess(multiprocessing.Process):
     def __init__(
         self,
@@ -190,18 +173,14 @@ class EvictorProcess(multiprocessing.Process):
         root_dir: str,
         storage_size: int | None,
         storage_threshold_pct: float | None,
-        access_time_threshold_s: int,
-        max_delete_queue_size: int,
-        delete_check_interval_s: int,
+        runtime_config: EvictorRuntimeConfig,
     ):
         super().__init__(name="Evictor")
         self.mount_path = mount_path
         self.root_dir = root_dir
         self.storage_size = storage_size
         self.storage_threshold_pct = storage_threshold_pct
-        self.access_time_threshold_s = access_time_threshold_s
-        self.max_delete_queue_size = max_delete_queue_size
-        self.delete_check_interval_s = delete_check_interval_s
+        self.runtime_config = runtime_config
 
         # disk usage thread for storage_size spawns
         self.du_thread: threading.Thread | None = None
@@ -281,8 +260,8 @@ class EvictorProcess(multiprocessing.Process):
         def is_evictor_file(entry: os.DirEntry):
             return (
                 entry.is_file(follow_symlinks=False)
-                and entry.path.startswith(f"{self.root_dir}/__")
-                and entry.path.endswith("evictor")
+                and entry.name.startswith("__")
+                and entry.name.endswith(".evictor")
             )
 
         def is_evictor_alive(evictor_path: str) -> bool:
@@ -305,7 +284,12 @@ class EvictorProcess(multiprocessing.Process):
 
         for evictor in dead_evictors:
             safe_remove(evictor)
-        return len(live_evictors), sorted(live_evictors).index(self.my_evictor_path)
+        sorted_live = sorted(live_evictors)
+        if self.my_evictor_path not in sorted_live:
+            raise RuntimeError(
+                f"Current evictor file missing from live set: {self.my_evictor_path}"
+            )
+        return len(sorted_live), sorted_live.index(self.my_evictor_path)
 
     def get_my_hex_ranges(self) -> tuple[int, int]:
         assert self.num_evictors is not None
@@ -348,7 +332,6 @@ class EvictorProcess(multiprocessing.Process):
             return min_hex <= hex_mod <= max_hex
 
         def _cleanup():
-            # drain the file_queue
             while self.file_heapq:
                 self.file_heapq.pop()
 
@@ -358,7 +341,6 @@ class EvictorProcess(multiprocessing.Process):
                     yield entry
 
         def _yield_bin_files() -> Iterator[os.DirEntry]:
-            # folders in root dir are of form
             # Layout: <root_dir>/<safe_model_name>_<sha256-prefix>/<hhh>/<hh>_g<group_idx>/<hash>.bin # noqa: E501
             for model_dir in _safe_yield_dir(self.root_dir):
                 for hex1 in _safe_yield_dir(model_dir.path):
@@ -411,10 +393,13 @@ class EvictorProcess(multiprocessing.Process):
                 access_time = safe_atime(Path(bin_file.path))
                 if access_time is None:
                     continue
-                if time.time() - access_time < self.access_time_threshold_s:
+                if (
+                    time.time() - access_time
+                    < self.runtime_config.access_time_threshold_s
+                ):
                     # skip
                     continue
-                if len(self.file_heapq) == self.max_delete_queue_size:
+                if len(self.file_heapq) == self.runtime_config.max_delete_queue_size:
                     # slow down
                     time.sleep(0.1)
                     if access_time < -self.file_heapq[0][0]:
@@ -455,7 +440,9 @@ class EvictorProcess(multiprocessing.Process):
             try:
                 # trigger crawler
                 crawler_p = self.crawler(
-                    min_hex, max_hex, timeout_s=self.delete_check_interval_s
+                    min_hex,
+                    max_hex,
+                    timeout_s=self.runtime_config.delete_check_interval_s,
                 )
                 crawler_p.send(None)
 
@@ -511,16 +498,18 @@ class Evictor:
         self.root_dir = root_dir
         self.storage_size = storage_size
         self.storage_threshold_pct = storage_threshold_pct
-        self.access_time_threshold_s = access_time_threshold_s
-        self.max_delete_queue_size = max_delete_queue_size
-        self.delete_check_interval_s = delete_check_interval_s
+        self.runtime_config = EvictorRuntimeConfig(
+            access_time_threshold_s=access_time_threshold_s,
+            max_delete_queue_size=max_delete_queue_size,
+            delete_check_interval_s=delete_check_interval_s,
+        )
 
         logger.info(
             "Evictor created with fields: \n"
             "   : mount_path : %s \n"
             "   : root_dir : %s \n"
-            "   : storage_size : %d \n"
-            "   : storage_threshold_pct : %.3f \n"
+            "   : storage_size : %s \n"
+            "   : storage_threshold_pct : %s \n"
             "   : access_time_threshold_s : %d \n"
             "   : max_delete_queue_size : %d \n"
             "   : delete_check_interval_s : %d \n",
@@ -528,9 +517,9 @@ class Evictor:
             self.root_dir,
             self.storage_size,
             self.storage_threshold_pct,
-            self.access_time_threshold_s,
-            self.max_delete_queue_size,
-            self.delete_check_interval_s,
+            self.runtime_config.access_time_threshold_s,
+            self.runtime_config.max_delete_queue_size,
+            self.runtime_config.delete_check_interval_s,
         )
 
     def is_alive(
@@ -549,9 +538,7 @@ class Evictor:
             self.root_dir,
             self.storage_size,
             self.storage_threshold_pct,
-            self.access_time_threshold_s,
-            self.max_delete_queue_size,
-            self.delete_check_interval_s,
+            self.runtime_config,
         )
         self.process.start()
 
