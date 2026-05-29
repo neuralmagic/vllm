@@ -206,7 +206,7 @@ class EplbModelState:
     the async worker.
     """
 
-    latest_my_tokens_per_layer: list[float] | None = None
+    latest_tokens_per_layer: list[float] | None = None
     """
     Most recent per-layer token counts for *this rank only* (pre-AR slice),
     one float per MoE layer, updated every ``log_balancedness_interval``
@@ -521,7 +521,7 @@ class EplbState:
             == 0
         ):
             ep_size = ep_group.size()
-            my_rank = ep_group.rank()
+            rank = ep_group.rank()
 
             # Pre-AR snapshot: each rank reads its own column of
             # ``expert_load_pass`` and publishes only its slice. No
@@ -531,14 +531,14 @@ class EplbState:
                 local = eplb_model_state.expert_load_pass
                 # local: (num_moe_layers, num_physical_experts)
                 # Reshape to (num_layers, ep_size, experts_per_rank) and slice
-                # to my_rank's column, then sum across that rank's experts.
-                my_tokens_per_layer_tensor = (
-                    local.reshape(local.shape[0], ep_size, -1)[:, my_rank, :]
+                # to this rank's column, then sum across that rank's experts.
+                tokens_per_layer_tensor = (
+                    local.reshape(local.shape[0], ep_size, -1)[:, rank, :]
                     .sum(dim=-1)
                     .float()
                 )
-                eplb_model_state.latest_my_tokens_per_layer = (
-                    my_tokens_per_layer_tensor.tolist()
+                eplb_model_state.latest_tokens_per_layer = (
+                    tokens_per_layer_tensor.tolist()
                 )
 
             expert_load_pass_list = self._sync_load_pass()
@@ -558,7 +558,7 @@ class EplbState:
                 avg_tokens, max_tokens = tokens_tensors
                 balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
 
-                if my_rank == 0:
+                if rank == 0:
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
                         "max_tokens=%d, balancedness=%.4f, "
@@ -651,15 +651,14 @@ class EplbState:
                 self._should_record_current_step(log_stats=log_stats)
             )
 
-    def get_latest_my_tokens_per_layer(self) -> dict[str, list[float]]:
-        """Return the latest per-layer token counts for *this rank only*,
-        keyed by model name. The ``rank`` label on the Prometheus gauge
-        identifies which rank each series came from at scrape time.
+    def get_latest_tokens_per_layer(self) -> dict[str, list[float]]:
+        """Return the latest per-layer token counts for this rank only,
+        keyed by model name.
         """
         return {
-            state.model_name: state.latest_my_tokens_per_layer
+            state.model_name: state.latest_tokens_per_layer
             for state in self.model_states.values()
-            if state.latest_my_tokens_per_layer is not None
+            if state.latest_tokens_per_layer is not None
         }
 
     def _init_should_record_tensor(self, model: "MixtureOfExperts") -> None:  # type: ignore[name-defined]

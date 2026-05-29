@@ -4512,9 +4512,7 @@ class GPUModelRunner(
 
         eplb_metrics: EplbMetrics | None = None
         if self.eplb_state is not None:
-            tokens_per_layer_per_model = (
-                self.eplb_state.get_latest_my_tokens_per_layer()
-            )
+            tokens_per_layer_per_model = self.eplb_state.get_latest_tokens_per_layer()
             if tokens_per_layer_per_model:
                 eplb_metrics = EplbMetrics(
                     ep_rank=get_ep_group().device_group.rank(),
