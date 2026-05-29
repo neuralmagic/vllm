@@ -57,6 +57,7 @@ class FileSystemTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         root_dir: str,
+        with_evictor_process: bool = True,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
     ):
