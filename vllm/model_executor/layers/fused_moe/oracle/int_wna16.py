@@ -94,12 +94,6 @@ def _get_priority_backends(
         WNA16MoEBackend.MARLIN,
         WNA16MoEBackend.BATCHED_MARLIN,
     ]
-    return _AVAILABLE_BACKENDS
-
-    if not may_have_bias:
-        _AVAILABLE_BACKENDS.append(WNA16MoEBackend.TRITON)
-
-    return _AVAILABLE_BACKENDS
 
     if not may_have_bias:
         _AVAILABLE_BACKENDS.append(WNA16MoEBackend.TRITON)
