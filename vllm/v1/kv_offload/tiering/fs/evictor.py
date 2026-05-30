@@ -8,6 +8,7 @@ old files when storage thresholds are hit.
 import ctypes
 import fcntl
 import heapq
+import json
 import math
 import multiprocessing
 import os
@@ -21,8 +22,8 @@ from pathlib import Path
 
 from vllm.logger import init_logger
 
-ACCESS_TIME_THRESHOLD_S = 60
-DISCOVERY_TIMEOUT_S = 300  # 5 minutes
+ACCESS_TIME_THRESHOLD_S = 30
+DISCOVERY_TIMEOUT_S = 60  # 5 minutes
 
 logger = init_logger(__name__)
 
@@ -37,12 +38,32 @@ class DiskUsage:
 
 @dataclass(frozen=True)
 class EvictorRuntimeConfig:
+    storage_size: int | None
+    storage_threshold_pct: float | None
     access_time_threshold_s: int = ACCESS_TIME_THRESHOLD_S
     max_delete_queue_size: int = 1000
     delete_check_interval_s: int = DISCOVERY_TIMEOUT_S
 
+    @staticmethod
+    def from_json_str(json_str: str) -> "EvictorRuntimeConfig":
+        data = json.loads(json_str)
+        config = EvictorRuntimeConfig(
+            storage_size=data.get("storage_size", None),
+            storage_threshold_pct=data.get("storage_threshold_pct", None),
+            access_time_threshold_s=data.get(
+                "access_time_threshold_s", ACCESS_TIME_THRESHOLD_S
+            ),
+            max_delete_queue_size=data.get("max_delete_queue_size", 1000),
+            delete_check_interval_s=data.get(
+                "delete_check_interval_s", DISCOVERY_TIMEOUT_S
+            ),
+        )
 
-def get_disk_usage_from_statvfs(mount_path: str) -> DiskUsage | None:
+        assert config.storage_size is None or config.storage_threshold_pct is None
+        return config
+
+
+def get_disk_usage_from_statvfs(root_dir: str) -> DiskUsage | None:
     """
     Get disk usage using statvfs() - O(1) operation, critical for multi-TB volumes.
 
@@ -50,7 +71,7 @@ def get_disk_usage_from_statvfs(mount_path: str) -> DiskUsage | None:
     than `du` which would be O(n) and could take hours on large volumes.
     """
     try:
-        stat = os.statvfs(mount_path)
+        stat = os.statvfs(root_dir)
         block_size = stat.f_frsize
         total_blocks = stat.f_blocks
         free_blocks = stat.f_bfree
@@ -169,17 +190,11 @@ def unregister_evictor_process(process_file_path: str, fd: int):
 class EvictorProcess(multiprocessing.Process):
     def __init__(
         self,
-        mount_path: str,
         root_dir: str,
-        storage_size: int | None,
-        storage_threshold_pct: float | None,
         runtime_config: EvictorRuntimeConfig,
     ):
         super().__init__(name="Evictor")
-        self.mount_path = mount_path
         self.root_dir = root_dir
-        self.storage_size = storage_size
-        self.storage_threshold_pct = storage_threshold_pct
         self.runtime_config = runtime_config
 
         # disk usage thread for storage_size spawns
@@ -213,7 +228,6 @@ class EvictorProcess(multiprocessing.Process):
             time.sleep(2)
 
     def signal_handler(self, signum, frame):
-        logger.info("Received signal %d, shutting down gracefully...", signum)
         self.running = False
         self.shutdown()
 
@@ -231,21 +245,21 @@ class EvictorProcess(multiprocessing.Process):
         """
         True if deletion should be triggered. False otherwise.
         """
-        if self.storage_size is not None:
+        if self.runtime_config.storage_size is not None:
             assert self.du_thread is not None
             assert self.du_thread.is_alive()
-            assert self.storage_threshold_pct is None
             with self.storage_alloc_size_lock:
-                return self.storage_size < self.storage_alloc_size
+                return self.runtime_config.storage_size < self.storage_alloc_size
         else:
-            assert self.storage_threshold_pct is not None
-            disk_usage = get_disk_usage_from_statvfs(self.mount_path)
+            assert self.runtime_config.storage_threshold_pct is not None
+            disk_usage = get_disk_usage_from_statvfs(self.root_dir)
             if disk_usage is None:
                 return False
-            return disk_usage.usage_percent > self.storage_threshold_pct
+            return disk_usage.usage_percent > self.runtime_config.storage_threshold_pct
 
     def maybe_delete(self):
         if self.should_delete():
+            logger.debug("Delete %d files ...", len(self.file_heapq))
             while self.file_heapq:
                 _, file_path = self.file_heapq.pop()
                 safe_remove(file_path)
@@ -309,7 +323,7 @@ class EvictorProcess(multiprocessing.Process):
     def crawler(self, min_hex: int, max_hex: int, timeout_s: int):
         assert max_hex >= min_hex
         yield
-        logger.info(
+        logger.debug(
             "Crawler triggered at %s  for hex range %s, %s",
             self.root_dir,
             min_hex,
@@ -432,7 +446,7 @@ class EvictorProcess(multiprocessing.Process):
 
         self.running = True
         # start the disk usage thread
-        if self.storage_size is not None:
+        if self.runtime_config.storage_size is not None:
             self.du_thread = threading.Thread(target=self.get_true_disk_usage_thread)
             self.du_thread.start()
 
@@ -469,7 +483,7 @@ class EvictorProcess(multiprocessing.Process):
                         min_hex, max_hex = self.get_my_hex_ranges()
                         crawler_p.send(False)  # this will trigger stopitereation
             except StopIteration:
-                logger.info(
+                logger.debug(
                     "Triggered Reassignment as new evictors discovered."
                     "new_num_evictors=%d, new_my_evictor_id=%d",
                     new_num_evictors,
@@ -479,47 +493,19 @@ class EvictorProcess(multiprocessing.Process):
 
 
 class Evictor:
-    def __init__(
-        self,
-        mount_path: str,
-        root_dir: str,
-        storage_size: int | None,
-        storage_threshold_pct: float | None,
-        access_time_threshold_s: int = 60,  # <60s is considered hot cache
-        max_delete_queue_size: int = 1000,  # Maximum candidates for delete at a time.
-        delete_check_interval_s: int = 300,  # check if a delete is needed every 5mins
-    ):
+    def __init__(self, root_dir: str, evictor_config: str):
         """
         root_dir: root directory of the storage to monitor.
-        storage_size: Maximum storage size available.
-        storage_threshold_pct: Threshold at which the Evictor starts evicting files.
         """
-        self.mount_path = mount_path
         self.root_dir = root_dir
-        self.storage_size = storage_size
-        self.storage_threshold_pct = storage_threshold_pct
-        self.runtime_config = EvictorRuntimeConfig(
-            access_time_threshold_s=access_time_threshold_s,
-            max_delete_queue_size=max_delete_queue_size,
-            delete_check_interval_s=delete_check_interval_s,
-        )
+        self.evictor_config = EvictorRuntimeConfig.from_json_str(evictor_config)
 
         logger.info(
             "Evictor created with fields: \n"
-            "   : mount_path : %s \n"
             "   : root_dir : %s \n"
-            "   : storage_size : %s \n"
-            "   : storage_threshold_pct : %s \n"
-            "   : access_time_threshold_s : %d \n"
-            "   : max_delete_queue_size : %d \n"
-            "   : delete_check_interval_s : %d \n",
-            self.mount_path,
+            "   : evictor_config : %s \n",
             self.root_dir,
-            self.storage_size,
-            self.storage_threshold_pct,
-            self.runtime_config.access_time_threshold_s,
-            self.runtime_config.max_delete_queue_size,
-            self.runtime_config.delete_check_interval_s,
+            self.evictor_config,
         )
 
     def is_alive(
@@ -534,11 +520,8 @@ class Evictor:
         Spawn evictor process and always monitor
         """
         self.process = EvictorProcess(
-            self.mount_path,
             self.root_dir,
-            self.storage_size,
-            self.storage_threshold_pct,
-            self.runtime_config,
+            self.evictor_config,
         )
         self.process.start()
 

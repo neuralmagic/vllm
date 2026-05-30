@@ -29,6 +29,7 @@ from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     SecondaryTierManager,
 )
+from vllm.v1.kv_offload.tiering.fs.evictor import Evictor
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -57,7 +58,7 @@ class FileSystemTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         root_dir: str,
-        with_evictor_process: bool = True,
+        evictor_config: str | None = None,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
     ):
@@ -94,6 +95,11 @@ class FileSystemTierManager(SecondaryTierManager):
                 json.dump(
                     self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
                 )
+
+        # evictor
+        self.evictor = None
+        if evictor_config is not None:
+            self.evictor = Evictor(root_dir, evictor_config)
 
         self._pool = DualQueueThreadPool(
             n_read_threads,
@@ -149,3 +155,5 @@ class FileSystemTierManager(SecondaryTierManager):
         active threads to complete.
         """
         self._pool.shutdown(wait=True)
+        if self.evictor is not None:
+            self.evictor.shutdown()
