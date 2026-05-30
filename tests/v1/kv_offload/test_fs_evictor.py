@@ -18,6 +18,7 @@ from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.fs.evictor import (
     EvictorProcess,
     EvictorRuntimeConfig,
+    StorageType,
     get_disk_usage_from_statvfs,
     register_evictor_process,
     safe_is_evictor_alive,
@@ -125,9 +126,9 @@ def test_register_evictor_filelock_effect_and_unregister_cleanup(tmp_path: Path)
 def test_discover_evictors_updates_after_spawn_and_random_shutdown(tmp_path: Path):
     observer = EvictorProcess(
         root_dir=str(tmp_path),
-        runtime_config=EvictorRuntimeConfig(
-            storage_size=None,
-            storage_threshold_pct=99.99,
+        cfg=EvictorRuntimeConfig(
+            storage_type=StorageType.Volume,
+            eviction_threshold=0.99,
             delete_check_interval_s=1,
         ),
     )
@@ -177,9 +178,9 @@ def test_discover_evictors_updates_after_spawn_and_random_shutdown(tmp_path: Pat
 def test_discover_evictors_with_arbitrary_spawn_delays(tmp_path: Path):
     observer = EvictorProcess(
         root_dir=str(tmp_path),
-        runtime_config=EvictorRuntimeConfig(
-            storage_size=None,
-            storage_threshold_pct=99.99,
+        cfg=EvictorRuntimeConfig(
+            storage_type=StorageType.Volume,
+            eviction_threshold=0.99,
             delete_check_interval_s=1,
         ),
     )
@@ -223,9 +224,9 @@ def test_crawler_builds_expected_lru_delete_queue(tmp_path: Path):
 
     evictor = EvictorProcess(
         root_dir=str(tmp_path),
-        runtime_config=EvictorRuntimeConfig(
-            storage_size=None,
-            storage_threshold_pct=99.99,
+        cfg=EvictorRuntimeConfig(
+            storage_type=StorageType.Volume,
+            eviction_threshold=0.99,
             access_time_threshold_s=0,
             max_delete_queue_size=2,
             delete_check_interval_s=1,
@@ -250,9 +251,9 @@ def test_maybe_delete_removes_files_from_queue(tmp_path: Path):
     files = _touch_bin_files(tmp_path, count=2)
     evictor = EvictorProcess(
         root_dir=str(tmp_path),
-        runtime_config=EvictorRuntimeConfig(
-            storage_size=None,
-            storage_threshold_pct=0.0,
+        cfg=EvictorRuntimeConfig(
+            storage_type=StorageType.Volume,
+            eviction_threshold=0.0,
             delete_check_interval_s=1,
         ),
     )
@@ -272,9 +273,9 @@ def test_crawler_parses_layout_and_ignores_non_bin_files(tmp_path: Path):
 
     evictor = EvictorProcess(
         root_dir=str(tmp_path),
-        runtime_config=EvictorRuntimeConfig(
-            storage_size=None,
-            storage_threshold_pct=99.99,
+        cfg=EvictorRuntimeConfig(
+            storage_type=StorageType.Volume,
+            eviction_threshold=0.99,
             access_time_threshold_s=0,
         ),
     )
@@ -298,9 +299,9 @@ def test_empty_or_no_bin_directory_still_runs_discovery_and_delete_paths(
 ):
     evictor = EvictorProcess(
         root_dir=str(tmp_path),
-        runtime_config=EvictorRuntimeConfig(
-            storage_size=None,
-            storage_threshold_pct=99.99,
+        cfg=EvictorRuntimeConfig(
+            storage_type=StorageType.Volume,
+            eviction_threshold=0.99,
             access_time_threshold_s=0,
         ),
     )
@@ -330,9 +331,9 @@ def test_empty_or_no_bin_directory_still_runs_discovery_and_delete_paths(
 def test_evictor_process_sigterm_cleans_registration(tmp_path: Path):
     process = EvictorProcess(
         root_dir=str(tmp_path),
-        runtime_config=EvictorRuntimeConfig(
-            storage_size=None,
-            storage_threshold_pct=99.99,
+        cfg=EvictorRuntimeConfig(
+            storage_type=StorageType.Volume,
+            eviction_threshold=0.99,
             access_time_threshold_s=0,
             delete_check_interval_s=1,
         ),
@@ -366,15 +367,19 @@ def test_parent_death_kills_evictor_child(tmp_path: Path):
     script = f"""
 import time
 from pathlib import Path
-from vllm.v1.kv_offload.tiering.fs.evictor import EvictorProcess, EvictorRuntimeConfig
+from vllm.v1.kv_offload.tiering.fs.evictor import (
+    EvictorProcess,
+    EvictorRuntimeConfig,
+    StorageType,
+)
 
 root = Path({str(tmp_path)!r})
 child_pid_path = root / "child.pid"
 proc = EvictorProcess(
     root_dir=str(root),
-    runtime_config=EvictorRuntimeConfig(
-        storage_size=None,
-        storage_threshold_pct=99.99,
+    cfg=EvictorRuntimeConfig(
+        storage_type=StorageType.Volume,
+        eviction_threshold=0.99,
         delete_check_interval_s=1,
     ),
 )
