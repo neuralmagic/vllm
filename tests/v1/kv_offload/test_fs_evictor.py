@@ -124,11 +124,12 @@ def test_register_evictor_filelock_effect_and_unregister_cleanup(tmp_path: Path)
 
 def test_discover_evictors_updates_after_spawn_and_random_shutdown(tmp_path: Path):
     observer = EvictorProcess(
-        mount_path=str(tmp_path),
         root_dir=str(tmp_path),
-        storage_size=None,
-        storage_threshold_pct=99.99,
-        runtime_config=EvictorRuntimeConfig(delete_check_interval_s=1),
+        runtime_config=EvictorRuntimeConfig(
+            storage_size=None,
+            storage_threshold_pct=99.99,
+            delete_check_interval_s=1,
+        ),
     )
     my_path, my_fd = register_evictor_process(str(tmp_path))
     assert my_path is not None
@@ -175,11 +176,12 @@ def test_discover_evictors_updates_after_spawn_and_random_shutdown(tmp_path: Pat
 
 def test_discover_evictors_with_arbitrary_spawn_delays(tmp_path: Path):
     observer = EvictorProcess(
-        mount_path=str(tmp_path),
         root_dir=str(tmp_path),
-        storage_size=None,
-        storage_threshold_pct=99.99,
-        runtime_config=EvictorRuntimeConfig(delete_check_interval_s=1),
+        runtime_config=EvictorRuntimeConfig(
+            storage_size=None,
+            storage_threshold_pct=99.99,
+            delete_check_interval_s=1,
+        ),
     )
     my_path, my_fd = register_evictor_process(str(tmp_path))
     assert my_path is not None
@@ -220,11 +222,10 @@ def test_crawler_builds_expected_lru_delete_queue(tmp_path: Path):
     os.utime(files[2], (now - 100, now - 100))
 
     evictor = EvictorProcess(
-        mount_path=str(tmp_path),
         root_dir=str(tmp_path),
-        storage_size=None,
-        storage_threshold_pct=99.99,
         runtime_config=EvictorRuntimeConfig(
+            storage_size=None,
+            storage_threshold_pct=99.99,
             access_time_threshold_s=0,
             max_delete_queue_size=2,
             delete_check_interval_s=1,
@@ -248,11 +249,12 @@ def test_crawler_builds_expected_lru_delete_queue(tmp_path: Path):
 def test_maybe_delete_removes_files_from_queue(tmp_path: Path):
     files = _touch_bin_files(tmp_path, count=2)
     evictor = EvictorProcess(
-        mount_path=str(tmp_path),
         root_dir=str(tmp_path),
-        storage_size=None,
-        storage_threshold_pct=0.0,
-        runtime_config=EvictorRuntimeConfig(delete_check_interval_s=1),
+        runtime_config=EvictorRuntimeConfig(
+            storage_size=None,
+            storage_threshold_pct=0.0,
+            delete_check_interval_s=1,
+        ),
     )
     for f in files:
         evictor.file_heapq.append((-time.time(), f))
@@ -269,11 +271,12 @@ def test_crawler_parses_layout_and_ignores_non_bin_files(tmp_path: Path):
     (tmp_path / "random_dir" / "abc" / "other.bin").write_bytes(b"ignored")
 
     evictor = EvictorProcess(
-        mount_path=str(tmp_path),
         root_dir=str(tmp_path),
-        storage_size=None,
-        storage_threshold_pct=99.99,
-        runtime_config=EvictorRuntimeConfig(access_time_threshold_s=0),
+        runtime_config=EvictorRuntimeConfig(
+            storage_size=None,
+            storage_threshold_pct=99.99,
+            access_time_threshold_s=0,
+        ),
     )
     evictor.running = True
     crawler = evictor.crawler(0, 15, timeout_s=0)
@@ -294,11 +297,12 @@ def test_empty_or_no_bin_directory_still_runs_discovery_and_delete_paths(
     tmp_path: Path,
 ):
     evictor = EvictorProcess(
-        mount_path=str(tmp_path),
         root_dir=str(tmp_path),
-        storage_size=None,
-        storage_threshold_pct=99.99,
-        runtime_config=EvictorRuntimeConfig(access_time_threshold_s=0),
+        runtime_config=EvictorRuntimeConfig(
+            storage_size=None,
+            storage_threshold_pct=99.99,
+            access_time_threshold_s=0,
+        ),
     )
     my_path, my_fd = register_evictor_process(str(tmp_path))
     assert my_path is not None
@@ -325,11 +329,10 @@ def test_empty_or_no_bin_directory_still_runs_discovery_and_delete_paths(
 
 def test_evictor_process_sigterm_cleans_registration(tmp_path: Path):
     process = EvictorProcess(
-        mount_path=str(tmp_path),
         root_dir=str(tmp_path),
-        storage_size=None,
-        storage_threshold_pct=99.99,
         runtime_config=EvictorRuntimeConfig(
+            storage_size=None,
+            storage_threshold_pct=99.99,
             access_time_threshold_s=0,
             delete_check_interval_s=1,
         ),
@@ -368,11 +371,12 @@ from vllm.v1.kv_offload.tiering.fs.evictor import EvictorProcess, EvictorRuntime
 root = Path({str(tmp_path)!r})
 child_pid_path = root / "child.pid"
 proc = EvictorProcess(
-    mount_path=str(root),
     root_dir=str(root),
-    storage_size=None,
-    storage_threshold_pct=99.99,
-    runtime_config=EvictorRuntimeConfig(delete_check_interval_s=1),
+    runtime_config=EvictorRuntimeConfig(
+        storage_size=None,
+        storage_threshold_pct=99.99,
+        delete_check_interval_s=1,
+    ),
 )
 proc.start()
 child_pid_path.write_text(str(proc.pid))

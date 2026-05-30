@@ -21,9 +21,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vllm.logger import init_logger
+from vllm.utils.system_utils import decorate_logs, get_mp_context, set_process_title
 
-ACCESS_TIME_THRESHOLD_S = 30
-DISCOVERY_TIMEOUT_S = 60  # 5 minutes
+DEFAULT_ACCESS_TIME_THRESHOLD_S = 300  # 5 minutes
+DEFAULT_DELETE_CHECK_INTERVAL_S = 30  # 30s
+DEFAULT_MAX_DELETE_QUEUE_SIZE = 1000
 
 logger = init_logger(__name__)
 
@@ -40,22 +42,29 @@ class DiskUsage:
 class EvictorRuntimeConfig:
     storage_size: int | None
     storage_threshold_pct: float | None
-    access_time_threshold_s: int = ACCESS_TIME_THRESHOLD_S
-    max_delete_queue_size: int = 1000
-    delete_check_interval_s: int = DISCOVERY_TIMEOUT_S
+    access_time_threshold_s: int = DEFAULT_ACCESS_TIME_THRESHOLD_S
+    max_delete_queue_size: int = DEFAULT_MAX_DELETE_QUEUE_SIZE
+    delete_check_interval_s: int = DEFAULT_DELETE_CHECK_INTERVAL_S
 
     @staticmethod
     def from_json_str(json_str: str) -> "EvictorRuntimeConfig":
         data = json.loads(json_str)
+
+        def _type_or_none(key: str, type_fn):
+            raw = data.get(key, None)
+            return type_fn(raw) if raw is not None else raw
+
         config = EvictorRuntimeConfig(
-            storage_size=data.get("storage_size", None),
-            storage_threshold_pct=data.get("storage_threshold_pct", None),
-            access_time_threshold_s=data.get(
-                "access_time_threshold_s", ACCESS_TIME_THRESHOLD_S
+            storage_size=_type_or_none("storage_size", int),
+            storage_threshold_pct=_type_or_none("storage_threshold_pct", float),
+            access_time_threshold_s=int(
+                data.get("access_time_threshold_s", DEFAULT_ACCESS_TIME_THRESHOLD_S)
             ),
-            max_delete_queue_size=data.get("max_delete_queue_size", 1000),
-            delete_check_interval_s=data.get(
-                "delete_check_interval_s", DISCOVERY_TIMEOUT_S
+            max_delete_queue_size=int(
+                data.get("max_delete_queue_size", DEFAULT_MAX_DELETE_QUEUE_SIZE)
+            ),
+            delete_check_interval_s=int(
+                data.get("delete_check_interval_s", DEFAULT_DELETE_CHECK_INTERVAL_S)
             ),
         )
 
@@ -165,6 +174,7 @@ def register_evictor_process(root_dir: str) -> tuple[str | None, int | None]:
             )
             # lock file. The lock is what other evictor processes check for liveness.
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            logger.info("Register evictor : %s", process_file_path)
             return process_file_path, fd
         except Exception as e:
             logger.error("Evictor registration error %s", e)
@@ -199,7 +209,6 @@ class EvictorProcess(multiprocessing.Process):
 
         # disk usage thread for storage_size spawns
         self.du_thread: threading.Thread | None = None
-        self.storage_alloc_size_lock = threading.Lock()
         self.storage_alloc_size = 0
 
         # delete file heapq. list of (access_time * -1, file_path)
@@ -426,8 +435,15 @@ class EvictorProcess(multiprocessing.Process):
                     heapq.heappush(self.file_heapq, (-access_time, bin_file.path))
 
     def run(self):
+        # Mirror vLLM worker process behavior so child logs carry process prefix.
+        set_process_title("Evictor")
+        decorate_logs("Evictor", skip_if_decorated=True)
+
+        # Cannot put this in __init__. Process spawn crashes.
+        self.storage_alloc_size_lock = threading.Lock()
         # handle signals and exit gracefully
         signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGINT, self.signal_handler)
         # register termination when parent dies
         libc = ctypes.CDLL(None)
         libc.prctl(1, 15)  # sigterm when parent dies
@@ -492,6 +508,10 @@ class EvictorProcess(multiprocessing.Process):
             continue
 
 
+def _run_evictor_process(root_dir: str, runtime_config: EvictorRuntimeConfig) -> None:
+    EvictorProcess(root_dir, runtime_config).run()
+
+
 class Evictor:
     def __init__(self, root_dir: str, evictor_config: str):
         """
@@ -508,9 +528,7 @@ class Evictor:
             self.evictor_config,
         )
 
-    def is_alive(
-        self,
-    ):
+    def is_alive(self):
         return self.process.is_alive()
 
     def spawn_evictor(
@@ -519,9 +537,11 @@ class Evictor:
         """
         Spawn evictor process and always monitor
         """
-        self.process = EvictorProcess(
-            self.root_dir,
-            self.evictor_config,
+        mp_ctx = get_mp_context()
+        self.process = mp_ctx.Process(
+            name="Evictor",
+            target=_run_evictor_process,
+            args=(self.root_dir, self.evictor_config),
         )
         self.process.start()
 

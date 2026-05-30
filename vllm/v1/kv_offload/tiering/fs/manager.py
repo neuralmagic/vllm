@@ -100,6 +100,7 @@ class FileSystemTierManager(SecondaryTierManager):
         self.evictor = None
         if evictor_config is not None:
             self.evictor = Evictor(root_dir, evictor_config)
+            self.evictor.spawn_evictor()
 
         self._pool = DualQueueThreadPool(
             n_read_threads,
