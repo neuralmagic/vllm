@@ -293,6 +293,9 @@ class EvictorProcess(multiprocessing.Process):
                                 ) and bin_file.path.endswith(".bin"):
                                     yield bin_file
 
+        def _cleanup():
+            self.queues.refresh_file_queue()
+
         deadline = time.monotonic() + yield_timeout_s
 
         def _maybe_yield() -> Generator[None, bool | None, bool | None]:
@@ -308,9 +311,8 @@ class EvictorProcess(multiprocessing.Process):
             # Check timeout and yield
             should_continue = yield from _maybe_yield()
             if not should_continue:
+                _cleanup()
                 return
-
-            self.queues.refresh_file_queue()
 
             for bin_file in _yield_bin_files():
                 if not self.running:
@@ -319,6 +321,7 @@ class EvictorProcess(multiprocessing.Process):
                 # Check timeout and yield
                 should_continue = yield from _maybe_yield()
                 if not should_continue:
+                    _cleanup()
                     return
 
                 access_time = safe_atime(Path(bin_file.path))
@@ -334,6 +337,8 @@ class EvictorProcess(multiprocessing.Process):
                 if self.queues.is_file_queue_full():
                     # slow down
                     time.sleep(0.1)
+
+            self.queues.refresh_file_queue()
 
     def discover_evictors(self) -> tuple[int, int]:
         """

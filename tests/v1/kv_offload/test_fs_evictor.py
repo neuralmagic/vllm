@@ -19,10 +19,14 @@ from vllm.v1.kv_offload.tiering.fs.evictor import (
     EvictorProcess,
     EvictorRuntimeConfig,
     StorageType,
-    get_disk_usage_from_statvfs,
+    get_evictor_hex_range,
     register_evictor_process,
     safe_is_evictor_alive,
     unregister_evictor_process,
+)
+from vllm.v1.kv_offload.tiering.fs.evictor_utils import (
+    EvictorQueues,
+    get_disk_usage_percent_form_statvfs,
 )
 
 
@@ -74,8 +78,8 @@ def _evictor_holder(root_dir: str, run_s: float):
             unregister_evictor_process(process_path, fd)
 
 
-def test_get_disk_usage_from_statvfs(tmp_path: Path):
-    usage = get_disk_usage_from_statvfs(str(tmp_path))
+def test_get_disk_usage_fraction_from_statvfs(tmp_path: Path):
+    usage = get_disk_usage_percent_form_statvfs(str(tmp_path))
     assert usage is not None
 
     stat = os.statvfs(tmp_path)
@@ -84,13 +88,10 @@ def test_get_disk_usage_from_statvfs(tmp_path: Path):
     expected_free = stat.f_bfree * block_size
     expected_used = expected_total - expected_free
 
-    assert usage.total_bytes == expected_total
-    assert usage.available_bytes == expected_free
-    assert usage.used_bytes == expected_used
     if expected_total > 0:
-        assert usage.usage_percent == pytest.approx(
-            (expected_used / expected_total) * 100
-        )
+        assert usage == pytest.approx(expected_used / expected_total)
+    else:
+        assert usage == 0
 
 
 def test_access_time_updates_after_read(tmp_path: Path):
@@ -152,7 +153,7 @@ def test_discover_evictors_updates_after_spawn_and_random_shutdown(tmp_path: Pat
             assert 0 <= my_id < count
             observer.num_evictors = count
             observer.my_evictor_id = my_id
-            min_hex, max_hex = observer.get_my_hex_ranges()
+            min_hex, max_hex = get_evictor_hex_range(my_id, count)
             if min_hex != -1:
                 assert 0 <= min_hex <= max_hex <= 15
                 assert (max_hex - min_hex + 1) in {1, 2, 4, 8, 16}
@@ -201,7 +202,7 @@ def test_discover_evictors_with_arbitrary_spawn_delays(tmp_path: Path):
             count, my_id = observer.discover_evictors()
             observer.num_evictors = count
             observer.my_evictor_id = my_id
-            min_hex, max_hex = observer.get_my_hex_ranges()
+            min_hex, max_hex = get_evictor_hex_range(my_id, count)
             if min_hex != -1:
                 width = max_hex - min_hex + 1
                 assert width in {1, 2, 4, 8, 16}
@@ -233,35 +234,31 @@ def test_crawler_builds_expected_lru_delete_queue(tmp_path: Path):
         ),
     )
     evictor.running = True
-    crawler = evictor.crawler(0, 15, timeout_s=0)
+    evictor.queues = EvictorQueues(max_queue_size=2)
+    crawler = evictor.crawler(0, 15, yield_timeout_s=0)
     next(crawler)
     for _ in range(30):
         crawler.send(True)
-        if len(evictor.file_heapq) == 2:
+        if len(evictor.queues.file_queue) == 2:
             break
-    assert len(evictor.file_heapq) == 2
-    oldest_candidates = {p for _, p in evictor.file_heapq}
+    assert len(evictor.queues.file_queue) == 2
+    oldest_candidates = {p for _, p in evictor.queues.file_queue}
     assert files[0] in oldest_candidates
     assert files[1] in oldest_candidates
     with pytest.raises(StopIteration):
         crawler.send(False)
 
 
-def test_maybe_delete_removes_files_from_queue(tmp_path: Path):
+def test_queue_drain_delete_files_removes_selected_candidates(tmp_path: Path):
     files = _touch_bin_files(tmp_path, count=2)
-    evictor = EvictorProcess(
-        root_dir=str(tmp_path),
-        cfg=EvictorRuntimeConfig(
-            storage_type=StorageType.Volume,
-            eviction_threshold=0.0,
-            delete_check_interval_s=1,
-        ),
-    )
+    queues = EvictorQueues(max_queue_size=4)
     for f in files:
-        evictor.file_heapq.append((-time.time(), f))
-    evictor.maybe_delete()
+        queues.maybe_put_file_queue(time.time() - 100, f)
+    queues.refresh_file_queue()
+    to_delete = queues.drain_delete_files(1.0)
+    for f in to_delete:
+        os.remove(f)
     assert all(not os.path.exists(f) for f in files)
-    assert evictor.file_heapq == []
 
 
 def test_crawler_parses_layout_and_ignores_non_bin_files(tmp_path: Path):
@@ -280,13 +277,14 @@ def test_crawler_parses_layout_and_ignores_non_bin_files(tmp_path: Path):
         ),
     )
     evictor.running = True
-    crawler = evictor.crawler(0, 15, timeout_s=0)
+    evictor.queues = EvictorQueues(max_queue_size=16)
+    crawler = evictor.crawler(0, 15, yield_timeout_s=0)
     next(crawler)
     for _ in range(30):
         crawler.send(True)
-        if len(evictor.file_heapq) >= 2:
+        if len(evictor.queues.file_queue) >= 2:
             break
-    queued_files = {p for _, p in evictor.file_heapq}
+    queued_files = {p for _, p in evictor.queues.file_queue}
     assert set(valid_files).issubset(queued_files)
     assert str(non_bin) not in queued_files
     assert str(tmp_path / "random_dir" / "abc" / "other.bin") not in queued_files
@@ -315,13 +313,12 @@ def test_empty_or_no_bin_directory_still_runs_discovery_and_delete_paths(
         assert my_id == 0
 
         evictor.running = True
-        crawler = evictor.crawler(0, 15, timeout_s=0)
+        evictor.queues = EvictorQueues(max_queue_size=8)
+        crawler = evictor.crawler(0, 15, yield_timeout_s=0)
         next(crawler)
         for _ in range(8):
             crawler.send(True)
-        assert evictor.file_heapq == []
-        # no-op delete path should not crash on empty queue.
-        evictor.maybe_delete()
+        assert evictor.queues.file_queue == []
         with pytest.raises(StopIteration):
             crawler.send(False)
     finally:
