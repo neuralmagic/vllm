@@ -8,7 +8,6 @@ old files when storage thresholds are hit.
 import ctypes
 import enum
 import fcntl
-import heapq
 import json
 import math
 import multiprocessing
@@ -23,6 +22,16 @@ from pathlib import Path
 
 from vllm.logger import init_logger
 from vllm.utils.system_utils import decorate_logs, get_mp_context, set_process_title
+from vllm.v1.kv_offload.tiering.fs.evictor_utils import (
+    EvictorQueues,
+    get_directory_size,
+    get_disk_usage_percent_form_statvfs,
+    hex_to_int,
+    safe_atime,
+    safe_remove,
+    safe_scandir,
+    safe_yield_dir,
+)
 
 DEFAULT_EVICTION_THRESHOLD = 0.95
 DEFAULT_ACCESS_TIME_THRESHOLD_S = 300  # 5 minutes
@@ -30,14 +39,6 @@ DEFAULT_DELETE_CHECK_INTERVAL_S = 30  # 30s
 DEFAULT_MAX_DELETE_QUEUE_SIZE = 1000
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class DiskUsage:
-    total_bytes: int
-    used_bytes: int
-    available_bytes: int
-    usage_percent: float
 
 
 class StorageType(enum.Enum):
@@ -77,24 +78,28 @@ class EvictorRuntimeConfig:
             raw = data.get(key, None)
             return type_fn(raw) if raw is not None else raw
 
+        def _type_or_default(key: str, type_fn, default):
+            raw = data.get(key, None)
+            return type_fn(raw) if raw is not None else default
+
         raw_storage_type = data.get("storage_type")
         assert raw_storage_type is not None, "Must specify a storage type"
         storage_type = StorageType.from_str(raw_storage_type)
 
         config = EvictorRuntimeConfig(
             storage_type=storage_type,
-            eviction_threshold=float(
-                data.get("eviction_threshold", DEFAULT_EVICTION_THRESHOLD)
+            eviction_threshold=_type_or_default(
+                "eviction_threshold", float, DEFAULT_EVICTION_THRESHOLD
             ),
             max_directory_size_gb=_type_or_none("max_directory_size_gb", int),
-            access_time_threshold_s=int(
-                data.get("access_time_threshold_s", DEFAULT_ACCESS_TIME_THRESHOLD_S)
+            access_time_threshold_s=_type_or_default(
+                "access_time_threshold_s", int, DEFAULT_ACCESS_TIME_THRESHOLD_S
             ),
-            max_delete_queue_size=int(
-                data.get("max_delete_queue_size", DEFAULT_MAX_DELETE_QUEUE_SIZE)
+            max_delete_queue_size=_type_or_default(
+                "max_delete_queue_size", int, DEFAULT_MAX_DELETE_QUEUE_SIZE
             ),
-            delete_check_interval_s=int(
-                data.get("delete_check_interval_s", DEFAULT_DELETE_CHECK_INTERVAL_S)
+            delete_check_interval_s=_type_or_default(
+                "delete_check_interval_s", int, DEFAULT_DELETE_CHECK_INTERVAL_S
             ),
         )
 
@@ -109,92 +114,6 @@ class EvictorRuntimeConfig:
         )
 
         return config
-
-
-def get_disk_usage_from_statvfs(root_dir: str) -> DiskUsage | None:
-    """
-    Get disk usage using statvfs() - O(1) operation, critical for multi-TB volumes.
-
-    Trade-off: statvfs() provides instant disk usage statistics but is less accurate
-    than `du` which would be O(n) and could take hours on large volumes.
-    """
-    try:
-        stat = os.statvfs(root_dir)
-        block_size = stat.f_frsize
-        total_blocks = stat.f_blocks
-        free_blocks = stat.f_bfree
-
-        total_bytes = total_blocks * block_size
-        free_bytes = free_blocks * block_size
-        used_bytes = total_bytes - free_bytes
-        usage_percent = (used_bytes / total_bytes) * 100 if total_bytes > 0 else 0
-
-        return DiskUsage(
-            total_bytes=total_bytes,
-            used_bytes=used_bytes,
-            available_bytes=free_bytes,
-            usage_percent=usage_percent,
-        )
-    except Exception as e:
-        logger.error("Cannot fetch disk usage. Failed with %s", e)
-        return None
-
-
-def safe_scandir(path: str) -> Iterator[os.DirEntry]:
-    """
-    Safely scan a directory, handling filesystem errors.
-
-    Returns an iterator of directory entries, or empty iterator on error.
-    This reduces exception handling duplication while maintaining streaming
-    behavior.
-    """
-    try:
-        return os.scandir(path)
-    except (OSError, PermissionError):
-        return iter([])
-
-
-def safe_remove(path: str) -> bool:
-    try:
-        os.remove(path)
-        return True
-    except Exception as e:
-        logger.error("Failed for remove path %s : %s", path, e)
-    return False
-
-
-def safe_atime(file_path: Path) -> float | None:
-    # Check file access time - skip recently accessed files
-    # Note: relatime filesystem may not update atime on every access
-    # This can cause false positives (deleting "hot" files)
-    try:
-        file_stat = file_path.stat()
-        return file_stat.st_atime  # Last access time
-    except (OSError, AttributeError) as e:
-        logger.error("Cannot fetch file atime : %s", e)
-    return None
-
-
-def safe_is_evictor_alive(evictor_path: str) -> bool:
-    fd: int | None = None
-    try:
-        fd = os.open(evictor_path, os.O_RDONLY)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except BlockingIOError:
-        # Lock still held by some Evictor process.
-        return True
-    except Exception as e:
-        # Cannot determine liveness. Consider evictor failed so as not
-        # to risk having untracked hash files.
-        logger.warning("Cannot determine evictor liveness %s : %s", evictor_path, e)
-        return False
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-    # Could successfully acquire and release lock.
-    return False
 
 
 def register_evictor_process(root_dir: str) -> tuple[str | None, int | None]:
@@ -236,6 +155,42 @@ def unregister_evictor_process(process_file_path: str, fd: int):
     assert not os.path.exists(process_file_path)
 
 
+def safe_is_evictor_alive(evictor_path: str) -> bool:
+    fd: int | None = None
+    try:
+        fd = os.open(evictor_path, os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except BlockingIOError:
+        # Lock still held by some Evictor process.
+        return True
+    except Exception as e:
+        # Cannot determine liveness. Consider evictor failed so as not
+        # to risk having untracked hash files.
+        logger.warning("Cannot determine evictor liveness %s : %s", evictor_path, e)
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    # Could successfully acquire and release lock.
+    return False
+
+
+def get_evictor_hex_range(evictor_id: int, num_evictors: int) -> tuple[int, int]:
+    # Always have power of 2 evictor processes doing work with
+    # a maximum of 16 evictors.
+    evictor_limit = min(16, 2 ** int(math.log2(num_evictors)))
+    if evictor_id > evictor_limit - 1:
+        return (-1, -1)
+
+    num_hex_per_process = 16 // evictor_limit
+    # split 16 hashes evenly among evictors
+    hex_range_start = num_hex_per_process * evictor_id
+    hex_range_end = hex_range_start + num_hex_per_process - 1
+    return (hex_range_start, hex_range_end)
+
+
 class EvictorProcess(multiprocessing.Process):
     def __init__(
         self,
@@ -250,8 +205,7 @@ class EvictorProcess(multiprocessing.Process):
         self.du_thread: threading.Thread | None = None
         self.storage_alloc_size = 0
 
-        # delete file heapq. list of (access_time * -1, file_path)
-        self.file_heapq: list[tuple[float, str]] = []
+        self.delete_thread: threading.Thread | None = None
 
         # global evictor status
         self.my_evictor_path: str | None = None
@@ -259,61 +213,127 @@ class EvictorProcess(multiprocessing.Process):
         self.num_evictors: int = 0
         self.my_evictor_id: int | None = None
 
-    def get_true_disk_usage_thread(self):
-        while self.running:
-            running_total_size_bytes = 0
-            stack: list[Path] = [Path(self.root_dir)]
-            while stack:
-                entry = stack.pop()
-                for sub_entry in safe_scandir(str(entry)):
-                    if sub_entry.is_dir(follow_symlinks=False):
-                        stack.append(Path(sub_entry.path))
-                    elif sub_entry.is_file(follow_symlinks=False):
-                        running_total_size_bytes += Path(sub_entry.path).stat().st_size
-            with self.storage_alloc_size_lock:
-                self.storage_alloc_size = running_total_size_bytes
-            # wait before next poll
-            time.sleep(2)
+    def delete_thread_fn(self):
+        def _should_delete() -> bool:
+            """
+            True if deletion should be triggered. False otherwise.
+            """
+            usage_percent = None
+            if self.cfg.storage_type == StorageType.Directory:
+                dir_size = get_directory_size(self.root_dir)
+                usage_percent = dir_size / self.cfg.max_directory_size_bytes
+            else:
+                usage_percent = get_disk_usage_percent_form_statvfs(self.root_dir)
 
-    def signal_handler(self, signum, frame):
-        self.running = False
-        self.shutdown()
-
-    def shutdown(self):
-        logger.info("Shutdown evictor ...")
-        self.running = False
-        if self.du_thread is not None and self.du_thread.is_alive():
-            # Wait for the du thread to complete
-            self.du_thread.join()
-        if self.my_evictor_path is not None:
-            assert self.my_evictor_path_fd is not None
-            unregister_evictor_process(self.my_evictor_path, self.my_evictor_path_fd)
-
-    def should_delete(self) -> bool:
-        """
-        True if deletion should be triggered. False otherwise.
-        """
-        usage_percent = None
-        if self.cfg.storage_type == StorageType.Directory:
-            assert self.du_thread is not None
-            assert self.du_thread.is_alive()
-            with self.storage_alloc_size_lock:
-                usage_percent = (
-                    self.storage_alloc_size / self.cfg.max_directory_size_bytes
-                )
-        else:
-            disk_usage = get_disk_usage_from_statvfs(self.root_dir)
-            if disk_usage is None:
+            if usage_percent is None:
+                logger.error("Cannot determine usage percent")
                 return False
-            usage_percent = disk_usage.usage_percent
-        return usage_percent > self.cfg.eviction_threshold
 
-    def maybe_delete(self):
-        if self.should_delete():
-            logger.info("Delete %d files ...", len(self.file_heapq))
-            while self.file_heapq:
-                _, file_path = self.file_heapq.pop()
+            return usage_percent > self.cfg.eviction_threshold
+
+        def _delete(pct: float):
+            assert 0.0 < pct <= 1.0
+            to_delete = self.queues.drain_delete_files(pct)
+            logger.info("Delete %d files ...", len(to_delete))
+            for file_path in to_delete:
                 safe_remove(file_path)
+
+        delete_pct = 0.1  # start with 10% of delete queue
+        while self.running:
+            if _should_delete():
+                _delete(delete_pct)
+                delete_pct = min(1.0, delete_pct + 0.1)
+            else:
+                # backoff
+                delete_pct = max(0.1, delete_pct - 0.1)
+            time.sleep(2.0)
+
+    def crawler(self, min_hex: int, max_hex: int, yield_timeout_s: int):
+        """
+        Crawls self.root_dir checking for files to delete.
+        Periodically, i.e. when yield_timeout_s runs out, the control
+        transfers to the caller where a Discovery step is performed to check
+        if this crawler's hex_range should change.
+        """
+        assert max_hex >= min_hex
+        yield
+        logger.info(
+            "Crawler triggered at %s  for hex range %s, %s",
+            self.root_dir,
+            min_hex,
+            max_hex,
+        )
+
+        if min_hex == -1 and max_hex == -1:
+            # dummy crawler code path code path code path code path
+            while True:
+                time.sleep(yield_timeout_s)
+                # Check timeout and yield
+                should_continue = yield
+                if not should_continue:
+                    return
+
+        def _record_dir(hex3_dir: os.DirEntry) -> bool:
+            # Apply hex modulo filtering for load balancing across crawlers.
+            hex_int = hex_to_int(hex3_dir.name)
+            if hex_int is None:
+                return False
+            hex_mod = hex_int % 16
+            return min_hex <= hex_mod <= max_hex
+
+        def _yield_bin_files() -> Iterator[os.DirEntry]:
+            # Layout: <root_dir>/<safe_model_name>_<sha256-prefix>/<hhh>/<hh>_g<group_idx>/<hash>.bin # noqa: E501
+            for model_dir in safe_yield_dir(self.root_dir):
+                for hex1 in safe_yield_dir(model_dir.path):
+                    if _record_dir(hex1):
+                        for hex2 in safe_yield_dir(hex1.path):
+                            for bin_file in safe_scandir(hex2.path):
+                                if bin_file.is_file(
+                                    follow_symlinks=False
+                                ) and bin_file.path.endswith(".bin"):
+                                    yield bin_file
+
+        deadline = time.monotonic() + yield_timeout_s
+
+        def _maybe_yield() -> Generator[None, bool | None, bool | None]:
+            nonlocal deadline
+            if time.monotonic() < deadline:
+                return True
+            should_continue = yield
+            if should_continue:
+                deadline = time.monotonic() + yield_timeout_s
+            return should_continue
+
+        while True:
+            # Check timeout and yield
+            should_continue = yield from _maybe_yield()
+            if not should_continue:
+                return
+
+            self.queues.refresh_file_queue()
+
+            for bin_file in _yield_bin_files():
+                if not self.running:
+                    return
+
+                # Check timeout and yield
+                should_continue = yield from _maybe_yield()
+                if not should_continue:
+                    return
+
+                access_time = safe_atime(Path(bin_file.path))
+                if access_time is None:
+                    # skip
+                    continue
+
+                if time.time() - access_time < self.cfg.access_time_threshold_s:
+                    # skip
+                    continue
+
+                self.queues.maybe_put_file_queue(access_time, bin_file.path)
+                if self.queues.is_file_queue_full():
+                    # slow down
+                    time.sleep(0.1)
 
     def discover_evictors(self) -> tuple[int, int]:
         """
@@ -356,130 +376,13 @@ class EvictorProcess(multiprocessing.Process):
             )
         return len(sorted_live), sorted_live.index(self.my_evictor_path)
 
-    def get_my_hex_ranges(self) -> tuple[int, int]:
-        assert self.num_evictors is not None
-        assert self.my_evictor_id is not None
-        # Always have power of 2 evictor processes doing work with
-        # a maximum of 16 evictors.
-        evictor_limit = min(16, 2 ** int(math.log2(self.num_evictors)))
-        if self.my_evictor_id > evictor_limit - 1:
-            return (-1, -1)
-
-        num_hex_per_process = 16 // evictor_limit
-        # split 16 hashes evenly among evictors
-        hex_range_start = num_hex_per_process * self.my_evictor_id
-        hex_range_end = hex_range_start + num_hex_per_process - 1
-        return (hex_range_start, hex_range_end)
-
-    def crawler(self, min_hex: int, max_hex: int, timeout_s: int):
-        assert max_hex >= min_hex
-        yield
-        logger.info(
-            "Crawler triggered at %s  for hex range %s, %s",
-            self.root_dir,
-            min_hex,
-            max_hex,
-        )
-
-        def hex_to_int(hex_str: str) -> int | None:
-            """Convert hex string to integer."""
-            try:
-                return int(hex_str, 16)
-            except (ValueError, TypeError):
-                return None
-
-        def _record_dir(hex3_dir: os.DirEntry, min_hex: int, max_hex: int) -> bool:
-            # Apply hex modulo filtering for load balancing across crawlers.
-            hex_int = hex_to_int(hex3_dir.name)
-            if hex_int is None:
-                return False
-            hex_mod = hex_int % 16
-            return min_hex <= hex_mod <= max_hex
-
-        def _cleanup():
-            while self.file_heapq:
-                self.file_heapq.pop()
-
-        def _safe_yield_dir(path: str) -> Iterator[os.DirEntry]:
-            for entry in safe_scandir(path):
-                if entry.is_dir(follow_symlinks=False):
-                    yield entry
-
-        def _yield_bin_files() -> Iterator[os.DirEntry]:
-            # Layout: <root_dir>/<safe_model_name>_<sha256-prefix>/<hhh>/<hh>_g<group_idx>/<hash>.bin # noqa: E501
-            for model_dir in _safe_yield_dir(self.root_dir):
-                for hex1 in _safe_yield_dir(model_dir.path):
-                    if _record_dir(hex1, min_hex, max_hex):
-                        for hex2 in _safe_yield_dir(hex1.path):
-                            for bin_file in safe_scandir(hex2.path):
-                                if bin_file.is_file(
-                                    follow_symlinks=False
-                                ) and bin_file.path.endswith(".bin"):
-                                    yield bin_file
-
-        deadline = time.monotonic() + timeout_s
-
-        def _maybe_yield() -> Generator[None, bool | None, bool | None]:
-            nonlocal deadline
-            if time.monotonic() < deadline:
-                return True
-            should_continue = yield
-            if should_continue:
-                deadline = time.monotonic() + timeout_s
-            return should_continue
-
-        if min_hex == -1 and max_hex == -1:
-            # dummy crawler code path code path code path code path
-            while True:
-                time.sleep(timeout_s)
-                # Check timeout and yield
-                should_continue = yield
-                if not should_continue:
-                    _cleanup()
-                    return
-
-        while True:
-            # Check timeout and yield
-            should_continue = yield from _maybe_yield()
-            if not should_continue:
-                _cleanup()
-                return
-
-            for bin_file in _yield_bin_files():
-                if not self.running:
-                    return
-
-                # Check timeout and yield
-                should_continue = yield from _maybe_yield()
-                if not should_continue:
-                    _cleanup()
-                    return
-
-                access_time = safe_atime(Path(bin_file.path))
-                if access_time is None:
-                    continue
-                if time.time() - access_time < self.cfg.access_time_threshold_s:
-                    # skip
-                    continue
-                if len(self.file_heapq) == self.cfg.max_delete_queue_size:
-                    # slow down
-                    time.sleep(0.1)
-                    if access_time < -self.file_heapq[0][0]:
-                        heapq.heappushpop(
-                            self.file_heapq, (-access_time, bin_file.path)
-                        )
-                else:
-                    # by default heapq is does min-heap. We want access times
-                    # that are larger to appear in front so we can swap them.
-                    heapq.heappush(self.file_heapq, (-access_time, bin_file.path))
-
     def run(self):
         # Mirror vLLM worker process behavior so child logs carry process prefix.
         set_process_title("Evictor")
         decorate_logs("Evictor", skip_if_decorated=True)
 
-        # Cannot put this in __init__. Process spawn crashes.
-        self.storage_alloc_size_lock = threading.Lock()
+        self.queues = EvictorQueues(self.cfg.max_delete_queue_size)
+
         # handle signals and exit gracefully
         signal.signal(signal.SIGTERM, self.signal_handler)
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -497,13 +400,13 @@ class EvictorProcess(multiprocessing.Process):
 
         self.num_evictors, self.my_evictor_id = self.discover_evictors()
         assert self.num_evictors > 0
-        min_hex, max_hex = self.get_my_hex_ranges()
+        min_hex, max_hex = get_evictor_hex_range(self.my_evictor_id, self.num_evictors)
 
         self.running = True
-        # start the disk usage thread
-        if self.cfg.storage_type == StorageType.Directory:
-            self.du_thread = threading.Thread(target=self.get_true_disk_usage_thread)
-            self.du_thread.start()
+
+        # launch monitor-delete thread
+        self.delete_thread = threading.Thread(target=self.delete_thread_fn)
+        self.delete_thread.start()
 
         while self.running:
             try:
@@ -511,14 +414,11 @@ class EvictorProcess(multiprocessing.Process):
                 crawler_p = self.crawler(
                     min_hex,
                     max_hex,
-                    timeout_s=self.cfg.delete_check_interval_s,
+                    yield_timeout_s=self.cfg.delete_check_interval_s,
                 )
                 crawler_p.send(None)
 
                 while self.running:
-                    # check deletes
-                    self.maybe_delete()
-
                     # Gets here after the first timeout
                     # discover evictors
                     new_num_evictors, new_my_evictor_id = self.discover_evictors()
@@ -535,7 +435,9 @@ class EvictorProcess(multiprocessing.Process):
                         self.num_evictors = new_num_evictors
                         self.my_evictor_id = new_my_evictor_id
                         # update min and max hex
-                        min_hex, max_hex = self.get_my_hex_ranges()
+                        min_hex, max_hex = get_evictor_hex_range(
+                            self.my_evictor_id, self.num_evictors
+                        )
                         crawler_p.send(False)  # this will trigger stopitereation
             except StopIteration:
                 logger.info(
@@ -545,6 +447,19 @@ class EvictorProcess(multiprocessing.Process):
                     new_my_evictor_id,
                 )
             continue
+
+    def signal_handler(self, signum, frame):
+        self.running = False
+        self.shutdown()
+
+    def shutdown(self):
+        logger.info("Shutdown evictor %s ", self.my_evictor_path)
+        self.running = False
+        if self.delete_thread is not None and self.delete_thread.is_alive():
+            self.delete_thread.join()
+        if self.my_evictor_path is not None:
+            assert self.my_evictor_path_fd is not None
+            unregister_evictor_process(self.my_evictor_path, self.my_evictor_path_fd)
 
 
 def _run_evictor_process(root_dir: str, runtime_config: EvictorRuntimeConfig) -> None:
