@@ -759,7 +759,7 @@ class OffloadingConnectorScheduler:
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
-                logger.warning("Request %s: cannot store blocks", req_id)
+                # logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
             if not store_output.keys_to_store:

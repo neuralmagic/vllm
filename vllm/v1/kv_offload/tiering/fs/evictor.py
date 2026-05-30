@@ -6,6 +6,7 @@ old files when storage thresholds are hit.
 """
 
 import ctypes
+import enum
 import fcntl
 import heapq
 import json
@@ -23,6 +24,7 @@ from pathlib import Path
 from vllm.logger import init_logger
 from vllm.utils.system_utils import decorate_logs, get_mp_context, set_process_title
 
+DEFAULT_EVICTION_THRESHOLD = 0.95
 DEFAULT_ACCESS_TIME_THRESHOLD_S = 300  # 5 minutes
 DEFAULT_DELETE_CHECK_INTERVAL_S = 30  # 30s
 DEFAULT_MAX_DELETE_QUEUE_SIZE = 1000
@@ -38,13 +40,34 @@ class DiskUsage:
     usage_percent: float
 
 
+class StorageType(enum.Enum):
+    # eviction threshold applied against the volume
+    Volume = 0
+    # eviction threshold applied against some directory in a volume.
+    Directory = 1
+
+    @staticmethod
+    def from_str(type_str: str):
+        if type_str.lower() == "volume":
+            return StorageType.Volume
+        elif type_str.lower() == "directory":
+            return StorageType.Directory
+        raise ValueError(f"Unrecognized storage type {type_str}")
+
+
 @dataclass(frozen=True)
 class EvictorRuntimeConfig:
-    storage_size: int | None
-    storage_threshold_pct: float | None
+    storage_type: StorageType
+    max_directory_size_gb: int | None = None
+    eviction_threshold: float = DEFAULT_EVICTION_THRESHOLD
     access_time_threshold_s: int = DEFAULT_ACCESS_TIME_THRESHOLD_S
     max_delete_queue_size: int = DEFAULT_MAX_DELETE_QUEUE_SIZE
     delete_check_interval_s: int = DEFAULT_DELETE_CHECK_INTERVAL_S
+
+    @property
+    def max_directory_size_bytes(self):
+        assert self.max_directory_size_gb is not None
+        return self.max_directory_size_gb * (1024**3)
 
     @staticmethod
     def from_json_str(json_str: str) -> "EvictorRuntimeConfig":
@@ -54,9 +77,16 @@ class EvictorRuntimeConfig:
             raw = data.get(key, None)
             return type_fn(raw) if raw is not None else raw
 
+        raw_storage_type = data.get("storage_type")
+        assert raw_storage_type is not None, "Must specify a storage type"
+        storage_type = StorageType.from_str(raw_storage_type)
+
         config = EvictorRuntimeConfig(
-            storage_size=_type_or_none("storage_size", int),
-            storage_threshold_pct=_type_or_none("storage_threshold_pct", float),
+            storage_type=storage_type,
+            eviction_threshold=float(
+                data.get("eviction_threshold", DEFAULT_EVICTION_THRESHOLD)
+            ),
+            max_directory_size_gb=_type_or_none("max_directory_size_gb", int),
             access_time_threshold_s=int(
                 data.get("access_time_threshold_s", DEFAULT_ACCESS_TIME_THRESHOLD_S)
             ),
@@ -68,7 +98,16 @@ class EvictorRuntimeConfig:
             ),
         )
 
-        assert config.storage_size is None or config.storage_threshold_pct is None
+        # sanity check
+        if config.max_directory_size_gb is not None:
+            assert storage_type == StorageType.Directory, (
+                "Invalid set of combinations. Need storage_type=Directory "
+                "when used with max_directory_size_gb"
+            )
+        assert 0.0 <= config.eviction_threshold <= 1.0, (
+            f"Invalid eviction threshold : {config.eviction_threshold}"
+        )
+
         return config
 
 
@@ -201,11 +240,11 @@ class EvictorProcess(multiprocessing.Process):
     def __init__(
         self,
         root_dir: str,
-        runtime_config: EvictorRuntimeConfig,
+        cfg: EvictorRuntimeConfig,
     ):
         super().__init__(name="Evictor")
         self.root_dir = root_dir
-        self.runtime_config = runtime_config
+        self.cfg = cfg
 
         # disk usage thread for storage_size spawns
         self.du_thread: threading.Thread | None = None
@@ -254,21 +293,24 @@ class EvictorProcess(multiprocessing.Process):
         """
         True if deletion should be triggered. False otherwise.
         """
-        if self.runtime_config.storage_size is not None:
+        usage_percent = None
+        if self.cfg.storage_type == StorageType.Directory:
             assert self.du_thread is not None
             assert self.du_thread.is_alive()
             with self.storage_alloc_size_lock:
-                return self.runtime_config.storage_size < self.storage_alloc_size
+                usage_percent = (
+                    self.storage_alloc_size / self.cfg.max_directory_size_bytes
+                )
         else:
-            assert self.runtime_config.storage_threshold_pct is not None
             disk_usage = get_disk_usage_from_statvfs(self.root_dir)
             if disk_usage is None:
                 return False
-            return disk_usage.usage_percent > self.runtime_config.storage_threshold_pct
+            usage_percent = disk_usage.usage_percent
+        return usage_percent > self.cfg.eviction_threshold
 
     def maybe_delete(self):
         if self.should_delete():
-            logger.debug("Delete %d files ...", len(self.file_heapq))
+            logger.info("Delete %d files ...", len(self.file_heapq))
             while self.file_heapq:
                 _, file_path = self.file_heapq.pop()
                 safe_remove(file_path)
@@ -332,7 +374,7 @@ class EvictorProcess(multiprocessing.Process):
     def crawler(self, min_hex: int, max_hex: int, timeout_s: int):
         assert max_hex >= min_hex
         yield
-        logger.debug(
+        logger.info(
             "Crawler triggered at %s  for hex range %s, %s",
             self.root_dir,
             min_hex,
@@ -416,13 +458,10 @@ class EvictorProcess(multiprocessing.Process):
                 access_time = safe_atime(Path(bin_file.path))
                 if access_time is None:
                     continue
-                if (
-                    time.time() - access_time
-                    < self.runtime_config.access_time_threshold_s
-                ):
+                if time.time() - access_time < self.cfg.access_time_threshold_s:
                     # skip
                     continue
-                if len(self.file_heapq) == self.runtime_config.max_delete_queue_size:
+                if len(self.file_heapq) == self.cfg.max_delete_queue_size:
                     # slow down
                     time.sleep(0.1)
                     if access_time < -self.file_heapq[0][0]:
@@ -462,7 +501,7 @@ class EvictorProcess(multiprocessing.Process):
 
         self.running = True
         # start the disk usage thread
-        if self.runtime_config.storage_size is not None:
+        if self.cfg.storage_type == StorageType.Directory:
             self.du_thread = threading.Thread(target=self.get_true_disk_usage_thread)
             self.du_thread.start()
 
@@ -472,7 +511,7 @@ class EvictorProcess(multiprocessing.Process):
                 crawler_p = self.crawler(
                     min_hex,
                     max_hex,
-                    timeout_s=self.runtime_config.delete_check_interval_s,
+                    timeout_s=self.cfg.delete_check_interval_s,
                 )
                 crawler_p.send(None)
 
@@ -499,7 +538,7 @@ class EvictorProcess(multiprocessing.Process):
                         min_hex, max_hex = self.get_my_hex_ranges()
                         crawler_p.send(False)  # this will trigger stopitereation
             except StopIteration:
-                logger.debug(
+                logger.info(
                     "Triggered Reassignment as new evictors discovered."
                     "new_num_evictors=%d, new_my_evictor_id=%d",
                     new_num_evictors,
