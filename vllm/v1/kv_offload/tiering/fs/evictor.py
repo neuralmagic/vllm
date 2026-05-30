@@ -234,8 +234,27 @@ class EvictorProcess(multiprocessing.Process):
         def _delete(pct: float):
             assert 0.0 < pct <= 1.0
             to_delete = self.queues.drain_delete_files(pct)
-            logger.info("Delete %d files ...", len(to_delete))
-            for file_path in to_delete:
+
+            import sys
+
+            max_atime = 0.0
+            min_atime = sys.float_info.max
+            for atime, x in to_delete:
+                if atime is not None:
+                    max_atime = max(atime, max_atime)
+                    min_atime = min(atime, min_atime)
+
+            now_time = time.time()
+            min_age_min = (now_time - max_atime) / 60.0
+            max_age_min = (now_time - min_atime) / 60.0
+            logger.info(
+                "Delete %d files [%.2f mins ago to %.2f mins ago]...",
+                len(to_delete),
+                max_age_min,
+                min_age_min,
+            )
+
+            for _, file_path in to_delete:
                 safe_remove(file_path)
 
         delete_pct = 0.1  # start with 10% of delete queue
@@ -445,17 +464,19 @@ class EvictorProcess(multiprocessing.Process):
                         )
                         crawler_p.send(False)  # this will trigger stopitereation
             except StopIteration:
-                logger.info(
-                    "Triggered Reassignment as new evictors discovered."
-                    "new_num_evictors=%d, new_my_evictor_id=%d",
-                    new_num_evictors,
-                    new_my_evictor_id,
-                )
+                if self.running:
+                    logger.info(
+                        "Triggered Reassignment as new evictors discovered."
+                        "new_num_evictors=%d, new_my_evictor_id=%d",
+                        new_num_evictors,
+                        new_my_evictor_id,
+                    )
             continue
+
+        self.shutdown()
 
     def signal_handler(self, signum, frame):
         self.running = False
-        self.shutdown()
 
     def shutdown(self):
         logger.info("Shutdown evictor %s ", self.my_evictor_path)

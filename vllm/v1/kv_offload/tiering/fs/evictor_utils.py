@@ -35,28 +35,27 @@ class EvictorQueues:
 
     def refresh_file_queue(self):
         with self._swap_lock:
+            # logger.info(f"Refresh swap ...")
             self._swap_queues()
             self.file_queue = []
 
-    def drain_delete_files(self, percent: float) -> list[str]:
+    def drain_delete_files(self, percent: float) -> list[tuple[float, str]]:
         assert 0.0 <= percent <= 1.0, f"got {percent}"
         with self._swap_lock:
             if not self.delete_queue and self.file_queue:
                 # swap only if delete_queue empty and file_queue has values
+                # logger.info(f"Delete swap - file queue {len(self.file_queue)}...")
                 self._swap_queues()
             total_delete = len(self.delete_queue)
             num_delete = int(total_delete * percent)
             to_delete = []
             while num_delete:
-                to_delete.append(heapq.heappop(self.delete_queue)[1])
+                atime, file_path = heapq.heappop(self.delete_queue)
+                to_delete.append((-atime, file_path))
                 num_delete -= 1
             return to_delete
 
     def maybe_put_file_queue(self, access_time: float, file_path: str):
-        """
-        Return True if the queue is full. The caller than then backoff
-        not trying to aggressively fill the queue.
-        """
         # Most accessed function
         with self._swap_lock:
             if len(self.file_queue) == self.max_queue_size:
