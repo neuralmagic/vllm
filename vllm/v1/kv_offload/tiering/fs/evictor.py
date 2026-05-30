@@ -218,7 +218,7 @@ class EvictorProcess(multiprocessing.Process):
         self.shutdown()
 
     def shutdown(self):
-        print("Shutdown evictor ...")
+        logger.info("Shutdown evictor ...")
         self.running = False
         if self.du_thread is not None and self.du_thread.is_alive():
             # Wait for the du thread to complete
@@ -446,7 +446,7 @@ class EvictorProcess(multiprocessing.Process):
                 )
                 crawler_p.send(None)
 
-                while True:
+                while self.running:
                     # check deletes
                     self.maybe_delete()
 
