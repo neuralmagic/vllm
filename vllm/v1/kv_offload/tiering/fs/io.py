@@ -34,13 +34,16 @@ def store_block(
     buffer: memoryview,
     offset: int,
     block_size: int,
-) -> None:
+) -> bool | None:
     """
     Store callback: Writes to a temp file then atomically replaces the destination.
+
+    Returns True if the block was written, None if the file already existed
+    (no write performed). Raises on I/O failure.
     """
     # Check if block already exists to avoid redundant writes
     if os.path.exists(dest_path):
-        return
+        return None
 
     tmp_path = dest_path + _get_tmp_suffix()
     # Ensure parent directories exist
@@ -70,6 +73,7 @@ def store_block(
         except OSError as cleanup_exc:
             logger.warning("Failed to remove temp file %s: %s", tmp_path, cleanup_exc)
         raise
+    return True
 
 
 def load_block(
@@ -77,7 +81,7 @@ def load_block(
     view: memoryview,
     offset: int,
     block_size: int,
-) -> None:
+) -> bool:
     """
     Load callback: read one KV block from disk. Remove the file on failure.
     """
@@ -99,3 +103,4 @@ def load_block(
     finally:
         if fd is not None:
             os.close(fd)
+    return True

@@ -137,7 +137,7 @@ class FileSystemTierManager(SecondaryTierManager):
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
-        self._pool.enqueue_store(job_metadata.job_id, len(keys), tasks)
+        self._pool.enqueue_store(job_metadata.job_id, tasks, keys)
         self._pending_jobs[job_metadata.job_id] = job_metadata
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
@@ -154,7 +154,7 @@ class FileSystemTierManager(SecondaryTierManager):
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
-        self._pool.enqueue_load(job_metadata.job_id, len(keys), tasks)
+        self._pool.enqueue_load(job_metadata.job_id, tasks, keys)
         self._pending_jobs[job_metadata.job_id] = job_metadata
 
     def get_finished(self) -> Iterable[JobResult]:
@@ -163,13 +163,13 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         results: list[JobResult] = []
 
-        for job_id, success, enospc in self._pool.get_finished():
+        for job_id, task_results in self._pool.get_finished():
             job = self._pending_jobs.pop(job_id)
-            keys = list(job.keys)
             if job.is_promotion:
-                self._space_manager.complete_load(keys, success)
+                self._space_manager.complete_load(task_results)
             else:
-                self._space_manager.complete_store(keys, success, enospc)
+                self._space_manager.complete_store(task_results)
+            success = all(r.success for r in task_results)
             results.append(JobResult(job_id=job_id, success=success))
 
         return results

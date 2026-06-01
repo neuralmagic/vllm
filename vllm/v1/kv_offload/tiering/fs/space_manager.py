@@ -11,6 +11,7 @@ from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.kv_offload.tiering.fs.thread_pool import TaskResult
 from vllm.v1.kv_offload.tiering.fs.ttl_evictor import (
     TTLEvictor,
     TTLEvictorHandle,
@@ -42,15 +43,13 @@ class SpaceManager:
     def prepare_load(self, keys: list[OffloadKey]) -> None:
         pass
 
-    def complete_load(self, keys: list[OffloadKey], success: bool) -> None:
+    def complete_load(self, results: list[TaskResult]) -> None:
         pass
 
     def prepare_store(self, keys: list[OffloadKey]) -> None:
         pass
 
-    def complete_store(
-        self, keys: list[OffloadKey], success: bool, enospc: bool = False
-    ) -> None:
+    def complete_store(self, results: list[TaskResult]) -> None:
         pass
 
     def shutdown(self) -> None:
@@ -117,10 +116,10 @@ class PooledSpaceManager(SpaceManager):
             if block is not None:
                 block.ref_cnt += 1
 
-    def complete_load(self, keys: list[OffloadKey], success: bool) -> None:
+    def complete_load(self, results: list[TaskResult]) -> None:
         """Unpin pool blocks once a load completes. Remove on failure."""
-        for key in keys:
-            block = self._policy.get(key)
+        for r in results:
+            block = self._policy.get(r.key)
             if block is None:
                 continue
             if block.ref_cnt > 0:
@@ -129,10 +128,31 @@ class PooledSpaceManager(SpaceManager):
                 logger.warning(
                     "complete_load: ref_cnt already 0 for key %s; "
                     "missing prepare_load?",
-                    key,
+                    r.key,
                 )
-            if not success:
-                self._policy.remove(key)
+            if not r.success:
+                self._policy.remove(r.key)
+
+    def _maybe_make_space(self, num_new_keys: int, protected: set[OffloadKey]) -> bool:
+        free_slots = self._max_tracked_blocks - len(self._policy.blocks)
+        need = num_new_keys - free_slots
+
+        if need == 0:
+            return True
+
+        evicted = self._policy.evict(need, protected)
+        if evicted is None:
+            # Pool fully pinned — accept without tracking.
+            return False
+
+        if self._enospc:
+            for key, _ in evicted:
+                # TODO (varun): this is a syscall on a hot-path.
+                # it is better to delegate to a deleter thread or the
+                # TTLEvictor.
+                # hard remove
+                safe_remove(Path(self.file_mapper.get_file_name(key)))
+        return True
 
     def prepare_store(self, keys: list[OffloadKey]) -> None:
         """
@@ -148,38 +168,46 @@ class PooledSpaceManager(SpaceManager):
         if not new_keys:
             return
 
-        free_slots = self._max_tracked_blocks - len(self._policy.blocks)
-        need = len(new_keys) - free_slots
-
-        if need > 0:
-            evicted = self._policy.evict(need, protected=set(keys))
-            if evicted is None:
-                # Pool fully pinned — accept without tracking.
-                return
-
-            if self._enospc:
-                for key, _ in evicted:
-                    # hard remove
-                    safe_remove(Path(self.file_mapper.get_file_name(key)))
+        if not self._maybe_make_space(len(new_keys), protected=set(keys)):
+            return
 
         for key in new_keys:
             self._policy.insert(key, BlockStatus(0))
 
-    def complete_store(
-        self, keys: list[OffloadKey], success: bool, enospc: bool = False
-    ) -> None:
-        """Mark blocks ready on success; remove them from the pool on failure."""
-        if enospc:
-            self._enospc = True
-        for key in keys:
-            block = self._policy.get(key)
-            if block is None or block.is_ready:
+    def complete_store(self, results: list[TaskResult]) -> None:
+        """
+        Update the pool for each completed store task.
+
+        - existed: file was already on disk (not owned) → remove from pool.
+        - success: newly written → mark ready.
+        - failure: remove from pool; set ENOSPC flag if applicable.
+        """
+        for r in results:
+            if r.enospc:
+                self._enospc = True
+            block = self._policy.get(r.key)
+            if block is None:
+                if not r.existed and r.success:  # noqa: SIM102
+                    # Block was written but not tracked (pool was full at
+                    # prepare_store time). Insert it now, evicting if needed.
+                    if self._maybe_make_space(1, set()):
+                        status = BlockStatus(0)
+                        status.ref_cnt = 0
+                        self._policy.insert(r.key, status)
                 continue
-            if success:
-                block.ref_cnt = 0
-                self._policy.touch([key])
-            else:
-                self._policy.remove(key)
+
+            if not r.existed and r.success:
+                # successful store with actual write
+                # Created by this task.
+                if block.is_ready:
+                    logger.warning("multiple stores detected")
+                else:
+                    block.ref_cnt += 1
+                continue
+
+            if r.existed or not r.success:
+                # not owned by us or a failed store
+                self._policy.remove(r.key)
 
     def shutdown(self) -> None:
         if self._evictor_handle is not None:
