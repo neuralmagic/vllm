@@ -30,7 +30,10 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
-from vllm.v1.kv_offload.tiering.fs.space_manager import SpaceManager
+from vllm.v1.kv_offload.tiering.fs.space_manager import (
+    PooledSpaceManager,
+    SpaceManager,
+)
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -49,7 +52,6 @@ class FileSystemTierManager(SecondaryTierManager):
 
     submit_store / submit_load are non-blocking: they enqueue tasks and return.
     get_finished() polls job completion and returns completed JobResults.
-
     """
 
     def __init__(
@@ -60,7 +62,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
-        ttl_evictor_args: dict[str, Any] | None = None,
+        space_manager_args: dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -71,28 +73,23 @@ class FileSystemTierManager(SecondaryTierManager):
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
-            ttl_evictor_args: Optional kwargs for TTLEvictor. When provided,
-                a TTL evictor process is spawned to evict stale block files.
-                Keys map to TTLEvictor.__init__ parameters (e.g. ttl_s,
-                is_lazy, lazy_eviction_high_watermark). When None, no evictor
-                is started.
+            space_manager_args: Optional kwargs forwarded to SpaceManager.
+                Supported keys: max_tracked_blocks, enospc_low_watermark,
+                ttl_evictor_args.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
-        # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
             "primary_kv_view.strides cannot be None"
         )
         self._block_size: int = primary_kv_view.strides[0]
 
-        # Create file mapper
         self.file_mapper = FileMapper.from_offloading_spec(
             root_dir=root_dir,
             offloading_spec=offloading_spec,
             gpu_blocks_per_file=offloading_spec.block_size_factor,
         )
 
-        # Write config file
         config_path = self.file_mapper.get_config_file_path()
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         if not os.path.exists(config_path):
@@ -107,18 +104,29 @@ class FileSystemTierManager(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
-        self._space_manager = SpaceManager(
-            root_dir=root_dir,
-            file_mapper=self.file_mapper,
-            ttl_evictor_args=ttl_evictor_args,
-        )
+        if space_manager_args is not None:
+            self._space_manager: SpaceManager = PooledSpaceManager(
+                root_dir=root_dir,
+                file_mapper=self.file_mapper,
+                **space_manager_args,
+            )
+        else:
+            self._space_manager = SpaceManager(
+                root_dir=root_dir,
+                file_mapper=self.file_mapper,
+            )
+
+        self._pending_jobs: dict[int, JobMetadata] = {}
 
     def lookup(
         self, key: OffloadKey, req_context: ReqContext | None = None
     ) -> bool | None:
-        return os.path.exists(self.file_mapper.get_file_name(key))
+        return self._space_manager.lookup(key)
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        keys = list(job_metadata.keys)
+        self._space_manager.prepare_store(keys)
+
         tasks = (
             functools.partial(
                 store_block,
@@ -129,9 +137,13 @@ class FileSystemTierManager(SecondaryTierManager):
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
-        self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
+        self._pool.enqueue_store(job_metadata.job_id, len(keys), tasks)
+        self._pending_jobs[job_metadata.job_id] = job_metadata
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        keys = list(job_metadata.keys)
+        self._space_manager.prepare_load(keys)
+
         tasks = (
             functools.partial(
                 load_block,
@@ -142,24 +154,32 @@ class FileSystemTierManager(SecondaryTierManager):
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
-        self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
+        self._pool.enqueue_load(job_metadata.job_id, len(keys), tasks)
+        self._pending_jobs[job_metadata.job_id] = job_metadata
 
     def get_finished(self) -> Iterable[JobResult]:
         """
         Collect completed jobs from the finished-jobs queue.
         """
-        return (
-            JobResult(job_id=job_id, success=success)
-            for job_id, success in self._pool.get_finished()
-        )
+        results: list[JobResult] = []
+
+        for job_id, success, enospc in self._pool.get_finished():
+            job = self._pending_jobs.pop(job_id)
+            keys = list(job.keys)
+            if job.is_promotion:
+                self._space_manager.complete_load(keys, success)
+            else:
+                self._space_manager.complete_store(keys, success, enospc)
+            results.append(JobResult(job_id=job_id, success=success))
+
+        return results
 
     def shutdown(self) -> None:
         """
         Release resources held by this tier.
 
-        Shuts down the thread pool, clearing pending tasks and waiting for
-        active threads to complete. Also stops the TTL evictor process if one
-        was started.
+        Shuts down the thread pool and stops the space manager (including any
+        TTL evictor process).
         """
         self._pool.shutdown(wait=True)
         self._space_manager.shutdown()

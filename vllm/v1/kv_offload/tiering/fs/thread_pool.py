@@ -8,6 +8,7 @@ Thread pool:
     Load jobs are enqueued to the load queue; store jobs to the store queue.
 """
 
+import errno as _errno
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -22,29 +23,32 @@ class JobState:
     """
     Thread-safe completion tracker for a set of per-block I/O tasks.
 
-    Each task calls task_done(success) when it finishes.
+    Each task calls task_done(success, enospc) when it finishes.
     """
 
-    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_lock")
+    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_enospc", "_lock")
 
     def __init__(self, job_id: JobId, n_tasks: int) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
         self._completed = 0
         self._success = True
+        self._enospc = False
         self._lock = threading.Lock()
 
     @property
     def job_id(self) -> JobId:
         return self._job_id
 
-    def task_done(self, success: bool) -> tuple[bool, bool]:
-        """Returns if job completed and success flag"""
+    def task_done(self, success: bool, enospc: bool = False) -> tuple[bool, bool, bool]:
+        """Returns (job_finished, success, enospc)."""
         with self._lock:
             self._completed += 1
             if not success:
                 self._success = False
-            return self._completed == self._n_tasks, self._success
+            if enospc:
+                self._enospc = True
+            return self._completed == self._n_tasks, self._success, self._enospc
 
 
 class DualQueueThreadPool:
@@ -67,7 +71,7 @@ class DualQueueThreadPool:
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
-        self._finished_q: deque[tuple[JobId, bool]] = deque()
+        self._finished_q: deque[tuple[JobId, bool, bool]] = deque()
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -115,7 +119,8 @@ class DualQueueThreadPool:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
 
-    def get_finished(self) -> list[tuple[JobId, bool]]:
+    def get_finished(self) -> list[tuple[JobId, bool, bool]]:
+        """Return completed jobs as (job_id, success, enospc) tuples."""
         jobs = []
         while self._finished_q:
             jobs.append(self._finished_q.popleft())
@@ -145,14 +150,15 @@ class DualQueueThreadPool:
                 task, state = primary.popleft() if primary else secondary.popleft()
             try:
                 task()
-                job_finished, success = state.task_done(True)
-            except Exception as exc:
-                logger.error(
-                    "Job %s block I/O failed: %s",
-                    state.job_id,
-                    exc,
+                job_finished, success, enospc = state.task_done(True)
+            except OSError as exc:
+                logger.error("Job %s block I/O failed: %s", state.job_id, exc)
+                job_finished, success, enospc = state.task_done(
+                    False, enospc=exc.errno == _errno.ENOSPC
                 )
-                job_finished, success = state.task_done(False)
+            except Exception as exc:
+                logger.error("Job %s block I/O failed: %s", state.job_id, exc)
+                job_finished, success, enospc = state.task_done(False)
 
             if job_finished:
-                self._finished_q.append((state.job_id, success))
+                self._finished_q.append((state.job_id, success, enospc))
