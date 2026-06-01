@@ -116,8 +116,8 @@ class TTLEvictor:
         root_dir: Path,
         ttl_s: int = 60 * 60,  # 1 hr
         is_lazy: bool = True,
-        lazy_eviction_high_watermark: float = 0.9,
-        lazy_eviction_low_watermark: float = 0.8,
+        lazy_eviction_high_watermark: float = 0.8,
+        lazy_eviction_low_watermark: float = 0.7,
         num_active_evictors: int = 8,
         register_retry_interval_s: int = 60,
     ):
