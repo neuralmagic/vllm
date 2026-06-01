@@ -31,7 +31,10 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
-from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+from vllm.v1.kv_offload.tiering.fs.thread_pool import (
+    AtimeTouchWorker,
+    DualQueueThreadPool,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
@@ -60,6 +63,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        atime_config: dict | None = None,
     ):
         """
         Args:
@@ -70,6 +74,14 @@ class FileSystemTierManager(SecondaryTierManager):
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
+            atime_config: Optional dict enabling background atime refresh.
+                If None (default), atime is never updated — suitable for local
+                or POSIX-compliant filesystems that maintain atime automatically.
+                When provided, accepted keys are:
+                  max_pending (int, default 10_000): flush when this many unique
+                    paths are accumulated.
+                  flush_interval_s (float, default 1800): flush at least this
+                    often in seconds even if the size cap is not reached.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -101,6 +113,16 @@ class FileSystemTierManager(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
+        if atime_config is not None:
+            self._atime_worker: AtimeTouchWorker | None = AtimeTouchWorker(atime_config)
+        else:
+            self._atime_worker = None
+
+        # Maps job_id → file paths for in-flight load jobs so
+        # get_finished_jobs() can enqueue atime updates only on success.
+        # Only populated when _atime_worker is active.
+        self._load_job_paths: dict[int, list[str]] = {}
+
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
@@ -123,6 +145,11 @@ class FileSystemTierManager(SecondaryTierManager):
         self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        if self._atime_worker is not None:
+            self._load_job_paths[job_metadata.job_id] = [
+                self.file_mapper.get_file_name(key) for key in job_metadata.keys
+            ]
+
         tasks = (
             functools.partial(
                 load_block,
@@ -138,17 +165,25 @@ class FileSystemTierManager(SecondaryTierManager):
     def get_finished_jobs(self) -> Iterable[JobResult]:
         """
         Collect completed jobs from the finished-jobs queue.
+
+        For successfully completed load jobs, enqueue the file paths to the
+        atime pool so their atime is refreshed in the background.
         """
-        return (
-            JobResult(job_id=job_id, success=success)
-            for job_id, success in self._pool.get_finished()
-        )
+        for job_id, success in self._pool.get_finished():
+            if self._atime_worker is not None:
+                paths = self._load_job_paths.pop(job_id, None)
+                if paths is not None and success:
+                    for p in paths:
+                        self._atime_worker.enqueue(p)
+            yield JobResult(job_id=job_id, success=success)
 
     def shutdown(self) -> None:
         """
         Release resources held by this tier.
 
-        Shuts down the thread pool, clearing pending tasks and waiting for
-        active threads to complete.
+        Shuts down the atime pool first (flushing any remaining atime updates),
+        then shuts down the I/O thread pool.
         """
+        if self._atime_worker is not None:
+            self._atime_worker.shutdown()
         self._pool.shutdown(wait=True)

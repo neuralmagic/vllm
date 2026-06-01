@@ -6,9 +6,18 @@ Thread pool:
       - Load-priority threads: drain the load queue first, then the store queue.
       - Store-priority threads: drain the store queue first, then the load queue.
     Load jobs are enqueued to the load queue; store jobs to the store queue.
+
+AtimeTouchWorker:
+    A single background worker that accumulates file paths whose atime should
+    be refreshed (via os.utime) and flushes them in batches.  Two triggers fire
+    the flush: the pending-set size reaching `max_pending`, or `flush_interval_s`
+    seconds elapsing — whichever comes first.
 """
 
+import contextlib
+import os
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
 
@@ -156,3 +165,93 @@ class DualQueueThreadPool:
 
             if job_finished:
                 self._finished_q.append((state.job_id, success))
+
+
+class AtimeTouchWorker:
+    """
+    Background worker that refreshes file atimes in batches.
+
+    Paths are accumulated in a dedup dict mapping path → enqueue timestamp.
+    The worker flushes — calling os.utime(path, (ts, ts)) for every collected
+    entry — when either the size cap is reached or the timeout elapses,
+    whichever comes first.  Duplicates within a window collapse to a single
+    syscall; the later enqueue timestamp wins.
+
+    Recording the timestamp at enqueue time (when the load is confirmed) rather
+    than at flush time means the atime written to disk reflects when the block
+    was actually read, not when the batch happened to run.
+    """
+
+    SUPPORTED_CONFIG_KEYS: frozenset[str] = frozenset(
+        {"max_pending", "flush_interval_s"}
+    )
+
+    def __init__(self, config: dict) -> None:
+        unknown = set(config) - self.SUPPORTED_CONFIG_KEYS
+        assert not unknown, (
+            f"Unrecognized atime_config keys: {sorted(unknown)}. "
+            f"Supported keys: {sorted(self.SUPPORTED_CONFIG_KEYS)}"
+        )
+        self._max_pending: int = config.get("max_pending", 10_000)
+        self._flush_interval_s: float = config.get("flush_interval_s", 1800.0)
+        # path → POSIX timestamp recorded at enqueue (load-confirmed) time.
+        self._pending: dict[str, float] = {}
+        self._cond = threading.Condition()
+        self._stop = False
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="vllm_kv_atime",
+        )
+        self._thread.start()
+
+    def enqueue(self, path: str) -> None:
+        """
+        Record a file path for atime refresh.
+
+        Called from the scheduler thread after get_finished_jobs() confirms a
+        successful load.  The current time is stored as the intended atime so
+        that the written timestamp reflects the actual read time, not the later
+        batch-flush time.  Wakes the worker immediately when the size cap is
+        reached.
+        """
+        ts = time.time()
+        with self._cond:
+            self._pending[path] = ts
+            if len(self._pending) >= self._max_pending:
+                self._cond.notify()
+
+    def shutdown(self) -> None:
+        """Flush remaining paths and stop the worker thread."""
+        with self._cond:
+            self._stop = True
+            self._cond.notify()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                timed_out = not self._cond.wait_for(
+                    lambda: self._stop or len(self._pending) >= self._max_pending,
+                    timeout=self._flush_interval_s,
+                )
+                # Flush on timeout, size cap, or stop.
+                if timed_out or self._stop or self._pending:
+                    pending, self._pending = self._pending, {}
+                else:
+                    pending = {}
+                stop = self._stop
+
+            if pending:
+                trigger = "stop" if stop else "timeout" if timed_out else "size_cap"
+                logger.debug(
+                    "AtimeTouchWorker flushing %d path(s) [trigger=%s]",
+                    len(pending),
+                    trigger,
+                )
+            for p, ts in pending.items():
+                with contextlib.suppress(OSError):
+                    os.utime(p, (ts, ts))
+
+            if stop:
+                return
