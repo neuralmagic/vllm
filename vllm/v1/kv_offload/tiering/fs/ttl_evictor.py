@@ -17,6 +17,7 @@
 #      start failing . This is so the new blocks have a shot -
 #      is flexible in providing some guarantees
 
+import contextlib
 import fcntl
 import os
 import random
@@ -24,11 +25,41 @@ import signal
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 from vllm.logger import init_logger
+from vllm.utils.system_utils import decorate_logs, get_mp_context, set_process_title
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class TTLEvictorHandle:
+    proc: BaseProcess
+    death_writer: Connection
+
+    def stop(self) -> None:
+        """Close the death pipe to signal graceful shutdown, then reap."""
+        with contextlib.suppress(Exception):
+            self.death_writer.close()
+        self.proc.join(timeout=15)
+        if self.proc.is_alive():
+            self.proc.terminate()
+            self.proc.join(timeout=5)
+
+
+def _monitor_death_pipe(death_pipe: Connection, shutdown: threading.Event) -> None:
+    """Block until the parent closes its end of the pipe, then signal shutdown."""
+    try:
+        death_pipe.recv()
+    except EOFError:
+        shutdown.set()
+    except Exception as e:
+        logger.warning("TTLEvictor death-pipe monitor error: %s", e)
+
 
 DU_CHECK_INTERVAL_S = 5  # check usage every 5s
 DELETE_TRIGGER_POLL_S = 5  # wake up delete trigger every 5s to check shutdown.
@@ -139,8 +170,58 @@ class TTLEvictor:
 
         assert self.eviction_high_watermark >= self.eviction_low_watermark
 
-    def signal_handler(self, signum, frame):
-        self.shutdown.set()
+    @staticmethod
+    def spawn(root_dir: Path, **evictor_kwargs) -> "TTLEvictorHandle":
+        """Spawn a TTLEvictor in a separate background process (non-blocking)."""
+        context = get_mp_context()
+        death_reader, death_writer = context.Pipe(duplex=False)
+        proc = context.Process(
+            target=TTLEvictor.evictor_main,
+            kwargs={
+                "root_dir": root_dir,
+                "death_pipe": death_reader,
+                **evictor_kwargs,
+            },
+            name="VllmTTLEvictor",
+            daemon=True,
+        )
+        proc.start()
+        death_reader.close()
+        return TTLEvictorHandle(proc=proc, death_writer=death_writer)
+
+    @staticmethod
+    def evictor_main(**kwargs) -> None:
+        """Process entry point. Owns signal handling and process setup."""
+        death_pipe: Connection | None = kwargs.pop("death_pipe", None)
+
+        set_process_title("TTLEvictor")
+        decorate_logs("TTLEvictor")
+
+        evictor = TTLEvictor(**kwargs)
+
+        def _signal_handler(signum, frame):
+            evictor.shutdown.set()
+
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
+
+        if death_pipe is not None:
+            threading.Thread(
+                target=_monitor_death_pipe,
+                args=(death_pipe, evictor.shutdown),
+                daemon=True,
+                name="TTLEvictorDeathMonitor",
+            ).start()
+
+        logger.info(
+            "TTLEvictor process started (pid=%d, root_dir=%s)",
+            os.getpid(),
+            evictor.root_dir,
+        )
+        try:
+            evictor.run()
+        finally:
+            logger.info("TTLEvictor process exiting (pid=%d)", os.getpid())
 
     @staticmethod
     def is_evictor_alive(evictor_path: Path) -> bool:
@@ -198,6 +279,9 @@ class TTLEvictor:
             safe_remove(self.evictor_path)
         except Exception as e:
             logger.error("Cannot unregister safely : %s", e)
+        finally:
+            self.evictor_fd = None
+            self.evictor_path = None
 
     def du_thread_fn(self):
         while not self.shutdown.is_set():
@@ -212,9 +296,6 @@ class TTLEvictor:
             self.shutdown.wait(timeout=DU_CHECK_INTERVAL_S)
 
     def run(self):
-        signal.signal(signal.SIGTERM, self.signal_handler)
-        signal.signal(signal.SIGINT, self.signal_handler)
-
         while not self.register():
             if self.shutdown.wait(timeout=self.register_retry_interval_s):
                 break
@@ -259,4 +340,5 @@ class TTLEvictor:
     def cleanup(self):
         if self.du_thread is not None:
             self.du_thread.join()
+            self.du_thread = None
         self.unregister()

@@ -19,7 +19,7 @@ import functools
 import json
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext
@@ -30,6 +30,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
+from vllm.v1.kv_offload.tiering.fs.space_manager import SpaceManager
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -59,6 +60,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        ttl_evictor_args: dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -69,6 +71,11 @@ class FileSystemTierManager(SecondaryTierManager):
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
+            ttl_evictor_args: Optional kwargs for TTLEvictor. When provided,
+                a TTL evictor process is spawned to evict stale block files.
+                Keys map to TTLEvictor.__init__ parameters (e.g. ttl_s,
+                is_lazy, lazy_eviction_high_watermark). When None, no evictor
+                is started.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -98,6 +105,12 @@ class FileSystemTierManager(SecondaryTierManager):
             n_read_threads,
             n_write_threads,
             thread_name_prefix="vllm_kv_py_fs",
+        )
+
+        self._space_manager = SpaceManager(
+            root_dir=root_dir,
+            file_mapper=self.file_mapper,
+            ttl_evictor_args=ttl_evictor_args,
         )
 
     def lookup(
@@ -145,6 +158,8 @@ class FileSystemTierManager(SecondaryTierManager):
         Release resources held by this tier.
 
         Shuts down the thread pool, clearing pending tasks and waiting for
-        active threads to complete.
+        active threads to complete. Also stops the TTL evictor process if one
+        was started.
         """
         self._pool.shutdown(wait=True)
+        self._space_manager.shutdown()
