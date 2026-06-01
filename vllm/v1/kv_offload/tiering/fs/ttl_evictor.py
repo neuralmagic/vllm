@@ -1,22 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# make a stale deleter
-#   - the deleter can exist in eager and lazy mode -
-#       - in eager mode - it just deletes what it can find
-#       - in lazy mode - it is triggered only when delete thresholds are reached
-#   - make a du reporter
-
-# make a evictor manager v1
-#   - evictor manager spawns a deleter process.
-#   - monitors store fails -- when stores start failing - retries after timeout.
-
-# make a evictor manager v2
-#   - spawns a stale deleter process
-#   - manages a cache -- starts removing from the cache for LRU if the stores
-#      start failing . This is so the new blocks have a shot -
-#      is flexible in providing some guarantees
-
 import contextlib
 import fcntl
 import os
@@ -34,6 +18,10 @@ from vllm.logger import init_logger
 from vllm.utils.system_utils import decorate_logs, get_mp_context, set_process_title
 
 logger = init_logger(__name__)
+
+
+DU_CHECK_INTERVAL_S = 5  # check usage every 5s
+DELETE_TRIGGER_POLL_S = 5  # wake up delete trigger every 5s to check shutdown.
 
 
 @dataclass
@@ -61,20 +49,10 @@ def _monitor_death_pipe(death_pipe: Connection, shutdown: threading.Event) -> No
         logger.warning("TTLEvictor death-pipe monitor error: %s", e)
 
 
-DU_CHECK_INTERVAL_S = 5  # check usage every 5s
-DELETE_TRIGGER_POLL_S = 5  # wake up delete trigger every 5s to check shutdown.
-
-
 def get_disk_usage_fraction_form_statvfs(root_dir: Path) -> float | None:
     try:
         stat = os.statvfs(root_dir)
-        block_size = stat.f_frsize
-        total_bytes = stat.f_blocks * block_size
-        free_bytes = stat.f_bfree * block_size
-        used_bytes = total_bytes - free_bytes
-        usage = (used_bytes / total_bytes) if total_bytes > 0 else 0
-        return usage
-
+        return (1 - stat.f_bfree / stat.f_blocks) if stat.f_blocks > 0 else 0
     except Exception as e:
         logger.error("Cannot fetch disk usage. Failed with %s", e)
         return None
@@ -116,17 +94,19 @@ def safe_atime(path: Path) -> float | None:
 
 
 def permute(it: Iterator[os.DirEntry], batch_size: int = 50) -> Iterator[os.DirEntry]:
+    """Yield entries in randomised order so concurrent evictors don't collide."""
+
+    def _shuffled(items: list[os.DirEntry]) -> list[os.DirEntry]:
+        random.shuffle(items)
+        return items
+
     batch: list[os.DirEntry] = []
     for e in it:
         batch.append(e)
         if len(batch) == batch_size:
-            random.shuffle(batch)
-            while batch:
-                yield batch.pop()
-    # balance
-    random.shuffle(batch)
-    while batch:
-        yield batch.pop()
+            yield from _shuffled(batch)
+            batch = []
+    yield from _shuffled(batch)
 
 
 # Layout: <root_dir>/<safe_model_name>_<sha256-prefix>/<hhh>/<hh>_g<group_idx>/<hash>.bin # noqa: E501
@@ -229,13 +209,12 @@ class TTLEvictor:
             with open(evictor_path) as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            return False  # acquired lock → no live holder
         except BlockingIOError:
-            return True
+            return True  # couldn't acquire → someone holds it
         except Exception as e:
-            # cannot determine liveness. consider unalive.
             logger.error("Cannot determine liveness %s : %s", evictor_path, e)
-            return False
-        return False
+            return False  # unknown → assume dead
 
     @staticmethod
     def maybe_register(e_path: Path) -> int | None:
@@ -259,7 +238,6 @@ class TTLEvictor:
         return fd
 
     def register(self) -> bool:
-        fd = None
         for e in range(self.num_active_evictors):
             e_path = self.root_dir / f"__{e}.evictor"
             fd = self.maybe_register(e_path)
@@ -289,10 +267,8 @@ class TTLEvictor:
             if pct is not None:
                 if pct >= self.eviction_high_watermark:
                     self.delete_trigger.set()
-
-                if pct < self.eviction_low_watermark:
+                elif pct < self.eviction_low_watermark:
                     self.delete_trigger.clear()
-
             self.shutdown.wait(timeout=DU_CHECK_INTERVAL_S)
 
     def run(self):
@@ -309,29 +285,17 @@ class TTLEvictor:
             self.du_thread = threading.Thread(target=self.du_thread_fn, daemon=True)
             self.du_thread.start()
         else:
-            # delete eagerly
             self.delete_trigger.set()
 
         try:
             while not self.shutdown.is_set():
-                if not self.delete_trigger.wait(timeout=DELETE_TRIGGER_POLL_S):
-                    # polling failed.
-                    continue
-
-                if self.shutdown.is_set():
-                    break
-
-                for bin_file in yield_bin_files(self.root_dir):
-                    if self.shutdown.is_set() or not self.delete_trigger.is_set():
-                        break
-
-                    a_time = safe_atime(bin_file)
-                    if a_time is None:
-                        continue
-
-                    if a_time + self.ttl_s < time.time():
-                        safe_remove(bin_file)
-
+                if self.delete_trigger.wait(timeout=DELETE_TRIGGER_POLL_S):
+                    for bin_file in yield_bin_files(self.root_dir):
+                        if self.shutdown.is_set() or not self.delete_trigger.is_set():
+                            break
+                        a_time = safe_atime(bin_file)
+                        if a_time is not None and a_time + self.ttl_s < time.time():
+                            safe_remove(bin_file)
         except Exception as e:
             logger.error("TTLEvictor terminated with %s", e)
         finally:
