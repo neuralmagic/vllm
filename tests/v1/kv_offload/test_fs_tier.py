@@ -10,7 +10,7 @@ data integrity throughout the process.
 
 import os
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -18,9 +18,8 @@ import torch
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.tiering.base import JobMetadata
-from vllm.v1.kv_offload.tiering.fs.manager import (
-    FileSystemTierManager,
-)
+from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
+from vllm.v1.kv_offload.tiering.fs.thread_pool import AtimeTouchWorker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -254,3 +253,123 @@ def test_store_load_data_integrity(fs_tier):
         assert torch.allclose(tensor[bid], expected[i]), (
             f"Block {bid} data mismatch after store+load"
         )
+
+
+## Test Atime integration
+
+
+def test_atime_size_cap_triggers_flush(tmp_path):
+    """Enqueueing max_pending paths wakes the worker before the timeout."""
+    files = [tmp_path / f"block_{i}.bin" for i in range(3)]
+    for f in files:
+        f.write_bytes(b"x")
+
+    original_atimes = {str(f): os.stat(f).st_atime for f in files}
+
+    worker = AtimeTouchWorker({"max_pending": 3, "flush_interval_s": 3600.0})
+    for f in files:
+        worker.enqueue(str(f))
+    time.sleep(0.3)  # worker should have flushed already
+    worker.shutdown()
+
+    for f in files:
+        assert os.stat(f).st_atime > original_atimes[str(f)], (
+            f"Expected atime newer than original for {f}"
+        )
+
+
+def test_atime_timeout_triggers_flush(tmp_path):
+    """Worker flushes via timeout when size cap is never reached."""
+    f = tmp_path / "block.bin"
+    f.write_bytes(b"x")
+    original_atime = os.stat(f).st_atime
+
+    worker = AtimeTouchWorker({"max_pending": 10_000, "flush_interval_s": 0.1})
+    worker.enqueue(str(f))
+    time.sleep(0.5)  # let the 100 ms timeout fire
+    worker.shutdown()
+
+    assert os.stat(f).st_atime > original_atime
+
+
+def test_atime_shutdown_flushes_remaining(tmp_path):
+    """shutdown() flushes any paths that haven't been flushed yet."""
+    f = tmp_path / "block.bin"
+    f.write_bytes(b"x")
+    original_atime = os.stat(f).st_atime
+
+    worker = AtimeTouchWorker({"max_pending": 10_000, "flush_interval_s": 3600.0})
+    worker.enqueue(str(f))
+    worker.shutdown()  # must flush before returning
+
+    assert os.stat(f).st_atime > original_atime
+
+
+def test_atime_deduplication(tmp_path):
+    """The same path enqueued multiple times results in a single os.utime call."""
+    f = tmp_path / "block.bin"
+    f.write_bytes(b"x")
+    calls: list[str] = []
+    original_utime = os.utime
+
+    def recording_utime(path: str, times: tuple) -> None:
+        calls.append(path)
+        original_utime(path, times)
+
+    with patch(
+        "vllm.v1.kv_offload.tiering.fs.thread_pool.os.utime",
+        side_effect=recording_utime,
+    ):
+        worker = AtimeTouchWorker({"max_pending": 10_000, "flush_interval_s": 3600.0})
+        for _ in range(5):
+            worker.enqueue(str(f))
+        worker.shutdown()
+
+    assert calls.count(str(f)) == 1, (
+        f"Expected exactly 1 utime call, got {calls.count(str(f))}"
+    )
+
+
+@pytest.fixture
+def fs_tier_with_atime(tmp_path):
+    tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+    mock_view = memoryview(tensor.numpy())
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+        # max_pending=1 so every load immediately triggers a flush
+        atime_config={"max_pending": 1, "flush_interval_s": 3600.0},
+    )
+    yield tier
+    tier.shutdown()
+
+
+def test_atime_updated_after_successful_load(fs_tier_with_atime):
+    """atime_worker enqueues the file path after a confirmed successful load."""
+    tier = fs_tier_with_atime
+
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(r.success for r in drain(tier))
+
+    path = tier.file_mapper.get_file_name(key(1))
+
+    # Pin atime in the past so we have a clear before/after.
+    past = time.time() - 7200
+    os.utime(path, (past, past))
+    original_atime = os.stat(path).st_atime
+
+    tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+    results = drain(tier)
+    assert all(r.success for r in results)
+
+    # shutdown() flushes the atime worker before returning
+    tier.shutdown()
+
+    atime = os.stat(path).st_atime
+    assert atime > original_atime, (
+        f"Expected atime newer than {original_atime}, got {atime}"
+    )
