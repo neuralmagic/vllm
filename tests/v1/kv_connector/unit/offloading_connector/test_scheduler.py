@@ -427,7 +427,19 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     )
     runner.run(
         decoded_tokens=[0] * (block_size * 3 + 2),
-        expected_stored=(0, 1, 2, 3, 4, 5),
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 5),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (1, 5),
+        ),
     )
 
     # touch called from _get_reqs_to_store * 3 blocks, once for each group
@@ -1264,7 +1276,6 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
     )
     runner.run(decoded_tokens=[0])
 
-    # Decode 1 more token to complete the deferred stores from above.
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
@@ -1276,11 +1287,10 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
         #   per segment of 4:
         #   Segment 0 (blocks 0-3): skip 0,1 -> store (1, 2), (1, 3)
         #   Segment 1 (blocks 4-7): skip 4,5 -> store (1, 6), (1, 7)
+        # Note: Segment 0 is skipped as it will be stale.
         expected_stored=(
             (0, 0),
             (0, 1),
-            (1, 2),
-            (1, 3),
             (1, 6),
             (1, 7),
         ),
@@ -1449,6 +1459,9 @@ def test_swa_block_recycling_smoke(request_runner, async_scheduling):
         generate_store_output(keys)
     )
 
-    # Change to (bypasses stored-block assertion) which is expected for
-    # this test
-    runner._run(decoded_tokens=[0, EOS_TOKEN_ID], complete_transfers=True)
+    # Verify that we are storing only active blocks.
+    runner.run(
+        decoded_tokens=[0, EOS_TOKEN_ID],
+        complete_transfers=True,
+        expected_stored=(5, 6),
+    )

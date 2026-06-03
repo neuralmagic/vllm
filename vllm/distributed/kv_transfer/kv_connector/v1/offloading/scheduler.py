@@ -754,6 +754,17 @@ class OffloadingConnectorScheduler:
                 self.config.kv_group_configs, req_status.group_states
             ):
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+
+                # For SWA groups, always advance past positions that
+                # remove_skipped_blocks has already freed back to the block pool.
+                # This prevents storing of potentially stale blocks.
+                sw = group_config.sliding_window_size_in_blocks
+                if sw is not None:
+                    num_evicted = max(0, num_blocks - sw)
+                    group_state.next_stored_block_idx = max(
+                        group_state.next_stored_block_idx, num_evicted
+                    )
+
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
                     continue
@@ -800,21 +811,6 @@ class OffloadingConnectorScheduler:
             )
             if store_output is None:
                 logger.warning("Request %s: cannot store blocks", req_id)
-                # Move past SWA blocks that have already been reclaimed.
-                for group_config, group_state in zip(
-                    self.config.kv_group_configs, req_status.group_states
-                ):
-                    sw = group_config.sliding_window_size_in_blocks
-                    if sw is None:
-                        # Not a SW group
-                        continue
-                    num_blocks = (
-                        num_offloadable_tokens // group_config.offloaded_block_size
-                    )
-                    num_evicted = max(0, num_blocks - sw)
-                    group_state.next_stored_block_idx = max(
-                        group_state.next_stored_block_idx, num_evicted
-                    )
                 continue
 
             if not store_output.keys_to_store:
