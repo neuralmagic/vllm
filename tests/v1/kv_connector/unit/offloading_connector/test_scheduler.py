@@ -1381,3 +1381,74 @@ def test_stale_sliding_window_block_after_prepare_store_failure(
         expected_stored=(2, 3),
         expected_flushed=(2, 3) if not async_scheduling else (),
     )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_block_recycling_smoke(request_runner, async_scheduling):
+    """
+    Integration test: SWA block eviction + prepare_store=None + pool reuse
+    must not offload stale blocks and crash _remove_pending_job.
+
+    Sequence that triggers the bug:
+    1. prepare_store returns None multiple times as offloaded tier is busy
+       → next_stored_block_idx stays at 0.
+    2. SWA window moves; old blocks are freed to the pool.
+    3. Pool reallocates the freed block IDs for new decode tokens, which are
+       appended to group_state.block_ids  → duplicate block IDs in the list.
+    4. prepare_store succeeds  → job built with the frozen store range [0, N).
+       Both old and new positions of the recycled block ID are included
+       → sliding_window_block_ids contains the ID twice.
+    5. Job completes → _remove_pending_job is called → must not KeyError.
+    """
+    block_size = 4
+    # 2-block window: eviction starts as soon as a 3rd block is allocated.
+    sliding_window = block_size * 2
+
+    runner = request_runner(
+        block_size=block_size,
+        # Pool must be small enough to force recycling of evicted SWA blocks.
+        num_gpu_blocks=6,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=sliding_window,
+                ),
+            )
+        ],
+    )
+
+    # Phase 1: block prepare_store (full CPU tier) so the request's
+    # swa group_state's  next_stored_block_idx stays at 0.
+    # stays frozen at 0 while the request keeps accumulating blocks.
+    runner.manager.prepare_store.side_effect = lambda keys, ctx: None
+
+    # Prefill with 4 blocks (2× the SWA window)
+    # request's group_state: block_ids=[1, 2, 3, 4]
+    # (0 is the null block and not used by the block pool).
+    runner.new_request(token_ids=[0] * (block_size * 4))
+
+    # request's group_state: block_ids=[1, 2, 3, 4, 5]
+    runner.run(decoded_tokens=[0] * block_size, complete_transfers=False)
+
+    # request's group_state: block_ids=[1, 2, 3, 4, 5, 1, 2]
+    # blocks 1 and 2 rejoin the pool as they were evicted by SWA.
+    runner.run(decoded_tokens=[0] * (block_size * 2), complete_transfers=False)
+
+    # Phase 2: allow prepare_store to succeed.  The store range starts at 0
+    # (never advanced) and covers the full accumulated block_ids list,
+    # including both old and recycled positions of the same block ID.
+    # _remove_pending_job must not raise KeyError. and there should
+    # only be 2 successful stores.
+    runner.manager.prepare_store.side_effect = lambda keys, ctx: (
+        generate_store_output(keys)
+    )
+
+    # Change to (bypasses stored-block assertion) which is expected for
+    # this test
+    runner._run(decoded_tokens=[0, EOS_TOKEN_ID], complete_transfers=True)

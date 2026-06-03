@@ -800,6 +800,21 @@ class OffloadingConnectorScheduler:
             )
             if store_output is None:
                 logger.warning("Request %s: cannot store blocks", req_id)
+                # Move past SWA blocks that have already been reclaimed.
+                for group_config, group_state in zip(
+                    self.config.kv_group_configs, req_status.group_states
+                ):
+                    sw = group_config.sliding_window_size_in_blocks
+                    if sw is None:
+                        # Not a SW group
+                        continue
+                    num_blocks = (
+                        num_offloadable_tokens // group_config.offloaded_block_size
+                    )
+                    num_evicted = max(0, num_blocks - sw)
+                    group_state.next_stored_block_idx = max(
+                        group_state.next_stored_block_idx, num_evicted
+                    )
                 continue
 
             if not store_output.keys_to_store:
