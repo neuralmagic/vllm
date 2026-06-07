@@ -173,6 +173,80 @@ def get_scheduler_metadata(
     return scheduler_metadata
 
 
+def _resolve_fwd_tile_mn(head_dim: int, head_dim_v: int) -> tuple[int, int]:
+    """Resolve the FA4 forward kernel's (tile_m, tile_n) for the mask_mod case.
+
+    Mirrors the tile selection in the cute interface ``_flash_attn_fwd`` so
+    that block-sparse tensors use the same block size the kernel will use.
+    mask_mod forces causal=False/local=False, so we resolve with those.
+    """
+    from vllm.vllm_flash_attn.cute.interface import (
+        _get_device_arch,
+        _tile_size_fwd_sm90,
+    )
+
+    arch = _get_device_arch()
+    if arch // 10 == 9:
+        cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal=False, is_local=False)
+        return cfg.m_block_size, cfg.n_block_size
+    elif arch // 10 == 8:
+        return 128, 64
+    elif arch // 10 == 12:
+        return (128, 128) if head_dim <= 64 else (128, 64)
+    # SM100/SM110 (Blackwell) standard kernel default.
+    return 128, 128
+
+
+def _compute_mask_mod_block_sparse(
+    q,
+    v,
+    mask_mod,
+    aux_tensors,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    max_seqlen_q,
+    max_seqlen_k,
+):
+    """Compute block sparsity for a mask_mod, using the kernel's exact tiles."""
+    from vllm.vllm_flash_attn.cute.compute_block_sparsity import (
+        compute_block_sparsity,
+    )
+
+    head_dim = q.shape[-1]
+    head_dim_v = v.shape[-1]
+    tile_m, tile_n = _resolve_fwd_tile_mn(head_dim, head_dim_v)
+    batch_size = cu_seqlens_q.shape[0] - 1
+
+    cu_total_m_blocks_list = [0]
+    for i in range(batch_size):
+        sq = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
+        cu_total_m_blocks_list.append(
+            cu_total_m_blocks_list[-1] + (sq + tile_m - 1) // tile_m
+        )
+    cu_total_m_blocks = torch.tensor(
+        cu_total_m_blocks_list, dtype=torch.int32, device=q.device
+    )
+
+    return compute_block_sparsity(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        batch_size=batch_size,
+        # num_heads=1 broadcasts across all heads (mask is head-independent).
+        num_heads=1,
+        seqlen_q=max_seqlen_q,
+        seqlen_k=max_seqlen_k,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        device=q.device,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        cu_total_m_blocks=cu_total_m_blocks,
+        use_fast_sampling=True,
+    )
+
+
 def flash_attn_varlen_func(
     q,
     k,
@@ -206,6 +280,11 @@ def flash_attn_varlen_func(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    # FA4 mask_mod support (cute DSL)
+    mask_mod=None,
+    aux_tensors=None,
+    block_sparse_tensors=None,
+    return_block_sparse=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -281,6 +360,12 @@ def flash_attn_varlen_func(
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
+
+    if (mask_mod is not None or block_sparse_tensors is not None) and fa_version != 4:
+        raise NotImplementedError(
+            "mask_mod/block_sparse_tensors are only supported with FA4, "
+            f"got fa_version={fa_version}"
+        )
 
     if fa_version == 2:
         if (
@@ -369,6 +454,21 @@ def flash_attn_varlen_func(
 
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
+        # Compute block sparsity on the first call (when not cached) using the
+        # kernel's exact tile sizes, so it can be returned for caching.
+        if mask_mod is not None and block_sparse_tensors is None:
+            block_sparse_tensors = _compute_mask_mod_block_sparse(
+                q,
+                v,
+                mask_mod,
+                aux_tensors,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k,
+                max_seqlen_q,
+                max_seqlen_k,
+            )
+
         out, softmax_lse = _flash_attn_fwd(
             q,
             k,
@@ -388,9 +488,15 @@ def flash_attn_varlen_func(
             return_lse=return_softmax_lse,
             out=out,
             learnable_sink=s_aux,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            block_sparse_tensors=block_sparse_tensors,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
+    if return_block_sparse:
+        # (out, block_sparse_tensors); mask_mod path does not return lse.
+        return out, block_sparse_tensors
     return (out, softmax_lse) if return_softmax_lse else out
 
 

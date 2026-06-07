@@ -263,14 +263,9 @@ class FlashAttentionMetadata:
     # Shape: (num_seqs, max_ranges, 2) int32, [start, end] per range.
     mm_prefix_range_tensor: torch.Tensor | None = None
 
-    # Precomputed indices for mm_prefix correction (set by
-    # gpu_model_runner to avoid CPU-GPU sync in the forward pass).
-    mm_prefix_indices: torch.Tensor | None = None
-    mm_prefix_cu_seqlens: torch.Tensor | None = None
-    mm_prefix_seqlens_k: torch.Tensor | None = None
-    mm_prefix_bt_indices: torch.Tensor | None = None
-    mm_prefix_max_seqlen_q: int = 0
-    mm_prefix_max_seqlen_k: int = 0
+    # Cached block sparsity tensors for FA4 mask_mod path.
+    # Computed lazily on first forward() call, shared across layers.
+    mm_prefix_block_sparse: object | None = None
 
 
 def _get_sliding_window_configs(
@@ -569,6 +564,21 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        req_doc_ranges = common_attn_metadata.mm_req_doc_ranges
+        mm_prefix_range_tensor = None
+        if req_doc_ranges is not None:
+            from vllm.v1.attention.backends.utils import (
+                compute_mm_prefix_range_tensor,
+            )
+
+            mm_prefix_range_tensor = compute_mm_prefix_range_tensor(
+                req_doc_ranges,
+                common_attn_metadata.num_reqs,
+                seq_lens.device,
+            )
+            if mm_prefix_range_tensor is not None:
+                mm_prefix_range_tensor.__assumed_align__ = 4  # type: ignore[attr-defined]
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -588,7 +598,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            mm_prefix_range_tensor=mm_prefix_range_tensor,
         )
+
         return attn_metadata
 
     def update_block_table(
@@ -810,10 +822,29 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                need_mm_prefix = (
+                # mm_prefix bidirectional attention uses an FA4 mask_mod
+                # (Gemma4Config forces FA4 whenever mm_prefix is active).
+                mask_mod = None
+                aux_tensors = None
+                if (
                     attn_metadata.mm_prefix_range_tensor is not None
                     and attn_metadata.causal
-                )
+                ):
+                    range_tensor = attn_metadata.mm_prefix_range_tensor
+                    sw_left = (
+                        self.sliding_window[0] + 1
+                        if self.sliding_window is not None
+                        else 0
+                    )
+                    mask_mod = _make_mm_prefix_mask_mod(
+                        max_ranges=range_tensor.shape[1],
+                        sliding_window_left=sw_left,
+                    )
+                    aux_tensors = [range_tensor]
+
+                # When mask_mod is set, flash_attn_varlen_func computes block
+                # sparsity on the first call (block_sparse_tensors is None)
+                # using the kernel's exact tiles, and returns it for caching.
                 result = flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -836,26 +867,13 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=v_descale,
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
-                    return_softmax_lse=need_mm_prefix,
+                    mask_mod=mask_mod,
+                    aux_tensors=aux_tensors,
+                    block_sparse_tensors=attn_metadata.mm_prefix_block_sparse,
+                    return_block_sparse=mask_mod is not None,
                 )
-                if need_mm_prefix:
-                    causal_out, causal_lse = result
-                    _apply_mm_prefix_correction(
-                        causal_out,
-                        causal_lse,
-                        query[:num_actual_tokens],
-                        key_cache,
-                        value_cache,
-                        attn_metadata,
-                        scale=self.scale,
-                        sliding_window=sliding_window_size,
-                        logits_soft_cap=self.logits_soft_cap,
-                        block_table=block_table,
-                        fa_version=self.vllm_flash_attn_version,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                    )
+                if mask_mod is not None:
+                    _, attn_metadata.mm_prefix_block_sparse = result
                 return output
 
         # Cascade attention (rare case).
@@ -1091,70 +1109,66 @@ class FlashAttentionImpl(AttentionImpl):
         return output
 
 
-def _apply_mm_prefix_correction(
-    causal_out: torch.Tensor,
-    causal_lse: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attn_metadata: FlashAttentionMetadata,
-    scale: float,
-    sliding_window: list[int] | None,
-    logits_soft_cap: float,
-    block_table: torch.Tensor,
-    fa_version: int,
-    q_descale: torch.Tensor | None,
-    k_descale: torch.Tensor | None,
-    v_descale: torch.Tensor | None,
-) -> None:
-    """Correct multimodal token attention from causal to bidirectional.
+def _make_mm_prefix_mask_mod(max_ranges: int, sliding_window_left: int):
+    """Build a cute.jit mask_mod for mm_prefix bidirectional attention.
 
-    Uses precomputed indices from FlashAttentionMetadata (populated by
-    gpu_model_runner before the forward pass) to avoid CPU-GPU sync.
+    The mask is: (causal AND sliding_window) OR mm_prefix_bidirectional
 
-    NOTE: The causal call and the non-causal correction call have
-    overlapping KV ranges for tokens within mm_prefix regions. The
-    LSE-based merge slightly over-weights keys in the overlap region
-    compared to the exact (causal OR mm_prefix) mask that the Triton
-    backend computes in a single kernel. This is a known approximation
-    until FA4 supports mask_mod with varlen sequences.
+    aux_tensors[0] shape: (num_seqs, max_ranges, 2) int32
+      Each row contains [range_start, range_end] pairs. A range is valid
+      when range_start < range_end. Both q and kv must fall in the same
+      valid range for the bidirectional override to apply.
+
+    Args:
+        max_ranges: Max mm_prefix ranges per sequence (compile-time const).
+        sliding_window_left: Sliding window size, 0 means no window.
     """
-    mm_idx = attn_metadata.mm_prefix_indices
-    if mm_idx is None or mm_idx.numel() == 0:
-        return
+    import cutlass
+    import cutlass.cute as cute
 
-    bt_indices = attn_metadata.mm_prefix_bt_indices
+    try:
+        from flash_attn.cute import utils as fa_utils
+        from flash_attn.cute.block_sparsity import fast_sampling
+    except ModuleNotFoundError:
+        from vllm.vllm_flash_attn.cute import utils as fa_utils
+        from vllm.vllm_flash_attn.cute.block_sparsity import fast_sampling
 
-    mm_out, mm_lse = flash_attn_varlen_func(
-        q=query[mm_idx],
-        k=key_cache,
-        v=value_cache,
-        cu_seqlens_q=attn_metadata.mm_prefix_cu_seqlens,
-        max_seqlen_q=attn_metadata.mm_prefix_max_seqlen_q,
-        seqused_k=attn_metadata.mm_prefix_seqlens_k,
-        max_seqlen_k=attn_metadata.mm_prefix_max_seqlen_k,
-        softmax_scale=scale,
-        causal=False,
-        window_size=sliding_window,
-        block_table=(block_table[bt_indices] if block_table is not None else None),
-        softcap=logits_soft_cap,
-        fa_version=fa_version,
-        q_descale=(q_descale[bt_indices] if q_descale is not None else None),
-        k_descale=(k_descale[bt_indices] if k_descale is not None else None),
-        v_descale=(v_descale[bt_indices] if v_descale is not None else None),
-        return_softmax_lse=True,
-    )
+    @fast_sampling
+    @cute.jit
+    def mask_mod(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        m_idx: cute.TensorSSA,
+        n_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors: list,
+    ) -> cute.TensorSSA:
+        offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
+        offset_ssa = fa_utils.scalar_to_ssa(offset, cutlass.Int32)
+        q_abs = m_idx + offset_ssa
 
-    # Fancy indexing creates a copy, so merge into a temporary and scatter back.
-    merged = causal_out[mm_idx].clone()
-    merge_attn_states(
-        merged,
-        merged.clone(),
-        causal_lse[:, mm_idx],
-        mm_out,
-        mm_lse,
-    )
-    causal_out[mm_idx] = merged
+        # causal: kv_idx <= q_abs
+        result = n_idx <= q_abs
+
+        # sliding window: (q_abs - kv_idx) < window
+        if sliding_window_left > 0:
+            sw_ssa = fa_utils.scalar_to_ssa(sliding_window_left, cutlass.Int32)
+            result = result & ((q_abs - n_idx) < sw_ssa)
+
+        # mm_prefix bidirectional: OR with ranges where both q and kv
+        # fall within the same [start, end] interval
+        ranges = aux_tensors[0]
+        for i in cutlass.range_constexpr(max_ranges):
+            r_start = fa_utils.scalar_to_ssa(ranges[batch[0], i, 0], cutlass.Int32)
+            r_end = fa_utils.scalar_to_ssa(ranges[batch[0], i, 1], cutlass.Int32)
+            is_valid = r_start < r_end
+            q_in = (q_abs >= r_start) & (q_abs <= r_end) & is_valid
+            k_in = (n_idx >= r_start) & (n_idx <= r_end) & is_valid
+            result = result | (q_in & k_in)
+
+        return result
+
+    return mask_mod
 
 
 def use_cascade_attention(

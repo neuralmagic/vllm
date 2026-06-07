@@ -387,6 +387,11 @@ class CommonAttentionMetadata:
 
     causal: bool = True
 
+    mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
+    """Per-request multimodal bidirectional attention ranges.
+    Maps seq_idx -> list of (start, end) token position ranges where
+    attention should be bidirectional instead of causal."""
+
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None

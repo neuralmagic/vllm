@@ -828,6 +828,38 @@ def compute_causal_conv1d_metadata(
     return nums_dict, batch_ptr, token_chunk_offset_ptr
 
 
+def compute_mm_prefix_range_tensor(
+    mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+    num_seqs: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Convert mm_prefix per-request ranges to a padded GPU tensor.
+
+    Returns shape: (num_seqs, max_ranges, 2) int32 with 0-padding.
+    Empty ranges have start==end==0, which kernels skip via is_valid check.
+    Returns None if all ranges are trivial.
+    """
+    from vllm.utils.torch_utils import async_tensor_h2d
+
+    if mm_prefix_range is None:
+        return None
+
+    range_lists = [
+        mm_prefix_range.get(i, [(0, 0)]) or [(0, 0)] for i in range(num_seqs)
+    ]
+
+    if all(r == [(0, 0)] for r in range_lists):
+        return None
+
+    max_ranges = max(len(r) for r in range_lists)
+    padded = []
+    for r in range_lists:
+        padded_r = list(r) + [(0, 0)] * (max_ranges - len(r))
+        padded.append(padded_r)
+    padded_tensor = async_tensor_h2d(padded, dtype=torch.int32, device=device)
+    return padded_tensor.view(num_seqs, max_ranges, 2)
+
+
 def get_dcp_local_seq_lens(
     seq_lens: torch.Tensor,
     dcp_size: int = 1,
