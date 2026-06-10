@@ -176,6 +176,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         if dispatch_start is not None:
+            assert dispatch_end is not None
             dispatch_end.record()
             collector.record_dispatch(
                 dispatch_start, dispatch_end, self.timing_layer_idx
@@ -402,10 +403,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         if combine_start is not None:
+            assert combine_end is not None
             combine_end.record()
-            collector.record_combine(
-                combine_start, combine_end, self.timing_layer_idx
-            )
+            collector.record_combine(combine_start, combine_end, self.timing_layer_idx)
 
         dbo_switch_to_compute()
 
@@ -415,7 +415,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 if event.event is not None:
                     event.current_stream_wait()
                 dbo_switch_to_comm()
-                # Respect inplace outputs.
                 output.copy_(combined_x, non_blocking=True)
 
                 # TODO(lucas): refactor the modular kernel so this will be
@@ -426,7 +425,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         else:
             # TODO(lucas): support this case with the refactored modular kernel
             assert not dbo_enabled()
-            # Respect inplace outputs.
             output.copy_(combined_x, non_blocking=True)
             return None
 
