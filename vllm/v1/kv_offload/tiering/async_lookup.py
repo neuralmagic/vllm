@@ -33,6 +33,7 @@ lookup() is a pure OrderedDict operation.
 
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -47,6 +48,67 @@ logger = init_logger(__name__)
 class LookupState:
     result: bool | None = None  # True (found), False (not found), None
     request_ids: set[str] = field(default_factory=set)  # requests asking for the lookup
+    start_time: float = field(
+        default_factory=time.perf_counter
+    )  # when key was first submitted
+
+
+class LookupStats:
+    """Scheduler-thread-only lookup metrics tracker.
+
+    All fields are accessed exclusively from the scheduler thread — no
+    locking is required.
+
+    ``total`` and ``resolved`` are live counters that reflect the current
+    state of ``_lookup_state``:
+      - ``total``    — keys currently tracked (submitted but not yet cleaned up).
+      - ``resolved`` — of those, keys that have a result.
+      - unresolved   — ``total - resolved`` (computed by the caller).
+
+    ``_max_lookup_ms`` is a per-step high-water mark; ``reset()`` snapshots
+    and zeros it.
+    """
+
+    __slots__ = ("total", "resolved", "max_lookup_ms")
+
+    def __init__(self) -> None:
+        self.total: int = 0
+        self.resolved: int = 0
+        self.max_lookup_ms: float = 0.0
+
+    def on_submit(self) -> None:
+        """Called when a new key is first submitted (lookup)."""
+        self.total += 1
+
+    def on_resolve(self, state: "LookupState") -> None:
+        """Called when a key's result arrives (drain_results).
+
+        Increments resolved and records end-to-end latency only if the key
+        was not already resolved.
+        """
+        if state.result is None:
+            self.resolved += 1
+            self._record_latency((time.perf_counter() - state.start_time) * 1e3)
+
+    def on_remove(self, state: "LookupState") -> None:
+        """Called when a key is removed from tracking (cleanup).
+
+        Decrements total. If the key was resolved, also decrements resolved.
+        If unresolved, records latency up to the eviction time.
+        """
+        if state.result is None:
+            self._record_latency((time.perf_counter() - state.start_time) * 1e3)
+        else:
+            self.resolved -= 1
+        self.total -= 1
+
+    def _record_latency(self, elapsed_ms: float) -> None:
+        if elapsed_ms > self.max_lookup_ms:
+            self.max_lookup_ms = elapsed_ms
+
+    def reset(self) -> None:
+        """Zero the per-step max latency."""
+        self.max_lookup_ms = 0.0
 
 
 class AsyncLookupManager(ABC):
@@ -97,6 +159,10 @@ class AsyncLookupManager(ABC):
         )
         self._need_to_drain: bool = False
 
+        # Lookup metrics; total/resolved are live counters,
+        # _max_lookup_ms resets each step.
+        self.lookup_stats = LookupStats()
+
         self._thread = threading.Thread(
             target=self._worker,
             name=f"vllm_offloading_lookup_{tier_type}",
@@ -140,6 +206,7 @@ class AsyncLookupManager(ABC):
             state = LookupState()
             self._lookup_state[key] = state
             self._lookup_batch.append((key, req_context))
+            self.lookup_stats.on_submit()
         state.request_ids.add(req_id)
         self._req_keys.setdefault(req_id, set()).add(key)
         return state.result
@@ -170,6 +237,7 @@ class AsyncLookupManager(ABC):
             for key, result in batch:
                 state = self._lookup_state.get(key)
                 if state is not None:
+                    self.lookup_stats.on_resolve(state)
                     state.result = result
 
     def cleanup(self, req_id: str) -> None:
@@ -182,6 +250,7 @@ class AsyncLookupManager(ABC):
             state = self._lookup_state[key]
             state.request_ids.discard(req_id)
             if not state.request_ids:
+                self.lookup_stats.on_remove(state)
                 del self._lookup_state[key]
 
     def shutdown(self) -> None:

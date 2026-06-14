@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
 
 if TYPE_CHECKING:
-    from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.v1.kv_offload.base import OffloadingMetricMetadata, OffloadingSpec
 
 
 class SecondaryTierFactory:
@@ -23,6 +23,29 @@ class SecondaryTierFactory:
             return getattr(module, class_name)
 
         cls._registry[tier_type] = loader
+
+    @classmethod
+    def get_metric_definitions(
+        cls, tier_configs: list[dict]
+    ) -> "dict[str, OffloadingMetricMetadata]":
+        """Collect Prometheus metric definitions from all configured secondary tiers.
+
+        Loads each tier class and calls its ``build_metric_definitions``
+        classmethod. Definitions from multiple tiers of the same type are
+        merged (last writer wins for duplicate names, though duplicates should
+        not occur in practice).
+
+        Args:
+            tier_configs: List of tier configuration dicts from extra_config
+                (each must contain a ``type`` key).
+        """
+        definitions: dict[str, OffloadingMetricMetadata] = {}
+        for tier_config in tier_configs:
+            tier_type = tier_config.get("type")
+            if tier_type and tier_type in cls._registry:
+                tier_cls = cls._registry[tier_type]()
+                definitions.update(tier_cls.build_metric_definitions(tier_config))
+        return definitions
 
     @classmethod
     def create_secondary_tier(

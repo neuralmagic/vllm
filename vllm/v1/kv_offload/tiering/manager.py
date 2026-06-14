@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 import numpy as np
 from typing_extensions import override
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
@@ -576,6 +579,18 @@ class TieringOffloadingManager(OffloadingManager):
         self._flush_pending_promotions()
         for tier in self.secondary_tiers:
             tier.on_schedule_end()
+
+    @override
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        stats = self.primary_tier.get_stats()
+        for tier in self.secondary_tiers:
+            tier_stats = tier.get_stats()
+            if tier_stats is not None:
+                if stats is None:
+                    stats = tier_stats
+                else:
+                    stats.aggregate(tier_stats)
+        return stats
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:

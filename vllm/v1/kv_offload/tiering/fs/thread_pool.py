@@ -9,8 +9,10 @@ Thread pool:
 """
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.tiering.base import JobId
@@ -18,21 +20,43 @@ from vllm.v1.kv_offload.tiering.base import JobId
 logger = init_logger(__name__)
 
 
+@dataclass(slots=True)
+class JobStats:
+    """Stats snapshot produced when a job completes."""
+
+    is_store: bool
+    n_tasks: int = 0
+    elapsed_ms: float = 0.0
+
+
 class JobState:
     """
     Thread-safe completion tracker for a set of per-block I/O tasks.
 
-    Each task calls task_done(success) when it finishes.
+    Each task calls task_done(success) when it finishes. Records wall-clock
+    elapsed time from enqueue to last-task completion.
     """
 
-    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_lock")
+    __slots__ = (
+        "_job_id",
+        "_n_tasks",
+        "_completed",
+        "_success",
+        "_lock",
+        "_start_time",
+        "_elapsed_ms",
+        "is_store",
+    )
 
-    def __init__(self, job_id: JobId, n_tasks: int) -> None:
+    def __init__(self, job_id: JobId, n_tasks: int, is_store: bool) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
         self._completed = 0
         self._success = True
         self._lock = threading.Lock()
+        self._start_time: float = time.perf_counter()
+        self._elapsed_ms: float = 0.0
+        self.is_store: bool = is_store
 
     @property
     def job_id(self) -> JobId:
@@ -44,7 +68,17 @@ class JobState:
             self._completed += 1
             if not success:
                 self._success = False
-            return self._completed == self._n_tasks, self._success
+            job_finished = self._completed == self._n_tasks
+            if job_finished:
+                self._elapsed_ms = (time.perf_counter() - self._start_time) * 1e3
+            return job_finished, self._success
+
+    def to_stats(self) -> JobStats:
+        return JobStats(
+            is_store=self.is_store,
+            n_tasks=self._n_tasks,
+            elapsed_ms=self._elapsed_ms,
+        )
 
 
 class DualQueueThreadPool:
@@ -67,7 +101,7 @@ class DualQueueThreadPool:
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
-        self._finished_q: deque[tuple[JobId, bool]] = deque()
+        self._finished_q: deque[tuple[JobId, bool, JobStats]] = deque()
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -96,7 +130,7 @@ class DualQueueThreadPool:
         tasks: Iterable[Callable],
     ) -> None:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
-        state = JobState(job_id, n_tasks)
+        state = JobState(job_id, n_tasks, is_store=False)
         with self._condition:
             for fn in tasks:
                 self._load_q.append((fn, state))
@@ -109,13 +143,13 @@ class DualQueueThreadPool:
         tasks: Iterable[Callable],
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
-        state = JobState(job_id, n_tasks)
+        state = JobState(job_id, n_tasks, is_store=True)
         with self._condition:
             for fn in tasks:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
 
-    def get_finished(self) -> list[tuple[JobId, bool]]:
+    def get_finished(self) -> list[tuple[JobId, bool, JobStats]]:
         jobs = []
         while self._finished_q:
             jobs.append(self._finished_q.popleft())
@@ -155,4 +189,4 @@ class DualQueueThreadPool:
                 job_finished, success = state.task_done(False)
 
             if job_finished:
-                self._finished_q.append((state.job_id, success))
+                self._finished_q.append((state.job_id, success, state.to_stats()))

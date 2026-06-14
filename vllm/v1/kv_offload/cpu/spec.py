@@ -14,11 +14,16 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     LoadStoreSpec,
     OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
     OffloadingManager,
     OffloadingMetricMetadata,
     OffloadingSpec,
 )
-from vllm.v1.kv_offload.cpu.common import METRIC_STORES_SKIPPED, CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.common import (
+    METRIC_CPU_CACHE_USAGE,
+    METRIC_STORES_SKIPPED,
+    CPULoadStoreSpec,
+)
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
@@ -31,17 +36,22 @@ class CPUOffloadingSpec(OffloadingSpec):
     def build_metric_definitions(
         cls, extra_config: dict[str, Any]
     ) -> dict[str, OffloadingMetricMetadata]:
+        definitions: dict[str, OffloadingMetricMetadata] = {
+            METRIC_CPU_CACHE_USAGE: OffloadingGaugeMetadata(
+                documentation=(
+                    "Fraction of CPU KV cache blocks currently in use (used / total)."
+                ),
+            ),
+        }
         store_threshold = int(extra_config.get("store_threshold", 0))
-        if store_threshold < 2:
-            return {}
-        return {
-            METRIC_STORES_SKIPPED: OffloadingCounterMetadata(
+        if store_threshold >= 2:
+            definitions[METRIC_STORES_SKIPPED] = OffloadingCounterMetadata(
                 documentation=(
                     "Number of KV offload stores skipped because the reuse "
                     "threshold was not reached."
                 ),
             )
-        }
+        return definitions
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)

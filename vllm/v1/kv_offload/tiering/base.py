@@ -14,7 +14,10 @@ import numpy as np
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, RequestOffloadingContext
 
 if TYPE_CHECKING:
-    from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+        OffloadingConnectorStats,
+    )
+    from vllm.v1.kv_offload.base import OffloadingMetricMetadata, OffloadingSpec
 
 # Type alias for job IDs used in async transfer tracking
 JobId = int
@@ -52,6 +55,18 @@ class SecondaryTierManager(ABC):
     lightweight and non-blocking. submit_load() and submit_store() submit
     async jobs; get_finished_jobs() polls for completion.
     """
+
+    @classmethod
+    def build_metric_definitions(
+        cls, tier_config: dict
+    ) -> "dict[str, OffloadingMetricMetadata]":
+        """Return Prometheus metric definitions for this tier type.
+
+        Args:
+            tier_config: The tier's configuration dict from extra_config
+                (with the ``type`` key already present).
+        """
+        return {}
 
     def __init__(
         self,
@@ -192,6 +207,12 @@ class SecondaryTierManager(ABC):
         deferred work submission.
         """
         return
+
+    def get_stats(self) -> "OffloadingConnectorStats | None":
+        """Return Prometheus stats accumulated since the last call.
+        Called once per scheduler step.
+        """
+        return None
 
     def shutdown(self) -> None:
         """Release resources held by this tier (threads, connections, etc.)."""

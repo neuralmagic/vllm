@@ -23,8 +23,15 @@ from typing import TYPE_CHECKING
 
 from typing_extensions import override
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import OffloadKey, ReqContext
+from vllm.v1.kv_offload.base import (
+    OffloadingMetricMetadata,
+    OffloadKey,
+    ReqContext,
+)
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
@@ -34,6 +41,11 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
+from vllm.v1.kv_offload.tiering.fs.stats import (
+    FSStats,
+    collect_fs_stats,
+    get_fs_metric_definitions,
+)
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -79,6 +91,13 @@ class FileSystemTierManager(SecondaryTierManager):
         random bytes, producing different block filenames for identical token
         content.
     """
+
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, tier_config: dict
+    ) -> dict[str, OffloadingMetricMetadata]:
+        return get_fs_metric_definitions()
 
     def __init__(
         self,
@@ -132,6 +151,8 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+        self._fs_stats = FSStats()
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -142,6 +163,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        self._fs_stats.on_submit_store()
         tasks = (
             functools.partial(
                 store_block,
@@ -156,6 +178,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        self._fs_stats.on_submit_load()
         tasks = (
             functools.partial(
                 load_block,
@@ -170,13 +193,14 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
-        """
-        Collect completed jobs from the finished-jobs queue.
-        """
-        return (
-            JobResult(job_id=job_id, success=success)
-            for job_id, success in self._pool.get_finished()
-        )
+        """Collect completed jobs and accumulate per-job stats."""
+        for job_id, success, job_stats in self._pool.get_finished():
+            self._fs_stats.on_finished(job_stats)
+            yield JobResult(job_id=job_id, success=success)
+
+    @override
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        return collect_fs_stats(self._fs_stats, self._lookup_manager.lookup_stats)
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
