@@ -117,7 +117,7 @@ def collect_fs_stats(
     Resets per-step state on both ``fs`` and ``ls`` before returning.
     Returns None when there is nothing to report.
     """
-    lookup_max_ms = ls.max_lookup_ms
+    lookup_max_ms = ls.max_lookup_latency_ms
     if (
         fs.is_step_empty()
         and not lookup_max_ms

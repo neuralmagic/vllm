@@ -65,16 +65,16 @@ class LookupStats:
       - ``resolved`` — of those, keys that have a result.
       - unresolved   — ``total - resolved`` (computed by the caller).
 
-    ``_max_lookup_ms`` is a per-step high-water mark; ``reset()`` snapshots
+    ``_max_lookup_latency_ms`` is a per-step high-water mark; ``reset()`` snapshots
     and zeros it.
     """
 
-    __slots__ = ("total", "resolved", "max_lookup_ms")
+    __slots__ = ("total", "resolved", "max_lookup_latency_ms")
 
     def __init__(self) -> None:
         self.total: int = 0
         self.resolved: int = 0
-        self.max_lookup_ms: float = 0.0
+        self.max_lookup_latency_ms: float = 0.0
 
     def on_submit(self) -> None:
         """Called when a new key is first submitted (lookup)."""
@@ -103,12 +103,12 @@ class LookupStats:
         self.total -= 1
 
     def _record_latency(self, elapsed_ms: float) -> None:
-        if elapsed_ms > self.max_lookup_ms:
-            self.max_lookup_ms = elapsed_ms
+        if elapsed_ms > self.max_lookup_latency_ms:
+            self.max_lookup_latency_ms = elapsed_ms
 
     def reset(self) -> None:
         """Zero the per-step max latency."""
-        self.max_lookup_ms = 0.0
+        self.max_lookup_latency_ms = 0.0
 
 
 class AsyncLookupManager(ABC):
@@ -160,7 +160,7 @@ class AsyncLookupManager(ABC):
         self._need_to_drain: bool = False
 
         # Lookup metrics; total/resolved are live counters,
-        # _max_lookup_ms resets each step.
+        # max_lookup_latency_ms resets each step.
         self.lookup_stats = LookupStats()
 
         self._thread = threading.Thread(
