@@ -27,6 +27,8 @@ class JobStats:
     is_store: bool
     n_tasks: int = 0
     elapsed_ms: float = 0.0
+    bytes_transferred: int = 0
+    io_elapsed_s: float = 0.0
 
 
 class JobState:
@@ -45,6 +47,8 @@ class JobState:
         "_lock",
         "_start_time",
         "_elapsed_ms",
+        "_bytes_transferred",
+        "_io_elapsed_s",
         "is_store",
     )
 
@@ -56,17 +60,27 @@ class JobState:
         self._lock = threading.Lock()
         self._start_time: float = time.perf_counter()
         self._elapsed_ms: float = 0.0
+        self._bytes_transferred: int = 0
+        self._io_elapsed_s: float = 0.0
         self.is_store: bool = is_store
 
     @property
     def job_id(self) -> JobId:
         return self._job_id
 
-    def task_done(self, success: bool) -> tuple[bool, bool]:
+    def task_done(
+        self,
+        success: bool,
+        task_bytes: int = 0,
+        task_elapsed_s: float = 0.0,
+    ) -> tuple[bool, bool]:
         """Returns if job completed and success flag"""
         with self._lock:
             self._completed += 1
-            if not success:
+            if success:
+                self._bytes_transferred += task_bytes
+                self._io_elapsed_s += task_elapsed_s
+            else:
                 self._success = False
             job_finished = self._completed == self._n_tasks
             if job_finished:
@@ -78,6 +92,8 @@ class JobState:
             is_store=self.is_store,
             n_tasks=self._n_tasks,
             elapsed_ms=self._elapsed_ms,
+            bytes_transferred=self._bytes_transferred,
+            io_elapsed_s=self._io_elapsed_s,
         )
 
 
@@ -178,8 +194,10 @@ class DualQueueThreadPool:
                 secondary = self._store_q if load_priority else self._load_q
                 task, state = primary.popleft() if primary else secondary.popleft()
             try:
-                task()
-                job_finished, success = state.task_done(True)
+                t0 = time.perf_counter()
+                task_bytes = task()
+                task_s = time.perf_counter() - t0
+                job_finished, success = state.task_done(True, task_bytes, task_s)
             except Exception as exc:
                 logger.error(
                     "Job %s block I/O failed: %s",
