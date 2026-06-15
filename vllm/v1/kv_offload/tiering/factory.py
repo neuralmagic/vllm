@@ -4,10 +4,46 @@ import importlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import regex as re
+
 from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingMetricMetadata, OffloadingSpec
+
+# tier_name is embedded directly in Prometheus metric names, which require
+# [a-zA-Z0-9_]. Do not sanitize silently — reject invalid names immediately
+# so users fix their config rather than end up with unexpected metric names.
+_TIER_NAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
+
+
+def _resolve_tier_name(tier_type: str, tier_config: dict) -> str:
+    """Resolve the effective name for a secondary tier instance.
+
+    Uses ``tier_config["name"]`` when provided; otherwise falls back to
+    ``tier_type`` (e.g. ``"fs"``), which preserves the original metric names
+    for single-tier deployments.
+
+    Args:
+        tier_type: Registered tier type string (e.g. ``"fs"``).
+        tier_config: Raw tier configuration dict from extra_config.
+
+    Returns:
+        Validated tier name string safe for use in Prometheus metric names.
+
+    Raises:
+        ValueError: If the user-supplied name contains characters outside
+            ``[a-zA-Z0-9_]``.
+    """
+    name = tier_config.get("name")
+    if name is not None:
+        if not _TIER_NAME_RE.match(name):
+            raise ValueError(
+                f"tier name {name!r} contains invalid characters. "
+                "Use only letters, digits, and underscores."
+            )
+        return name
+    return tier_type
 
 
 class SecondaryTierFactory:
@@ -31,9 +67,8 @@ class SecondaryTierFactory:
         """Collect Prometheus metric definitions from all configured secondary tiers.
 
         Loads each tier class and calls its ``build_metric_definitions``
-        classmethod. Definitions from multiple tiers of the same type are
-        merged (last writer wins for duplicate names, though duplicates should
-        not occur in practice).
+        classmethod, passing the full ``tier_config`` so each tier can resolve
+        its own optional ``name`` for metric namespacing.
 
         Args:
             tier_configs: List of tier configuration dicts from extra_config
@@ -44,7 +79,10 @@ class SecondaryTierFactory:
             tier_type = tier_config.get("type")
             if tier_type and tier_type in cls._registry:
                 tier_cls = cls._registry[tier_type]()
-                definitions.update(tier_cls.build_metric_definitions(tier_config))
+                tier_name = _resolve_tier_name(tier_type, tier_config)
+                definitions.update(
+                    tier_cls.build_metric_definitions(tier_config, tier_name)
+                )
         return definitions
 
     @classmethod
@@ -66,11 +104,14 @@ class SecondaryTierFactory:
                 f"Supported types: {list(cls._registry)}"
             )
 
+        tier_name = _resolve_tier_name(tier_type, config)
+        config.pop("name", None)
+
         tier_cls = cls._registry[tier_type]()
         return tier_cls(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,
-            tier_type=tier_type,
+            tier_name=tier_name,
             **config,
         )
 

@@ -146,9 +146,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     )
                     secondary_tiers.append(tier)
                     logger.info(
-                        "Created secondary tier #%d (%s)",
+                        "Created secondary tier #%d (name=%s)",
                         i,
-                        tier.tier_type,
+                        tier.tier_name,
                     )
                 except Exception as e:
                     logger.error(

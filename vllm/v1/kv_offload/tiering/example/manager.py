@@ -41,7 +41,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         self,
         offloading_spec: "OffloadingSpec",
         primary_kv_view: memoryview,
-        tier_type: str,
+        tier_name: str,
         custom_param: int = 0,
     ):
         """
@@ -53,7 +53,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         super().__init__(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,
-            tier_type=tier_type,
+            tier_name=tier_name,
         )
 
         logger.info(

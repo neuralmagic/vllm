@@ -58,13 +58,16 @@ class SecondaryTierManager(ABC):
 
     @classmethod
     def build_metric_definitions(
-        cls, tier_config: dict
+        cls, tier_config: dict, tier_name: str = ""
     ) -> "dict[str, OffloadingMetricMetadata]":
-        """Return Prometheus metric definitions for this tier type.
+        """Return Prometheus metric definitions for this tier instance.
 
         Args:
             tier_config: The tier's configuration dict from extra_config
                 (with the ``type`` key already present).
+            tier_name: Resolved tier name (e.g. ``"fs"``, ``"nvme"``), supplied
+                by :class:`SecondaryTierFactory`.  Subclasses use this to
+                namespace their Prometheus metric names.
         """
         return {}
 
@@ -72,18 +75,21 @@ class SecondaryTierManager(ABC):
         self,
         offloading_spec: "OffloadingSpec",
         primary_kv_view: memoryview,
-        tier_type: str,
+        tier_name: str,
     ) -> None:
         """
         Args:
             offloading_spec: Offloading configuration.
             primary_kv_view: Memoryview of the primary tier's CPU KV cache.
-            tier_type: Tier type identifier, set by SecondaryTierFactory
-                from the registered tier type.
+            tier_name: Unique identifier for this tier instance, set by
+                :class:`SecondaryTierFactory`.  Defaults to the registered
+                tier type (e.g. ``"fs"``) when no ``name`` is supplied in the
+                config; overridden by ``tier_config["name"]`` otherwise.
+                Used for metric namespacing, thread naming, and logging.
         """
         self._offloading_spec = offloading_spec
         self._primary_kv_view: memoryview = primary_kv_view
-        self.tier_type = tier_type
+        self.tier_name = tier_name
 
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:

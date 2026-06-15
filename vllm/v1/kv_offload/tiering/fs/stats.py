@@ -17,70 +17,80 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.tiering.async_lookup import LookupStats
 from vllm.v1.kv_offload.tiering.fs.thread_pool import JobStats
 
-# Counters — cumulative totals, use rate() for throughput.
-METRIC_FS_STORE_JOBS = "vllm:kv_offload_fs_store_jobs"
-METRIC_FS_LOAD_JOBS = "vllm:kv_offload_fs_load_jobs"
 
-# Gauges — per-step snapshots.
-METRIC_FS_ACTIVE_STORE_JOBS = "vllm:kv_offload_fs_active_store_jobs"
-METRIC_FS_ACTIVE_LOAD_JOBS = "vllm:kv_offload_fs_active_load_jobs"
-METRIC_FS_STORE_JOB_MAX_LATENCY = "vllm:kv_offload_fs_store_job_max_latency"
-METRIC_FS_LOAD_JOB_MAX_LATENCY = "vllm:kv_offload_fs_load_job_max_latency"
-METRIC_FS_LOOKUP_TOTAL = "vllm:kv_offload_fs_lookup_total"
-METRIC_FS_LOOKUP_RESOLVED = "vllm:kv_offload_fs_lookup_resolved"
-METRIC_FS_LOOKUP_MAX_LATENCY = "vllm:kv_offload_fs_lookup_max_latency"
-METRIC_FS_STORE_BYTES = "vllm:kv_offload_fs_store_bytes"
-METRIC_FS_LOAD_BYTES = "vllm:kv_offload_fs_load_bytes"
-METRIC_FS_STORE_TIME = "vllm:kv_offload_fs_store_time"
-METRIC_FS_LOAD_TIME = "vllm:kv_offload_fs_load_time"
+def _fs_metric_names(tier_name: str) -> dict[str, str]:
+    """Return Prometheus metric names for this FS tier instance.
+
+    ``tier_name`` is always non-empty (``SecondaryTierFactory`` falls back to
+    the registered tier type, e.g. ``"fs"``).  A single unnamed FS tier
+    produces ``vllm:kv_offload_fs_store_jobs``; a tier named ``"nvme"``
+    produces ``vllm:kv_offload_nvme_store_jobs``.
+    """
+    p = f"vllm:kv_offload_{tier_name}"
+    return {
+        "store_jobs": f"{p}_store_jobs",
+        "load_jobs": f"{p}_load_jobs",
+        "active_store_jobs": f"{p}_active_store_jobs",
+        "active_load_jobs": f"{p}_active_load_jobs",
+        "store_job_max_latency": f"{p}_store_job_max_latency",
+        "load_job_max_latency": f"{p}_load_job_max_latency",
+        "lookup_total": f"{p}_lookup_total",
+        "lookup_resolved": f"{p}_lookup_resolved",
+        "lookup_max_latency": f"{p}_lookup_max_latency",
+        "store_bytes": f"{p}_store_bytes",
+        "load_bytes": f"{p}_load_bytes",
+        "store_time": f"{p}_store_time",
+        "load_time": f"{p}_load_time",
+    }
 
 
-def get_fs_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
+def get_fs_metric_definitions(tier_name: str) -> dict[str, OffloadingMetricMetadata]:
+    m = _fs_metric_names(tier_name)
     return {
         # Counters
-        METRIC_FS_STORE_JOBS: OffloadingCounterMetadata(
+        m["store_jobs"]: OffloadingCounterMetadata(
             documentation="Number of FS store jobs completed.",
         ),
-        METRIC_FS_LOAD_JOBS: OffloadingCounterMetadata(
+        m["load_jobs"]: OffloadingCounterMetadata(
             documentation="Number of FS load jobs completed.",
         ),
         # Gauges
-        METRIC_FS_ACTIVE_STORE_JOBS: OffloadingGaugeMetadata(
+        m["active_store_jobs"]: OffloadingGaugeMetadata(
             documentation="Number of FS store jobs currently queued or executing.",
         ),
-        METRIC_FS_ACTIVE_LOAD_JOBS: OffloadingGaugeMetadata(
+        m["active_load_jobs"]: OffloadingGaugeMetadata(
             documentation="Number of FS load jobs currently queued or executing.",
         ),
-        METRIC_FS_STORE_JOB_MAX_LATENCY: OffloadingGaugeMetadata(
+        m["store_job_max_latency"]: OffloadingGaugeMetadata(
             documentation="Max wall-clock latency of FS store jobs completed this "
             "step, in seconds.",
         ),
-        METRIC_FS_LOAD_JOB_MAX_LATENCY: OffloadingGaugeMetadata(
+        m["load_job_max_latency"]: OffloadingGaugeMetadata(
             documentation="Max wall-clock latency of FS load jobs completed this "
             "step, in seconds.",
         ),
-        METRIC_FS_LOOKUP_TOTAL: OffloadingGaugeMetadata(
+        m["lookup_total"]: OffloadingGaugeMetadata(
             documentation="Number of FS lookup keys currently tracked.",
         ),
-        METRIC_FS_LOOKUP_RESOLVED: OffloadingGaugeMetadata(
+        m["lookup_resolved"]: OffloadingGaugeMetadata(
             documentation="Number of tracked FS lookup keys that have a result.",
         ),
-        METRIC_FS_LOOKUP_MAX_LATENCY: OffloadingGaugeMetadata(
+        m["lookup_max_latency"]: OffloadingGaugeMetadata(
             documentation="Max end-to-end FS lookup latency this step, in seconds "
             "(from first lookup() call to result available or request cleanup).",
         ),
-        METRIC_FS_STORE_BYTES: OffloadingCounterMetadata(
+        m["store_bytes"]: OffloadingCounterMetadata(
             documentation="Cumulative bytes written to disk (excludes skipped blocks "
             "where the file already existed).",
         ),
-        METRIC_FS_LOAD_BYTES: OffloadingCounterMetadata(
+        m["load_bytes"]: OffloadingCounterMetadata(
             documentation="Cumulative bytes read from disk.",
         ),
-        METRIC_FS_STORE_TIME: OffloadingGaugeMetadata(
+        m["store_time"]: OffloadingGaugeMetadata(
             documentation="Total I/O time (seconds) spent on store tasks this step, "
             "summed across all worker threads (excludes queue wait time).",
         ),
-        METRIC_FS_LOAD_TIME: OffloadingGaugeMetadata(
+        m["load_time"]: OffloadingGaugeMetadata(
             documentation="Total I/O time (seconds) spent on load tasks this step, "
             "summed across all worker threads (excludes queue wait time).",
         ),
@@ -146,11 +156,20 @@ class FSStats:
 def collect_fs_stats(
     fs: FSStats,
     ls: LookupStats,
+    tier_name: str,
 ) -> OffloadingConnectorStats | None:
     """Build an OffloadingConnectorStats from the current FS and lookup stats.
 
     Resets per-step state on both ``fs`` and ``ls`` before returning.
     Returns None when there is nothing to report.
+
+    Args:
+        fs: Per-step FS job stats accumulator.
+        ls: Per-step async lookup stats accumulator.
+        tier_name: Resolved tier name from :func:`_resolve_tier_name`
+            (e.g. ``"fs"`` or ``"nvme"``).  Determines the Prometheus metric
+            prefix ``vllm:kv_offload_{tier_name}_*``.  Must match the name
+            used at registration time in ``build_metric_definitions``.
     """
     lookup_max_ms = ls.max_lookup_latency_ms
     if (
@@ -162,31 +181,28 @@ def collect_fs_stats(
     ):
         return None
 
+    m = _fs_metric_names(tier_name)
     connector_stats = OffloadingConnectorStats()
 
     # Active job gauges — always emitted when returning stats.
-    connector_stats.set_gauge(METRIC_FS_ACTIVE_STORE_JOBS, fs.active_store_jobs)
-    connector_stats.set_gauge(METRIC_FS_ACTIVE_LOAD_JOBS, fs.active_load_jobs)
+    connector_stats.set_gauge(m["active_store_jobs"], fs.active_store_jobs)
+    connector_stats.set_gauge(m["active_load_jobs"], fs.active_load_jobs)
 
     if fs.store_jobs:
-        connector_stats.increase_counter(METRIC_FS_STORE_JOBS, fs.store_jobs)
-        connector_stats.set_gauge(
-            METRIC_FS_STORE_JOB_MAX_LATENCY, fs.store_job_max_latency
-        )
-        connector_stats.increase_counter(METRIC_FS_STORE_BYTES, fs.store_bytes)
-        connector_stats.set_gauge(METRIC_FS_STORE_TIME, fs.store_time)
+        connector_stats.increase_counter(m["store_jobs"], fs.store_jobs)
+        connector_stats.set_gauge(m["store_job_max_latency"], fs.store_job_max_latency)
+        connector_stats.increase_counter(m["store_bytes"], fs.store_bytes)
+        connector_stats.set_gauge(m["store_time"], fs.store_time)
     if fs.load_jobs:
-        connector_stats.increase_counter(METRIC_FS_LOAD_JOBS, fs.load_jobs)
-        connector_stats.set_gauge(
-            METRIC_FS_LOAD_JOB_MAX_LATENCY, fs.load_job_max_latency
-        )
-        connector_stats.increase_counter(METRIC_FS_LOAD_BYTES, fs.load_bytes)
-        connector_stats.set_gauge(METRIC_FS_LOAD_TIME, fs.load_time)
+        connector_stats.increase_counter(m["load_jobs"], fs.load_jobs)
+        connector_stats.set_gauge(m["load_job_max_latency"], fs.load_job_max_latency)
+        connector_stats.increase_counter(m["load_bytes"], fs.load_bytes)
+        connector_stats.set_gauge(m["load_time"], fs.load_time)
 
-    connector_stats.set_gauge(METRIC_FS_LOOKUP_TOTAL, ls.total)
-    connector_stats.set_gauge(METRIC_FS_LOOKUP_RESOLVED, ls.resolved)
+    connector_stats.set_gauge(m["lookup_total"], ls.total)
+    connector_stats.set_gauge(m["lookup_resolved"], ls.resolved)
     if lookup_max_ms:
-        connector_stats.set_gauge(METRIC_FS_LOOKUP_MAX_LATENCY, lookup_max_ms / 1e3)
+        connector_stats.set_gauge(m["lookup_max_latency"], lookup_max_ms / 1e3)
 
     ls.reset()
     fs.reset_step()

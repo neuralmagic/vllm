@@ -92,12 +92,12 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self,
         offloading_spec: "OffloadingSpec",
         primary_kv_view: memoryview,
-        tier_type: str,
+        tier_name: str,
         store_config: dict,
         prefix: str = "",
         io_threads: int = 4,
     ):
-        super().__init__(offloading_spec, primary_kv_view, tier_type)
+        super().__init__(offloading_spec, primary_kv_view, tier_name)
         agent_config = nixl_agent_config(backends=[])
         self._agent = nixl_agent("ObjAgent", agent_config)
         obj_config = ObjStoreConfig(**store_config)
@@ -135,7 +135,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         )
 
         self._lookup_manager = ObjAsyncLookupManager(
-            tier=self, tier_type=self.tier_type
+            tier=self, tier_type=self.tier_name
         )
 
     def _probe_connectivity(self) -> None:

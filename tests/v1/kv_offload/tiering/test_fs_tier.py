@@ -147,7 +147,7 @@ def fs_tier(tmp_path):
     tier = FileSystemTierManager(
         offloading_spec=_MOCK_OFFLOADING_SPEC,
         primary_kv_view=mock_view,
-        tier_type="fs",
+        tier_name="fs0",
         root_dir=str(tmp_path),
         n_read_threads=4,
         n_write_threads=4,
@@ -205,7 +205,7 @@ def test_invalid_path_raises_at_construction():
         FileSystemTierManager(
             offloading_spec=_MOCK_OFFLOADING_SPEC,
             primary_kv_view=mock_view,
-            tier_type="fs",
+            tier_name="fs0",
             root_dir="/dev/null/invalid_path",
         )
 

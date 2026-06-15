@@ -95,15 +95,15 @@ class FileSystemTierManager(SecondaryTierManager):
     @classmethod
     @override
     def build_metric_definitions(
-        cls, tier_config: dict
+        cls, tier_config: dict, tier_name: str = ""
     ) -> dict[str, OffloadingMetricMetadata]:
-        return get_fs_metric_definitions()
+        return get_fs_metric_definitions(tier_name)
 
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
         primary_kv_view: memoryview,
-        tier_type: str,
+        tier_name: str,
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
@@ -113,12 +113,14 @@ class FileSystemTierManager(SecondaryTierManager):
             offloading_spec: contains the vllm_config, kv_cache_config
                 and block_size_factor.
             primary_kv_view: Memoryview of the primary tier's CPU KV cache.
-            tier_type: Tier type identifier, set by SecondaryTierFactory.
+            tier_name: Unique name for this tier instance (e.g. ``"fs"``,
+                ``"nvme"``), set by :class:`SecondaryTierFactory`.  Used to
+                namespace metric names and thread names.
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
         """
-        super().__init__(offloading_spec, primary_kv_view, tier_type)
+        super().__init__(offloading_spec, primary_kv_view, tier_name)
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -146,10 +148,10 @@ class FileSystemTierManager(SecondaryTierManager):
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
-            thread_name_prefix="vllm_kv_py_fs",
+            thread_name_prefix=f"vllm_kv_py_{tier_name}",
         )
 
-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=tier_name)
 
         self._fs_stats = FSStats()
 
@@ -200,7 +202,9 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
-        return collect_fs_stats(self._fs_stats, self._lookup_manager.lookup_stats)
+        return collect_fs_stats(
+            self._fs_stats, self._lookup_manager.lookup_stats, self.tier_name
+        )
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
