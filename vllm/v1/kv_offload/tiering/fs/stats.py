@@ -24,11 +24,11 @@ METRIC_FS_LOAD_JOBS = "vllm:kv_offload_fs_load_jobs"
 # Gauges — per-step snapshots.
 METRIC_FS_ACTIVE_STORE_JOBS = "vllm:kv_offload_fs_active_store_jobs"
 METRIC_FS_ACTIVE_LOAD_JOBS = "vllm:kv_offload_fs_active_load_jobs"
-METRIC_FS_STORE_JOB_MAX_TIME_MS = "vllm:kv_offload_fs_store_job_max_time_ms"
-METRIC_FS_LOAD_JOB_MAX_TIME_MS = "vllm:kv_offload_fs_load_job_max_time_ms"
+METRIC_FS_STORE_JOB_MAX_LATENCY_MS = "vllm:kv_offload_fs_store_job_max_latency_ms"
+METRIC_FS_LOAD_JOB_MAX_LATENCY_MS = "vllm:kv_offload_fs_load_job_max_latency_ms"
 METRIC_FS_LOOKUP_TOTAL = "vllm:kv_offload_fs_lookup_total"
 METRIC_FS_LOOKUP_RESOLVED = "vllm:kv_offload_fs_lookup_resolved"
-METRIC_FS_LOOKUP_MAX_TIME_MS = "vllm:kv_offload_fs_lookup_max_time_ms"
+METRIC_FS_LOOKUP_MAX_LATENCY_MS = "vllm:kv_offload_fs_lookup_max_latency_ms"
 
 
 def get_fs_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
@@ -47,12 +47,12 @@ def get_fs_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         METRIC_FS_ACTIVE_LOAD_JOBS: OffloadingGaugeMetadata(
             documentation="Number of FS load jobs currently queued or executing.",
         ),
-        METRIC_FS_STORE_JOB_MAX_TIME_MS: OffloadingGaugeMetadata(
-            documentation="Max wall-clock time of FS store jobs completed this "
+        METRIC_FS_STORE_JOB_MAX_LATENCY_MS: OffloadingGaugeMetadata(
+            documentation="Max wall-clock latency of FS store jobs completed this "
             "step, in milliseconds.",
         ),
-        METRIC_FS_LOAD_JOB_MAX_TIME_MS: OffloadingGaugeMetadata(
-            documentation="Max wall-clock time of FS load jobs completed this "
+        METRIC_FS_LOAD_JOB_MAX_LATENCY_MS: OffloadingGaugeMetadata(
+            documentation="Max wall-clock latency of FS load jobs completed this "
             "step, in milliseconds.",
         ),
         METRIC_FS_LOOKUP_TOTAL: OffloadingGaugeMetadata(
@@ -61,7 +61,7 @@ def get_fs_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         METRIC_FS_LOOKUP_RESOLVED: OffloadingGaugeMetadata(
             documentation="Number of tracked FS lookup keys that have a result.",
         ),
-        METRIC_FS_LOOKUP_MAX_TIME_MS: OffloadingGaugeMetadata(
+        METRIC_FS_LOOKUP_MAX_LATENCY_MS: OffloadingGaugeMetadata(
             documentation="Max end-to-end FS lookup latency this step, in milliseconds "
             "(from first lookup() call to result available or request cleanup).",
         ),
@@ -135,15 +135,15 @@ def collect_fs_stats(
 
     if fs.store_jobs:
         connector_stats.increase_counter(METRIC_FS_STORE_JOBS, fs.store_jobs)
-        connector_stats.set_gauge(METRIC_FS_STORE_JOB_MAX_TIME_MS, fs.store_max_ms)
+        connector_stats.set_gauge(METRIC_FS_STORE_JOB_MAX_LATENCY_MS, fs.store_max_ms)
     if fs.load_jobs:
         connector_stats.increase_counter(METRIC_FS_LOAD_JOBS, fs.load_jobs)
-        connector_stats.set_gauge(METRIC_FS_LOAD_JOB_MAX_TIME_MS, fs.load_max_ms)
+        connector_stats.set_gauge(METRIC_FS_LOAD_JOB_MAX_LATENCY_MS, fs.load_max_ms)
 
     connector_stats.set_gauge(METRIC_FS_LOOKUP_TOTAL, ls.total)
     connector_stats.set_gauge(METRIC_FS_LOOKUP_RESOLVED, ls.resolved)
     if lookup_max_ms:
-        connector_stats.set_gauge(METRIC_FS_LOOKUP_MAX_TIME_MS, lookup_max_ms)
+        connector_stats.set_gauge(METRIC_FS_LOOKUP_MAX_LATENCY_MS, lookup_max_ms)
 
     ls.reset()
     fs.reset_step()
