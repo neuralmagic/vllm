@@ -14,6 +14,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.transform.linear
     TransformTuple,
 )
 from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    slice_nvfp4_output,
+)
 from vllm.utils.flashinfer import (
     flashinfer_scaled_fp4_mm,
 )
@@ -21,11 +24,20 @@ from vllm.utils.flashinfer import (
 __all__ = ["is_qutlass_mxfp4_scheme", "QutlassMxFP4LinearMethod"]
 
 
+# QUTLASS supports block sizes (32, 64, 128) for MXFP4
+# https://github.com/IST-DASLab/qutlass/blob/v0.2.0/qutlass/csrc/bindings.cpp#L321-L322
 def is_qutlass_mxfp4_scheme(
     quant_scheme: CompressedTensorsScheme | None,
     input_tfms: dict[int, TransformTuple],
 ) -> bool:
-    return isinstance(quant_scheme, CompressedTensorsW4A4Mxfp4) and len(input_tfms) >= 1
+    return (
+        isinstance(quant_scheme, CompressedTensorsW4A4Mxfp4)
+        and len(input_tfms) >= 1
+        and all(
+            input_tfm.scheme.head_dim in (32, 64, 128)
+            for input_tfm in input_tfms.values()
+        )
+    )
 
 
 class QutlassMxFP4LinearMethod(CompressedTensorsLinearTransformMethod):
@@ -89,16 +101,12 @@ class QutlassMxFP4LinearMethod(CompressedTensorsLinearTransformMethod):
             layer.weight_scale,
             alpha=None,
             out_dtype=x.dtype,
-            backend="cutlass",
+            backend="cudnn",  # "cutlass" backend not compatible with mxfp4
             block_size=32,
             use_nvfp4=False,
         )
 
-        # MXFP4 packs 2 values per byte (same as NVFP4)
-        # Output size matches input without needing slicing
-        # But we keep the pattern consistent with NVFP4
-        if out.shape[-1] != output_size:
-            out = out[..., :output_size]
+        out = slice_nvfp4_output(out, output_size)
 
         if self.output_transform is not None:
             for part_id, (start, length) in enumerate(self.partition_ranges):
