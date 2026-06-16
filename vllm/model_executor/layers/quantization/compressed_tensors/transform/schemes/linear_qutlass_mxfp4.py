@@ -24,7 +24,7 @@ from vllm.utils.flashinfer import (
 __all__ = ["is_qutlass_mxfp4_scheme", "QutlassMxFP4LinearMethod"]
 
 
-# QUTLASS supports block sizes (32, 64, 128) for MXFP4
+# QUTLASS supports transform block sizes (32, 64, 128) for MXFP4
 # https://github.com/IST-DASLab/qutlass/blob/v0.2.0/qutlass/csrc/bindings.cpp#L321-L322
 def is_qutlass_mxfp4_scheme(
     quant_scheme: CompressedTensorsScheme | None,
