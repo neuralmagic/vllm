@@ -53,8 +53,6 @@ class QutlassMxFP4LinearMethod(CompressedTensorsLinearTransformMethod):
 
         assert self.input_transform is not None
         assert len(self.input_transform.weight.partitions) >= 1
-        for partition in self.input_transform.weight.partitions.values():
-            assert partition.data.shape[0] == layer.scheme.group_size
 
         return ret
 
@@ -65,14 +63,6 @@ class QutlassMxFP4LinearMethod(CompressedTensorsLinearTransformMethod):
         h = self.input_transform.weight.partitions[0].data
         h_normalized = (h * self.input_transform.scales[0]).to(torch.bfloat16)
         layer.hadamard_matrix = Parameter(h_normalized, requires_grad=False)
-
-        # MXFP4 uses E8M0 scales without a global scale factor
-        # The GEMM computes alpha * sum(fp4_a * scale_a * fp4_w * scale_w)
-        # For MXFP4, alpha is just 1.0 since there's no global scale adjustment
-        layer.fused_alpha = Parameter(
-            torch.tensor([1.0], dtype=torch.float32, device=h.device),
-            requires_grad=False,
-        )
 
     def apply(
         self,
@@ -97,8 +87,8 @@ class QutlassMxFP4LinearMethod(CompressedTensorsLinearTransformMethod):
             layer.weight,
             x_scales_blocked,
             layer.weight_scale,
-            layer.fused_alpha,
-            x.dtype,
+            alpha=None,
+            out_dtype=x.dtype,
             backend="cutlass",
             block_size=32,
             use_nvfp4=False,
