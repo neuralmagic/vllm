@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import _get_kv_cache_config_deepseek_v4
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -22,6 +23,20 @@ def _make_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSpec:
         head_size=512,
         dtype=torch.uint8,
         page_size_padded=page_size,
+        cache_dtype_str="fp8_ds_mla",
+        model_version="deepseek_v4",
+        alignment=576,
+    )
+
+
+def _make_swa_spec(page_size: int, block_size: int = 64) -> SlidingWindowMLASpec:
+    return SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        page_size_padded=page_size,
+        sliding_window=128,
         cache_dtype_str="fp8_ds_mla",
         model_version="deepseek_v4",
         alignment=576,
@@ -48,7 +63,7 @@ def _make_groups(n_c4, n_c128, n_swa):
 
     swa_specs = {}
     for i in range(n_swa):
-        swa_specs[f"swa.{i}"] = _make_mla_spec(PS_SWA)
+        swa_specs[f"swa.{i}"] = _make_swa_spec(PS_SWA)
 
     swa_group = KVCacheGroupSpec(
         layer_names=list(swa_specs.keys()),
@@ -60,7 +75,7 @@ def _make_groups(n_c4, n_c128, n_swa):
 
 def _mock_vllm_config():
     config = MagicMock()
-    config.scheduler_config.num_gpu_blocks_override = None
+    config.cache_config.num_gpu_blocks_override = None
     return config
 
 
@@ -69,17 +84,30 @@ def _run(n_c4=3, n_c128=2, n_swa=5, mem=100 * 1024 * 1024):
     return _get_kv_cache_config_deepseek_v4(_mock_vllm_config(), groups, mem)
 
 
+def _specs_by_layer(groups):
+    specs = {}
+    for group in groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        specs.update(group.kv_cache_spec.kv_cache_specs)
+    return specs
+
+
 class TestInterleavedPacking:
     def test_all_tensors_have_block_stride(self):
         _, tensors = _run()
         for t in tensors:
             assert t.block_stride > 0
 
-    def test_all_tensors_share_same_size(self):
+    def test_tensors_share_size_within_backing(self):
         _, tensors = _run()
-        sizes = set(t.size for t in tensors)
-        assert len(sizes) == 1
-        assert sizes.pop() > 0
+        sizes_by_backing = {}
+        for t in tensors:
+            sizes_by_backing.setdefault(t.backing_id, set()).add(t.size)
+
+        assert len(sizes_by_backing) == 2
+        for sizes in sizes_by_backing.values():
+            assert len(sizes) == 1
+            assert sizes.pop() > 0
 
     def test_offsets_within_one_block(self):
         _, tensors = _run()
@@ -95,24 +123,41 @@ class TestInterleavedPacking:
         expected = n_c4 * 2 + n_c128 + n_swa
         assert len(all_names) == expected
 
-    def test_mla_and_swa_in_separate_tensors(self):
+    def test_mla_and_swa_in_separate_backings(self):
         _, tensors = _run(n_c4=3, n_swa=3)
+        backing_by_layer = {}
         for t in tensors:
-            names = t.shared_by
-            has_mla = any("c4_mla" in n or "c4_idx" in n or "c128" in n for n in names)
-            has_swa = any("swa" in n for n in names)
-            assert not (has_mla and has_swa), (
-                "MLA and SWA layers must be in separate tensors"
-            )
+            for name in t.shared_by:
+                backing_by_layer[name] = t.backing_id
+
+        linear_backings = {
+            backing
+            for name, backing in backing_by_layer.items()
+            if name.startswith(("c4_", "c128_"))
+        }
+        swa_backings = {
+            backing
+            for name, backing in backing_by_layer.items()
+            if name.startswith("swa.")
+        }
+        assert len(linear_backings) == 1
+        assert len(swa_backings) == 1
+        assert linear_backings.isdisjoint(swa_backings)
 
     def test_strided_views_are_independent(self):
-        num_blocks, tensors = _run()
-        backing = torch.zeros(tensors[0].size, dtype=torch.uint8)
+        groups = _make_groups(3, 2, 5)
+        specs = _specs_by_layer(groups)
+        num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
+            _mock_vllm_config(), groups, 100 * 1024 * 1024
+        )
+        backings = {
+            t.backing_id: torch.zeros(t.size, dtype=torch.uint8) for t in tensors
+        }
         views = []
         for t in tensors:
-            page_size = t.block_stride // 1
+            page_size = specs[t.shared_by[0]].page_size_bytes
             v = torch.as_strided(
-                backing,
+                backings[t.backing_id],
                 size=(num_blocks, page_size),
                 stride=(t.block_stride, 1),
                 storage_offset=t.offset,

@@ -840,14 +840,15 @@ class NixlBaseConnectorWorker:
         # Forwarding a real layer name rather than a synthetic key
         self.register_kv_caches({first_layer: kv_cache})
 
-    def _register_packed_kv_cache(
-        self, kv_cache: torch.Tensor, block_stride: int
+    def _register_packed_kv_caches(
+        self,
+        packed_caches: list[tuple[torch.Tensor, int]],
+        device_kv_caches: dict[str, torch.Tensor],
     ) -> None:
-        """Register a packed KV cache as a single NIXL region.
+        """Register packed KV caches as NIXL regions.
 
-        The packed allocation interleaves all layers per block, so each
-        block_stride-byte chunk is one logical block.  We register 1
-        NIXL region and create 1 descriptor per block.
+        Each packed allocation interleaves layers per block, so each
+        block_stride-byte chunk is one logical block in that allocation.
         """
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
@@ -866,29 +867,35 @@ class NixlBaseConnectorWorker:
             self.transfer_topo.cross_layers_blocks,
         )
 
-        total_size = kv_cache.numel() * kv_cache.element_size()
+        caches_data = []
+        base_addresses = []
+        block_strides = []
+        for kv_cache, block_stride in packed_caches:
+            total_size = kv_cache.numel() * kv_cache.element_size()
+            self.device_id = max(kv_cache.get_device(), 0)
+            caches_data.append((kv_cache.data_ptr(), total_size, self.device_id, ""))
+            base_addresses.append(kv_cache.data_ptr())
+            block_strides.append(block_stride)
 
         logger.info(
-            "Registering packed KV cache: total_size=%s, block_stride=%s, "
-            "num_blocks=%s, num_regions=1",
-            total_size,
-            block_stride,
+            "Registering packed KV cache: block_strides=%s, "
+            "num_blocks=%s, num_regions=%s",
+            block_strides,
             self.num_blocks,
+            len(packed_caches),
         )
 
-        self.device_id = max(kv_cache.get_device(), 0)
-        caches_data = [(kv_cache.data_ptr(), total_size, self.device_id, "")]
-
-        self.block_len_per_layer = [block_stride]
-        self.num_regions = 1
-        self.num_descs = self.num_blocks
-        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = [kv_cache.data_ptr()]
+        self.block_len_per_layer = block_strides
+        self._region_is_mla = [self.use_mla] * len(block_strides)
+        self.num_regions = len(packed_caches)
+        self.num_descs = self.num_regions * self.num_blocks
+        self.kv_caches_base_addr[self.engine_id][self.tp_rank] = base_addresses
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
         self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
         self._registered_descs.append(descs)
 
-        self.device_kv_caches = {layer: kv_cache for layer in self._layer_specs}
+        self.device_kv_caches = device_kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
         self.src_xfer_handles_by_block_size[self.block_size], (self.src_blocks_data) = (
@@ -919,28 +926,53 @@ class NixlBaseConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
+    def _register_packed_kv_cache(
+        self, kv_cache: torch.Tensor, block_stride: int
+    ) -> None:
+        self._register_packed_kv_caches(
+            [(kv_cache, block_stride)],
+            {layer: kv_cache for layer in self._layer_specs},
+        )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
-        # Detect packed allocation: all tensors are strided views into the
-        # same backing storage (different data_ptr but same storage).
+        # Detect packed allocation: tensors are strided views into one or more
+        # backing storages.
         # This happens with DSv4-style contiguous per-block packing.
         if len(kv_caches) > 1:
-            storage_ptrs: dict[int, torch.Tensor] = {}
-            data_ptrs: set[int] = set()
-            for cache in kv_caches.values():
-                if isinstance(cache, torch.Tensor):
-                    storage_ptrs[cache.untyped_storage().data_ptr()] = cache
-                    data_ptrs.add(cache.data_ptr())
-            if len(storage_ptrs) == 1 and len(data_ptrs) > 1:
-                any_cache = next(iter(storage_ptrs.values()))
-                total_bytes = any_cache.untyped_storage().nbytes()
-                block_stride = total_bytes // self.num_blocks
-                flat = torch.tensor(
-                    [], dtype=torch.uint8, device=any_cache.device
-                ).set_(any_cache.untyped_storage())
-                self._register_packed_kv_cache(flat, block_stride)
-                return
+            tensor_caches = {
+                layer_name: cache
+                for layer_name, cache in kv_caches.items()
+                if isinstance(cache, torch.Tensor)
+            }
+            if len(tensor_caches) == len(kv_caches):
+                storage_groups: dict[int, list[torch.Tensor]] = defaultdict(list)
+                for cache in tensor_caches.values():
+                    storage_groups[cache.untyped_storage().data_ptr()].append(cache)
+
+                packed_caches: list[tuple[torch.Tensor, int]] = []
+                for caches in storage_groups.values():
+                    any_cache = caches[0]
+                    storage = any_cache.untyped_storage()
+                    total_bytes = storage.nbytes()
+                    if total_bytes % self.num_blocks != 0:
+                        break
+                    block_stride = total_bytes // self.num_blocks
+                    data_ptrs = {cache.data_ptr() for cache in caches}
+                    has_strided_blocks = any(
+                        total_bytes > cache.numel() * cache.element_size()
+                        for cache in caches
+                    )
+                    if len(data_ptrs) == 1 and not has_strided_blocks:
+                        break
+                    flat = torch.tensor(
+                        [], dtype=torch.uint8, device=any_cache.device
+                    ).set_(storage)
+                    packed_caches.append((flat, block_stride))
+                else:
+                    self._register_packed_kv_caches(packed_caches, tensor_caches)
+                    return
 
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,

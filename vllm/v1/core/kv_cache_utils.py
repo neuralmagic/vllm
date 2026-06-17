@@ -941,9 +941,12 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
-        # buckets = {page_size: [[layer_names], [layer_names], ...]}
-        buckets = _bucket_layers_by_page_size(kv_cache_groups)
-        return sum(ps * len(slots) for ps, slots in buckets.items())
+        allocation_buckets = _bucket_layers_by_page_size(kv_cache_groups)
+        return sum(
+            ps * len(slots)
+            for buckets in allocation_buckets
+            for ps, slots in buckets.items()
+        )
     group_size = max(len(g.layer_names) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
@@ -1195,26 +1198,37 @@ def _get_kv_cache_groups_uniform_page_size(
 
 def _bucket_layers_by_page_size(
     kv_cache_groups: list[KVCacheGroupSpec],
-) -> dict[int, list[list[str]]]:
-    """Bucket layers by page size: ``result[ps][slot_idx] = [layer_names]``.
+) -> list[dict[int, list[list[str]]]]:
+    """Bucket layers by growth class and page size.
 
-    Layers from different groups at the same ``slot_idx`` share an underlying tensor
-    (they have independent block tables so block-id namespaces never collide).
+    Within each returned allocation, ``allocation[ps][slot_idx] = [layer_names]``.
+    Layers from different groups at the same slot share a KVCacheTensor only when
+    they have the same allocation growth class and page size.
     """
-    buckets: dict[int, list[list[str]]] = defaultdict(list)
+    allocation_ids: dict[str, int] = {}
+    buckets: list[dict[int, list[list[str]]]] = []
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
-        slot_count: dict[int, int] = defaultdict(int)
+        slot_count: dict[tuple[str, int], int] = defaultdict(int)
         for layer_name in group.layer_names:
             if isinstance(spec, UniformTypeKVCacheSpecs):
-                ps = spec.kv_cache_specs[layer_name].page_size_bytes
+                layer_spec = spec.kv_cache_specs[layer_name]
             else:
-                ps = spec.page_size_bytes
-            slot_idx = slot_count[ps]
-            slot_count[ps] += 1
-            if slot_idx == len(buckets[ps]):
-                buckets[ps].append([])
-            buckets[ps][slot_idx].append(layer_name)
+                layer_spec = spec
+            ps = layer_spec.page_size_bytes
+            allocation_key = (
+                "sliding" if isinstance(layer_spec, SlidingWindowSpec) else "linear"
+            )
+            if allocation_key not in allocation_ids:
+                allocation_ids[allocation_key] = len(buckets)
+                buckets.append(defaultdict(list))
+            allocation_id = allocation_ids[allocation_key]
+            slot_key = (allocation_key, ps)
+            slot_idx = slot_count[slot_key]
+            slot_count[slot_key] += 1
+            if slot_idx == len(buckets[allocation_id][ps]):
+                buckets[allocation_id][ps].append([])
+            buckets[allocation_id][ps][slot_idx].append(layer_name)
     return buckets
 
 
@@ -1225,32 +1239,38 @@ def _get_kv_cache_config_deepseek_v4(
 ) -> tuple[int, list[KVCacheTensor]]:
     """DeepseekV4 KV cache tensor layout planning.
 
-    Emit one KVCacheTensor per (slot_idx, page_size). Layers from different
-    groups at the same slot share a tensor (they have independent block
-    tables so block-id namespaces never collide).
+    Emit one KVCacheTensor per (growth_class, slot_idx, page_size). Layers from
+    different groups at the same slot share a tensor only when they grow at the
+    same rate.
     """
-    # buckets = {page_size: [[layer_names], [layer_names], ...]}
-    buckets = _bucket_layers_by_page_size(kv_cache_groups)
-    total_num_bytes_per_block = sum(ps * len(slots) for ps, slots in buckets.items())
+    # allocation_buckets = [{page_size: [[layer_names], [layer_names], ...]}, ...]
+    allocation_buckets = _bucket_layers_by_page_size(kv_cache_groups)
+    bytes_per_block_by_backing = [
+        sum(ps * len(slots) for ps, slots in buckets.items())
+        for buckets in allocation_buckets
+    ]
+    total_num_bytes_per_block = sum(bytes_per_block_by_backing)
 
     num_blocks = available_memory // total_num_bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
-    total_size = total_num_bytes_per_block * num_blocks
-
     kv_cache_tensors: list[KVCacheTensor] = []
-    byte_offset = 0
-    for ps, slots in buckets.items():
-        for slot in slots:
-            kv_cache_tensors.append(
-                KVCacheTensor(
-                    size=total_size,
-                    shared_by=slot,
-                    offset=byte_offset,
-                    block_stride=total_num_bytes_per_block,
+    for backing_id, buckets in enumerate(allocation_buckets):
+        block_stride = bytes_per_block_by_backing[backing_id]
+        total_size = block_stride * num_blocks
+        byte_offset = 0
+        for ps, slots in buckets.items():
+            for slot in slots:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=total_size,
+                        shared_by=slot,
+                        offset=byte_offset,
+                        block_stride=block_stride,
+                        backing_id=backing_id,
+                    )
                 )
-            )
-            byte_offset += ps
+                byte_offset += ps
 
     return num_blocks, kv_cache_tensors
 

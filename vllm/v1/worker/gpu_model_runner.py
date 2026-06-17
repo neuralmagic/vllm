@@ -7025,17 +7025,16 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        packed_backing: torch.Tensor | None = None
+        packed_backings: dict[int, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             if kv_cache_tensor.block_stride > 0:
-                # Allocate once; all packed tensors alias the same backing.
-                if packed_backing is None:
-                    packed_backing = torch.zeros(
+                if kv_cache_tensor.backing_id not in packed_backings:
+                    packed_backings[kv_cache_tensor.backing_id] = torch.zeros(
                         kv_cache_tensor.size,
                         dtype=torch.int8,
                         device=self.device,
                     )
-                tensor = packed_backing
+                tensor = packed_backings[kv_cache_tensor.backing_id]
             else:
                 tensor = torch.zeros(
                     kv_cache_tensor.size, dtype=torch.int8, device=self.device
