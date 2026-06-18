@@ -941,12 +941,13 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
-        allocation_buckets = _bucket_layers_by_page_size(kv_cache_groups)
-        return sum(
-            ps * len(slots)
-            for buckets in allocation_buckets
-            for ps, slots in buckets.items()
+        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
+        layer_tuple_page_bytes = sum(full_mla_spec.get_page_sizes())
+        num_layer_tuples = max(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
+            for group in kv_cache_groups
         )
+        return layer_tuple_page_bytes * num_layer_tuples
     group_size = max(len(g.layer_names) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
@@ -1196,75 +1197,6 @@ def _get_kv_cache_groups_uniform_page_size(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
-def _bucket_layers_by_page_size(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> list[dict[int, list[list[str]]]]:
-    """Bucket layers by growth class and page size.
-
-    Within each returned allocation, ``allocation[ps][slot_idx] = [layer_names]``.
-    Layers from different groups at the same slot share a KVCacheTensor only when
-    they have the same allocation growth class and page size.
-    """
-    allocation_ids: dict[str, int] = {}
-    buckets: list[dict[int, list[list[str]]]] = []
-    for group in kv_cache_groups:
-        spec = group.kv_cache_spec
-        slot_count: dict[tuple[str, int], int] = defaultdict(int)
-        for layer_name in group.layer_names:
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                layer_spec = spec.kv_cache_specs[layer_name]
-            else:
-                layer_spec = spec
-            ps = layer_spec.page_size_bytes
-            allocation_key = (
-                "sliding" if isinstance(layer_spec, SlidingWindowSpec) else "linear"
-            )
-            if allocation_key not in allocation_ids:
-                allocation_ids[allocation_key] = len(buckets)
-                buckets.append(defaultdict(list))
-            allocation_id = allocation_ids[allocation_key]
-            slot_key = (allocation_key, ps)
-            slot_idx = slot_count[slot_key]
-            slot_count[slot_key] += 1
-            if slot_idx == len(buckets[allocation_id][ps]):
-                buckets[allocation_id][ps].append([])
-            buckets[allocation_id][ps][slot_idx].append(layer_name)
-    return buckets
-
-
-def _get_dsv4_layer_specs(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> dict[str, KVCacheSpec]:
-    layer_specs: dict[str, KVCacheSpec] = {}
-    for group in kv_cache_groups:
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            layer_specs.update(spec.kv_cache_specs)
-        else:
-            for layer_name in group.layer_names:
-                layer_specs[layer_name] = spec
-    return layer_specs
-
-
-def _get_dsv4_bounded_blocks(
-    vllm_config: VllmConfig,
-    specs: Sequence[KVCacheSpec],
-) -> int | None:
-    if not specs or not all(isinstance(spec, SlidingWindowSpec) for spec in specs):
-        return None
-
-    scheduler_config = vllm_config.scheduler_config
-    model_config = vllm_config.model_config
-    return max(
-        spec.max_admission_blocks_per_request(
-            max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
-            max_model_len=model_config.max_model_len,
-        )
-        for spec in specs
-        if isinstance(spec, SlidingWindowSpec)
-    )
-
-
 def _get_kv_cache_config_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1272,61 +1204,50 @@ def _get_kv_cache_config_deepseek_v4(
 ) -> tuple[int, list[KVCacheTensor]]:
     """DeepseekV4 KV cache tensor layout planning.
 
-    Emit one KVCacheTensor per (growth_class, slot_idx, page_size). Layers from
-    different groups at the same slot share a tensor only when they grow at the
-    same rate.
+    Emit one KVCacheTensor per (tuple_idx, page_size), matching HMA's shared
+    block-slot model, but place those tensors in one packed backing.
     """
-    # allocation_buckets = [{page_size: [[layer_names], [layer_names], ...]}, ...]
-    allocation_buckets = _bucket_layers_by_page_size(kv_cache_groups)
-    bytes_per_block_by_backing = [
-        sum(ps * len(slots) for ps, slots in buckets.items())
-        for buckets in allocation_buckets
-    ]
+    full_mla_spec = kv_cache_groups[0].kv_cache_spec
+    assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
+    page_sizes = sorted(full_mla_spec.get_page_sizes())
+    layer_tuple_page_bytes = sum(page_sizes)
 
-    layer_specs = _get_dsv4_layer_specs(kv_cache_groups)
-    backing_num_blocks: list[int | None] = []
-    bounded_memory = 0
-    linear_bytes_per_block = 0
-    for backing_id, buckets in enumerate(allocation_buckets):
-        backing_layers = [
-            layer_name
-            for slots in buckets.values()
-            for slot in slots
-            for layer_name in slot
-        ]
-        bounded_blocks = _get_dsv4_bounded_blocks(
-            vllm_config, [layer_specs[layer_name] for layer_name in backing_layers]
-        )
-        backing_num_blocks.append(bounded_blocks)
-        if bounded_blocks is None:
-            linear_bytes_per_block += bytes_per_block_by_backing[backing_id]
-        else:
-            bounded_memory += bytes_per_block_by_backing[backing_id] * bounded_blocks
+    bucketed: list[dict[int, list[str]]] = []
+    for group in kv_cache_groups:
+        assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        specs = group.kv_cache_spec.kv_cache_specs
+        buckets: dict[int, list[str]] = defaultdict(list)
+        for name in group.layer_names:
+            buckets[specs[name].page_size_bytes].append(name)
+        bucketed.append(buckets)
 
-    if linear_bytes_per_block > 0:
-        num_blocks = max(available_memory - bounded_memory, 0) // linear_bytes_per_block
-    else:
-        num_blocks = available_memory // sum(bytes_per_block_by_backing)
+    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
+    block_stride = layer_tuple_page_bytes * num_layer_tuples
+
+    num_blocks = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    for backing_id, buckets in enumerate(allocation_buckets):
-        block_stride = bytes_per_block_by_backing[backing_id]
-        backing_blocks = backing_num_blocks[backing_id] or num_blocks
-        total_size = block_stride * backing_blocks
-        byte_offset = 0
-        for ps, slots in buckets.items():
-            for slot in slots:
+    total_size = block_stride * num_blocks
+    byte_offset = 0
+    for tuple_idx in range(num_layer_tuples):
+        for ps in page_sizes:
+            shared_by: list[str] = []
+            for buckets in bucketed:
+                bucket = buckets.get(ps)
+                if bucket is not None and tuple_idx < len(bucket):
+                    shared_by.append(bucket[tuple_idx])
+            if shared_by:
                 kv_cache_tensors.append(
                     KVCacheTensor(
                         size=total_size,
-                        shared_by=slot,
+                        shared_by=shared_by,
                         offset=byte_offset,
                         block_stride=block_stride,
-                        backing_id=backing_id,
+                        backing_id=0,
                     )
                 )
-                byte_offset += ps
+            byte_offset += ps
 
     return num_blocks, kv_cache_tensors
 
@@ -2149,8 +2070,8 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
-            if tensor.size % num_blocks_old == 0:
-                tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            assert tensor.size % num_blocks_old == 0
+            tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

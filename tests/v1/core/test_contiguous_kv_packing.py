@@ -30,7 +30,7 @@ def _make_mla_spec(page_size: int, block_size: int = 256) -> MLAAttentionSpec:
 
 
 def _make_swa_spec(page_size: int, block_size: int = 64) -> SlidingWindowMLASpec:
-    return SlidingWindowMLASpec(
+    spec = SlidingWindowMLASpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=512,
@@ -41,13 +41,15 @@ def _make_swa_spec(page_size: int, block_size: int = 64) -> SlidingWindowMLASpec
         model_version="deepseek_v4",
         alignment=576,
     )
+    object.__setattr__(spec, "page_size_padded", page_size)
+    return spec
 
 
 def _make_groups(n_c4, n_c128, n_swa):
     PS_C4_MLA = 37440
     PS_C4_IDX = 8640
     PS_C128 = 1728
-    PS_SWA = 37440
+    PS_SWA = 149760
 
     mla_specs = {}
     for i in range(n_c4):
@@ -107,7 +109,7 @@ class TestInterleavedPacking:
         for t in tensors:
             sizes_by_backing.setdefault(t.backing_id, set()).add(t.size)
 
-        assert len(sizes_by_backing) == 2
+        assert len(sizes_by_backing) == 1
         for sizes in sizes_by_backing.values():
             assert len(sizes) == 1
             assert sizes.pop() > 0
@@ -126,10 +128,15 @@ class TestInterleavedPacking:
         expected = n_c4 * 2 + n_c128 + n_swa
         assert len(all_names) == expected
 
-    def test_mla_and_swa_in_separate_backings(self):
+    def test_mla_and_swa_share_hma_tuple_storage(self):
         _, tensors = _run(n_c4=3, n_swa=3)
         backing_by_layer = {}
+        shared_slots = []
         for t in tensors:
+            if any(name.startswith("swa.") for name in t.shared_by) and any(
+                name.startswith(("c4_", "c128_")) for name in t.shared_by
+            ):
+                shared_slots.append(t.shared_by)
             for name in t.shared_by:
                 backing_by_layer[name] = t.backing_id
 
@@ -145,28 +152,19 @@ class TestInterleavedPacking:
         }
         assert len(linear_backings) == 1
         assert len(swa_backings) == 1
-        assert linear_backings.isdisjoint(swa_backings)
+        assert linear_backings == swa_backings
+        assert shared_slots
 
-    def test_swa_backing_uses_bounded_hma_blocks(self):
+    def test_packed_backing_uses_shared_hma_blocks(self):
         config = _mock_vllm_config()
         groups = _make_groups(n_c4=3, n_c128=2, n_swa=5)
-        specs = _specs_by_layer(groups)
         num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
             config, groups, 100 * 1024 * 1024
         )
 
         rows_by_backing = {t.backing_id: t.size // t.block_stride for t in tensors}
-        backing_by_layer = {name: t.backing_id for t in tensors for name in t.shared_by}
-        linear_backing = backing_by_layer["c4_mla.0"]
-        swa_backing = backing_by_layer["swa.0"]
-        swa_spec = specs["swa.0"]
-        expected_swa_blocks = swa_spec.max_admission_blocks_per_request(
-            max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
-            max_model_len=config.model_config.max_model_len,
-        )
 
-        assert rows_by_backing[linear_backing] == num_blocks
-        assert rows_by_backing[swa_backing] == expected_swa_blocks
+        assert set(rows_by_backing.values()) == {num_blocks}
 
     def test_strided_views_are_independent(self):
         groups = _make_groups(3, 2, 5)
