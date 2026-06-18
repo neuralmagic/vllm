@@ -18,7 +18,6 @@ class BlockTables:
         max_num_blocks_per_group: list[int],
         device: torch.device,
         kernel_block_sizes: list[int],
-        storage_num_blocks_per_group: list[int] | None = None,
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
@@ -35,14 +34,10 @@ class BlockTables:
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
-        if storage_num_blocks_per_group is None:
-            storage_num_blocks_per_group = [0] * self.num_kv_cache_groups
-        assert len(storage_num_blocks_per_group) == self.num_kv_cache_groups
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
         ]
-        self.storage_num_blocks_per_group = storage_num_blocks_per_group
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
@@ -95,11 +90,6 @@ class BlockTables:
         )
         self.block_sizes_tensor = torch.tensor(
             self.kernel_block_sizes, dtype=torch.int32, device=self.device
-        )
-        self.storage_num_blocks_tensor = torch.tensor(
-            self.storage_num_blocks_per_group,
-            dtype=torch.int64,
-            device=self.device,
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
@@ -168,7 +158,6 @@ class BlockTables:
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
-            self.storage_num_blocks_tensor,
             self.slot_mappings,
             self.slot_mappings.stride(0),
             self.cp_rank,
@@ -240,7 +229,6 @@ def _compute_slot_mappings_kernel(
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
-    storage_num_blocks,  # [num_kv_cache_groups], 0 means no remap
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
@@ -268,7 +256,6 @@ def _compute_slot_mappings_kernel(
     block_table_ptr = _load_ptr(block_table_ptrs + group_id, tl.int32)
     block_table_stride = tl.load(block_table_strides + group_id)
     block_size = tl.load(block_sizes + group_id)
-    storage_blocks = tl.load(storage_num_blocks + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
     start_idx = tl.load(query_start_loc + batch_idx)
@@ -281,10 +268,6 @@ def _compute_slot_mappings_kernel(
         block_offsets = positions % (block_size * CP_SIZE)
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices
-        )
-        mapped_block_numbers = block_numbers % tl.maximum(storage_blocks, 1)
-        block_numbers = tl.where(
-            storage_blocks > 0, mapped_block_numbers, block_numbers
         )
 
         if CP_SIZE == 1:

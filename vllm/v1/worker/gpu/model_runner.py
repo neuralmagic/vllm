@@ -431,34 +431,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
-        bounded_storage_blocks_by_layer: dict[str, int] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if kv_cache_tensor.block_stride <= 0:
-                continue
-            storage_blocks = kv_cache_tensor.size // kv_cache_tensor.block_stride
-            if storage_blocks >= kv_cache_config.num_blocks:
-                continue
-            for layer_name in kv_cache_tensor.shared_by:
-                bounded_storage_blocks_by_layer[layer_name] = storage_blocks
-
-        storage_num_blocks_per_group: list[int] = []
-        for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            group_storage_blocks = {
-                bounded_storage_blocks_by_layer[layer_name]
-                for layer_name in kv_cache_group.layer_names
-                if layer_name in bounded_storage_blocks_by_layer
-            }
-            assert len(group_storage_blocks) <= 1
-            if group_storage_blocks:
-                blocks_per_kv_block = (
-                    block_sizes[group_id] // self.kernel_block_sizes[group_id]
-                )
-                storage_num_blocks_per_group.append(
-                    next(iter(group_storage_blocks)) * blocks_per_kv_block
-                )
-            else:
-                storage_num_blocks_per_group.append(0)
-
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -466,7 +438,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group=max_num_blocks_per_group,
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
-            storage_num_blocks_per_group=storage_num_blocks_per_group,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
