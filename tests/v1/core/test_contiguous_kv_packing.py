@@ -160,12 +160,9 @@ class TestInterleavedPacking:
         linear_backing = backing_by_layer["c4_mla.0"]
         swa_backing = backing_by_layer["swa.0"]
         swa_spec = specs["swa.0"]
-        expected_swa_blocks = (
-            config.scheduler_config.max_num_seqs
-            * swa_spec.max_admission_blocks_per_request(
-                max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
-                max_model_len=config.model_config.max_model_len,
-            )
+        expected_swa_blocks = swa_spec.max_admission_blocks_per_request(
+            max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
+            max_model_len=config.model_config.max_model_len,
         )
 
         assert rows_by_backing[linear_backing] == num_blocks

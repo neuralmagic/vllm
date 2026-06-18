@@ -1255,7 +1255,7 @@ def _get_dsv4_bounded_blocks(
 
     scheduler_config = vllm_config.scheduler_config
     model_config = vllm_config.model_config
-    return scheduler_config.max_num_seqs * max(
+    return max(
         spec.max_admission_blocks_per_request(
             max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
             max_model_len=model_config.max_model_len,
