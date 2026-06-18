@@ -105,7 +105,7 @@ class TestInterleavedPacking:
 
     def test_tensors_share_size_within_backing(self):
         _, tensors = _run()
-        sizes_by_backing = {}
+        sizes_by_backing: dict[int, set[int]] = {}
         for t in tensors:
             sizes_by_backing.setdefault(t.backing_id, set()).add(t.size)
 

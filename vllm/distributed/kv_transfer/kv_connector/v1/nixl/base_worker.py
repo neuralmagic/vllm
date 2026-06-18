@@ -138,11 +138,11 @@ class NixlBaseConnectorWorker:
         # num_blocks entries per region (kernel granularity), SSM descs have
         # logical_blocks entries per region (no kernel splitting).
         logical_blocks = num_blocks // physical_blocks_per_logical
-        all_descs: list[np.ndarray] = []
+        mixed_descs: list[np.ndarray] = []
         for i, group in enumerate(block_ids):
             group_arr = np.asarray(group)
             if _is_attention_spec(self._group_spec_types[i]):
-                all_descs.append(
+                mixed_descs.append(
                     (region_offsets[:, None] + group_arr[None, :]).flatten()
                 )
             elif _is_ssm_spec(self._group_spec_types[i]):
@@ -154,7 +154,7 @@ class NixlBaseConnectorWorker:
                 # P and D can have different num_blocks (and thus
                 # different FA desc counts).
                 ssm_region_ids = np.arange(num_ssm_regions)[:, None]
-                all_descs.append(
+                mixed_descs.append(
                     (
                         ssm_region_ids * logical_blocks
                         + group_arr[None, :]
@@ -166,7 +166,7 @@ class NixlBaseConnectorWorker:
                     f"Unknown spec type {self._group_spec_types[i]} at index {i}"
                 )
 
-        return np.concatenate(all_descs)
+        return np.concatenate(mixed_descs)
 
     def _get_region_num_blocks_for_engine(self, engine_id: EngineId) -> list[int]:
         if not self.region_num_blocks:
