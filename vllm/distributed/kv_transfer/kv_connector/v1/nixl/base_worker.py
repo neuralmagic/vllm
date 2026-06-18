@@ -128,9 +128,10 @@ class NixlBaseConnectorWorker:
                     for block_id in block_ids[group_id]
                 ]
                 if region_blocks:
-                    all_descs.append(
-                        region_offsets[region_id] + np.asarray(region_blocks)
-                    )
+                    region_block_arr = np.asarray(region_blocks)
+                    if region_num_blocks[region_id] != num_blocks:
+                        region_block_arr %= region_num_blocks[region_id]
+                    all_descs.append(region_offsets[region_id] + region_block_arr)
             return np.concatenate(all_descs) if all_descs else np.array([])
 
         # Compute desc ids per group using the right stride: FA descs have

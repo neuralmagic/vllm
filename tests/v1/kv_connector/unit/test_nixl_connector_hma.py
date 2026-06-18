@@ -573,6 +573,7 @@ def _make_mock_worker_for_desc_ids(
     has_mamba: bool,
     group_spec_types: tuple,
     block_len_per_layer: list[int] | None = None,
+    region_group_ids: list[tuple[int, ...]] | None = None,
 ):
     """Build a mock NixlConnectorWorker with attrs needed by _compute_desc_ids."""
     from unittest.mock import MagicMock
@@ -586,6 +587,8 @@ def _make_mock_worker_for_desc_ids(
     worker._has_mamba = has_mamba
     worker._group_spec_types = group_spec_types
     worker.block_len_per_layer = block_len_per_layer or [100]
+    if region_group_ids is not None:
+        worker._region_group_ids = region_group_ids
     worker._compute_desc_ids = NixlConnectorWorker._compute_desc_ids.__get__(
         worker, NixlConnectorWorker
     )
@@ -645,6 +648,31 @@ def test_get_block_descs_ids_kernel_block_mismatch():
     )
 
     expected = [3, 7, 403, 407, 801, 802, 901, 902, 1001, 1002, 1101, 1102]
+    assert list(result) == expected, f"Expected {expected}, got {list(result)}"
+
+
+@pytest.mark.cpu_test
+def test_get_block_descs_ids_bounded_packed_region_wraps_blocks():
+    """Bounded packed regions map global block IDs to physical region rows."""
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+    worker = _make_mock_worker_for_desc_ids(
+        num_regions=2,
+        has_mamba=False,
+        group_spec_types=(FullAttentionSpec, SlidingWindowSpec),
+        block_len_per_layer=[100, 20],
+        region_group_ids=[(0,), (1,)],
+    )
+
+    result = worker._compute_desc_ids(
+        block_ids=([7, 8], [8, 9]),
+        dst_num_blocks=100,
+        block_size_ratio=None,
+        physical_blocks_per_logical=1,
+        dst_region_num_blocks=[100, 4],
+    )
+
+    expected = [7, 8, 100, 101]
     assert list(result) == expected, f"Expected {expected}, got {list(result)}"
 
 
