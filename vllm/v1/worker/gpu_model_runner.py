@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
+from math import prod
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -7152,16 +7153,16 @@ class GPUModelRunner(
 
                     raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
                     if packing is not None:
-                        layer_offset, blk_stride = packing
-                        dtype_size = get_dtype_size(dtype)
-                        page_stride = blk_stride // dtype_size
-                        strides = list(torch.empty(kv_cache_shape).stride())
-                        strides[inv_order[0]] = page_stride
-                        kv_cache = torch.as_strided(
-                            raw_tensor,
-                            size=kv_cache_shape,
-                            stride=tuple(strides),
-                            storage_offset=layer_offset // dtype_size,
+                        offset, block_stride = packing
+                        assert inv_order[0] == 0
+                        page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(dtype)
+                        kv_cache = (
+                            kv_cache_raw_tensors[layer_name]
+                            .view(kv_cache_shape[0], block_stride)[
+                                :, offset : offset + page_bytes
+                            ]
+                            .view(dtype)
+                            .view(kv_cache_shape)
                         )
                     elif kv_cache_spec.page_size_padded is not None:
                         # Use strided view to handle page_size_bytes that
