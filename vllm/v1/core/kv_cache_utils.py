@@ -1232,6 +1232,39 @@ def _bucket_layers_by_page_size(
     return buckets
 
 
+def _get_dsv4_layer_specs(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> dict[str, KVCacheSpec]:
+    layer_specs: dict[str, KVCacheSpec] = {}
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            layer_specs.update(spec.kv_cache_specs)
+        else:
+            for layer_name in group.layer_names:
+                layer_specs[layer_name] = spec
+    return layer_specs
+
+
+def _get_dsv4_bounded_blocks(
+    vllm_config: VllmConfig,
+    specs: Sequence[KVCacheSpec],
+) -> int | None:
+    if not specs or not all(isinstance(spec, SlidingWindowSpec) for spec in specs):
+        return None
+
+    scheduler_config = vllm_config.scheduler_config
+    model_config = vllm_config.model_config
+    return scheduler_config.max_num_seqs * max(
+        spec.max_admission_blocks_per_request(
+            max_num_batched_tokens=scheduler_config.max_num_batched_tokens,
+            max_model_len=model_config.max_model_len,
+        )
+        for spec in specs
+        if isinstance(spec, SlidingWindowSpec)
+    )
+
+
 def _get_kv_cache_config_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1249,15 +1282,38 @@ def _get_kv_cache_config_deepseek_v4(
         sum(ps * len(slots) for ps, slots in buckets.items())
         for buckets in allocation_buckets
     ]
-    total_num_bytes_per_block = sum(bytes_per_block_by_backing)
 
-    num_blocks = available_memory // total_num_bytes_per_block
+    layer_specs = _get_dsv4_layer_specs(kv_cache_groups)
+    backing_num_blocks: list[int | None] = []
+    bounded_memory = 0
+    linear_bytes_per_block = 0
+    for backing_id, buckets in enumerate(allocation_buckets):
+        backing_layers = [
+            layer_name
+            for slots in buckets.values()
+            for slot in slots
+            for layer_name in slot
+        ]
+        bounded_blocks = _get_dsv4_bounded_blocks(
+            vllm_config, [layer_specs[layer_name] for layer_name in backing_layers]
+        )
+        backing_num_blocks.append(bounded_blocks)
+        if bounded_blocks is None:
+            linear_bytes_per_block += bytes_per_block_by_backing[backing_id]
+        else:
+            bounded_memory += bytes_per_block_by_backing[backing_id] * bounded_blocks
+
+    if linear_bytes_per_block > 0:
+        num_blocks = max(available_memory - bounded_memory, 0) // linear_bytes_per_block
+    else:
+        num_blocks = available_memory // sum(bytes_per_block_by_backing)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for backing_id, buckets in enumerate(allocation_buckets):
         block_stride = bytes_per_block_by_backing[backing_id]
-        total_size = block_stride * num_blocks
+        backing_blocks = backing_num_blocks[backing_id] or num_blocks
+        total_size = block_stride * backing_blocks
         byte_offset = 0
         for ps, slots in buckets.items():
             for slot in slots:
@@ -2093,8 +2149,8 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            if tensor.size % num_blocks_old == 0:
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len

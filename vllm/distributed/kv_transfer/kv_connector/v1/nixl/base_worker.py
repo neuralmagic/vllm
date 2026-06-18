@@ -92,15 +92,19 @@ class NixlBaseConnectorWorker:
         dst_num_blocks: int,
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
+        dst_region_num_blocks: list[int] | None = None,
     ) -> np.ndarray:
         """Compute NIXL descriptor IDs for given block IDs."""
         num_fa_regions = self.num_regions
         num_ssm_regions = len(self.block_len_per_layer) * 4 if self._has_mamba else 0
 
         num_blocks = dst_num_blocks
+        region_num_blocks = dst_region_num_blocks or [dst_num_blocks] * num_fa_regions
         if block_size_ratio is not None:
             num_blocks = int(num_blocks * block_size_ratio)
-        num_fa_descs = num_fa_regions * num_blocks
+            region_num_blocks = [int(n * block_size_ratio) for n in region_num_blocks]
+        num_fa_descs = sum(region_num_blocks)
+        region_offsets = np.cumsum([0, *region_num_blocks[:-1]])
 
         # All-attention fast path: single vectorized broadcast.
         if num_ssm_regions == 0:
@@ -110,9 +114,24 @@ class NixlBaseConnectorWorker:
             # read across all regions, same for [3], but group0-group1 blocks will
             # always differ (different areas). Therefore we can just flatten the
             # block_ids and compute the descs ids for all groups at once.
-            block_arr = np.concatenate(block_ids)[None, :]
-            region_ids = np.arange(num_fa_regions)[:, None]
-            return (region_ids * num_blocks + block_arr).flatten()
+            region_group_ids = getattr(self, "_region_group_ids", None)
+            if region_group_ids is None:
+                block_arr = np.concatenate(block_ids)[None, :]
+                region_ids = np.arange(num_fa_regions)[:, None]
+                return (region_ids * num_blocks + block_arr).flatten()
+
+            all_descs: list[np.ndarray] = []
+            for region_id, group_ids in enumerate(region_group_ids):
+                region_blocks = [
+                    block_id
+                    for group_id in group_ids
+                    for block_id in block_ids[group_id]
+                ]
+                if region_blocks:
+                    all_descs.append(
+                        region_offsets[region_id] + np.asarray(region_blocks)
+                    )
+            return np.concatenate(all_descs) if all_descs else np.array([])
 
         # Compute desc ids per group using the right stride: FA descs have
         # num_blocks entries per region (kernel granularity), SSM descs have
@@ -122,9 +141,8 @@ class NixlBaseConnectorWorker:
         for i, group in enumerate(block_ids):
             group_arr = np.asarray(group)
             if _is_attention_spec(self._group_spec_types[i]):
-                fa_region_ids = np.arange(num_fa_regions)[:, None]
                 all_descs.append(
-                    (fa_region_ids * num_blocks + group_arr[None, :]).flatten()
+                    (region_offsets[:, None] + group_arr[None, :]).flatten()
                 )
             elif _is_ssm_spec(self._group_spec_types[i]):
                 # NOTE (NickLucche) SSM and Attention block regions can
@@ -148,6 +166,16 @@ class NixlBaseConnectorWorker:
                 )
 
         return np.concatenate(all_descs)
+
+    def _get_region_num_blocks_for_engine(self, engine_id: EngineId) -> list[int]:
+        if not self.region_num_blocks:
+            return [self.dst_num_blocks[engine_id]] * self.num_regions
+        return [
+            self.dst_num_blocks[engine_id]
+            if num_blocks == self.num_blocks
+            else num_blocks
+            for num_blocks in self.region_num_blocks
+        ]
 
     def _build_local_splits_from_plan(
         self,
@@ -415,6 +443,8 @@ class NixlBaseConnectorWorker:
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
+        self.region_num_blocks: list[int] = []
+        self._region_group_ids: list[tuple[int, ...]] | None = None
         self._registered_descs: list[Any] = []
 
         # In progress transfers.
@@ -842,7 +872,7 @@ class NixlBaseConnectorWorker:
 
     def _register_packed_kv_caches(
         self,
-        packed_caches: list[tuple[torch.Tensor, int]],
+        packed_caches: list[tuple[torch.Tensor, int, int, tuple[int, ...]]],
         device_kv_caches: dict[str, torch.Tensor],
     ) -> None:
         """Register packed KV caches as NIXL regions.
@@ -870,12 +900,16 @@ class NixlBaseConnectorWorker:
         caches_data = []
         base_addresses = []
         block_strides = []
-        for kv_cache, block_stride in packed_caches:
+        region_num_blocks = []
+        region_group_ids = []
+        for kv_cache, block_stride, num_blocks, group_ids in packed_caches:
             total_size = kv_cache.numel() * kv_cache.element_size()
             self.device_id = max(kv_cache.get_device(), 0)
             caches_data.append((kv_cache.data_ptr(), total_size, self.device_id, ""))
             base_addresses.append(kv_cache.data_ptr())
             block_strides.append(block_stride)
+            region_num_blocks.append(num_blocks)
+            region_group_ids.append(group_ids)
 
         logger.info(
             "Registering packed KV cache: block_strides=%s, "
@@ -886,9 +920,11 @@ class NixlBaseConnectorWorker:
         )
 
         self.block_len_per_layer = block_strides
+        self.region_num_blocks = region_num_blocks
+        self._region_group_ids = region_group_ids
         self._region_is_mla = [self.use_mla] * len(block_strides)
         self.num_regions = len(packed_caches)
-        self.num_descs = self.num_regions * self.num_blocks
+        self.num_descs = sum(region_num_blocks)
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = base_addresses
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
@@ -929,8 +965,9 @@ class NixlBaseConnectorWorker:
     def _register_packed_kv_cache(
         self, kv_cache: torch.Tensor, block_stride: int
     ) -> None:
+        group_ids = tuple(range(len(self._group_spec_types)))
         self._register_packed_kv_caches(
-            [(kv_cache, block_stride)],
+            [(kv_cache, block_stride, self.num_blocks, group_ids)],
             {layer: kv_cache for layer in self._layer_specs},
         )
 
@@ -947,29 +984,50 @@ class NixlBaseConnectorWorker:
                 if isinstance(cache, torch.Tensor)
             }
             if len(tensor_caches) == len(kv_caches):
-                storage_groups: dict[int, list[torch.Tensor]] = defaultdict(list)
-                for cache in tensor_caches.values():
-                    storage_groups[cache.untyped_storage().data_ptr()].append(cache)
+                layer_to_group_id = {
+                    layer_name: group_id
+                    for group_id, group in enumerate(
+                        self.kv_cache_config.kv_cache_groups
+                    )
+                    for layer_name in group.layer_names
+                }
+                storage_groups: dict[int, list[tuple[str, torch.Tensor]]] = defaultdict(
+                    list
+                )
+                for layer_name, cache in tensor_caches.items():
+                    storage_groups[cache.untyped_storage().data_ptr()].append(
+                        (layer_name, cache)
+                    )
 
-                packed_caches: list[tuple[torch.Tensor, int]] = []
+                packed_caches: list[tuple[torch.Tensor, int, int, tuple[int, ...]]] = []
                 for caches in storage_groups.values():
-                    any_cache = caches[0]
+                    any_cache = caches[0][1]
                     storage = any_cache.untyped_storage()
                     total_bytes = storage.nbytes()
-                    if total_bytes % self.num_blocks != 0:
+                    num_blocks = any_cache.shape[0]
+                    if total_bytes % num_blocks != 0:
                         break
-                    block_stride = total_bytes // self.num_blocks
-                    data_ptrs = {cache.data_ptr() for cache in caches}
+                    block_stride = total_bytes // num_blocks
+                    data_ptrs = {cache.data_ptr() for _, cache in caches}
                     has_strided_blocks = any(
                         total_bytes > cache.numel() * cache.element_size()
-                        for cache in caches
+                        for _, cache in caches
                     )
                     if len(data_ptrs) == 1 and not has_strided_blocks:
                         break
                     flat = torch.tensor(
                         [], dtype=torch.uint8, device=any_cache.device
                     ).set_(storage)
-                    packed_caches.append((flat, block_stride))
+                    group_ids = tuple(
+                        sorted(
+                            {
+                                layer_to_group_id[layer_name]
+                                for layer_name, _ in caches
+                                if layer_name in layer_to_group_id
+                            }
+                        )
+                    )
+                    packed_caches.append((flat, block_stride, num_blocks, group_ids))
                 else:
                     self._register_packed_kv_caches(packed_caches, tensor_caches)
                     return
@@ -1156,6 +1214,8 @@ class NixlBaseConnectorWorker:
             )
 
         # Total local FA descriptors (boundary between FA and mamba descs).
+        self.region_num_blocks = [self.num_blocks] * self.num_regions
+        self._region_group_ids = None
         self.num_descs = self.num_regions * self.num_blocks
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
@@ -1307,6 +1367,11 @@ class NixlBaseConnectorWorker:
         num_blocks = self.num_blocks * block_size_ratio
         result: list[tuple[int, int, int]] = []
         for i, base_addr in enumerate(base_addresses):
+            region_blocks = (
+                self.region_num_blocks[i] * block_size_ratio
+                if self.region_num_blocks
+                else num_blocks
+            )
             kv_block_len = (
                 self.get_backend_aware_kv_block_len(
                     layer_idx=i, first_split=True, mamba_view=False
@@ -1314,7 +1379,7 @@ class NixlBaseConnectorWorker:
                 // block_size_ratio
             )
             page_stride = self.block_len_per_layer[i] // block_size_ratio
-            for block_id in range(num_blocks):
+            for block_id in range(region_blocks):
                 block_offset = block_id * page_stride
                 addr = base_addr + block_offset
                 result.append((addr, kv_block_len, self.device_id))
@@ -1329,7 +1394,7 @@ class NixlBaseConnectorWorker:
                 second_split = self.get_backend_aware_kv_block_len(
                     layer_idx=i, first_split=False, mamba_view=False
                 )
-                for block_id in range(num_blocks):
+                for block_id in range(region_blocks):
                     block_offset = block_id * page_stride
                     addr = base_addr + block_offset
                     v_addr = addr + kv_block_len
@@ -1350,9 +1415,16 @@ class NixlBaseConnectorWorker:
         # SPLIT regions read their head slice from this many remote ranks at a
         # per-rank offset; REPLICATE regions read the whole block once.
         split_reads = len(plan.source_ranks_per_group[fa_group_idx])
-        num_blocks = nixl_agent_meta.num_blocks
         result: list[tuple[int, int, int]] = []
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
+            num_blocks = (
+                nixl_agent_meta.num_blocks
+                if (
+                    not self.region_num_blocks
+                    or self.region_num_blocks[i] == self.num_blocks
+                )
+                else self.region_num_blocks[i]
+            )
             replicated = self._is_region_replicated(i)
             # Read our whole local region size from remote..
             local_block_len = self.get_backend_aware_kv_block_len(

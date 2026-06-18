@@ -616,12 +616,16 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
+            dst_region_num_blocks=self._get_region_num_blocks_for_engine(dst_engine_id),
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
             dst_num_blocks=self.dst_num_blocks[self.engine_id],
             block_size_ratio=block_size_ratio,
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+            dst_region_num_blocks=self._get_region_num_blocks_for_engine(
+                self.engine_id
+            ),
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)

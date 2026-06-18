@@ -76,6 +76,9 @@ def _make_groups(n_c4, n_c128, n_swa):
 def _mock_vllm_config():
     config = MagicMock()
     config.cache_config.num_gpu_blocks_override = None
+    config.scheduler_config.max_num_batched_tokens = 64
+    config.scheduler_config.max_num_seqs = 4
+    config.model_config.max_model_len = 1024
     return config
 
 
@@ -144,6 +147,30 @@ class TestInterleavedPacking:
         assert len(swa_backings) == 1
         assert linear_backings.isdisjoint(swa_backings)
 
+    def test_swa_backing_uses_bounded_hma_blocks(self):
+        config = _mock_vllm_config()
+        groups = _make_groups(n_c4=3, n_c128=2, n_swa=5)
+        specs = _specs_by_layer(groups)
+        num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
+            config, groups, 100 * 1024 * 1024
+        )
+
+        rows_by_backing = {t.backing_id: t.size // t.block_stride for t in tensors}
+        backing_by_layer = {name: t.backing_id for t in tensors for name in t.shared_by}
+        linear_backing = backing_by_layer["c4_mla.0"]
+        swa_backing = backing_by_layer["swa.0"]
+        swa_spec = specs["swa.0"]
+        expected_swa_blocks = (
+            config.scheduler_config.max_num_seqs
+            * swa_spec.max_admission_blocks_per_request(
+                max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
+                max_model_len=config.model_config.max_model_len,
+            )
+        )
+
+        assert rows_by_backing[linear_backing] == num_blocks
+        assert rows_by_backing[swa_backing] == expected_swa_blocks
+
     def test_strided_views_are_independent(self):
         groups = _make_groups(3, 2, 5)
         specs = _specs_by_layer(groups)
@@ -156,9 +183,10 @@ class TestInterleavedPacking:
         views = []
         for t in tensors:
             page_size = specs[t.shared_by[0]].page_size_bytes
+            backing_blocks = t.size // t.block_stride
             v = torch.as_strided(
                 backings[t.backing_id],
-                size=(num_blocks, page_size),
+                size=(backing_blocks, page_size),
                 stride=(t.block_stride, 1),
                 storage_offset=t.offset,
             )
