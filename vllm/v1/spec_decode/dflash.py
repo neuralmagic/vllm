@@ -73,13 +73,30 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
+        arch = base.model_config.model_arch_config
         # The draft model is text-only — clear the target's multimodal
         # flag so flash_attn is not rejected for mm_prefix support.
-        arch = base.model_config.model_arch_config
         if arch.is_mm_prefix_lm:
-            base.model_config.model_arch_config = replace(arch, is_mm_prefix_lm=False)
+            arch = replace(arch, is_mm_prefix_lm=False)
+        # The draft model uses standard Qwen3/Llama attention, not MLA.
+        # Clear the MLA flag inherited from the target model (e.g.
+        # DeepSeek-V4) so sliding-window layers are not rejected.
+        if arch.is_deepseek_mla:
+            arch = replace(arch, is_deepseek_mla=False)
+        if arch is not base.model_config.model_arch_config:
+            base.model_config.model_arch_config = arch
+        # The draft model uses standard attention and cannot inherit
+        # specialized kv-cache formats (e.g. fp8_ds_mla from DeepSeek-V4).
+        cache_config = base.cache_config
+        if cache_config is not None and cache_config.cache_dtype not in (
+            "auto",
+            "bfloat16",
+            "float16",
+        ):
+            cache_config = replace(cache_config, cache_dtype="auto")
         return replace(
             base,
+            cache_config=cache_config,
             attention_config=replace(
                 base.attention_config,
                 use_non_causal=not self.dflash_causal,

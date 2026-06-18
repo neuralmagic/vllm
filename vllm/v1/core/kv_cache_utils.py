@@ -927,16 +927,16 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
-def _split_uniform_hidden(
+def _split_uniform_and_standalone(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> tuple[list[KVCacheGroupSpec], list[KVCacheGroupSpec]] | None:
-    """If all groups are UniformTypeKVCacheSpecs or HiddenStateCacheSpec,
-    return (uniform_groups, hidden_groups).  Otherwise return None."""
-    if not all(
-        isinstance(g.kv_cache_spec, (UniformTypeKVCacheSpecs, HiddenStateCacheSpec))
-        for g in kv_cache_groups
-    ):
-        return None
+    """Split groups into UniformTypeKVCacheSpecs (DSv4) and standalone groups.
+
+    Standalone groups include HiddenStateCacheSpec, FullAttentionSpec (from
+    draft models like DFlash), and any other non-UniformTypeKVCacheSpecs.
+    Returns (uniform_groups, standalone_groups) or None if there are no
+    uniform groups or no standalone groups.
+    """
     uniform = [
         g
         for g in kv_cache_groups
@@ -944,10 +944,14 @@ def _split_uniform_hidden(
     ]
     if not uniform:
         return None
-    hidden = [
-        g for g in kv_cache_groups if isinstance(g.kv_cache_spec, HiddenStateCacheSpec)
+    standalone = [
+        g
+        for g in kv_cache_groups
+        if not isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
     ]
-    return uniform, hidden
+    if not standalone:
+        return None
+    return uniform, standalone
 
 
 def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
@@ -961,12 +965,12 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
-    if (split := _split_uniform_hidden(kv_cache_groups)) is not None:
+    if (split := _split_uniform_and_standalone(kv_cache_groups)) is not None:
         uniform, hidden = split
         buckets = _bucket_layers_by_page_size(uniform)
         total = sum(ps * len(slots) for ps, slots in buckets.items())
         for g in hidden:
-            total += g.kv_cache_spec.page_size_bytes
+            total += g.kv_cache_spec.page_size_bytes * len(g.layer_names)
         return total
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
@@ -1317,10 +1321,10 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
-    elif (split := _split_uniform_hidden(kv_cache_groups)) is not None:
+    elif (split := _split_uniform_and_standalone(kv_cache_groups)) is not None:
         uniform_groups, hidden_groups = split
         hidden_cost_per_block = sum(
-            g.kv_cache_spec.page_size_bytes for g in hidden_groups
+            g.kv_cache_spec.page_size_bytes * len(g.layer_names) for g in hidden_groups
         )
         if hidden_cost_per_block > 0:
             buckets = _bucket_layers_by_page_size(uniform_groups)
@@ -1715,6 +1719,24 @@ def get_kv_cache_groups(
             if not isinstance(v, HiddenStateCacheSpec)
         }
 
+    # When DSv4 MLA layers are mixed with non-MLA layers (e.g.
+    # FullAttentionSpec from a DFlash draft model), pull the non-MLA
+    # specs out so group_and_unify_kv_cache_specs only sees MLA types.
+    draft_specs: dict[str, KVCacheSpec] = {}
+    has_swa_mla = any(
+        isinstance(v, SlidingWindowMLASpec) for v in kv_cache_spec.values()
+    )
+    if has_swa_mla:
+        draft_specs = {
+            k: v
+            for k, v in kv_cache_spec.items()
+            if not isinstance(v, (MLAAttentionSpec, SlidingWindowMLASpec))
+        }
+        if draft_specs:
+            kv_cache_spec = {
+                k: v for k, v in kv_cache_spec.items() if k not in draft_specs
+            }
+
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
@@ -1738,6 +1760,16 @@ def get_kv_cache_groups(
         # function will raise an error.
         kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
         groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+
+    # Add draft model (non-MLA) layers back as their own group(s).
+    if draft_specs:
+        if is_kv_cache_spec_uniform(draft_specs):
+            groups.extend(_get_kv_cache_groups_uniform_spec(draft_specs))
+        elif draft_uniform := UniformTypeKVCacheSpecs.from_specs(draft_specs):
+            groups.extend(_get_kv_cache_groups_uniform_type(draft_uniform))
+        else:
+            for name, spec in draft_specs.items():
+                groups.append(KVCacheGroupSpec([name], spec))
 
     if hidden_specs:
         page_sizes = {g.kv_cache_spec.page_size_bytes for g in groups}
@@ -1815,7 +1847,7 @@ def _max_memory_usage_bytes_from_groups(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
-    elif (split := _split_uniform_hidden(kv_cache_groups)) is not None:
+    elif (split := _split_uniform_and_standalone(kv_cache_groups)) is not None:
         uniform, hidden = split
         full_mla_spec = cast(UniformTypeKVCacheSpecs, uniform[0].kv_cache_spec)
         layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
@@ -1835,7 +1867,7 @@ def _max_memory_usage_bytes_from_groups(
         for group in hidden:
             total_max_mem_usage_bytes += group.kv_cache_spec.max_memory_usage_bytes(
                 vllm_config
-            )
+            ) * len(group.layer_names)
         return total_max_mem_usage_bytes
 
     # General case: group_size pools, each shared by one layer per group
