@@ -60,13 +60,24 @@ def _make_groups(n_c4, n_c128, n_swa):
 
 def _mock_vllm_config():
     config = MagicMock()
-    config.scheduler_config.num_gpu_blocks_override = None
+    config.cache_config.num_gpu_blocks_override = None
     return config
 
 
 def _run(n_c4=3, n_c128=2, n_swa=5, mem=100 * 1024 * 1024):
     groups = _make_groups(n_c4, n_c128, n_swa)
     return _get_kv_cache_config_deepseek_v4(_mock_vllm_config(), groups, mem)
+
+
+def _page_sizes_by_layer(
+    groups: list[KVCacheGroupSpec],
+) -> dict[str, int]:
+    page_sizes = {}
+    for group in groups:
+        specs = group.kv_cache_spec.kv_cache_specs
+        for layer_name in group.layer_names:
+            page_sizes[layer_name] = specs[layer_name].page_size_bytes
+    return page_sizes
 
 
 class TestInterleavedPacking:
@@ -96,11 +107,15 @@ class TestInterleavedPacking:
         assert len(all_names) == expected
 
     def test_strided_views_are_independent(self):
-        num_blocks, tensors = _run()
+        groups = _make_groups(n_c4=3, n_c128=2, n_swa=5)
+        page_sizes = _page_sizes_by_layer(groups)
+        num_blocks, tensors = _get_kv_cache_config_deepseek_v4(
+            _mock_vllm_config(), groups, 100 * 1024 * 1024
+        )
         backing = torch.zeros(tensors[0].size, dtype=torch.uint8)
         views = []
         for t in tensors:
-            page_size = t.block_stride // 1
+            page_size = page_sizes[t.shared_by[0]]
             v = torch.as_strided(
                 backing,
                 size=(num_blocks, page_size),
