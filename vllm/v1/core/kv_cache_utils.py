@@ -935,7 +935,7 @@ def _split_uniform_and_standalone(
     Standalone groups include HiddenStateCacheSpec, FullAttentionSpec (from
     draft models like DFlash), and any other non-UniformTypeKVCacheSpecs.
     Returns (uniform_groups, standalone_groups) or None if there are no
-    uniform groups or no standalone groups.
+    uniform groups.  standalone_groups may be empty.
     """
     uniform = [
         g
@@ -949,8 +949,6 @@ def _split_uniform_and_standalone(
         for g in kv_cache_groups
         if not isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
     ]
-    if not standalone:
-        return None
     return uniform, standalone
 
 
@@ -972,11 +970,6 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         for g in hidden:
             total += g.kv_cache_spec.page_size_bytes * len(g.layer_names)
         return total
-    if all(
-        isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
-    ):
-        buckets = _bucket_layers_by_page_size(kv_cache_groups)
-        return sum(ps * len(slots) for ps, slots in buckets.items())
     group_size = max(len(g.layer_names) for g in kv_cache_groups)
     page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
     return page_size * group_size
@@ -1346,15 +1339,6 @@ def get_kv_cache_config_from_groups(
                         shared_by=[name],
                     )
                 )
-    elif all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        for group in kv_cache_groups
-    ):
-        # DeepseekV4: UniformTypeKVCacheSpecs but multiple groups.
-        # Delegate to the DeepseekV4-specific allocator.
-        num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
-            vllm_config, kv_cache_groups, available_memory
-        )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
