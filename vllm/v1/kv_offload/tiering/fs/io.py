@@ -6,6 +6,18 @@ import os
 import random
 import threading
 
+try:
+    from vllm.fsio_C import (  # pyright: ignore[reportMissingImports]
+        load_block as load_block_C,
+    )
+    from vllm.fsio_C import (
+        store_block as store_block_C,
+    )
+
+    _HAS_FSIO_C = True
+except ImportError:
+    _HAS_FSIO_C = False
+
 logger = logging.getLogger(__name__)
 
 # O_DIRECT is Linux-specific and not available on macOS
@@ -38,17 +50,21 @@ def store_block(
     """
     Store callback: Writes to a temp file then atomically replaces the destination.
     """
+    tmp_path = dest_path + _get_tmp_suffix()
+    # Write block atomically. Cast to a flat byte view so the slice uses byte
+    # indices; the raw memoryview may be multi-dimensional with itemsize > 1.
+    view_slice = buffer.cast("B")[offset : offset + block_size]
+
+    if _HAS_FSIO_C:
+        return store_block_C(tmp_path, dest_path, view_slice)
+
     # Check if block already exists to avoid redundant writes
     if os.path.exists(dest_path):
         return
 
-    tmp_path = dest_path + _get_tmp_suffix()
     # Ensure parent directories exist
     _ensure_dirs(dest_path)
 
-    # Write block atomically. Cast to a flat byte view so the slice uses byte
-    # indices; the raw memoryview may be multi-dimensional with itemsize > 1.
-    view_slice = buffer.cast("B")[offset : offset + block_size]
     try:
         fd = os.open(
             tmp_path,
@@ -81,8 +97,12 @@ def load_block(
     """
     Load callback: read one KV block from disk. Remove the file on failure.
     """
-    fd: int | None = None
     view_slice = view.cast("B")[offset : offset + block_size]
+
+    if _HAS_FSIO_C:
+        return load_block_C(source_path, view_slice, block_size)
+
+    fd: int | None = None
     try:
         fd = os.open(source_path, os.O_RDONLY | O_DIRECT)
         bytes_read = os.readv(fd, [view_slice])
