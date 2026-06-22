@@ -32,6 +32,7 @@ lookup() is a pure OrderedDict operation.
 """
 
 import queue
+import resource, time
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -213,7 +214,27 @@ class AsyncLookupManager(ABC):
             results: list[tuple[OffloadKey, bool]] = []
             for req_context, keys in batches.values():
                 try:
-                    hits = self.batch_lookup(keys, req_context)
+
+                    wall_0 = time.perf_counter()
+                    r0 = resource.getrusage(resource.RUSAGE_THREAD)
+
+                    hits = list(self.batch_lookup(keys, req_context))
+
+                    wall_1 = time.perf_counter()
+                    r1 = resource.getrusage(resource.RUSAGE_THREAD)
+
+                    wall    = wall_1 - wall_0
+                    cpu     = (r1.ru_utime + r1.ru_stime) - (r0.ru_utime + r0.ru_stime)
+                    nvcsw   = r1.ru_nvcsw  - r0.ru_nvcsw   # voluntary: GIL yield + blocking
+                    nivcsw  = r1.ru_nivcsw - r0.ru_nivcsw  # involuntary: OS preempted
+                    logger.info(
+                        "batch_lookup n=%d  wall=%.1fms  cpu=%.1fms  util=%.0f%%  "
+                        "vol_csw=%d  invol_csw=%d",
+                        len(keys), wall*1000, cpu*1000,
+                        cpu/wall*100 if wall else 0,
+                        nvcsw, nivcsw,
+                    )
+
                 except Exception as exc:
                     logger.warning(
                         "batch_lookup failed on tier %s for %d keys: %s",
@@ -222,6 +243,8 @@ class AsyncLookupManager(ABC):
                         exc,
                     )
                     hits = (False for _ in keys)
+
+
 
                 for key, hit in zip(keys, hits):
                     results.append((key, hit))
