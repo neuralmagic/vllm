@@ -19,7 +19,7 @@ import functools
 import json
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from typing_extensions import override
 
@@ -42,6 +42,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _fs_batch_lookup(
+    file_mapper: FileMapper, keys: list[OffloadKey], _req_context: ReqContext
+) -> Iterable[bool]:
+    return (os.path.exists(file_mapper.get_file_name(k)) for k in keys)
+
+
 class FsAsyncLookupManager(AsyncLookupManager):
     """Async lookup manager for FileSystemTierManager."""
 
@@ -49,14 +55,25 @@ class FsAsyncLookupManager(AsyncLookupManager):
         self,
         tier: "FileSystemTierManager",
         tier_type: str,
+        worker_mode: Literal["thread", "process"] = "process",
     ) -> None:
-        super().__init__(tier_type=tier_type)
-        self._tier = tier
+        self._file_mapper = tier.file_mapper
+        super().__init__(
+            tier_type=tier_type,
+            worker_mode=worker_mode,
+            process_context=self._file_mapper,
+        )
 
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
-        return (os.path.exists(self._tier.file_mapper.get_file_name(k)) for k in keys)
+        return _fs_batch_lookup(self._file_mapper, keys, req_context)
+
+    @staticmethod
+    def process_batch_lookup(
+        keys: list[OffloadKey], req_context: ReqContext, file_mapper: FileMapper
+    ) -> Iterable[bool]:
+        return _fs_batch_lookup(file_mapper, keys, req_context)
 
 
 class FileSystemTierManager(SecondaryTierManager):
@@ -88,6 +105,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        lookup_worker_mode: Literal["thread", "process"] = "process",
     ):
         """
         Args:
@@ -98,6 +116,8 @@ class FileSystemTierManager(SecondaryTierManager):
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
+            lookup_worker_mode: Async lookup worker mode. "process" is default,
+                "thread" can be used as a fallback.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
@@ -130,7 +150,11 @@ class FileSystemTierManager(SecondaryTierManager):
             thread_name_prefix="vllm_kv_py_fs",
         )
 
-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+        self._lookup_manager = FsAsyncLookupManager(
+            tier=self,
+            tier_type=self.tier_type,
+            worker_mode=lookup_worker_mode,
+        )
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
