@@ -365,28 +365,16 @@ def convert_to_nvfp4_moe_kernel_format(
             prepare_humming_moe_layer,
         )
 
-        quant_method_name = layer.quant_method.__class__.__name__
-        if "CompressedTensor" in quant_method_name:
-            from compressed_tensors.quantization import QuantizationArgs
-
-            weight_quant = getattr(layer.quant_method, "weight_quant", None)
-            assert isinstance(weight_quant, QuantizationArgs)
-            quant_config = weight_quant.model_dump()
-            quant_config["quant_method"] = "compressed-tensors"
-            quant_config["format"] = "nvfp4-pack-quantized"
-
-            # CompressedTensorsW4A4Nvfp4MoEMethod rename weight_packed to weight
-            # we need to rename it back to match the checkpoint name
-            w13_weight = torch.nn.Parameter(layer.w13_weight.data, requires_grad=False)
-            w2_weight = torch.nn.Parameter(layer.w2_weight.data, requires_grad=False)
-            layer.w13_weight_packed = w13_weight
-            layer.w2_weight_packed = w2_weight
-            delattr(layer, "w13_weight")
-            delattr(layer, "w2_weight")
-        else:
-            quant_config = {"quant_method": "modelopt", "quant_algo": "nvfp4"}
-
-        prepare_humming_moe_layer(layer, quant_config)
+        # compressed-tensors nvfp4 and modelopt nvfp4 share the same canonical
+        # fp4 layout (packed uint8 weights + e4m3 group-16 scales + an fp32
+        # global scale), so describe it with humming's modelopt nvfp4 schema
+        # regardless of source. This drops the quant_method class sniffing, the
+        # weight_quant.model_dump() reconstruction, and the weight->weight_packed
+        # rename the CT loader required.
+        # NOTE: validate compressed-tensors nvfp4 through the modelopt schema.
+        prepare_humming_moe_layer(
+            layer, {"quant_method": "modelopt", "quant_algo": "nvfp4"}
+        )
 
         a13_scale = None
         a2_scale = None

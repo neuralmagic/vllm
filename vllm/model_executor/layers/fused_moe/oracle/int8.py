@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
+from typing import Any
 
 import torch
 
@@ -203,6 +204,22 @@ def make_int8_moe_quant_config(
     )
 
 
+def _humming_int8_weight_schema(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> dict[str, Any]:
+    """Describe the canonical int8 MoE layout to humming's native int8 schema.
+
+    Derived from the on-device tensors (weight/scale shapes), not from the
+    producing quant method. Channelwise is the default; a small scale (one per
+    expert) is tensorwise.
+    """
+    config: dict[str, Any] = {"quant_method": "humming", "dtype": "int8"}
+    num_experts, num_output = weight.shape[0], weight.shape[-2]
+    if weight_scale.numel() < num_experts * num_output:
+        config["weight_scale_type"] = "tensor"
+    return config
+
+
 def convert_to_int8_moe_kernel_format(
     int8_backend: Int8MoeBackend,
     layer: torch.nn.Module,
@@ -218,26 +235,25 @@ def convert_to_int8_moe_kernel_format(
             prepare_humming_moe_layer,
         )
 
-        quant_method_name = layer.quant_method.__class__.__name__
-        if "CompressedTensors" in quant_method_name:
-            from compressed_tensors.quantization import QuantizationArgs
+        # Both compressed-tensors w8a8-int8 and online experts_int8 land here in
+        # the same canonical layout: signed int8 weights + channel/tensor scales.
+        # Convert to humming's native uint8 (+128) layout and derive the schema
+        # from the canonical tensors -- no quant_method class sniffing.
+        # NOTE: this routes compressed-tensors int8 through humming's native int8
+        # path (instead of its CT int-quantized loader); validate w8a8-int8.
+        schema = _humming_int8_weight_schema(w13, w13_scale)
+        replace_parameter(layer, "w13_weight", (w13 + 128).view(torch.int32))
+        replace_parameter(layer, "w2_weight", (w2 + 128).view(torch.int32))
+        w13_scale = w13_scale.to(layer.params_dtype)
+        w2_scale = w2_scale.to(layer.params_dtype)
+        if w13_scale.dim() < 3:
+            w13_scale = w13_scale.unsqueeze(-1)
+        if w2_scale.dim() < 3:
+            w2_scale = w2_scale.unsqueeze(-1)
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
 
-            weight_quant = getattr(layer.quant_method, "weight_quant", None)
-            assert isinstance(weight_quant, QuantizationArgs)
-            quant_config = weight_quant.model_dump()
-            quant_config["quant_method"] = "compressed-tensors"
-            quant_config["format"] = "int-quantized"
-        else:
-            assert "Int8Online" in quant_method_name
-            replace_parameter(layer, "w13_weight", (w13 + 128).view(torch.int32))
-            replace_parameter(layer, "w2_weight", (w2 + 128).view(torch.int32))
-            w13_scale = w13_scale.to(layer.params_dtype).unsqueeze(-1)
-            w2_scale = w2_scale.to(layer.params_dtype).unsqueeze(-1)
-            layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
-            layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
-            quant_config = {"quant_method": "humming", "dtype": "int8"}
-
-        prepare_humming_moe_layer(layer, quant_config)
+        prepare_humming_moe_layer(layer, schema)
 
         return (
             layer.w13_weight,
