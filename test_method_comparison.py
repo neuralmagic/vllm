@@ -228,7 +228,7 @@ def main():
     # Results
     # =========================================================================
     print(
-        "Baseline (BF16):                       range=[{:.2f}, {:.2f}], mean={:.4f}, std={:.2f}".format(
+        "Baseline (BF16):         range=[{:.2f}, {:.2f}], mean={:.4f}, std={:.3f}".format(
             out_0.min().item(),
             out_0.max().item(),
             out_0.mean().item(),
@@ -238,7 +238,7 @@ def main():
 
     mse_1 = ((out_1 - out_0) ** 2).mean().item()
     print(
-        "Method 1 (Hadacore):                   range=[{:.2f}, {:.2f}], mean={:.4f}, std={:.2f}, MSE={:.2f}".format(
+        "Method 1 (Hadacore):     range=[{:.2f}, {:.2f}], mean={:.4f}, std={:.2f}, MSE={:.3f}".format(
             out_1.min().item(),
             out_1.max().item(),
             out_1.mean().item(),
@@ -249,7 +249,7 @@ def main():
 
     mse_2 = ((out_2 - out_0) ** 2).mean().item()
     print(
-        "Method 2 (QutlassMxFP4):               range=[{:.2f}, {:.2f}], mean={:.4f}, std={:.2f}, MSE={:.2f}".format(
+        "Method 2 (QutlassMxFP4): range=[{:.2f}, {:.2f}], mean={:.4f}, std={:.2f}, MSE={:.3f}".format(
             out_2.min().item(),
             out_2.max().item(),
             out_2.mean().item(),
