@@ -11,9 +11,11 @@ Thread pool:
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.tiering.base import JobId
+from vllm.v1.kv_offload.tiering.fs.rw_lock import RWLock
 
 logger = init_logger(__name__)
 
@@ -61,6 +63,7 @@ class DualQueueThreadPool:
         n_read_threads: int,
         n_write_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
+        io_bookkeeping_lock: RWLock | None = None,
     ) -> None:
         self._load_q: deque = deque()
         self._store_q: deque = deque()
@@ -69,6 +72,7 @@ class DualQueueThreadPool:
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
+        self._io_bookkeeping_lock = io_bookkeeping_lock
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -89,6 +93,14 @@ class DualQueueThreadPool:
             )
             t.start()
             self._threads.append(t)
+
+    @property
+    def io_bookkeeping_lock(self) -> RWLock | None:
+        return self._io_bookkeeping_lock
+
+    def _bookkeeping_read_lock(self):
+        lock = self._io_bookkeeping_lock
+        return lock.read_locked() if lock is not None else nullcontext()
 
     def enqueue_load(
         self,
@@ -153,7 +165,7 @@ class DualQueueThreadPool:
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
         while True:
-            with self._condition:
+            with self._bookkeeping_read_lock(), self._condition:
                 self._condition.wait_for(
                     lambda: self._stop or self._load_q or self._store_q
                 )
@@ -164,17 +176,19 @@ class DualQueueThreadPool:
                 task, state = primary.popleft() if primary else secondary.popleft()
             try:
                 task()
-                job_finished, success = state.task_done(True)
+                with self._bookkeeping_read_lock():
+                    job_finished, success = state.task_done(True)
             except Exception as exc:
                 logger.error(
                     "Job %s block I/O failed: %s",
                     state.job_id,
                     exc,
                 )
-                job_finished, success = state.task_done(False)
+                with self._bookkeeping_read_lock():
+                    job_finished, success = state.task_done(False)
 
             if job_finished:
-                with self._condition:
+                with self._bookkeeping_read_lock(), self._condition:
                     self._finished_q.append((state.job_id, success))
                     self._inflight_jobs -= 1
                     self._condition.notify_all()

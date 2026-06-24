@@ -19,6 +19,7 @@ import functools
 import json
 import os
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from typing_extensions import override
@@ -34,6 +35,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
+from vllm.v1.kv_offload.tiering.fs.rw_lock import RWLock
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -49,14 +51,21 @@ class FsAsyncLookupManager(AsyncLookupManager):
         self,
         tier: "FileSystemTierManager",
         tier_type: str,
+        io_bookkeeping_lock: RWLock | None = None,
     ) -> None:
         super().__init__(tier_type=tier_type)
         self._tier = tier
+        self._io_bookkeeping_lock = io_bookkeeping_lock
 
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
-        return (os.path.exists(self._tier.file_mapper.get_file_name(k)) for k in keys)
+        lock = self._io_bookkeeping_lock
+        write_lock = lock.write_locked() if lock is not None else nullcontext()
+        with write_lock:
+            return [
+                os.path.exists(self._tier.file_mapper.get_file_name(k)) for k in keys
+            ]
 
 
 class FileSystemTierManager(SecondaryTierManager):
@@ -128,9 +137,14 @@ class FileSystemTierManager(SecondaryTierManager):
             n_read_threads,
             n_write_threads,
             thread_name_prefix="vllm_kv_py_fs",
+            io_bookkeeping_lock=RWLock(),
         )
 
-        self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+        self._lookup_manager = FsAsyncLookupManager(
+            tier=self,
+            tier_type=self.tier_type,
+            io_bookkeeping_lock=self._pool.io_bookkeeping_lock,
+        )
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
