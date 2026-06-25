@@ -305,18 +305,24 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Handle MTP: adjust decode_threshold like the indexer does
+        # Handle speculative decoding: adjust decode_threshold to match the
+        # threshold used by the indexer and flashmla_sparse so that all backends
+        # agree on the decode/prefill split. With parallel drafting, a decode
+        # step verifies the previous proposal and drafts the next one, so the
+        # query length can reach 1 + 2 * num_speculative_tokens.
+        spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
-            self.vllm_config.speculative_config.num_speculative_tokens
-            if self.vllm_config.speculative_config
-            else 0
+            spec_config.num_speculative_tokens if spec_config else 0
         )
-        # With MTP, decode can have query_len up to 1 + num_speculative_tokens.
-        # Must match the threshold used by the indexer and flashmla_sparse so
-        # that all backends agree on the decode/prefill split.
-        self.decode_threshold = (
-            self.reorder_batch_threshold + self.num_speculative_tokens
-        )
+        if spec_config and spec_config.num_speculative_tokens:
+            self.decode_threshold = max(
+                self.reorder_batch_threshold,
+                1
+                + (2 if spec_config.parallel_drafting else 1)
+                * spec_config.num_speculative_tokens,
+            )
+        else:
+            self.decode_threshold = self.reorder_batch_threshold
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")

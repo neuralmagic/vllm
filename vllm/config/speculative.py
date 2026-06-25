@@ -1112,6 +1112,15 @@ class SpeculativeConfig:
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 
+    def requires_eagle_cache_drop(self) -> bool:
+        """Whether a prefix cache hit must drop the last block.
+
+        EAGLE-style drafters shift the hidden states by one position, so the
+        final matched block cannot be reused. DFlash precomputes context KV for
+        every position instead, so it must keep the full cache history.
+        """
+        return self.use_eagle() and not self.use_dflash()
+
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
 

@@ -264,7 +264,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         next_n = self.num_speculative_tokens + 1
-        self.reorder_batch_threshold += self.num_speculative_tokens
+        spec_config = self.vllm_config.speculative_config
+        if spec_config and spec_config.num_speculative_tokens:
+            # With parallel drafting, a decode step both verifies the previous
+            # proposal and drafts the next one, so the query length can reach
+            # 1 + 2 * num_speculative_tokens.
+            self.reorder_batch_threshold = max(
+                self.reorder_batch_threshold,
+                1
+                + (2 if spec_config.parallel_drafting else 1)
+                * spec_config.num_speculative_tokens,
+            )
+        else:
+            self.reorder_batch_threshold += self.num_speculative_tokens
         # NOTE: SM100 datacenter GPUs support any next_n natively via the
         # multi-atom paged MQA logits kernels (FP8 and FP4 indexer
         # caches). Outside the SM100 family the FP8
