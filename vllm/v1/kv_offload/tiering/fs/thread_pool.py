@@ -165,15 +165,16 @@ class DualQueueThreadPool:
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
         while True:
-            with self._bookkeeping_read_lock(), self._condition:
+            with self._condition:
                 self._condition.wait_for(
                     lambda: self._stop or self._load_q or self._store_q
                 )
                 if self._stop:
                     return
-                primary = self._load_q if load_priority else self._store_q
-                secondary = self._store_q if load_priority else self._load_q
-                task, state = primary.popleft() if primary else secondary.popleft()
+                with self._bookkeeping_read_lock():
+                    primary = self._load_q if load_priority else self._store_q
+                    secondary = self._store_q if load_priority else self._load_q
+                    task, state = primary.popleft() if primary else secondary.popleft()
             try:
                 task()
                 with self._bookkeeping_read_lock():
@@ -188,7 +189,8 @@ class DualQueueThreadPool:
                     job_finished, success = state.task_done(False)
 
             if job_finished:
-                with self._bookkeeping_read_lock(), self._condition:
-                    self._finished_q.append((state.job_id, success))
-                    self._inflight_jobs -= 1
-                    self._condition.notify_all()
+                with self._condition:
+                    with self._bookkeeping_read_lock():
+                        self._finished_q.append((state.job_id, success))
+                        self._inflight_jobs -= 1
+                        self._condition.notify_all()
