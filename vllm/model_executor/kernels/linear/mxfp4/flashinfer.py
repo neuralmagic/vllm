@@ -64,7 +64,8 @@ class FlashInferMxFp4LinearKernel(MxFp4LinearKernel):
             layer.weight_scale,
             alpha=None,
             out_dtype=x.dtype,
-            backend="cute-dsl",
+            # TODO get to work with cute-dsl?
+            backend="cudnn",
             block_size=_MXFP4_GROUP_SIZE,
             use_nvfp4=False,
         )
