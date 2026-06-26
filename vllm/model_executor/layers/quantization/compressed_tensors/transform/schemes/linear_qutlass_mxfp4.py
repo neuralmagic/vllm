@@ -88,10 +88,12 @@ class QutlassMxFP4LinearMethod(CompressedTensorsLinearTransformMethod):
 
         x_flat = x.contiguous().flatten(end_dim=-2)
 
-        # fusedQuantizeMx performs Hadamard transform + MXFP4 quantization
-        # Returns E2M1 packed values and E8M0 scales
-        x_fp4, x_scales = fusedQuantizeMx(x_flat, layer.hadamard_matrix)
-
+        # TODO: abs_max currently hard-codes a weight_global_scale of 3
+        # to cancel it out, divide hadamard matrix by 3. Once Roberto's QUTLASS
+        # changes to fusedQuantizeMx have landed, we can fix this
+        x_fp4, x_scales = fusedQuantizeMx(
+            x_flat, layer.hadamard_matrix / 3, method="abs_max"
+        )
         x_scales_blocked = to_blocked(x_scales, backend="triton").view(x_scales.shape)
 
         out = flashinfer_scaled_fp4_mm(
