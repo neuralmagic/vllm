@@ -41,6 +41,10 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
         input_tfms: dict[int, TransformTuple],
         output_tfms: dict[int, TransformTuple],
     ) -> "CompressedTensorsLinearTransformMethod":
+        from vllm.model_executor.layers.quantization.compressed_tensors.transform.schemes.linear_qutlass_mxfp4 import (  # noqa: E501
+            QutlassMxFP4LinearMethod,
+            is_qutlass_mxfp4_scheme,
+        )
         from vllm.model_executor.layers.quantization.compressed_tensors.transform.schemes.linear_qutlass_nvfp4 import (  # noqa: E501
             QutlassNvFP4LinearMethod,
             is_qutlass_fp4_scheme,
@@ -50,6 +54,9 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
 
         if is_qutlass_fp4_scheme(quant_scheme, input_tfms):
             return QutlassNvFP4LinearMethod(quant_method, input_tfms, output_tfms)
+
+        if is_qutlass_mxfp4_scheme(quant_scheme, input_tfms):
+            return QutlassMxFP4LinearMethod(quant_method, input_tfms, output_tfms)
 
         # hadacore or dense gemm is selected by Transform module
         return cls(quant_method, input_tfms, output_tfms)
