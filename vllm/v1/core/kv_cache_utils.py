@@ -1676,7 +1676,10 @@ def _annotate_eagle_groups_deepseek_v4(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> None:
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    # Only EAGLE/MTP drafters shift hidden states by one and therefore need the
+    # last-block drop flagged here. DFlash precomputes context KV for every
+    # position and must keep the full history, so it is intentionally excluded.
+    if spec_config is None or not spec_config.requires_eagle_cache_drop():
         return
     # Detection uses the merged MLA spec's model_version.
     if not any(
@@ -1731,6 +1734,24 @@ def get_kv_cache_groups(
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        # The grouping above only captures the DeepSeek-V4 MLA / SWA-MLA target
+        # layers. A DFlash draft adds dense (non-MLA) attention layers whose
+        # FullAttentionSpec is not part of any MLA group. Collect those leftover
+        # layers into their own uniform group so they receive a KV cache
+        # allocation; keeping every group a UniformTypeKVCacheSpecs preserves the
+        # packed DeepSeek-V4 layout for the target layers.
+        grouped_layers = {n for g in kv_cache_groups for n in g.layer_names}
+        leftover_specs = {
+            name: spec
+            for name, spec in kv_cache_spec.items()
+            if name not in grouped_layers
+        }
+        if leftover_specs:
+            leftover_uniform = UniformTypeKVCacheSpecs.from_specs(leftover_specs)
+            assert leftover_uniform is not None
+            kv_cache_groups.append(
+                KVCacheGroupSpec(list(leftover_specs.keys()), leftover_uniform)
+            )
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 

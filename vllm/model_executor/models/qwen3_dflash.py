@@ -35,11 +35,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheSpec,
-    SlidingWindowSpec,
-)
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
@@ -101,18 +97,19 @@ class DFlashAttention(Attention):
     """
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        spec = super().get_kv_cache_spec(vllm_config)
-        if isinstance(spec, SlidingWindowSpec):
-            return FullAttentionSpec(
-                block_size=spec.block_size,
-                num_kv_heads=spec.num_kv_heads,
-                head_size=spec.head_size,
-                head_size_v=getattr(spec, "head_size_v", spec.head_size),
-                dtype=spec.dtype,
-                kv_quant_mode=spec.kv_quant_mode,
-                page_size_padded=spec.page_size_padded,
-            )
-        return spec
+        if self.sliding_window is None:
+            return super().get_kv_cache_spec(vllm_config)
+        # DFlash writes every context KV before drafting and never evicts old
+        # context, so even sliding-window draft layers need a full-attention KV
+        # cache. Temporarily clear the window so the base builds a
+        # FullAttentionSpec; this also sidesteps the MLA+sliding-window guard,
+        # which only applies to the MLA target model, not this dense draft.
+        saved_window = self.sliding_window
+        self.sliding_window = None
+        try:
+            return super().get_kv_cache_spec(vllm_config)
+        finally:
+            self.sliding_window = saved_window
 
 
 class DFlashQwen3Attention(nn.Module):
@@ -347,13 +344,12 @@ class DFlashQwen3Model(nn.Module):
                 num_features_to_use = len(drafter_config["layer_ids"])
             # Each auxiliary hidden state carries `hc_mult` residual streams
             # (1 for single-stream targets, >1 for DeepSeek-V4 multi-stream
-            # residuals), so the per-layer feature width is
-            # `hc_mult * hidden_size`. Matches the DFlash trainer's `fc` input.
+            # residuals), so the per-layer feature width is `hc_mult * hidden_size`.
+            # This mirrors the DFlash trainer exactly (see speculators
+            # DFlashDraftModel: ``fc_in = num_target_layers * hc_mult * hidden_size``)
+            # where ``hidden_size`` is the draft model's hidden size.
             hc_mult = getattr(self.config, "hc_mult", 1)
-            per_layer_hidden_size = getattr(self.config, "target_hidden_size", None)
-            if per_layer_hidden_size is None:
-                per_layer_hidden_size = self.config.hidden_size
-            fc_input_size = per_layer_hidden_size * hc_mult * num_features_to_use
+            fc_input_size = self.config.hidden_size * hc_mult * num_features_to_use
             self.fc = ReplicatedLinear(
                 input_size=fc_input_size,
                 output_size=self.config.hidden_size,
