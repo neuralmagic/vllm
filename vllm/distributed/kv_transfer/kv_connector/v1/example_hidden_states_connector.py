@@ -477,7 +477,13 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         the hidden states from the KV cache.
         """
         req_id = request.request_id
-        filename = self._request_filenames.pop(req_id)
+        filename = self._request_filenames.pop(req_id, None)
+        if filename is None:
+            # The request was aborted (e.g. the client disconnected or timed out
+            # while queued) before a forward pass produced hidden states, so there
+            # is nothing to extract. Don't delay block freeing — and never raise,
+            # which would take down the whole engine core.
+            return False, None
         kv_params = request.kv_transfer_params or {}
         if kv_params.get("include_output_tokens", False):
             # Exclude the final token — it was the model's output, never an

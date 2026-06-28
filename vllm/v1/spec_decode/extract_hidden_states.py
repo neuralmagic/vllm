@@ -71,7 +71,12 @@ class ExtractHiddenStatesProposer:
                 "model config for extract_hidden_states method"
             )
         self.num_hidden_states = len(layer_ids)
-        self.hidden_size = vllm_config.model_config.get_hidden_size()
+        # DeepSeek-V4 keeps a multi-stream (hc_mult) residual, so each auxiliary
+        # hidden state is the post-`mhc` projection flattened over the stream
+        # dimension: width = hc_mult * hidden_size. Other models leave hc_mult
+        # unset (== 1), so this reduces to the plain hidden size.
+        hc_mult = getattr(vllm_config.model_config.hf_config, "hc_mult", 1)
+        self.hidden_size = vllm_config.model_config.get_hidden_size() * hc_mult
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.num_hidden_states, self.hidden_size),
             dtype=self.dtype,

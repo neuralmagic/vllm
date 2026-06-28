@@ -1516,6 +1516,14 @@ def group_and_unify_kv_cache_specs(
     # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
     # be fragile with only block_size and sliding_window as keys, but fine for now.
     for name, spec in kv_cache_spec.items():
+        if isinstance(spec, HiddenStateCacheSpec):
+            # HiddenStateCacheSpec subclasses MLAAttentionSpec but is a hidden-state
+            # store (extract_hidden_states) with a much larger, differently-shaped
+            # page than real MLA layers. Packing it into the DeepSeek-V4 MLA layout
+            # poisons the shared layer-tuple page accounting and explodes the KV
+            # reservation. Leave it out here; get_kv_cache_groups places it in its
+            # own group, mirroring the general (non-packed) path.
+            continue
         if isinstance(spec, SlidingWindowMLASpec):
             grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
         elif isinstance(spec, MLAAttentionSpec):

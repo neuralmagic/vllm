@@ -2451,8 +2451,15 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests.get(req_id)
+            if req is None:
+                # The request was aborted (e.g. client disconnect/retry) before
+                # its KV transfer — for the hidden-states connector, the async
+                # hidden-state save — reported completion. Its blocks were freed
+                # on abort, so there is nothing to free here; skip rather than
+                # crash the engine core on a stale completion.
+                continue
+            self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,
