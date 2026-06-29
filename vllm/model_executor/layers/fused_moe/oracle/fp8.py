@@ -432,13 +432,14 @@ def _humming_fp8_weight_schema(
     unaware that humming exists. ``compressed-tensors`` is just the vocabulary
     humming's schema loader speaks for this canonical layout.
     """
-    # mxfp8: UE8M0 group-32 scales -> humming's modelopt mxfp8 schema.
-    # NOTE: humming has no compressed-tensors mxfp8 loader (CT formats are
-    # int/float/naive/pack/nvfp4-pack/mxfp4-pack only), and the modelopt loader
-    # expects the modelopt scale layout. So this is correct only for modelopt
-    # mxfp8 checkpoints; compressed-tensors ``mxfp8-quantized`` MoE produces
-    # WRONG output through humming and must not select it (see select gating).
-    if weight_scale.dtype == torch.float8_e8m0fnu:
+    # mxfp8: fp8 weights with UE8M0 group-32 scales. The scale is stored as
+    # raw bytes (uint8) or as float8_e8m0fnu; either way it is an E8M0 exponent,
+    # not an fp32/float block scale, so route to humming's modelopt mxfp8 schema
+    # (which views the bytes as e8m0). This covers both modelopt and
+    # compressed-tensors ``mxfp8-quantized`` MoE -- their canonical layout
+    # (weight (N, K) fp8 + scale (N, K/32) e8m0) is identical; humming has no
+    # separate compressed-tensors mxfp8 loader.
+    if weight_scale.dtype in (torch.uint8, torch.float8_e8m0fnu):
         return {"quant_method": "modelopt", "quant_algo": "mxfp8"}
 
     # Otherwise fp8 (e4m3). Recover the scale strategy from the canonical scale
