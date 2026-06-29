@@ -366,22 +366,37 @@ def convert_to_nvfp4_moe_kernel_format(
             convert_to_humming_moe_kernel_format,
         )
 
-        # compressed-tensors nvfp4 and modelopt nvfp4 share the same canonical
-        # fp4 layout (packed uint8 weights + e4m3 group-16 scales + an fp32
-        # global scale), so describe it with humming's modelopt nvfp4 schema
-        # regardless of source -- no quant_method class sniffing or
-        # weight_quant.model_dump() reconstruction.
-        convert_to_humming_moe_kernel_format(
-            layer, quant_config={"quant_method": "modelopt", "quant_algo": "nvfp4"}
-        )
+        # Both nvfp4 sources are packed fp4 weights + e4m3 group-16 scales + an
+        # fp32 global scale, but with different on-layer param names. Pick the
+        # matching humming schema by which global-scale param is present (no
+        # quant_method class sniffing): compressed-tensors registers
+        # ``*_weight_global_scale``; modelopt uses ``*_weight_scale_2``.
+        if hasattr(layer, "w13_weight_global_scale"):
+            quant_config = {
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+                "type": "float",
+                "num_bits": 4,
+                "strategy": "group",
+                "group_size": 16,
+            }
+            # humming's CT pack-quantized loader reads ``weight_packed``; the CT
+            # method renamed it to ``weight`` for the marlin path, so re-expose
+            # the packed alias (humming replaces all params during convert).
+            layer.w13_weight_packed = layer.w13_weight
+            layer.w2_weight_packed = layer.w2_weight
+        else:
+            quant_config = {"quant_method": "modelopt", "quant_algo": "nvfp4"}
+
+        convert_to_humming_moe_kernel_format(layer, quant_config=quant_config)
         a13_scale = None
         a2_scale = None
         w13 = layer.w13_weight
         w13_scale = layer.w13_weight_scale
-        w13_scale_2 = layer.w13_global_scale
+        w13_scale_2 = getattr(layer, "w13_global_scale", None)
         w2 = layer.w2_weight
         w2_scale = layer.w2_weight_scale
-        w2_scale_2 = layer.w2_global_scale
+        w2_scale_2 = getattr(layer, "w2_global_scale", None)
     elif nvfp4_backend == NvFp4MoeBackend.MARLIN:
         a13_scale = None
         a2_scale = None
