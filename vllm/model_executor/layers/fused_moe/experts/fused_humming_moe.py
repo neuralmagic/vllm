@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
     kMxfp8Dynamic,
     kMxfp8Static,
+    kNvfp4Dynamic,
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
@@ -206,6 +207,9 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             # int8 (compressed-tensors w8a8 / experts_int8)
             (kInt8StaticChannelSym, None),
             (kInt8StaticChannelSym, kInt8DynamicTokenSym),
+            # nvfp4 (compressed-tensors / modelopt / quark) carry an fp4
+            # dynamic activation key in the checkpoint.
+            (kNvfp4Static, kNvfp4Dynamic),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
