@@ -432,7 +432,12 @@ def _humming_fp8_weight_schema(
     unaware that humming exists. ``compressed-tensors`` is just the vocabulary
     humming's schema loader speaks for this canonical layout.
     """
-    # mxfp8: UE8M0 group-32 scales map to humming's modelopt schema.
+    # mxfp8: UE8M0 group-32 scales -> humming's modelopt mxfp8 schema.
+    # NOTE: humming has no compressed-tensors mxfp8 loader (CT formats are
+    # int/float/naive/pack/nvfp4-pack/mxfp4-pack only), and the modelopt loader
+    # expects the modelopt scale layout. So this is correct only for modelopt
+    # mxfp8 checkpoints; compressed-tensors ``mxfp8-quantized`` MoE produces
+    # WRONG output through humming and must not select it (see select gating).
     if weight_scale.dtype == torch.float8_e8m0fnu:
         return {"quant_method": "modelopt", "quant_algo": "mxfp8"}
 
