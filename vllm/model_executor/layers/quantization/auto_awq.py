@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe import (
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+    WNA16MoEBackend,
     convert_to_wna16_moe_kernel_format,
     make_wna16_moe_kernel,
     make_wna16_moe_quant_config,
@@ -663,6 +664,25 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
         layer.workspace = marlin_make_workspace_new(device, 4)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:
+            # Humming consumes the AWQ weights in-place (no marlin repack),
+            # converting them to the standard w13_weight / w2_weight names.
+            from vllm.model_executor.layers.quantization.utils.humming_utils import (
+                convert_to_humming_moe_kernel_format,
+            )
+
+            convert_to_humming_moe_kernel_format(
+                layer,
+                quant_config={
+                    "quant_method": "awq",
+                    "bits": self.quant_config.weight_bits,
+                    "group_size": self.quant_config.group_size,
+                    "zero_point": self.quant_config.zero_point,
+                },
+            )
+            self._setup_kernel(layer)
+            return
+
         (
             w13,
             w2,
@@ -734,6 +754,8 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             experts_cls=self.experts_cls,
+            backend=self.wna16_moe_backend,
+            layer=layer,
             is_k_full=self.is_k_full,
             w13_g_idx=getattr(layer, "w13_g_idx", None),
             w2_g_idx=getattr(layer, "w2_g_idx", None),
@@ -743,6 +765,12 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
         )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+        if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:
+            from vllm.model_executor.layers.quantization.utils.humming_utils import (
+                get_humming_moe_quant_config,
+            )
+
+            return get_humming_moe_quant_config(layer)
         return make_wna16_moe_quant_config(
             w1_scale=layer.w13_scales,
             w2_scale=layer.w2_scales,
@@ -783,8 +811,8 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             hidden_states=x,
-            w1=layer.w13_qweight,
-            w2=layer.w2_qweight,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=layer.activation,
@@ -806,8 +834,8 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
         assert self.moe_kernel is not None
         return self.moe_kernel.apply_monolithic(
             hidden_states=x,
-            w1=layer.w13_qweight,
-            w2=layer.w2_qweight,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
             router_logits=router_logits,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
