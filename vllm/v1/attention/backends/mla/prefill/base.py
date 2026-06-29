@@ -124,11 +124,11 @@ class MLAPrefillBackend(ABC):
 
         Called by the metadata builder after constructing the prefill metadata.
         """
-        self._prefill_metadata = prefill_metadata
 
     @abstractmethod
     def run_prefill_new_tokens(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -141,6 +141,7 @@ class MLAPrefillBackend(ABC):
     @abstractmethod
     def run_prefill_context_chunk(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         chunk_idx: int,
         q: torch.Tensor,
         k: torch.Tensor,

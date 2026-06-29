@@ -82,17 +82,9 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             ),
         )
 
-    def prepare_metadata(
-        self,
-        prefill_metadata: "MLACommonPrefillMetadata",
-    ) -> None:
-        super().prepare_metadata(prefill_metadata)
-        self._query_seq_lens = (
-            prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
-        )
-
     def run_prefill_new_tokens(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -102,12 +94,16 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
+        query_seq_lens = (
+            prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
+        )
+
         out = torch.empty(
             q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
-            dtype=self._prefill_metadata.output_dtype,
+            dtype=prefill_metadata.output_dtype,
         )
 
         ret = trtllm_ragged_attention_deepseek(
@@ -115,16 +111,16 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             key=k,
             value=v,
             workspace_buffer=self._workspace_buffer,
-            seq_lens=self._query_seq_lens,
-            max_q_len=self._prefill_metadata.max_query_len,
-            max_kv_len=self._prefill_metadata.max_query_len,
+            seq_lens=query_seq_lens,
+            max_q_len=prefill_metadata.max_query_len,
+            max_kv_len=prefill_metadata.max_query_len,
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
             o_sf_scale=1.0,
-            batch_size=self._query_seq_lens.shape[0],
+            batch_size=query_seq_lens.shape[0],
             window_left=-1,
-            cum_seq_lens_q=self._prefill_metadata.query_start_loc,
-            cum_seq_lens_kv=self._prefill_metadata.query_start_loc,
+            cum_seq_lens_q=prefill_metadata.query_start_loc,
+            cum_seq_lens_kv=prefill_metadata.query_start_loc,
             enable_pdl=False,
             is_causal=True,
             return_lse=return_softmax_lse,
@@ -138,6 +134,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
 
     def run_prefill_context_chunk(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         chunk_idx: int,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -145,15 +142,15 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
-        assert self._prefill_metadata.chunked_context is not None
-        assert self._prefill_metadata.chunked_context.seq_lens[chunk_idx] is not None
+        assert prefill_metadata.chunked_context is not None
+        assert prefill_metadata.chunked_context.seq_lens[chunk_idx] is not None
 
         out = torch.empty(
             q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
-            dtype=self._prefill_metadata.output_dtype,
+            dtype=prefill_metadata.output_dtype,
         )
 
         attn_out, lse = trtllm_ragged_attention_deepseek(
@@ -161,20 +158,16 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             key=k,
             value=v,
             workspace_buffer=self._workspace_buffer,
-            seq_lens=self._prefill_metadata.chunked_context.seq_lens[chunk_idx],
-            max_q_len=self._prefill_metadata.max_query_len,
-            max_kv_len=self._prefill_metadata.chunked_context.max_seq_lens[chunk_idx],
+            seq_lens=prefill_metadata.chunked_context.seq_lens[chunk_idx],
+            max_q_len=prefill_metadata.max_query_len,
+            max_kv_len=prefill_metadata.chunked_context.max_seq_lens[chunk_idx],
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
             o_sf_scale=1.0,
-            batch_size=self._prefill_metadata.chunked_context.seq_lens[chunk_idx].shape[
-                0
-            ],
+            batch_size=prefill_metadata.chunked_context.seq_lens[chunk_idx].shape[0],
             window_left=-1,
-            cum_seq_lens_q=self._prefill_metadata.query_start_loc,
-            cum_seq_lens_kv=self._prefill_metadata.chunked_context.cu_seq_lens[
-                chunk_idx
-            ],
+            cum_seq_lens_q=prefill_metadata.query_start_loc,
+            cum_seq_lens_kv=prefill_metadata.chunked_context.cu_seq_lens[chunk_idx],
             enable_pdl=False,
             is_causal=False,
             return_lse=True,

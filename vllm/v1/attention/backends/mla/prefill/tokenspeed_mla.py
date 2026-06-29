@@ -102,24 +102,9 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
                 enable_pdl=False,
             )
 
-    def prepare_metadata(
-        self,
-        prefill_metadata: "MLACommonPrefillMetadata",
-    ) -> None:
-        super().prepare_metadata(prefill_metadata)
-        # Kernel signature requires `seq_lens` but the implementation never reads
-        # it (per-batch lengths are derived from `cum_seq_lens` diffs); compute
-        # for parity with trtllm_ragged. cuda-graph padding in
-        # `query_start_loc` is saturated to `total_num_tokens`
-        # (gpu_model_runner.py:1905), so trailing diffs are 0 and padded batches
-        # are kernel no-ops — same reason trtllm passes the padded length as
-        # batch_size directly.
-        self._query_seq_lens = (
-            prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
-        )
-
     def run_prefill_new_tokens(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -128,6 +113,17 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         output_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_mla import tokenspeed_mla_prefill
+
+        # Kernel signature requires `seq_lens` but the implementation never reads
+        # it (per-batch lengths are derived from `cum_seq_lens` diffs); compute
+        # for parity with trtllm_ragged. cuda-graph padding in
+        # `query_start_loc` is saturated to `total_num_tokens`
+        # (gpu_model_runner.py:1905), so trailing diffs are 0 and padded batches
+        # are kernel no-ops — same reason trtllm passes the padded length as
+        # batch_size directly.
+        query_seq_lens = (
+            prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
+        )
 
         # `v` arrives as the second half of `kv_nope.split(...)` in
         # mla_attention.forward_mha — a non-contiguous view of `kv_nope` along
@@ -140,10 +136,10 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             query=q,
             key=k,
             value=v,
-            seq_lens=self._query_seq_lens,
-            cum_seq_lens=self._prefill_metadata.query_start_loc,
-            max_seq_len=self._prefill_metadata.max_query_len,
-            batch_size=self._query_seq_lens.shape[0],
+            seq_lens=query_seq_lens,
+            cum_seq_lens=prefill_metadata.query_start_loc,
+            max_seq_len=prefill_metadata.max_query_len,
+            batch_size=query_seq_lens.shape[0],
             softmax_scale=self.scale,
             is_causal=True,
             return_lse=return_softmax_lse,
@@ -157,6 +153,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
 
     def run_prefill_context_chunk(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         chunk_idx: int,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -164,8 +161,8 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_mla import tokenspeed_mla_prefill
 
-        assert self._prefill_metadata.chunked_context is not None
-        chunked = self._prefill_metadata.chunked_context
+        assert prefill_metadata.chunked_context is not None
+        chunked = prefill_metadata.chunked_context
 
         # See note in run_prefill_new_tokens — `v` is a split-view of `kv_nope`
         # in `_compute_prefill_context` and arrives non-contiguous.
@@ -182,8 +179,8 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             softmax_scale=self.scale,
             is_causal=False,
             return_lse=True,
-            cum_seq_lens_q=self._prefill_metadata.query_start_loc,
-            max_seq_len_q=self._prefill_metadata.max_query_len,
+            cum_seq_lens_q=prefill_metadata.query_start_loc,
+            max_seq_len_q=prefill_metadata.max_query_len,
             enable_pdl=False,
         )
 

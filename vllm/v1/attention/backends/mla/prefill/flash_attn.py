@@ -20,6 +20,9 @@ from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.attention.mla_attention import (
+        MLACommonPrefillMetadata,
+    )
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 
 if is_flash_attn_varlen_func_available():
@@ -155,6 +158,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
     def run_prefill_new_tokens(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -166,10 +170,10 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=self._prefill_metadata.query_start_loc,
-            cu_seqlens_k=self._prefill_metadata.query_start_loc,
-            max_seqlen_q=self._prefill_metadata.max_query_len,
-            max_seqlen_k=self._prefill_metadata.max_query_len,
+            cu_seqlens_q=prefill_metadata.query_start_loc,
+            cu_seqlens_k=prefill_metadata.query_start_loc,
+            max_seqlen_q=prefill_metadata.max_query_len,
+            max_seqlen_k=prefill_metadata.max_query_len,
             softmax_scale=self.scale,
             causal=True,
             return_softmax_lse=return_softmax_lse,
@@ -179,20 +183,21 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
     def run_prefill_context_chunk(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         chunk_idx: int,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self._prefill_metadata.chunked_context is not None
+        assert prefill_metadata.chunked_context is not None
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=self._prefill_metadata.query_start_loc,
-            cu_seqlens_k=self._prefill_metadata.chunked_context.cu_seq_lens[chunk_idx],
-            max_seqlen_q=self._prefill_metadata.max_query_len,
-            max_seqlen_k=self._prefill_metadata.chunked_context.max_seq_lens[chunk_idx],
+            cu_seqlens_q=prefill_metadata.query_start_loc,
+            cu_seqlens_k=prefill_metadata.chunked_context.cu_seq_lens[chunk_idx],
+            max_seqlen_q=prefill_metadata.max_query_len,
+            max_seqlen_k=prefill_metadata.chunked_context.max_seq_lens[chunk_idx],
             softmax_scale=self.scale,
             causal=False,  # Context is unmasked
             return_softmax_lse=True,

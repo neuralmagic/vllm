@@ -193,6 +193,7 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
 
     def run_prefill_new_tokens(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -216,6 +217,7 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
 
     def run_prefill_context_chunk(
         self,
+        prefill_metadata: "MLACommonPrefillMetadata",
         chunk_idx: int,
         q: torch.Tensor,
         k: torch.Tensor,

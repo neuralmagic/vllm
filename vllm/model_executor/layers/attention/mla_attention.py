@@ -2168,6 +2168,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(
+                    prefill_metadata=prefill_metadata,
                     chunk_idx=i,
                     q=q,
                     k=k,
@@ -2311,6 +2312,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(
+                    prefill_metadata=prefill_metadata,
                     chunk_idx=i,
                     q=q,
                     k=k,
@@ -2376,6 +2378,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             v = v.to(prefill_metadata.q_data_type)
 
         output_prefill = prefill_metadata.prefill_backend.run_prefill_new_tokens(
+            prefill_metadata=prefill_metadata,
             q=q,
             k=k,
             v=v,
