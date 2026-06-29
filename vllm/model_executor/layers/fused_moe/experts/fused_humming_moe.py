@@ -210,6 +210,9 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             # nvfp4 (compressed-tensors / modelopt / quark) carry an fp4
             # dynamic activation key in the checkpoint.
             (kNvfp4Static, kNvfp4Dynamic),
+            # mxfp8 (compressed-tensors / modelopt / online) selects with the
+            # mxfp8 dynamic activation key.
+            (kMxfp8Static, kMxfp8Dynamic),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 

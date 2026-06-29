@@ -905,6 +905,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
+            layer=layer,
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -951,6 +952,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
+            layer=layer,
         )
 
     def apply_monolithic(
@@ -2165,6 +2167,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
+            layer=layer,
         )
 
         # No native MXFP8 MoE kernel on this device (e.g. gfx942): the emulation
@@ -2210,6 +2213,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             gemm1_alpha=getattr(layer, "swiglu_alpha", None),
             gemm1_beta=getattr(layer, "swiglu_beta", None),
+            layer=layer,
         )
 
     def apply_monolithic(
