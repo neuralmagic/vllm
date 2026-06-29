@@ -139,8 +139,6 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 )
             # Canonicalize to (K, N) for the kernel.
             replace_parameter(layer, "weight", layer.weight.t())
-            layer.weight.input_dim = 0
-            layer.weight.output_dim = 1
 
         self.linear_kernel.process_weights_after_loading(layer)
 

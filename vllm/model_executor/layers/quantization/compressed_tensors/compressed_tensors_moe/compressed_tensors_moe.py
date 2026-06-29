@@ -68,18 +68,14 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 CompressedTensorsW4A4Mxfp4MoEMethod,
             )
 
-            return CompressedTensorsW4A4Mxfp4MoEMethod(
-                weight_quant, input_quant, layer.moe_config
-            )
+            return CompressedTensorsW4A4Mxfp4MoEMethod(layer.moe_config)
 
         if quant_config._is_mxfp8(weight_quant):
             from .compressed_tensors_moe_w8a8_mxfp8 import (
                 CompressedTensorsW8A8Mxfp8MoEMethod,
             )
 
-            return CompressedTensorsW8A8Mxfp8MoEMethod(
-                weight_quant, input_quant, layer.moe_config
-            )
+            return CompressedTensorsW8A8Mxfp8MoEMethod(layer.moe_config)
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             # group_size=None means channelwise
@@ -100,15 +96,18 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 )
 
             # Prefer to use the MarlinMoE kernel when it is supported.
+            is_actorder = (
+                weight_quant.strategy == QuantizationStrategy.GROUP
+                and weight_quant.actorder
+                in (ActivationOrdering.GROUP, ActivationOrdering.DYNAMIC)
+            )
             if (
-                not check_moe_marlin_supports_layer(layer, group_size)
+                not check_moe_marlin_supports_layer(
+                    layer, group_size, allow_tile_padding=not is_actorder
+                )
                 or current_platform.is_rocm()
             ):
-                if (
-                    weight_quant.strategy == QuantizationStrategy.GROUP
-                    and weight_quant.actorder
-                    in (ActivationOrdering.GROUP, ActivationOrdering.DYNAMIC)
-                ):
+                if is_actorder:
                     raise ValueError(
                         "WNA16MoE is not supported with actorder=group/dynamic."
                     )
@@ -174,11 +173,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     f"or None for NVFP4A16, found {input_quant}",
                 )
             return CompressedTensorsW4A4Nvfp4MoEMethod(
-                weight_quant,
-                input_quant,
-                layer.moe_config,
-                layer_name,
-                use_a16=(input_quant is None),
+                layer.moe_config, layer_name, use_a16=(input_quant is None)
             )
         elif (
             quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)

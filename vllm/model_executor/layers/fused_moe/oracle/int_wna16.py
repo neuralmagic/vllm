@@ -11,7 +11,6 @@ from compressed_tensors.quantization import (
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -22,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     BatchedMarlinExperts,
     MarlinExperts,
+    MarlinExpertsBase,
 )
 from vllm.model_executor.layers.fused_moe.experts.trtllm_mxint4_moe import (
     TrtLlmMxint4ExpertsMonolithic,
@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_mxint4_moe import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_act_int8_process_scales,
+    marlin_moe_padded_intermediate,
     marlin_moe_permute_scales,
     marlin_permute_bias,
     moe_awq_to_marlin_zero_points,
@@ -45,7 +46,6 @@ logger = init_logger(__name__)
 class WNA16MoEBackend(Enum):
     MARLIN = "MARLIN"
     BATCHED_MARLIN = "BATCHED_MARLIN"
-    HUMMING = "HUMMING"
     CPU = "CPU"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     XPU = "XPU"
@@ -55,20 +55,7 @@ def backend_to_kernel_cls(
     backend: WNA16MoEBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
     """Return the experts class for the given backend, or None for NONE."""
-    if backend == WNA16MoEBackend.HUMMING:
-        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
-            BatchedHummingGroupedExperts,
-            HummingGroupedExperts,
-            HummingIndexedExperts,
-        )
-
-        return [
-            BatchedHummingGroupedExperts,
-            HummingGroupedExperts,
-            HummingIndexedExperts,
-        ]
-
-    elif backend == WNA16MoEBackend.MARLIN:
+    if backend == WNA16MoEBackend.MARLIN:
         return [MarlinExperts]
     elif backend == WNA16MoEBackend.BATCHED_MARLIN:
         return [BatchedMarlinExperts]
@@ -103,24 +90,8 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
         WNA16MoEBackend.FLASHINFER_TRTLLM,
         WNA16MoEBackend.MARLIN,
         WNA16MoEBackend.BATCHED_MARLIN,
-        WNA16MoEBackend.HUMMING,
     ]
     return _AVAILABLE_BACKENDS
-
-
-def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
-    """Map user's MoEBackend to WNA16MoEBackend."""
-    mapping = {
-        "marlin": WNA16MoEBackend.MARLIN,
-        "humming": WNA16MoEBackend.HUMMING,
-        "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
-    }
-    if backend := mapping.get(runner_backend):
-        return backend
-    raise ValueError(
-        f"moe_backend='{runner_backend}' is not supported for WNA16 MoE. "
-        f"Expected one of {list(mapping.keys())}."
-    )
 
 
 def select_wna16_moe_backend(
@@ -174,14 +145,6 @@ def select_wna16_moe_backend(
                 logger.info_once(_make_log_backend(backend), scope="local")
                 return backend, k_cls
         raise ValueError(_make_log_unsupported(backend, reason))
-
-    # Handle explicit moe_backend from user.
-    runner_backend = config.moe_backend
-    if runner_backend != "auto":
-        requested_backend = map_wna16_backend(runner_backend)
-        return _return_or_raise(
-            requested_backend, config, weight_key, None, activation_format
-        )
 
     # Select kernels in order of backend.
     AVAILABLE_BACKENDS = _get_priority_backends()
@@ -247,8 +210,6 @@ def make_wna16_moe_kernel(
     moe_quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
     experts_cls: type[mk.FusedMoEExperts],
-    backend: WNA16MoEBackend,
-    layer: torch.nn.Module,
     is_k_full: bool = False,
     w13_g_idx: torch.Tensor | None = None,
     w2_g_idx: torch.Tensor | None = None,
@@ -267,18 +228,14 @@ def make_wna16_moe_kernel(
     )
 
     # Currently, we only support TrtLlmMxint4ExpertsMonolithic, MarlinExperts,
-    # BatchedMarlinExperts, XPUExpertsWNA16, CPUExpertsInt4, and the Humming
-    # grouped/indexed experts.
-    allowed_experts: tuple[type[mk.FusedMoEExperts], ...] = (
+    # BatchedMarlinExperts, XPUExpertsWNA16, and CPUExpertsInt4
+    assert experts_cls in (
         MarlinExperts,
         BatchedMarlinExperts,
         TrtLlmMxint4ExpertsMonolithic,
         XPUExpertsWNA16,
         CPUExpertsInt4,
     )
-    if backend == WNA16MoEBackend.HUMMING:
-        allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
-    assert experts_cls in allowed_experts
 
     is_monolithic = experts_cls.is_monolithic()
 
@@ -294,10 +251,7 @@ def make_wna16_moe_kernel(
     logger.info_once("Using %s", prepare_finalize.__class__.__name__, scope="local")
 
     extra_args: dict[str, Any] = {}
-    if backend == WNA16MoEBackend.HUMMING:
-        assert layer is not None
-        extra_args = {"layer": layer}
-    elif backend == WNA16MoEBackend.MARLIN:
+    if issubclass(experts_cls, MarlinExpertsBase):
         extra_args = {
             "w13_g_idx": w13_g_idx,
             "w2_g_idx": w2_g_idx,
@@ -408,6 +362,34 @@ def _process_weights_flashinfer(
     )
 
 
+def _pad_w13_shard_cols(x: torch.Tensor, unit: int, padded_unit: int) -> torch.Tensor:
+    """Zero-pad each of the two gate/up shards of a ``(E, rows, 2 * unit)``
+    tensor along its last dim, from ``unit`` to ``padded_unit`` columns."""
+    if padded_unit == unit:
+        return x
+    e, rows, _ = x.shape
+    x = x.view(e, rows, 2, unit)
+    x = torch.nn.functional.pad(x, (0, padded_unit - unit))
+    return x.reshape(e, rows, 2 * padded_unit).contiguous()
+
+
+def _pad_rows(x: torch.Tensor, padded_rows: int) -> torch.Tensor:
+    """Zero-pad a ``(E, rows, cols)`` tensor to ``padded_rows`` rows."""
+    if padded_rows == x.size(1):
+        return x
+    return torch.nn.functional.pad(x, (0, 0, 0, padded_rows - x.size(1)))
+
+
+def _pad_w13_bias(bias: torch.Tensor, n: int, padded_n: int) -> torch.Tensor:
+    """Zero-pad each gate/up shard of a ``(E, 2 * n)`` bias to ``padded_n``."""
+    if padded_n == n:
+        return bias
+    e = bias.size(0)
+    bias = bias.view(e, 2, n)
+    bias = torch.nn.functional.pad(bias, (0, padded_n - n))
+    return bias.reshape(e, 2 * padded_n).contiguous()
+
+
 def _process_weights_marlin(
     layer: torch.nn.Module,
     input_dtype: torch.dtype | None,
@@ -477,6 +459,29 @@ def _process_weights_marlin(
         marlin_w2_qweight = w2_qweight
         marlin_w13_scales = w13_scales
         marlin_w2_scales = w2_scales
+
+    # --- Pad the intermediate size to a valid Marlin thread tile ---
+    # GPTQ packs along K: w13's N is in the (shard) columns, w2's N in the rows.
+    # Act-order keeps the strict shape and is never padded.
+    N = layer.intermediate_size_per_partition
+    padded_N = marlin_moe_padded_intermediate(N, group_size)
+    if padded_N != N:
+        assert actorder != "group", (
+            "Marlin MoE thread-tile padding is unsupported with act-order"
+        )
+        marlin_w13_qweight = _pad_w13_shard_cols(marlin_w13_qweight, N, padded_N)
+        marlin_w2_qweight = _pad_rows(marlin_w2_qweight, padded_N // pack_factor)
+        marlin_w13_scales = _pad_w13_shard_cols(marlin_w13_scales, N, padded_N)
+        if group_size > 0:
+            marlin_w2_scales = _pad_rows(marlin_w2_scales, padded_N // group_size)
+        if w13_qzeros is not None:
+            w13_qzeros = _pad_w13_shard_cols(
+                w13_qzeros, N // pack_factor, padded_N // pack_factor
+            )
+        if w2_qzeros is not None and group_size > 0:
+            w2_qzeros = _pad_rows(w2_qzeros, padded_N // group_size)
+        if w13_bias is not None:
+            w13_bias = _pad_w13_bias(w13_bias, N, padded_N)
 
     # --- Process act_order (g_idx) ---
     if actorder == "group":
@@ -654,6 +659,25 @@ def _process_awq_weights_marlin(
         )
         w13_scales = w13_scales.data * 512
         w2_scales = w2_scales.data * 512
+
+    # --- Pad the intermediate size to a valid Marlin thread tile ---
+    # AWQ packs along N: w13's N is in the (shard) columns, w2's N in the rows.
+    N = layer.intermediate_size_per_partition
+    padded_N = marlin_moe_padded_intermediate(N, group_size)
+    if padded_N != N:
+        w13_qweight = _pad_w13_shard_cols(
+            w13_qweight, N // pack_factor, padded_N // pack_factor
+        )
+        w2_qweight = _pad_rows(w2_qweight, padded_N)
+        w13_scales = _pad_w13_shard_cols(w13_scales, N, padded_N)
+        w13_qzeros = _pad_w13_shard_cols(
+            w13_qzeros, N // pack_factor, padded_N // pack_factor
+        )
+        if group_size > 0:
+            w2_scales = _pad_rows(w2_scales, padded_N // group_size)
+            w2_qzeros = _pad_rows(w2_qzeros, padded_N // group_size)
+        if w13_bias is not None:
+            w13_bias = _pad_w13_bias(w13_bias, N, padded_N)
 
     w13_g_idx_sort_indices = torch.nn.Parameter(
         torch.empty((num_experts, 0), dtype=torch.int32, device=device),
@@ -959,15 +983,7 @@ def convert_to_wna16_moe_kernel_format(
         quant_config: the ``QuantizationConfig`` for this layer.
         input_dtype: optional activation dtype, usually should be 16 bit.
     """
-    if backend == WNA16MoEBackend.HUMMING:
-        from vllm.model_executor.layers.fused_moe import RoutedExperts
-        from vllm.model_executor.layers.quantization.utils.humming_utils import (
-            get_humming_moe_quant_config,
-        )
-
-        assert isinstance(layer, RoutedExperts)
-        return get_humming_moe_quant_config(layer)
-    elif backend in (
+    if backend in (
         WNA16MoEBackend.MARLIN,
         WNA16MoEBackend.BATCHED_MARLIN,
     ):
