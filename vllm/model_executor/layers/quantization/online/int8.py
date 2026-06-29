@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.oracle.int8 import (
+    Int8MoeBackend,
+    convert_to_int8_moe_kernel_format,
     make_int8_moe_kernel,
     make_int8_moe_quant_config,
     select_int8_moe_backend,
@@ -92,22 +94,43 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w2_scale", w2_scale)
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
+        if self.int8_backend == Int8MoeBackend.HUMMING:
+            # Online int8 stores per-channel scales as w13_scale/w2_scale.
+            # Re-expose them under the canonical w13_weight_scale names that
+            # humming's compressed-tensors loader consumes, dropping the
+            # originals so the converter sees a clean weight/weight_scale pair.
+            replace_parameter(layer, "w13_weight_scale", layer.w13_scale.data)
+            replace_parameter(layer, "w2_weight_scale", layer.w2_scale.data)
+            delattr(layer, "w13_scale")
+            delattr(layer, "w2_scale")
+            convert_to_int8_moe_kernel_format(
+                int8_backend=self.int8_backend,
+                w13=layer.w13_weight,
+                w2=layer.w2_weight,
+                layer=layer,
+                w13_scale=layer.w13_weight_scale,
+            )
+
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
         self.moe_kernel = make_int8_moe_kernel(
+            int8_backend=self.int8_backend,
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
+            layer=layer,
         )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> "FusedMoEQuantConfig | None":
         return make_int8_moe_quant_config(
-            w1_scale=layer.w13_scale,
-            w2_scale=layer.w2_scale,
+            int8_backend=self.int8_backend,
+            w1_scale=getattr(layer, "w13_scale", None),
+            w2_scale=getattr(layer, "w2_scale", None),
             w1_bias=getattr(layer, "w13_bias", None),
             w2_bias=getattr(layer, "w2_bias", None),
+            layer=layer,
         )

@@ -38,11 +38,15 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kFp8Dynamic128Sym,
     kFp8DynamicTokenSym,
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
+    kFp8StaticTensorSym,
     kInt4Static,
+    kInt8DynamicTokenSym,
     kInt8Static,
+    kInt8StaticChannelSym,
     kMxfp4Dynamic,
     kMxfp4Static,
     kMxfp8Dynamic,
@@ -186,6 +190,22 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             (kInt4Static, kFp8DynamicTokenSym),
             (kInt8Static, None),
             (kInt8Static, kFp8DynamicTokenSym),
+            # --- Checkpoint-driven formats via the shared dense/MoE oracle. ---
+            # Humming defers input quantization (see expects_unquantized_inputs),
+            # so the checkpoint's activation scheme does not constrain support.
+            # These are the (weight, activation) pairs the fp8/int8 oracles pass
+            # straight from a checkpoint's quant config.
+            # fp8 (compressed-tensors / native / modelopt)
+            (kFp8StaticChannelSym, kFp8StaticTensorSym),
+            (kFp8StaticChannelSym, kFp8Dynamic128Sym),
+            (kFp8StaticTensorSym, None),
+            (kFp8StaticTensorSym, kFp8DynamicTokenSym),
+            (kFp8StaticTensorSym, kFp8StaticTensorSym),
+            (kFp8StaticTensorSym, kFp8Dynamic128Sym),
+            (kFp8Static128BlockSym, kFp8Dynamic128Sym),
+            # int8 (compressed-tensors w8a8 / experts_int8)
+            (kInt8StaticChannelSym, None),
+            (kInt8StaticChannelSym, kInt8DynamicTokenSym),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
