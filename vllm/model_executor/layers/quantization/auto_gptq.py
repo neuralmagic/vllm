@@ -652,8 +652,7 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:
-            # Humming consumes the GPTQ weights in-place (no marlin repack),
-            # converting them to the standard w13_weight / w2_weight names.
+            # Humming consumes the GPTQ weights in-place (no marlin repack).
             from vllm.model_executor.layers.quantization.utils.humming_utils import (
                 convert_to_humming_moe_kernel_format,
             )
@@ -812,10 +811,8 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
         )
 
     def _moe_weights(self, layer: RoutedExperts) -> tuple[torch.Tensor, torch.Tensor]:
-        # Humming converts weights in-place to the standard w13_weight /
-        # w2_weight names; marlin keeps the GPTQ *_qweight params. (Humming's
-        # experts ignore these and read from the layer internally, but the
-        # attribute must still exist.)
+        # Humming renames to w13_weight/w2_weight; marlin keeps *_qweight.
+        # (Humming reads weights from the layer; the arg just needs to exist.)
         if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:
             return layer.w13_weight, layer.w2_weight
         return layer.w13_qweight, layer.w2_qweight

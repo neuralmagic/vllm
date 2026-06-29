@@ -34,12 +34,9 @@ class HummingNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Consume the canonical nvfp4 layout (packed fp4 weight + e4m3 group-16
-        # scale + fp32 global scale) through humming's compressed-tensors nvfp4
-        # loader -- the same canonical -> humming path the MoE oracle uses.
-        # The native humming `group_tensor` schema mishandles a scalar global
-        # scale (it folds weight_scale*global to bf16 but leaves the on-layer
-        # tensor e4m3, tripping humming's dtype validation).
+        # Route through humming's compressed-tensors nvfp4 loader (same path as
+        # the MoE oracle); the native group_tensor schema mishandles a scalar
+        # global scale.
         quant_config = {
             "quant_method": "compressed-tensors",
             "format": "nvfp4-pack-quantized",
@@ -48,14 +45,12 @@ class HummingNvFp4LinearKernel(NvFp4LinearKernel):
             "strategy": "group",
             "group_size": 16,
         }
-        # humming's CT pack-quantized loader reads `weight_packed`; the nvfp4
-        # linear scheme renames it to `weight`.
+        # CT pack-quantized reads `weight_packed`; the scheme renamed it to `weight`.
         if not hasattr(layer, "weight_packed"):
             layer.weight_packed = layer.weight
             del layer.weight
-        # The CT nvfp4 linear scheme stores the global scale inverted (1/scale)
-        # for its marlin/cutlass kernels; humming's loader expects the original
-        # scale (the MoE path leaves it un-inverted on the layer). Restore it.
+        # The CT linear scheme inverts the global scale (1/scale) for
+        # marlin/cutlass; humming wants the original.
         layer.weight_global_scale = torch.nn.Parameter(
             1.0 / layer.weight_global_scale, requires_grad=False
         )

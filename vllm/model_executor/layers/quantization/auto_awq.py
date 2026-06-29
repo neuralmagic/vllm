@@ -665,8 +665,7 @@ class AutoAWQMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:
-            # Humming consumes the AWQ weights in-place (no marlin repack),
-            # converting them to the standard w13_weight / w2_weight names.
+            # Humming consumes the AWQ weights in-place (no marlin repack).
             from vllm.model_executor.layers.quantization.utils.humming_utils import (
                 convert_to_humming_moe_kernel_format,
             )

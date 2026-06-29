@@ -366,11 +366,8 @@ def convert_to_nvfp4_moe_kernel_format(
             convert_to_humming_moe_kernel_format,
         )
 
-        # Both nvfp4 sources are packed fp4 weights + e4m3 group-16 scales + an
-        # fp32 global scale, but with different on-layer param names. Pick the
-        # matching humming schema by which global-scale param is present (no
-        # quant_method class sniffing): compressed-tensors registers
-        # ``*_weight_global_scale``; modelopt uses ``*_weight_scale_2``.
+        # Pick the schema by which global-scale param is present:
+        # compressed-tensors uses *_weight_global_scale, modelopt *_weight_scale_2.
         if hasattr(layer, "w13_weight_global_scale"):
             quant_config = {
                 "quant_method": "compressed-tensors",
@@ -380,9 +377,8 @@ def convert_to_nvfp4_moe_kernel_format(
                 "strategy": "group",
                 "group_size": 16,
             }
-            # humming's CT pack-quantized loader reads ``weight_packed``; the CT
-            # method renamed it to ``weight`` for the marlin path, so re-expose
-            # the packed alias (humming replaces all params during convert).
+            # CT pack-quantized reads `weight_packed`; the method renamed it to
+            # `weight`. Re-alias (convert replaces all params anyway).
             layer.w13_weight_packed = layer.w13_weight
             layer.w2_weight_packed = layer.w2_weight
         else:

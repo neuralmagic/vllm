@@ -95,11 +95,8 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
 
     def _setup_kernel(self, layer: RoutedExperts) -> None:
         if self.int8_backend == Int8MoeBackend.HUMMING:
-            # Online int8 stores per-channel scales as w13_scale/w2_scale with
-            # shape (E, N). Re-expose them under the canonical w13_weight_scale
-            # names humming's compressed-tensors loader consumes, adding the
-            # trailing per-channel dim (E, N, 1) it expects, and dropping the
-            # originals so the converter sees a clean weight/weight_scale pair.
+            # Re-expose online (E, N) scales as canonical w13_weight_scale
+            # (E, N, 1) for humming's loader, dropping the originals.
             w13_scale = layer.w13_scale.data
             w2_scale = layer.w2_scale.data
             if w13_scale.dim() < 3:

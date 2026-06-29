@@ -227,14 +227,8 @@ def make_int8_moe_quant_config(
 def _humming_int8_weight_schema(
     weight: torch.Tensor, weight_scale: torch.Tensor
 ) -> dict[str, Any]:
-    """Describe the canonical int8 MoE layout to humming's compressed-tensors
-    ``int-quantized`` loader.
-
-    Mirrors the fp8 oracle: the schema is derived from the on-device tensors
-    (scale count -> channel vs tensor) rather than the producing quant method,
-    so humming performs the signed-int8 -> native conversion itself and the
-    quant methods stay unaware that humming exists.
-    """
+    """Build the humming compressed-tensors int8 schema from the canonical
+    on-device tensors; humming does the signed-int8 -> native conversion."""
     config: dict[str, Any] = {
         "quant_method": "compressed-tensors",
         "format": "int-quantized",

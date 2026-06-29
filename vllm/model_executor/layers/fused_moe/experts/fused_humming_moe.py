@@ -191,11 +191,9 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             (kInt4Static, kFp8DynamicTokenSym),
             (kInt8Static, None),
             (kInt8Static, kFp8DynamicTokenSym),
-            # --- Checkpoint-driven formats via the shared dense/MoE oracle. ---
-            # Humming defers input quantization (see expects_unquantized_inputs),
-            # so the checkpoint's activation scheme does not constrain support.
-            # These are the (weight, activation) pairs the fp8/int8 oracles pass
-            # straight from a checkpoint's quant config.
+            # Checkpoint-driven (weight, activation) pairs the dense/MoE oracles
+            # pass. Humming defers input quant (see expects_unquantized_inputs),
+            # so the activation key does not constrain support.
             # fp8 (compressed-tensors / native / modelopt)
             (kFp8StaticChannelSym, kFp8StaticTensorSym),
             (kFp8StaticChannelSym, kFp8Dynamic128Sym),
@@ -207,11 +205,9 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
             # int8 (compressed-tensors w8a8 / experts_int8)
             (kInt8StaticChannelSym, None),
             (kInt8StaticChannelSym, kInt8DynamicTokenSym),
-            # nvfp4 (compressed-tensors / modelopt / quark) carry an fp4
-            # dynamic activation key in the checkpoint.
+            # nvfp4 (compressed-tensors / modelopt / quark)
             (kNvfp4Static, kNvfp4Dynamic),
-            # mxfp8 (compressed-tensors / modelopt / online) selects with the
-            # mxfp8 dynamic activation key.
+            # mxfp8 (compressed-tensors / modelopt / online)
             (kMxfp8Static, kMxfp8Dynamic),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A

@@ -422,29 +422,15 @@ def select_fp8_moe_backend(
 def _humming_fp8_weight_schema(
     layer: RoutedExperts, weight: torch.Tensor, weight_scale: torch.Tensor
 ) -> dict[str, Any]:
-    """Describe the *canonical* vLLM fp8 MoE weight layout to humming.
-
-    By the time weights reach the oracle they are already in vLLM's canonical
-    fp8 format, so the humming weight schema is derived from the on-device
-    tensors (scale dtype/shape and the block size) instead of from the
-    checkpoint's quant config or the producing quant method's class. This keeps
-    humming dispatch self-contained in the oracle, and leaves the quant methods
-    unaware that humming exists. ``compressed-tensors`` is just the vocabulary
-    humming's schema loader speaks for this canonical layout.
-    """
-    # mxfp8: fp8 weights with UE8M0 group-32 scales. The scale is stored as
-    # raw bytes (uint8) or as float8_e8m0fnu; either way it is an E8M0 exponent,
-    # not an fp32/float block scale, so route to humming's modelopt mxfp8 schema
-    # (which views the bytes as e8m0). This covers both modelopt and
-    # compressed-tensors ``mxfp8-quantized`` MoE -- their canonical layout
-    # (weight (N, K) fp8 + scale (N, K/32) e8m0) is identical; humming has no
-    # separate compressed-tensors mxfp8 loader.
+    """Build the humming weight schema from the canonical on-device fp8/mxfp8
+    tensors (scale dtype/shape, block size), not the producing quant method."""
+    # mxfp8: e8m0 group-32 scales (stored as uint8 bytes or e8m0). humming has
+    # no compressed-tensors mxfp8 loader; its modelopt schema fits both sources.
     if weight_scale.dtype in (torch.uint8, torch.float8_e8m0fnu):
         return {"quant_method": "modelopt", "quant_algo": "mxfp8"}
 
-    # Otherwise fp8 (e4m3). Recover the scale strategy from the canonical scale
-    # layout: block from weight_block_size, channel vs tensor from how many
-    # scales exist per expert (one per output channel => channelwise).
+    # fp8 (e4m3): recover the strategy from the scale layout (block from
+    # weight_block_size, else channel vs tensor by per-expert scale count).
     config: dict[str, Any] = {
         "quant_method": "compressed-tensors",
         "format": "float-quantized",

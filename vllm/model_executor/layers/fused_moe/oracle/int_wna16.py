@@ -104,8 +104,7 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
         WNA16MoEBackend.FLASHINFER_TRTLLM,
         WNA16MoEBackend.MARLIN,
         WNA16MoEBackend.BATCHED_MARLIN,
-        # Humming is last-resort in auto mode (gated by has_humming() + device
-        # capability); normally opt-in via --moe-backend humming.
+        # Last-resort in auto mode (gated by has_humming()); opt-in via --moe-backend.
         WNA16MoEBackend.HUMMING,
     ]
     return _AVAILABLE_BACKENDS
