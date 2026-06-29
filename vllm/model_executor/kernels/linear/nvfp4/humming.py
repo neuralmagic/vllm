@@ -5,7 +5,6 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.humming_utils import (
-    convert_linear_layer_to_humming_standard,
     prepare_humming_layer,
 )
 from vllm.platforms import current_platform
@@ -35,21 +34,31 @@ class HummingNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        name_map = {
-            "weight": "weight",
-            "weight_scale": "weight_scale",
-            "global_scale": "weight_global_scale",
-        }
-
+        # Consume the canonical nvfp4 layout (packed fp4 weight + e4m3 group-16
+        # scale + fp32 global scale) through humming's compressed-tensors nvfp4
+        # loader -- the same canonical -> humming path the MoE oracle uses.
+        # The native humming `group_tensor` schema mishandles a scalar global
+        # scale (it folds weight_scale*global to bf16 but leaves the on-layer
+        # tensor e4m3, tripping humming's dtype validation).
         quant_config = {
-            "quant_method": "humming",
-            "dtype": "float4e2m1",
-            "scale_dtype": "float8e4m3",
+            "quant_method": "compressed-tensors",
+            "format": "nvfp4-pack-quantized",
+            "type": "float",
+            "num_bits": 4,
+            "strategy": "group",
             "group_size": 16,
-            "weight_scale_type": "group_tensor",
         }
-
-        convert_linear_layer_to_humming_standard(layer=layer, name_map=name_map)
+        # humming's CT pack-quantized loader reads `weight_packed`; the nvfp4
+        # linear scheme renames it to `weight`.
+        if not hasattr(layer, "weight_packed"):
+            layer.weight_packed = layer.weight
+            del layer.weight
+        # The CT nvfp4 linear scheme stores the global scale inverted (1/scale)
+        # for its marlin/cutlass kernels; humming's loader expects the original
+        # scale (the MoE path leaves it un-inverted on the layer). Restore it.
+        layer.weight_global_scale = torch.nn.Parameter(
+            1.0 / layer.weight_global_scale, requires_grad=False
+        )
         prepare_humming_layer(layer, quant_config)
 
     def apply_weights(
