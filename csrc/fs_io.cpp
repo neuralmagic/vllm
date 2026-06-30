@@ -3,9 +3,19 @@
 
 #include <Python.h>
 
+#include <errno.h>
+#include <fcntl.h>
 #include <unistd.h>
 
+#include <filesystem>
+#include <string>
 #include <vector>
+
+#if defined(O_DIRECT)
+constexpr int kODirectFlag = O_DIRECT;
+#else
+constexpr int kODirectFlag = 0;
+#endif
 
 extern "C" {
 
@@ -152,6 +162,7 @@ inline bool _store_block(const char* tmp_path, const char* dest_path,
   if (result->has_error()) {
     /* write, close or rename failed  */
     safe_unlink(tmp_path, result);
+    return false;
   }
 
   return true;
