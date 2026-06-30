@@ -7,10 +7,10 @@ import random
 import threading
 
 try:
-    from vllm.fsio_C import (  # pyright: ignore[reportMissingImports]
+    from vllm.fs_io_C import (  # pyright: ignore[reportMissingImports]
         load_block as load_block_C,
     )
-    from vllm.fsio_C import (
+    from vllm.fs_io_C import (
         store_block as store_block_C,
     )
 
