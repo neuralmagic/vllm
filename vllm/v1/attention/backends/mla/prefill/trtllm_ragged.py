@@ -65,6 +65,7 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         qk_rope_head_dim: int,
         v_head_dim: int,
         vllm_config: "VllmConfig",
+        ubatch_id: int = 0,
     ) -> None:
         super().__init__(
             num_heads=num_heads,
@@ -74,13 +75,16 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
             vllm_config=vllm_config,
+            ubatch_id=ubatch_id,
         )
-        (self._workspace_buffer,) = current_workspace_manager().get_simultaneous(
-            (
-                (envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,),
-                torch.uint8,
-            ),
+        num_ubatches = max(1, vllm_config.parallel_config.num_ubatches)
+        buffers = current_workspace_manager().get_simultaneous(
+            *(
+                ((envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,), torch.uint8)
+                for _ in range(num_ubatches)
+            )
         )
+        self._workspace_buffer = buffers[ubatch_id]
 
     def run_prefill_new_tokens(
         self,

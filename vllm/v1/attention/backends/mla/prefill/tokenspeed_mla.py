@@ -79,6 +79,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         qk_rope_head_dim: int,
         v_head_dim: int,
         vllm_config: "VllmConfig",
+        ubatch_id: int = 0,
     ) -> None:
         super().__init__(
             num_heads=num_heads,
@@ -88,6 +89,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=v_head_dim,
             vllm_config=vllm_config,
+            ubatch_id=ubatch_id,
         )
 
         # Pre-JIT BF16 and FP8 prefill kernels. Idempotent — also called from

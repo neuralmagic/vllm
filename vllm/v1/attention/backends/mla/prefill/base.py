@@ -107,6 +107,7 @@ class MLAPrefillBackend(ABC):
         qk_rope_head_dim: int,
         v_head_dim: int,
         vllm_config: "VllmConfig",
+        ubatch_id: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.scale = scale
@@ -115,6 +116,7 @@ class MLAPrefillBackend(ABC):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.vllm_config = vllm_config
+        self.ubatch_id = ubatch_id
 
     def prepare_metadata(  # noqa: B027
         self,

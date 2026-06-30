@@ -491,15 +491,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
         prefill_backend_cls = get_mla_prefill_backend(vllm_config)
-        self.prefill_backend = prefill_backend_cls(
-            num_heads=self.num_heads,
-            scale=self.scale,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim,
-            vllm_config=vllm_config,
-        )
+        num_ubatches = max(1, vllm_config.parallel_config.num_ubatches)
+        self.prefill_backends = [
+            prefill_backend_cls(
+                num_heads=self.num_heads,
+                scale=self.scale,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                vllm_config=vllm_config,
+                ubatch_id=ubid,
+            )
+            for ubid in range(num_ubatches)
+        ]
+        self.prefill_backend = self.prefill_backends[0]
 
         self.kv_cache = torch.tensor([])
 
@@ -1563,9 +1569,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 device=device,
             )
 
-        self._prefill_backend = self.compilation_config.static_forward_context[
-            layer_names[0]
-        ].prefill_backend
+        self.layer_names = layer_names
+        self.ubatch_id = 0
 
         supports_spec_decode = self.query_len_support != QueryLenSupport.SINGLE_ONLY
         self._init_reorder_batch_threshold(
@@ -1593,6 +1598,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             seq_lens=seq_lens_device,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
         )
+
+    @property
+    def _prefill_backend(self):
+        return self.compilation_config.static_forward_context[
+            self.layer_names[0]
+        ].prefill_backends[self.ubatch_id]
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
