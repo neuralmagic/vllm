@@ -437,12 +437,10 @@ class EplbState:
             device=self.device,
         )
 
-        # Set the initial progress of rearrangement to 3/4
-        eplb_step_interval = self.parallel_config.eplb_config.step_interval
-        self.expert_rearrangement_step = max(
-            0, eplb_step_interval - eplb_step_interval // 4
-        )
-        self.expert_rearrangement_step_interval = eplb_step_interval
+        self.expert_rearrangement_step = 0
+        initial_delay = self.parallel_config.eplb_config.initial_delay
+        assert initial_delay is not None, "EPLBConfig validator sets initial_delay"
+        self.expert_rearrangement_step_interval = initial_delay
 
         policy_type = self.parallel_config.eplb_config.policy
         self.policy = EPLB_POLICIES[policy_type]
@@ -653,6 +651,9 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
+            self.expert_rearrangement_step_interval = (
+                self.parallel_config.eplb_config.step_interval
+            )
             self.rearrange()
 
         self._update_layer_should_record(log_stats=log_stats)

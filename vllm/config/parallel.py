@@ -97,6 +97,14 @@ class EPLBConfig:
     - None: Auto-select backend (prefers "nixl", falls back to "torch_gloo")
     """
 
+    initial_delay: int | None = Field(default=None, ge=0)
+    """
+    Number of steps to delay the first EPLB rearrangement.
+    Subsequent rearrangements use ``step_interval``.
+    If None, uses the default behavior of setting the initial
+    rearrangement progress to 3/4 of ``step_interval``.
+    """
+
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
         if self.use_async and self.policy != "default":
@@ -110,6 +118,17 @@ class EPLBConfig:
             )
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
+        if self.initial_delay is None:
+            self.initial_delay = self.step_interval - self.step_interval // 4
+        if self.initial_delay < self.window_size:
+            logger.warning(
+                "EPLB initial_delay (%d) is less than "
+                "window_size (%d). Clamping initial_delay "
+                "to window_size.",
+                self.initial_delay,
+                self.window_size,
+            )
+            self.initial_delay = self.window_size
         return self
 
 
