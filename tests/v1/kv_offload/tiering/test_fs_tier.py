@@ -98,7 +98,7 @@ def lookup_and_wait(
     keys: list[OffloadKey],
     ctx: ReqContext = _CTX,
     timeout: float = 1.0,
-) -> list[LookupResult]:
+) -> list[bool]:
     """Perform a full async lookup cycle and return resolved results."""
     for k in keys:
         tier.lookup(k, ctx)
@@ -380,4 +380,4 @@ def test_batch_lookup_dispatch(fs_tier, monkeypatch, use_c_ext):
     assert all(r.success for r in drain(tier))
 
     results = lookup_and_wait(tier, [key(1), key(2)])
-    assert results == [LookupResult.HIT, LookupResult.MISS]
+    assert results == [True, False]
