@@ -244,15 +244,16 @@ class AttentionGroup:
             if kernel_block_size is not None
             else self.kv_cache_spec
         )
-        self.metadata_builders = [
-            self.backend.get_builder_cls()(
+        self.metadata_builders = []
+        for ubatch_id in range(num_metadata_builders):
+            builder = self.backend.get_builder_cls()(
                 kv_cache_spec_builder,
                 self.layer_names,
                 vllm_config,
                 device,
             )
-            for _ in range(num_metadata_builders)
-        ]
+            builder.ubatch_id = ubatch_id
+            self.metadata_builders.append(builder)
 
     def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
         assert len(self.metadata_builders) > ubatch_id

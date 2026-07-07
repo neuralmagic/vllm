@@ -116,7 +116,7 @@ class MLAPrefillBackend(ABC):
         self.v_head_dim = v_head_dim
         self.vllm_config = vllm_config
 
-    def prepare_metadata(  # noqa: B027
+    def prepare_metadata(
         self,
         prefill_metadata: "MLACommonPrefillMetadata",
     ) -> None:
