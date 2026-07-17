@@ -83,7 +83,7 @@ def _timing_end(kind: str, start: _RusageSnapshot | None) -> None:
     buf.append(line)
 
     if t1 - _thread_local.timing_last_flush >= _TIMING_FLUSH_INTERVAL_S:
-        logger.debug("\n".join(buf))
+        logger.info("\n".join(buf))
         buf.clear()
         _thread_local.timing_last_flush = t1
 
