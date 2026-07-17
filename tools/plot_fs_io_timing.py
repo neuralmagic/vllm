@@ -2,17 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Parse FSIO_TIMING lines emitted by vllm/v1/kv_offload/tiering/fs/io.py out of
-a (redirected) vLLM log file and plot store_block/load_block I/O timing.
+a (redirected) vLLM log file and render an interactive Plotly HTML dashboard
+of store_block/load_block I/O timing.
 
 Usage:
-    python tools/plot_fs_io_timing.py /path/to/vllm.log
+    python tools/plot_fs_io_timing.py /path/to/vllm.log -o fs_io_timing.html
 """
 
 import argparse
 import re
 
-import matplotlib.pyplot as plt
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Matches the FSIO_TIMING payload regardless of what (if anything) precedes
 # it on the line -- only the first physical line of a flushed batch carries
@@ -35,6 +37,16 @@ STORE_OPS = [
     "store.write",
     "store.close",
     "store.replace",
+]
+
+# (title, kinds, group_by_kind) for each of the 6 dashboard panels.
+_PLOTS = [
+    ("load_block total wall time", ["load.total"], False),
+    ("store_block total wall time", ["store.total"], False),
+    ("load_block per-operation wall time", LOAD_OPS, True),
+    ("store_block per-operation wall time", STORE_OPS, True),
+    ("load_block os.readv wall time", ["load.read"], False),
+    ("store_block os.write wall time", ["store.write"], False),
 ]
 
 
@@ -60,28 +72,40 @@ def parse_log(path: str) -> pd.DataFrame:
     return df
 
 
-def plot_wall_time(
-    df: pd.DataFrame,
-    kinds: list[str],
-    title: str,
-    group_by_kind: bool = False,
-) -> None:
-    """Scatter wall_ms vs elapsed time, one figure, optionally one series per kind."""
-    subset = df[df["kind"].isin(kinds)]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    if subset.empty:
-        ax.set_title(f"{title} (no data)")
-    elif group_by_kind:
-        for kind, group in subset.groupby("kind"):
-            ax.scatter(group["t"], group["wall_ms"], s=4, alpha=0.4, label=kind)
-        ax.legend(markerscale=3)
-        ax.set_title(title)
-    else:
-        ax.scatter(subset["t"], subset["wall_ms"], s=4, alpha=0.4)
-        ax.set_title(title)
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("wall time (ms)")
-    fig.tight_layout()
+def build_dashboard(df: pd.DataFrame) -> go.Figure:
+    """Build a 3x2 grid of scatter panels, one per entry in _PLOTS."""
+    fig = make_subplots(
+        rows=3,
+        cols=2,
+        subplot_titles=[title for title, _, _ in _PLOTS],
+    )
+
+    for idx, (_title, kinds, group_by_kind) in enumerate(_PLOTS):
+        row, col = idx // 2 + 1, idx % 2 + 1
+        subset = df[df["kind"].isin(kinds)]
+
+        series = subset.groupby("kind") if group_by_kind else [(kinds[0], subset)]
+        for kind, group in series:
+            if group.empty:
+                continue
+            fig.add_trace(
+                go.Scattergl(
+                    x=group["t"],
+                    y=group["wall_ms"],
+                    mode="markers",
+                    marker=dict(size=4, opacity=0.4),
+                    name=kind,
+                    legendgroup=kind,
+                    showlegend=group_by_kind,
+                ),
+                row=row,
+                col=col,
+            )
+        fig.update_xaxes(title_text="time (s)", row=row, col=col)
+        fig.update_yaxes(title_text="wall time (ms)", row=row, col=col)
+
+    fig.update_layout(height=1400, width=1400, title_text="FSIO Timing")
+    return fig
 
 
 def main() -> None:
@@ -89,22 +113,18 @@ def main() -> None:
     parser.add_argument(
         "logfile", help="Path to a vLLM log file (or redirected stdout)."
     )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="fs_io_timing.html",
+        help="Path to write the interactive HTML dashboard to.",
+    )
     args = parser.parse_args()
 
     df = parse_log(args.logfile)
-
-    plot_wall_time(df, ["load.total"], "load_block total wall time")
-    plot_wall_time(df, ["store.total"], "store_block total wall time")
-    plot_wall_time(
-        df, LOAD_OPS, "load_block per-operation wall time", group_by_kind=True
-    )
-    plot_wall_time(
-        df, STORE_OPS, "store_block per-operation wall time", group_by_kind=True
-    )
-    plot_wall_time(df, ["load.read"], "load_block os.readv wall time")
-    plot_wall_time(df, ["store.write"], "store_block os.write wall time")
-
-    plt.show()
+    fig = build_dashboard(df)
+    fig.write_html(args.output)
+    print(f"Wrote {args.output}")
 
 
 if __name__ == "__main__":

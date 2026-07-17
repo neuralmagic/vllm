@@ -22,7 +22,14 @@ _HAS_RUSAGE_THREAD = hasattr(resource, "RUSAGE_THREAD")
 # Raw (unaggregated) lines are buffered rather than logged per-task so the
 # series can be parsed later to plot wall/cpu time and context-switch counts
 # over time, without paying a logging call per I/O task.
-_TIMING_FLUSH_INTERVAL_S = 10.0
+_TIMING_FLUSH_INTERVAL_S = 1.0
+
+# Only actually measure/record 1 in every N calls per kind, so the resulting
+# series stays small enough to visualize (and skips the getrusage() syscall
+# entirely on the other N-1 calls). Since every sub-op kind for a given
+# store_block/load_block call increments in lockstep, the Nth call to each
+# gets sampled together, giving one fully-instrumented call every N.
+_TIMING_SAMPLE_EVERY_N = 200
 
 # Thread-local storage for unique temporary file suffixes and timing state
 _thread_local = threading.local()
@@ -31,8 +38,16 @@ _thread_local = threading.local()
 _RusageSnapshot = tuple[float, "resource.struct_rusage"]
 
 
-def _timing_start() -> _RusageSnapshot | None:
+def _timing_start(kind: str) -> _RusageSnapshot | None:
     if not _HAS_RUSAGE_THREAD:
+        return None
+    try:
+        counts = _thread_local.timing_call_counts
+    except AttributeError:
+        counts = _thread_local.timing_call_counts = {}
+    n = counts.get(kind, 0) + 1
+    counts[kind] = n
+    if n % _TIMING_SAMPLE_EVERY_N != 0:
         return None
     return time.perf_counter(), resource.getrusage(resource.RUSAGE_THREAD)
 
@@ -95,7 +110,7 @@ def _timed(kind: str) -> Iterator[None]:
     Uses try/finally so a sub-operation that raises (e.g. a short write)
     still gets its timing recorded before the exception propagates.
     """
-    start = _timing_start()
+    start = _timing_start(kind)
     try:
         yield
     finally:
@@ -129,7 +144,7 @@ def store_block(
     if os.path.exists(dest_path):
         return None
 
-    _t_total = _timing_start()
+    _t_total = _timing_start("store.total")
 
     tmp_path = dest_path + _get_tmp_suffix()
     # Ensure parent directories exist
@@ -177,7 +192,7 @@ def load_block(
     """
     Load callback: read one KV block from disk. Remove the file on failure.
     """
-    _t_total = _timing_start()
+    _t_total = _timing_start("load.total")
 
     fd: int | None = None
     view_slice = view.cast("B")[offset : offset + block_size]
