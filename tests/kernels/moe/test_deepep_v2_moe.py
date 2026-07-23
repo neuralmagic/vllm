@@ -330,6 +330,154 @@ def test_deep_ep_v2_moe(
     )
 
 
+def _deep_ep_v2_moe_dbo_prefill_parity(
+    pgi: ProcessGroupInfo,
+    dp_size: int,
+    config: TestConfig,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    use_fp8_dispatch: bool,
+    per_act_token_quant: bool,
+):
+    """Parity check for the DBO prefill path.
+
+    Under DBO, prefill must dispatch without the blocking CPU sync
+    (``do_cpu_sync=False``), which forces the buffer to be worst-case allocated
+    and the per-expert layout to be reconstructed on-device via
+    ``_build_expand_recv_topk_idx`` + device-only ``ExpertTokensMetadata``.
+    This must produce the same result as the ordinary (host-synced) prefill
+    path and the torch reference.
+
+    DBO is forced by patching ``dbo_enabled`` inside the deepep_v2 module: that
+    flips ``do_cpu_sync`` off and drives the on-device reconstruction. The
+    yield/stream-switch primitives remain no-ops because no real ubatch context
+    is entered (``_THREAD_ID_TO_CONTEXT`` stays empty) and the modular kernel's
+    own ``dbo_enabled`` is untouched, so the run stays single-threaded and
+    deterministic. This exercises the correctness-critical divergent logic; the
+    stream-overlap orchestration itself needs a real 2-ubatch context.
+    """
+    from unittest import mock
+
+    import vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_v2 as v2_mod
+
+    device = torch.device(f"cuda:{pgi.local_rank}")
+    init_workspace_manager(device)
+
+    is_quantized = w1.dtype == torch.float8_e4m3fn
+    device_idx = torch.accelerator.current_device_index()
+    w1 = w1.to(device=device_idx)
+    w2 = w2.to(device=device_idx)
+    if is_quantized:
+        assert w1_scale is not None and w2_scale is not None
+        w1_scale = w1_scale.to(device=device_idx)
+        w2_scale = w2_scale.to(device=device_idx)
+
+    pg = torch.distributed.new_group(list(range(pgi.world_size)))
+    test_tensors = TestTensors.make(config)
+
+    num_local_experts = config.num_experts // pgi.world_size
+    e_start = num_local_experts * pgi.rank
+    e_end = e_start + num_local_experts
+    w1_ep = w1[e_start:e_end]
+    w2_ep = w2[e_start:e_end]
+    w1_scale_ep = w1_scale[e_start:e_end] if is_quantized else None
+    w2_scale_ep = w2_scale[e_start:e_end] if is_quantized else None
+
+    with set_current_vllm_config(VllmConfig()):
+        q_dtype = torch.float8_e4m3fn if is_quantized else None
+        torch_combined = torch_experts(
+            test_tensors.rank_tokens,
+            w1,
+            w2,
+            test_tensors.topk_weights,
+            test_tensors.topk,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            quant_dtype=q_dtype,
+            per_act_token_quant=per_act_token_quant,
+        )
+
+        def run_prefill() -> torch.Tensor:
+            # use_cudagraph=False -> do_expand=True (prefill layout).
+            return deepep_v2_moe_impl(
+                pg,
+                pgi,
+                dp_size,
+                test_tensors,
+                w1_ep,
+                w2_ep,
+                w1_scale_ep,
+                w2_scale_ep,
+                config.num_experts,
+                config.topk,
+                use_fp8_dispatch,
+                per_act_token_quant,
+            )
+
+        # Non-DBO prefill: do_cpu_sync=True, host-side per-expert counts.
+        assert not v2_mod.dbo_enabled()
+        baseline = run_prefill()
+
+        # DBO prefill: do_cpu_sync=False, on-device reconstruction.
+        with mock.patch.object(v2_mod, "dbo_enabled", lambda: True):
+            dbo_out = run_prefill()
+
+    # DBO prefill must match the ordinary prefill path...
+    torch.testing.assert_close(dbo_out, baseline, atol=6e-2, rtol=6e-2)
+    # ...and the reference MoE.
+    torch.testing.assert_close(dbo_out, torch_combined, atol=6e-2, rtol=6e-2)
+
+
+@pytest.mark.parametrize("m,n,k", [(2, 256, 512), (45, 512, 2048), (222, 1024, 2048)])
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("topk", [6])
+@pytest.mark.parametrize("world_dp_size", [(2, 1)])
+@multi_gpu_test(num_gpus=2)
+@requires_deep_ep_v2
+def test_deep_ep_v2_moe_dbo_prefill_parity(
+    m: int,
+    n: int,
+    k: int,
+    num_experts: int,
+    topk: int,
+    world_dp_size: tuple[int, int],
+    workspace_init,
+):
+    set_random_seed(7)
+    world_size, dp_size = world_dp_size
+    config = TestConfig(
+        dtype=torch.bfloat16,
+        topk=topk,
+        m=m,
+        k=k,
+        n=n,
+        num_experts=num_experts,
+    )
+
+    (_, w1, w1_scale, _), (_, w2, w2_scale, _) = make_test_weights(
+        num_experts,
+        n,
+        k,
+        quant_dtype=None,
+        per_out_ch_quant=True,
+    )
+
+    parallel_launch(
+        world_size,
+        _deep_ep_v2_moe_dbo_prefill_parity,
+        dp_size,
+        config,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        False,  # use_fp8_dispatch
+        False,  # per_act_token_quant
+    )
+
+
 def _deep_ep_v2_moe_cudagraph(
     pgi: ProcessGroupInfo,
     dp_size: int,
