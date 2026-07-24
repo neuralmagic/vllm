@@ -10,6 +10,9 @@
     "UBUNTU_VERSION": {
       "default": "22.04"
     },
+    "PYTORCH_NIGHTLY_PACKAGES": {
+      "default": "torch torchaudio torchvision"
+    },
     "BUILD_BASE_IMAGE": {
       "default": "nvidia/cuda:13.0.3-devel-ubuntu22.04"
     },
@@ -33,6 +36,12 @@
     },
     "INSTALL_KV_CONNECTORS": {
       "default": "false"
+    },
+    "CUDNN_VERSION": {
+      "default": "9.24.0.43"
+    },
+    "NCCL_VERSION": {
+      "default": "v2.30.7-1"
     },
     "SCCACHE_BUCKET_NAME": {
       "default": "vllm-build-sccache"

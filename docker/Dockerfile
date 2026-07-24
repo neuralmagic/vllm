@@ -26,6 +26,14 @@ ARG CUDA_VERSION=13.0.3
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=22.04
 
+# Override these when the CUDA toolkit is newer than the published PyTorch or
+# FlashInfer wheel channel. PYTORCH_NIGHTLY_PACKAGES optionally pins a coherent
+# nightly set instead of resolving the latest packages from that channel.
+ARG PYTORCH_CUDA_INDEX
+ARG FLASHINFER_CUDA_INDEX
+ARG PYTORCH_NIGHTLY_PACKAGES="torch torchaudio torchvision"
+ARG PYTORCH_NIGHTLY_NO_DEPS_PACKAGES
+
 # By parameterizing the base images, we allow third-party to use their own
 # base images. One use case is hermetic builds with base images stored in
 # private registries that use a different repository naming conventions.
@@ -95,12 +103,74 @@ ARG UV_KEYRING_PROVIDER=${PIP_KEYRING_PROVIDER}
 # Flag enables built-in KV-connector dependency libs into docker images
 ARG INSTALL_KV_CONNECTORS=false
 
+#################### CUDA 13.4 PREVIEW BASE IMAGE ####################
+# CUDA 13.4 is not yet available as a public nvidia/cuda image. This stage
+# mirrors the preview toolkit and cuDNN setup used by pytorch/pytorch#190639.
+FROM ubuntu:${UBUNTU_VERSION} AS cuda134-base
+
+ARG CUDNN_VERSION=9.24.0.43
+ARG NCCL_VERSION=v2.30.7-1
+ARG TARGETARCH
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        build-essential \
+        git \
+        wget \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN . /etc/os-release \
+    && wget -q "https://packages.nvidia.com/${VERSION_CODENAME}/nvidia-preview-keyring.deb" \
+    && dpkg -i nvidia-preview-keyring.deb \
+    && rm nvidia-preview-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends cuda-toolkit-13-4 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --branch "${NCCL_VERSION}" --depth 1 \
+        https://github.com/NVIDIA/nccl.git /tmp/nccl \
+    && make -C /tmp/nccl -j"$(nproc)" src.build \
+        NVCC_GENCODE="-gencode=arch=compute_107,code=sm_107 \
+        -gencode=arch=compute_107,code=compute_107" \
+    && cp -a /tmp/nccl/build/include/. /usr/local/cuda/include/ \
+    && cp -a /tmp/nccl/build/lib/. /usr/local/cuda/lib64/ \
+    && rm -rf /tmp/nccl \
+    && ldconfig
+
+RUN case "${TARGETARCH}" in \
+        amd64) CUDNN_ARCH=x86_64 ;; \
+        arm64) CUDNN_ARCH=aarch64 ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && CUDNN_ARCHIVE="cudnn-linux-${CUDNN_ARCH}-${CUDNN_VERSION}_cuda13-archive" \
+    && wget -q \
+        "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-${CUDNN_ARCH}/${CUDNN_ARCHIVE}.tar.xz" \
+    && tar -xf "${CUDNN_ARCHIVE}.tar.xz" \
+    && cp -a "${CUDNN_ARCHIVE}/include/." /usr/local/cuda/include/ \
+    && cp -a "${CUDNN_ARCHIVE}/lib/." /usr/local/cuda/lib64/ \
+    && rm -rf "${CUDNN_ARCHIVE}" "${CUDNN_ARCHIVE}.tar.xz" \
+    && ldconfig
+
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+#################### CUDA 13.4 PREVIEW BASE IMAGE ####################
+
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
 
 ARG TARGETPLATFORM
 ARG CUDA_VERSION
+ARG PYTORCH_CUDA_INDEX
+ARG PYTORCH_NIGHTLY_PACKAGES
+ARG PYTORCH_NIGHTLY_NO_DEPS_PACKAGES
 ARG PYTHON_VERSION
 ARG BUILD_OS
 ARG USE_SCCACHE
@@ -123,6 +193,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # `ENV` unless they override them explicitly.
 ENV UV_HTTP_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV PYTORCH_CUDA_INDEX=${PYTORCH_CUDA_INDEX}
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/uv/cache
 ENV UV_INSTALL_DIR=/opt/uv/bin
@@ -255,15 +326,21 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi \
     && if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
-        && uv pip install --python /opt/venv/bin/python3 torch torchaudio torchvision --pre \
-        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        && uv pip install --python /opt/venv/bin/python3 \
+        ${PYTORCH_NIGHTLY_PACKAGES} --pre \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')} \
+        && if [ -n "${PYTORCH_NIGHTLY_NO_DEPS_PACKAGES}" ]; then \
+            uv pip install --python /opt/venv/bin/python3 --no-deps \
+            ${PYTORCH_NIGHTLY_NO_DEPS_PACKAGES} --pre \
+            --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
+        fi \
         && echo "Installing other requirements..." \
         && /opt/venv/bin/python3 use_existing_torch.py --prefix \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     else \
         uv pip install --python /opt/venv/bin/python3 -r requirements/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     fi
 
 # Track PyTorch lib versions used during build and match in downstream instances.
@@ -273,6 +350,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip freeze | grep -i "^torch=\|^torchvision=\|^torchaudio=" > torch_lib_versions.txt \
     && TORCH_LIB_VERSIONS=$(cat torch_lib_versions.txt | xargs) \
     && echo "Installed torch libs: ${TORCH_LIB_VERSIONS}"
+
+# CUDA 13.4 builds require the Rubin awareness added by pytorch/pytorch#190654
+# and Triton 3.8 with the CUDA 13.4 PTX assembler.
+RUN if [ "$(echo $CUDA_VERSION | cut -d. -f1,2)" = "13.4" ]; then \
+        nvcc --version | grep -q "release 13.4" \
+        && TORCH_CUDA_ARCH_LIST=Rubin /opt/venv/bin/python3 -c \
+        "import torchaudio, torchvision, triton; from torch.utils.cpp_extension import _get_cuda_arch_flags; assert tuple(map(int, triton.__version__.split('+', 1)[0].split('.')[:2])) >= (3, 8); assert any('compute_107' in flag for flag in _get_cuda_arch_flags())"; \
+    fi
 
 # CUDA arch list used by torch
 # Explicitly set the list to avoid issues with torch 2.2
@@ -377,11 +462,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
         && echo "Installing torch nightly..." \
         && uv pip install --python /opt/venv/bin/python3 $(cat torch_lib_versions.txt | grep -i "^torch=" | xargs) --pre \
-        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     else \
         echo "Installing build requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     fi
 
 WORKDIR /workspace
@@ -446,6 +531,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG vllm_target_device="cuda"
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 ENV CCACHE_DIR=/root/.cache/ccache
+ENV CCACHE_MAXSIZE=100G
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "$USE_SCCACHE" != "1" ]; then \
@@ -471,6 +557,8 @@ ARG CUDA_VERSION
 ENV UV_HTTP_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
+ENV CCACHE_DIR=/root/.cache/ccache
+ENV CCACHE_MAXSIZE=100G
 
 WORKDIR /workspace
 
@@ -479,7 +567,8 @@ COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
 ARG DEEPEP_COMMIT_HASH=73b6ea4
 ARG NVSHMEM_VER
-RUN --mount=type=cache,target=/opt/uv/cache \
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
     export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
     /tmp/install_python_libraries.sh \
@@ -520,11 +609,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
         && echo "Installing torch nightly..." \
         && uv pip install --python /opt/venv/bin/python3 $(cat torch_lib_versions.txt | grep -i "^torch=" | xargs) --pre \
-        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     else \
         echo "Installing build requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/build/cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     fi
 
 WORKDIR /workspace
@@ -547,6 +636,11 @@ ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 
 # Skip adding +precompiled suffix to version (preserves git-derived version)
 ENV VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1
+
+# Allows builders without BuildKit's source bind mounts (for example Podman)
+# to package a source checkout whose .git directory is excluded from context.
+ARG VLLM_VERSION_OVERRIDE
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}
 
 # Use existing torch for nightly builds
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -627,14 +721,14 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && python3 use_existing_torch.py --prefix \
         && cat torch_lib_versions.txt >> requirements/test/cuda.in \
         && uv pip compile requirements/test/cuda.in -o requirements/test/cuda.txt --index-strategy unsafe-best-match \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')} \
         && uv pip install --python /opt/venv/bin/python3 $(cat torch_lib_versions.txt | xargs) --pre \
         -r requirements/dev.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     else \
         echo "Installing dev requirements..." \
         && uv pip install --python /opt/venv/bin/python3 -r requirements/dev.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     fi
 
 #################### DEV IMAGE ####################
@@ -643,12 +737,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 FROM ${FINAL_BASE_IMAGE} AS vllm-base
 
 ARG CUDA_VERSION
+ARG PYTORCH_CUDA_INDEX
+ARG FLASHINFER_CUDA_INDEX
 ARG PYTHON_VERSION
 ARG DEADSNAKES_MIRROR_URL
 ARG DEADSNAKES_GPGKEY_URL
 ARG GET_PIP_URL
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTORCH_CUDA_INDEX=${PYTORCH_CUDA_INDEX}
+ENV FLASHINFER_CUDA_INDEX=${FLASHINFER_CUDA_INDEX}
 WORKDIR /vllm-workspace
 
 
@@ -714,7 +812,13 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     # NCCL packages don't use the cuda-MAJOR-MINOR naming convention,
     # so we pin the version to match our CUDA version
     NCCL_VER=$(apt-cache madison libnccl-dev | grep "+cuda${CUDA_VERSION_SHORT}" | head -1 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}') && \
-    apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
+    if [ -n "${NCCL_VER}" ]; then \
+        apt-get install -y --no-install-recommends --allow-change-held-packages \
+            libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER}; \
+    else \
+        test -f /usr/local/cuda/include/nccl.h \
+        && test -f /usr/local/cuda/lib64/libnccl.so; \
+    fi && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv for faster pip installs
@@ -787,7 +891,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         sed -i 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' /tmp/requirements-cuda.txt; \
     fi && \
     uv pip install --system -r /tmp/requirements-cuda.txt \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')} && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
 # Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
@@ -796,7 +900,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 ARG FLASHINFER_VERSION=0.6.15.post1
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+        --index-url https://flashinfer.ai/whl/${FLASHINFER_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -859,15 +963,19 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
     --mount=type=cache,target=/opt/uv/cache \
     if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
-        && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
-        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        && uv pip install --system \
+        $(grep -i '^torch==' torch_lib_versions.txt | xargs) --pre \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')} \
+        && uv pip install --system --no-deps \
+        $(grep -Ei '^torch(audio|vision)==' torch_lib_versions.txt | xargs) --pre \
+        --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')} \
         && echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     else \
         echo "Installing vLLM..." \
         && uv pip install --system dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
     fi
 
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -884,7 +992,7 @@ COPY --from=build /tmp/ep_kernels_workspace/dist/wheels.sha256 /tmp/ep-kernels-w
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
@@ -939,19 +1047,19 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             && python3 use_existing_torch.py --prefix \
             && cat torch_lib_versions.txt >> requirements/test/cuda.in \
             && uv pip compile requirements/test/cuda.in -o requirements/test/cuda.txt --index-strategy unsafe-best-match \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')} \
             && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
             -r requirements/dev.txt \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
         else \
             echo "Installing dev requirements..." \
             && if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
                 echo "Recompiling test requirements for arm64..." \
                 && uv pip compile requirements/test/cuda.in -o requirements/test/cuda.txt --index-strategy unsafe-best-match \
-                --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+                --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
             fi \
             && uv pip install --system -r requirements/dev.txt \
-            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${PYTORCH_CUDA_INDEX:-cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')}; \
         fi \
     fi
 
@@ -1073,6 +1181,14 @@ FROM vllm-openai-base AS vllm-openai
 # USER vllm
 ENTRYPOINT ["vllm", "serve"]
 #################### OPENAI API SERVER ####################
+
+#################### VERA RUBIN PREVIEW SERVER ####################
+FROM vllm-openai AS vllm-openai-rubin
+
+# Triton's bundled ptxas may predate sm_107. Use the CUDA 13.4 toolkit from
+# the preview image for runtime JIT compilation.
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+#################### VERA RUBIN PREVIEW SERVER ####################
 
 #################### OPENAI API SERVER (NON-ROOT, OPT-IN) ####################
 # Non-root-ready variant of `vllm-openai`. Built via:
