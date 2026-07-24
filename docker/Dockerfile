@@ -146,7 +146,7 @@ RUN apt-get update \
 
 RUN case "${TARGETARCH}" in \
         amd64) CUDNN_ARCH=x86_64 ;; \
-        arm64) CUDNN_ARCH=aarch64 ;; \
+        arm64) CUDNN_ARCH=sbsa ;; \
         *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && CUDNN_ARCHIVE="cudnn-linux-${CUDNN_ARCH}-${CUDNN_VERSION}_cuda13-archive" \
