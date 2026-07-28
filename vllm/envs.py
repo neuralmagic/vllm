@@ -326,6 +326,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_ENABLE_HPC_OPS: bool = False
+    VLLM_FS_THREAD_POOL_SCHEDULER_CLS: str = "NoBatchTPScheduler"
 
 
 def get_default_cache_root():
@@ -1173,6 +1174,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
+    ),
+    "VLLM_FS_THREAD_POOL_SCHEDULER_CLS": lambda: (
+        os.environ.get("VLLM_FS_THREAD_POOL_SCHEDULER_CLS", "NoBatchTPScheduler")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

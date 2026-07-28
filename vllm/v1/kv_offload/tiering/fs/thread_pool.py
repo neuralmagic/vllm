@@ -11,12 +11,28 @@ Thread pool:
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
+from typing import Any
 
+import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.base import JobId
+from vllm.v1.kv_offload.tiering.fs.scheduler import SCHEDULER_CLASS_MAPPING, TPScheduler
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class Task:
+    """
+    I/O Task inputs
+    """
+
+    key: OffloadKey
+    path: str
+    offset: int
 
 
 class JobState:
@@ -48,11 +64,11 @@ class JobState:
         return self._job_id
 
     def task_done(
-        self, success: bool, transfer_time: float
+        self, batch_size: int, success: bool, transfer_time: float
     ) -> tuple[bool, bool, float]:
         """Returns if job completed and success flag"""
         with self._lock:
-            self._completed += 1
+            self._completed += batch_size
             self._transfer_time += transfer_time
             if not success:
                 self._success = False
@@ -74,61 +90,97 @@ class DualQueueThreadPool:
         n_write_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
-        self._load_q: deque = deque()
-        self._store_q: deque = deque()
+        self._n_read_threads = n_read_threads
+        self._n_write_threads = n_write_threads
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool, float]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
 
-        for i in range(n_read_threads):
-            t = threading.Thread(
-                target=self._worker,
-                args=(True,),
-                name=f"{thread_name_prefix}_l{i}",
-                daemon=True,
-            )
-            t.start()
-            self._threads.append(t)
+        assert self.total_threads > 0, "ThreadPool needs at least one thread"
 
-        for i in range(n_write_threads):
-            t = threading.Thread(
-                target=self._worker,
-                args=(False,),
-                name=f"{thread_name_prefix}_s{i}",
-                daemon=True,
-            )
-            t.start()
-            self._threads.append(t)
+        scheduler_cls = SCHEDULER_CLASS_MAPPING[envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS]
+        self._scheduler: TPScheduler = scheduler_cls(n_read_threads, n_write_threads)
+        self._threads = self._scheduler.make_threads(self._worker, thread_name_prefix)
+
+    @property
+    def total_threads(self) -> int:
+        return self._n_read_threads + self._n_write_threads
+
+    def _batch_tasks(
+        self,
+        tasks: list[Task],
+        n_threads: int,
+    ) -> Iterator[list[Task]]:
+        """
+        Batch tasks so that the request's tasks are split evenly across the
+        n_threads.
+        """
+        assert n_threads > 0
+
+        n_tasks = len(tasks)
+        q, r = divmod(n_tasks, n_threads)
+        batch_sizes = [q + 1 if i < r else q for i in range(n_threads)]
+        assert sum(batch_sizes) == n_tasks
+        start = 0
+        for bs in batch_sizes[: min(n_tasks, n_threads)]:
+            yield tasks[start : start + bs]
+            start += bs
+
+    def _enqueue(
+        self,
+        make_batch_fn: Callable[[list[Task]], Callable[[], None]],
+        job_id: JobId,
+        tasks: Iterable[Task],
+        n_tasks: int,
+        is_load: bool,
+    ) -> None:
+        """Batch `tasks` and append (fn, state, batch_size) entries to `queue`."""
+        if n_tasks == 0:
+            self._finished_q.append((job_id, True, 0.0))
+            return
+        state = JobState(job_id, n_tasks)
+        task_lst = list(tasks)  # Materialize tasks out of self._condition
+        assert len(task_lst) == n_tasks, "Unaccounted tasks"
+        with self._condition:
+            self._inflight_jobs += 1
+            n_notify = self._scheduler.submit(state, make_batch_fn, task_lst, is_load)
+            self._condition.notify(n_notify)
 
     def enqueue_load(
         self,
         job_id: JobId,
         n_tasks: int,
-        tasks: Iterable[Callable],
+        tasks: Iterable[Task],
+        make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
-        state = JobState(job_id, n_tasks)
-        with self._condition:
-            self._inflight_jobs += 1
-            for fn in tasks:
-                self._load_q.append((fn, state))
-            self._condition.notify(n_tasks)
+
+        self._enqueue(
+            make_batch_fn,
+            job_id,
+            tasks,
+            n_tasks=n_tasks,
+            is_load=True,
+        )
 
     def enqueue_store(
         self,
         job_id: JobId,
         n_tasks: int,
-        tasks: Iterable[Callable],
+        tasks: Iterable[Task],
+        make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
-        state = JobState(job_id, n_tasks)
-        with self._condition:
-            self._inflight_jobs += 1
-            for fn in tasks:
-                self._store_q.append((fn, state))
-            self._condition.notify(n_tasks)
+
+        self._enqueue(
+            make_batch_fn,
+            job_id,
+            tasks,
+            n_tasks=n_tasks,
+            is_load=False,
+        )
 
     def get_finished(self) -> list[tuple[JobId, bool, float]]:
         # No lock needed: deque is thread-safe for concurrent append/popleft,
@@ -152,8 +204,7 @@ class DualQueueThreadPool:
     def shutdown(self, wait: bool = True) -> None:
         with self._condition:
             self._stop = True
-            self._load_q.clear()
-            self._store_q.clear()
+            self._scheduler.clear()
             # Cancelled tasks will not decrement _inflight_jobs; reset it so a
             # subsequent wait_idle() returns instead of hanging.
             self._inflight_jobs = 0
@@ -162,23 +213,23 @@ class DualQueueThreadPool:
             for t in self._threads:
                 t.join()
 
-    def _worker(self, load_priority: bool) -> None:
+    def _worker(self, args: Any) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
+                    lambda: self._stop or self._scheduler.has_work(args)
                 )
                 if self._stop:
                     return
-                primary = self._load_q if load_priority else self._store_q
-                secondary = self._store_q if load_priority else self._load_q
-                task, state = primary.popleft() if primary else secondary.popleft()
+                fn, batch_size, state = self._scheduler.fetch_work(args)
             try:
                 start_time = time.monotonic()
-                task()
+                fn()
                 transfer_time = time.monotonic() - start_time
-                job_finished, success, total_time = state.task_done(True, transfer_time)
+                job_finished, success, total_time = state.task_done(
+                    batch_size, True, transfer_time
+                )
             except Exception as exc:
                 transfer_time = time.monotonic() - start_time
                 logger.error(
@@ -187,7 +238,7 @@ class DualQueueThreadPool:
                     exc,
                 )
                 job_finished, success, total_time = state.task_done(
-                    False, transfer_time
+                    batch_size, False, transfer_time
                 )
 
             if job_finished:
