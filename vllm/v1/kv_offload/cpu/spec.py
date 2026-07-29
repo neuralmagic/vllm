@@ -135,6 +135,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                bytes_per_block=self.kv_bytes_per_chunk,
             )
         return self._manager
 

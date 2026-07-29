@@ -9,6 +9,7 @@ from typing_extensions import override
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -27,6 +28,8 @@ from vllm.v1.kv_offload.cpu.common import (
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+
+logger = init_logger(__name__)
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
@@ -51,9 +54,15 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        bytes_per_block: int = 0,
     ):
         self.medium: Medium = Medium.CPU
         self._num_blocks: int = num_blocks
+        self._bytes_per_block: int = bytes_per_block
+        # Debug-only: lifetime total of blocks that were stored and later
+        # evicted without ever being re-read (use_count == 1 at eviction).
+        # Monotonically increasing.
+        self._num_singleton_stores: int = 0
         self._num_allocated_blocks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -164,6 +173,7 @@ class CPUOffloadingManager(OffloadingManager):
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found"
             assert block.ref_cnt > 0, f"Block {key!r} ref_cnt is already 0"
+            block.use_count += 1
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
                 self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
@@ -212,6 +222,8 @@ class CPUOffloadingManager(OffloadingManager):
             assert self._num_evictable_cache_blocks >= 0
 
             for key, block in evicted:
+                if block.use_count == 1:
+                    self._num_singleton_stores += 1
                 self._free_block(block)
                 to_evict.append(key)
 
@@ -256,6 +268,7 @@ class CPUOffloadingManager(OffloadingManager):
                 block = self._policy.get(key)
                 if block is not None and not block.is_ready:
                     block.ref_cnt = 0
+                    block.use_count += 1
                     self._num_write_pending_blocks -= 1
                     self._num_evictable_cache_blocks += 1
                     self._policy.mark_evictable(key)
@@ -287,6 +300,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
+        # _num_singleton_stores is intentionally NOT reset here: it is a
+        # lifetime total across the manager's life, not a cache-contents
+        # snapshot. Note blocks cleared here without going through the
+        # eviction path above are not counted even if never re-read.
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
@@ -330,5 +347,13 @@ class CPUOffloadingManager(OffloadingManager):
                 self.stores_skipped_in_current_batch,
             )
             self.stores_skipped_in_current_batch = 0
+
+        gb_used_once = self._num_singleton_stores * self._bytes_per_block / 1e9
+        logger.info(
+            "CPU offload: %d blocks (%.3f GB) stored and evicted over this "
+            "run's lifetime without ever being re-read",
+            self._num_singleton_stores,
+            gb_used_once,
+        )
 
         return stats

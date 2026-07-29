@@ -15,15 +15,22 @@ class BlockStatus(ctypes.Structure):
     ref_cnt - the current number of transfers using this block as a source.
         A value of -1 indicates the block is not yet ready to be read.
     block_id - index of the physical CPU buffer slot.
+    use_count - debug-only counter of how many times this block has been
+        used (1 = stored but never re-read; bumped on the first load).
     """
 
-    _fields_ = [("ref_cnt", ctypes.c_int32), ("block_id", ctypes.c_int64)]
+    _fields_ = [
+        ("ref_cnt", ctypes.c_int32),
+        ("block_id", ctypes.c_int64),
+        ("use_count", ctypes.c_int32),
+    ]
 
     def __init__(self, block_id: int):
         super().__init__()
         # initialize block as "not ready" (ref_cnt = -1)
         self.ref_cnt = -1
         self.block_id = block_id
+        self.use_count = 0
 
     @property
     def is_ready(self) -> bool:
