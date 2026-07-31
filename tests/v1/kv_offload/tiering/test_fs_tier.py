@@ -23,6 +23,7 @@ from vllm.v1.kv_offload.base import (
     LookupResult,
     Medium,
     OffloadingEvent,
+    OffloadingHistogramMetadata,
     OffloadingKVEventsConfig,
     OffloadKey,
     ReqContext,
@@ -39,6 +40,7 @@ from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
+    FsThreadPoolMetrics,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool, Task
 
@@ -798,3 +800,62 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+def test_build_metric_definitions_registers_job_timing_histograms():
+    definitions = FileSystemTierManager.build_metric_definitions({})
+    assert FsThreadPoolMetrics.JOB_DURATION in definitions
+    assert FsThreadPoolMetrics.JOB_QUEUEING_DELAY in definitions
+    assert isinstance(
+        definitions[FsThreadPoolMetrics.JOB_DURATION], OffloadingHistogramMetadata
+    )
+    assert isinstance(
+        definitions[FsThreadPoolMetrics.JOB_QUEUEING_DELAY],
+        OffloadingHistogramMetadata,
+    )
+
+
+def test_get_stats_reports_job_duration_and_queueing_delay(fs_tier):
+    """A drained job's timing shows up as one observation in each histogram."""
+    tier, _ = fs_tier
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(r.success for r in drain(tier))
+
+    stats = tier.get_stats()
+    assert stats is not None
+    reduced = stats.reduce()
+    assert reduced[f"{FsThreadPoolMetrics.JOB_DURATION}_count"] == 1
+    assert reduced[f"{FsThreadPoolMetrics.JOB_QUEUEING_DELAY}_count"] == 1
+    assert reduced[f"{FsThreadPoolMetrics.JOB_DURATION}_sum"] >= 0.0
+    assert reduced[f"{FsThreadPoolMetrics.JOB_QUEUEING_DELAY}_sum"] >= 0.0
+
+
+def test_get_stats_accumulates_across_multiple_jobs(fs_tier):
+    tier, _ = fs_tier
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    tier.submit_store(make_job(2, [key(2)], [1]))
+    assert all(r.success for r in drain(tier))
+
+    stats = tier.get_stats()
+    assert stats is not None
+    reduced = stats.reduce()
+    assert reduced[f"{FsThreadPoolMetrics.JOB_DURATION}_count"] == 2
+    assert reduced[f"{FsThreadPoolMetrics.JOB_QUEUEING_DELAY}_count"] == 2
+
+
+def test_get_stats_returns_none_without_new_jobs(fs_tier):
+    """get_stats() only reports newly observed jobs since the last call."""
+    tier, _ = fs_tier
+    assert tier.get_stats() is None
+
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert tier.get_stats() is not None
+
+    # Buffers were drained by the previous call; nothing new happened since.
+    assert tier.get_stats() is None

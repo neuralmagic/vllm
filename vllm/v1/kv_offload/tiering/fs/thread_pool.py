@@ -10,6 +10,7 @@ Thread pool:
 
 import itertools
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -37,7 +38,15 @@ class JobState:
     Each task calls task_done(success) when it finishes.
     """
 
-    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_lock")
+    __slots__ = (
+        "_job_id",
+        "_n_tasks",
+        "_completed",
+        "_success",
+        "_lock",
+        "_enqueue_time",
+        "_first_batch_time",
+    )
 
     def __init__(self, job_id: JobId, n_tasks: int) -> None:
         self._job_id: JobId = job_id
@@ -45,10 +54,30 @@ class JobState:
         self._completed = 0
         self._success = True
         self._lock = threading.Lock()
+        self._enqueue_time = time.monotonic()
+        self._first_batch_time: float | None = None
 
     @property
     def job_id(self) -> JobId:
         return self._job_id
+
+    @property
+    def enqueue_time(self) -> float:
+        return self._enqueue_time
+
+    @property
+    def first_batch_time(self) -> float | None:
+        return self._first_batch_time
+
+    def mark_batch_start(self) -> None:
+        """Record, once, when the first batch of this job started executing.
+
+        Multiple threads may pop different batches of the same job at
+        nearly the same time; only the first call sets the timestamp.
+        """
+        with self._lock:
+            if self._first_batch_time is None:
+                self._first_batch_time = time.monotonic()
 
     def task_done(self, batch_size: int, success: bool) -> tuple[bool, bool]:
         """Returns if job completed and success flag"""
@@ -81,7 +110,8 @@ class DualQueueThreadPool:
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
-        self._finished_q: deque[tuple[JobId, bool]] = deque()
+        # (job_id, success, job_duration, queueing_delay)
+        self._finished_q: deque[tuple[JobId, bool, float, float]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
 
         for i in range(self._n_read_threads):
@@ -135,7 +165,7 @@ class DualQueueThreadPool:
     ) -> None:
         """Batch `tasks` and append (fn, state, batch_size) entries to `queue`."""
         if n_tasks == 0:
-            self._finished_q.append((job_id, True))
+            self._finished_q.append((job_id, True, 0.0, 0.0))
             return
         state = JobState(job_id, n_tasks)
         n_batches = 0
@@ -182,7 +212,13 @@ class DualQueueThreadPool:
             n_threads=self._n_write_threads,
         )
 
-    def get_finished(self) -> list[tuple[JobId, bool]]:
+    def get_finished(self) -> list[tuple[JobId, bool, float, float]]:
+        """Returns (job_id, success, job_duration, queueing_delay) tuples.
+
+        job_duration is the time from enqueue to the job's last task
+        completing; queueing_delay is the time from enqueue to a worker
+        thread picking up the job's first batch, both in seconds.
+        """
         # No lock needed: deque is thread-safe for concurrent append/popleft,
         # and the manager is the sole popper.
         jobs = []
@@ -228,6 +264,7 @@ class DualQueueThreadPool:
                 fn, batch_size, state = (
                     primary.popleft() if primary else secondary.popleft()
                 )
+            state.mark_batch_start()
             try:
                 fn()
                 job_finished, success = state.task_done(batch_size, True)
@@ -240,7 +277,12 @@ class DualQueueThreadPool:
                 job_finished, success = state.task_done(batch_size, False)
 
             if job_finished:
+                now = time.monotonic()
+                job_duration = now - state.enqueue_time
+                queueing_delay = (state.first_batch_time or now) - state.enqueue_time
                 with self._condition:
-                    self._finished_q.append((state.job_id, success))
+                    self._finished_q.append(
+                        (state.job_id, success, job_duration, queueing_delay)
+                    )
                     self._inflight_jobs -= 1
                     self._condition.notify_all()

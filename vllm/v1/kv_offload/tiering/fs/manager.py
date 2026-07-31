@@ -19,7 +19,7 @@ import functools
 import json
 import os
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 try:
     from vllm.fs_io_C import batch_lookup as batch_lookup_C
@@ -30,12 +30,17 @@ except ImportError:
 
 from typing_extensions import override
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
     Medium,
     OffloadingEvent,
+    OffloadingHistogramMetadata,
+    OffloadingMetricMetadata,
     OffloadKey,
     ReqContext,
 )
@@ -60,6 +65,13 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+
+class FsThreadPoolMetrics:
+    """Metric names for FileSystemTierManager's thread pool."""
+
+    JOB_DURATION = "vllm:kv_offload_fs_job_duration_seconds"
+    JOB_QUEUEING_DELAY = "vllm:kv_offload_fs_job_queueing_delay_seconds"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -106,6 +118,43 @@ class FileSystemTierManager(SecondaryTierManager):
 
     medium: ClassVar[Medium] = Medium.STORAGE
 
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        buckets = (
+            0.0001,
+            0.0005,
+            0.001,
+            0.005,
+            0.01,
+            0.05,
+            0.1,
+            0.5,
+            1,
+            5,
+            10,
+        )
+        return {
+            FsThreadPoolMetrics.JOB_DURATION: OffloadingHistogramMetadata(
+                documentation=(
+                    "Histogram of FS thread-pool job duration: time from a "
+                    "job being enqueued to the thread pool until its last "
+                    "task completes, in seconds."
+                ),
+                buckets=buckets,
+            ),
+            FsThreadPoolMetrics.JOB_QUEUEING_DELAY: OffloadingHistogramMetadata(
+                documentation=(
+                    "Histogram of FS thread-pool queueing delay: time from "
+                    "a job being enqueued until a worker thread picks up "
+                    "its first batch, in seconds."
+                ),
+                buckets=buckets,
+            ),
+        }
+
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
@@ -148,6 +197,10 @@ class FileSystemTierManager(SecondaryTierManager):
                 )
         # Keys of in-flight store jobs, tracked only when events are enabled.
         self._store_job_keys: dict[JobId, list[OffloadKey]] = {}
+
+        # Per-job thread-pool timings, buffered between get_stats() calls.
+        self._job_durations: list[float] = []
+        self._job_queueing_delays: list[float] = []
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -257,7 +310,9 @@ class FileSystemTierManager(SecondaryTierManager):
         Collect completed jobs from the finished-jobs queue.
         """
         results = []
-        for job_id, success in self._pool.get_finished():
+        for job_id, success, job_duration, queueing_delay in self._pool.get_finished():
+            self._job_durations.append(job_duration)
+            self._job_queueing_delays.append(queueing_delay)
             if self.events is not None:
                 keys = self._store_job_keys.pop(job_id, None)
                 if success and keys:
@@ -271,6 +326,19 @@ class FileSystemTierManager(SecondaryTierManager):
                     )
             results.append(JobResult(job_id=job_id, success=success))
         return results
+
+    @override
+    def get_stats(self) -> "OffloadingConnectorStats | None":
+        if not self._job_durations and not self._job_queueing_delays:
+            return None
+        stats = OffloadingConnectorStats()
+        for duration in self._job_durations:
+            stats.observe_histogram(FsThreadPoolMetrics.JOB_DURATION, duration)
+        for delay in self._job_queueing_delays:
+            stats.observe_histogram(FsThreadPoolMetrics.JOB_QUEUEING_DELAY, delay)
+        self._job_durations.clear()
+        self._job_queueing_delays.clear()
+        return stats
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:
