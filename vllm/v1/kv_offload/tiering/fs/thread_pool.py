@@ -46,9 +46,10 @@ class JobState:
         "_lock",
         "_enqueue_time",
         "_first_batch_time",
+        "_is_load",
     )
 
-    def __init__(self, job_id: JobId, n_tasks: int) -> None:
+    def __init__(self, job_id: JobId, n_tasks: int, is_load: bool) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
         self._completed = 0
@@ -56,10 +57,15 @@ class JobState:
         self._lock = threading.Lock()
         self._enqueue_time = time.monotonic()
         self._first_batch_time: float | None = None
+        self._is_load = is_load
 
     @property
     def job_id(self) -> JobId:
         return self._job_id
+
+    @property
+    def is_load(self) -> bool:
+        return self._is_load
 
     @property
     def enqueue_time(self) -> float:
@@ -113,6 +119,8 @@ class DualQueueThreadPool:
         # (job_id, success, job_duration, queueing_delay)
         self._finished_q: deque[tuple[JobId, bool, float, float]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
+        self._active_read_threads = 0  # guarded by _condition
+        self._active_write_threads = 0  # guarded by _condition
 
         for i in range(self._n_read_threads):
             t = threading.Thread(
@@ -167,7 +175,7 @@ class DualQueueThreadPool:
         if n_tasks == 0:
             self._finished_q.append((job_id, True, 0.0, 0.0))
             return
-        state = JobState(job_id, n_tasks)
+        state = JobState(job_id, n_tasks, is_load=queue is self._load_q)
         n_batches = 0
         with self._condition:
             self._inflight_jobs += 1
@@ -236,6 +244,18 @@ class DualQueueThreadPool:
         with self._condition:
             return self._inflight_jobs
 
+    @property
+    def num_active_read_threads(self) -> int:
+        """Number of worker threads currently executing a load batch."""
+        with self._condition:
+            return self._active_read_threads
+
+    @property
+    def num_active_write_threads(self) -> int:
+        """Number of worker threads currently executing a store batch."""
+        with self._condition:
+            return self._active_write_threads
+
     def wait_idle(self) -> None:
         """Block until there are no in-flight jobs.
 
@@ -274,6 +294,10 @@ class DualQueueThreadPool:
                 fn, batch_size, state = (
                     primary.popleft() if primary else secondary.popleft()
                 )
+                if state.is_load:
+                    self._active_read_threads += 1
+                else:
+                    self._active_write_threads += 1
             state.mark_batch_start()
             try:
                 fn()
@@ -285,6 +309,12 @@ class DualQueueThreadPool:
                     exc,
                 )
                 job_finished, success = state.task_done(batch_size, False)
+            finally:
+                with self._condition:
+                    if state.is_load:
+                        self._active_read_threads -= 1
+                    else:
+                        self._active_write_threads -= 1
 
             if job_finished:
                 now = time.monotonic()

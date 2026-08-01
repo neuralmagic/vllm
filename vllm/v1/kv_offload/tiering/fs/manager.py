@@ -74,6 +74,8 @@ class FsThreadPoolMetrics:
     JOB_DURATION = "vllm:kv_offload_fs_job_duration_seconds"
     JOB_QUEUEING_DELAY = "vllm:kv_offload_fs_job_queueing_delay_seconds"
     JOBS_IN_FLIGHT = "vllm:kv_offload_fs_jobs_in_flight"
+    ACTIVE_READ_THREADS = "vllm:kv_offload_fs_active_read_threads"
+    ACTIVE_WRITE_THREADS = "vllm:kv_offload_fs_active_write_threads"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -164,6 +166,18 @@ class FileSystemTierManager(SecondaryTierManager):
                 documentation=(
                     "Number of FS thread-pool jobs submitted but not yet "
                     "fully completed (queued plus currently executing)."
+                ),
+            ),
+            FsThreadPoolMetrics.ACTIVE_READ_THREADS: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of FS thread-pool worker threads currently "
+                    "executing a load (read) batch."
+                ),
+            ),
+            FsThreadPoolMetrics.ACTIVE_WRITE_THREADS: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of FS thread-pool worker threads currently "
+                    "executing a store (write) batch."
                 ),
             ),
         }
@@ -345,6 +359,14 @@ class FileSystemTierManager(SecondaryTierManager):
         stats = OffloadingConnectorStats()
         stats.set_gauge(
             FsThreadPoolMetrics.JOBS_IN_FLIGHT, self._pool.num_inflight_jobs
+        )
+        stats.set_gauge(
+            FsThreadPoolMetrics.ACTIVE_READ_THREADS,
+            self._pool.num_active_read_threads,
+        )
+        stats.set_gauge(
+            FsThreadPoolMetrics.ACTIVE_WRITE_THREADS,
+            self._pool.num_active_write_threads,
         )
         for duration in self._job_durations:
             stats.observe_histogram(FsThreadPoolMetrics.JOB_DURATION, duration)

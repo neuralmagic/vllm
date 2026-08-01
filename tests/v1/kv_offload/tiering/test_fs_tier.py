@@ -515,6 +515,65 @@ def test_num_inflight_jobs_tracks_queued_and_executing_jobs(monkeypatch):
         pool.shutdown(wait=True)
 
 
+def test_active_thread_counts_distinguish_reads_from_writes(monkeypatch):
+    """A blocked store job bumps num_active_write_threads only, and a
+    blocked load job bumps num_active_read_threads only."""
+
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    store_gate = threading.Event()
+    load_gate = threading.Event()
+
+    def blocking_batch_store_block(*args, **kwargs):
+        store_gate.wait(timeout=5.0)
+
+    def blocking_batch_load_block(*args, **kwargs):
+        load_gate.wait(timeout=5.0)
+
+    monkeypatch.setattr(mgr_mod, "batch_store_block", blocking_batch_store_block)
+    monkeypatch.setattr(mgr_mod, "batch_load_block", blocking_batch_load_block)
+    task = Task(path="unused", offset=0)
+
+    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+    try:
+        assert pool.num_active_read_threads == 0
+        assert pool.num_active_write_threads == 0
+
+        pool.enqueue_store(
+            job_id=1,
+            n_tasks=1,
+            tasks=[task],
+            make_batch_fn=lambda batch: mgr_mod.batch_store_block,
+        )
+        deadline = time.monotonic() + 5.0
+        while pool.num_active_write_threads == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pool.num_active_write_threads == 1
+        assert pool.num_active_read_threads == 0
+
+        pool.enqueue_load(
+            job_id=2,
+            n_tasks=1,
+            tasks=[task],
+            make_batch_fn=lambda batch: mgr_mod.batch_load_block,
+        )
+        deadline = time.monotonic() + 5.0
+        while pool.num_active_read_threads == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pool.num_active_read_threads == 1
+        assert pool.num_active_write_threads == 1
+
+        store_gate.set()
+        load_gate.set()
+        pool.wait_idle()
+        assert pool.num_active_read_threads == 0
+        assert pool.num_active_write_threads == 0
+    finally:
+        store_gate.set()
+        load_gate.set()
+        pool.shutdown(wait=True)
+
+
 def test_batch_lookup_c_extension(tmp_path):
     """Validates batch_lookup_C: empty, single, all-existing, all-missing,
     mixed ordering, and input type validation."""
@@ -866,6 +925,26 @@ def test_build_metric_definitions_registers_jobs_in_flight_gauge():
     )
 
 
+def test_build_metric_definitions_registers_active_thread_gauges():
+    definitions = FileSystemTierManager.build_metric_definitions({})
+    assert FsThreadPoolMetrics.ACTIVE_READ_THREADS in definitions
+    assert FsThreadPoolMetrics.ACTIVE_WRITE_THREADS in definitions
+    assert isinstance(
+        definitions[FsThreadPoolMetrics.ACTIVE_READ_THREADS], OffloadingGaugeMetadata
+    )
+    assert isinstance(
+        definitions[FsThreadPoolMetrics.ACTIVE_WRITE_THREADS], OffloadingGaugeMetadata
+    )
+
+
+def test_get_stats_reports_active_thread_gauges_at_zero_when_idle(fs_tier):
+    """With no in-flight work, both active-thread gauges report zero."""
+    tier, _ = fs_tier
+    reduced = tier.get_stats().reduce()
+    assert reduced[FsThreadPoolMetrics.ACTIVE_READ_THREADS] == 0
+    assert reduced[FsThreadPoolMetrics.ACTIVE_WRITE_THREADS] == 0
+
+
 def test_get_stats_reports_job_duration_and_queueing_delay(fs_tier):
     """A drained job's timing shows up as one observation in each histogram."""
     tier, _ = fs_tier
@@ -913,5 +992,3 @@ def test_get_stats_reports_jobs_in_flight_gauge_without_new_jobs(fs_tier):
     reduced = tier.get_stats().reduce()
     assert reduced[FsThreadPoolMetrics.JOBS_IN_FLIGHT] == 0
     assert f"{FsThreadPoolMetrics.JOB_DURATION}_count" not in reduced
-
-
