@@ -31,6 +31,23 @@ class Task:
     offset: int
 
 
+@dataclass(frozen=True)
+class FinishedJob:
+    """Result and timing information for one completed job."""
+
+    job_id: JobId
+    success: bool
+    is_load: bool
+    n_tasks: int
+    # Time from enqueue to the job's last task completing.
+    job_duration: float
+    # Time from enqueue to a worker thread picking up the job's first batch.
+    queueing_delay: float
+    # Time from a worker picking up the first batch to the last task
+    # completing, i.e. job_duration - queueing_delay.
+    execution_time: float
+
+
 class JobState:
     """
     Thread-safe completion tracker for a set of per-block I/O tasks.
@@ -68,6 +85,10 @@ class JobState:
         return self._is_load
 
     @property
+    def n_tasks(self) -> int:
+        return self._n_tasks
+
+    @property
     def enqueue_time(self) -> float:
         return self._enqueue_time
 
@@ -75,15 +96,21 @@ class JobState:
     def first_batch_time(self) -> float | None:
         return self._first_batch_time
 
-    def mark_batch_start(self) -> None:
+    def mark_batch_start(self) -> bool:
         """Record, once, when the first batch of this job started executing.
 
         Multiple threads may pop different batches of the same job at
         nearly the same time; only the first call sets the timestamp.
+
+        Returns:
+            True if this call was the one that set the timestamp (i.e. the
+            job just transitioned from queued to executing), False otherwise.
         """
         with self._lock:
             if self._first_batch_time is None:
                 self._first_batch_time = time.monotonic()
+                return True
+            return False
 
     def task_done(self, batch_size: int, success: bool) -> tuple[bool, bool]:
         """Returns if job completed and success flag"""
@@ -116,11 +143,14 @@ class DualQueueThreadPool:
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
-        # (job_id, success, job_duration, queueing_delay)
-        self._finished_q: deque[tuple[JobId, bool, float, float]] = deque()
-        self._inflight_jobs = 0  # guarded by _condition
-        self._active_read_threads = 0  # guarded by _condition
-        self._active_write_threads = 0  # guarded by _condition
+        self._finished_q: deque[FinishedJob] = deque()
+        # All of the following are guarded by _condition.
+        self._inflight_read_jobs = 0
+        self._inflight_write_jobs = 0
+        self._active_read_threads = 0
+        self._active_write_threads = 0
+        self._active_read_jobs = 0
+        self._active_write_jobs = 0
 
         for i in range(self._n_read_threads):
             t = threading.Thread(
@@ -172,13 +202,27 @@ class DualQueueThreadPool:
         n_threads: int,
     ) -> None:
         """Batch `tasks` and append (fn, state, batch_size) entries to `queue`."""
+        is_load = queue is self._load_q
         if n_tasks == 0:
-            self._finished_q.append((job_id, True, 0.0, 0.0))
+            self._finished_q.append(
+                FinishedJob(
+                    job_id=job_id,
+                    success=True,
+                    is_load=is_load,
+                    n_tasks=0,
+                    job_duration=0.0,
+                    queueing_delay=0.0,
+                    execution_time=0.0,
+                )
+            )
             return
-        state = JobState(job_id, n_tasks, is_load=queue is self._load_q)
+        state = JobState(job_id, n_tasks, is_load=is_load)
         n_batches = 0
         with self._condition:
-            self._inflight_jobs += 1
+            if is_load:
+                self._inflight_read_jobs += 1
+            else:
+                self._inflight_write_jobs += 1
             for batch in self._batch_tasks(tasks, n_tasks, n_threads):
                 queue.append((make_batch_fn(batch), len(batch), state))
                 n_batches += 1
@@ -220,13 +264,9 @@ class DualQueueThreadPool:
             n_threads=self._n_write_threads,
         )
 
-    def get_finished(self) -> list[tuple[JobId, bool, float, float]]:
-        """Returns (job_id, success, job_duration, queueing_delay) tuples.
-
-        job_duration is the time from enqueue to the job's last task
-        completing; queueing_delay is the time from enqueue to a worker
-        thread picking up the job's first batch, both in seconds.
-        """
+    def get_finished(self) -> list[FinishedJob]:
+        """Returns the list of jobs that have fully completed since the
+        last call."""
         # No lock needed: deque is thread-safe for concurrent append/popleft,
         # and the manager is the sole popper.
         jobs = []
@@ -235,14 +275,24 @@ class DualQueueThreadPool:
         return jobs
 
     @property
-    def num_inflight_jobs(self) -> int:
-        """Number of jobs submitted but not yet fully completed.
+    def num_inflight_read_jobs(self) -> int:
+        """Number of load jobs submitted but not yet fully completed.
 
         Includes jobs still waiting in the load/store queues as well as
         jobs currently being executed by a worker thread.
         """
         with self._condition:
-            return self._inflight_jobs
+            return self._inflight_read_jobs
+
+    @property
+    def num_inflight_write_jobs(self) -> int:
+        """Number of store jobs submitted but not yet fully completed.
+
+        Includes jobs still waiting in the load/store queues as well as
+        jobs currently being executed by a worker thread.
+        """
+        with self._condition:
+            return self._inflight_write_jobs
 
     @property
     def num_active_read_threads(self) -> int:
@@ -256,6 +306,26 @@ class DualQueueThreadPool:
         with self._condition:
             return self._active_write_threads
 
+    @property
+    def num_active_read_jobs(self) -> int:
+        """Number of distinct load jobs currently executing.
+
+        Unlike num_active_read_threads, a job with multiple batches running
+        concurrently on multiple threads is only counted once here.
+        """
+        with self._condition:
+            return self._active_read_jobs
+
+    @property
+    def num_active_write_jobs(self) -> int:
+        """Number of distinct store jobs currently executing.
+
+        Unlike num_active_write_threads, a job with multiple batches running
+        concurrently on multiple threads is only counted once here.
+        """
+        with self._condition:
+            return self._active_write_jobs
+
     def wait_idle(self) -> None:
         """Block until there are no in-flight jobs.
 
@@ -265,16 +335,20 @@ class DualQueueThreadPool:
         for ``get_finished()`` to drain them.
         """
         with self._condition:
-            self._condition.wait_for(lambda: self._inflight_jobs == 0)
+            self._condition.wait_for(
+                lambda: self._inflight_read_jobs == 0 and self._inflight_write_jobs == 0
+            )
 
     def shutdown(self, wait: bool = True) -> None:
         with self._condition:
             self._stop = True
             self._load_q.clear()
             self._store_q.clear()
-            # Cancelled tasks will not decrement _inflight_jobs; reset it so a
-            # subsequent wait_idle() returns instead of hanging.
-            self._inflight_jobs = 0
+            # Cancelled tasks will not decrement _inflight_{read,write}_jobs;
+            # reset them so a subsequent wait_idle() returns instead of
+            # hanging.
+            self._inflight_read_jobs = 0
+            self._inflight_write_jobs = 0
             self._condition.notify_all()
         if wait:
             for t in self._threads:
@@ -298,7 +372,13 @@ class DualQueueThreadPool:
                     self._active_read_threads += 1
                 else:
                     self._active_write_threads += 1
-            state.mark_batch_start()
+            is_first_batch = state.mark_batch_start()
+            if is_first_batch:
+                with self._condition:
+                    if state.is_load:
+                        self._active_read_jobs += 1
+                    else:
+                        self._active_write_jobs += 1
             try:
                 fn()
                 job_finished, success = state.task_done(batch_size, True)
@@ -320,9 +400,23 @@ class DualQueueThreadPool:
                 now = time.monotonic()
                 job_duration = now - state.enqueue_time
                 queueing_delay = (state.first_batch_time or now) - state.enqueue_time
+                execution_time = job_duration - queueing_delay
                 with self._condition:
                     self._finished_q.append(
-                        (state.job_id, success, job_duration, queueing_delay)
+                        FinishedJob(
+                            job_id=state.job_id,
+                            success=success,
+                            is_load=state.is_load,
+                            n_tasks=state.n_tasks,
+                            job_duration=job_duration,
+                            queueing_delay=queueing_delay,
+                            execution_time=execution_time,
+                        )
                     )
-                    self._inflight_jobs -= 1
+                    if state.is_load:
+                        self._inflight_read_jobs -= 1
+                        self._active_read_jobs -= 1
+                    else:
+                        self._inflight_write_jobs -= 1
+                        self._active_write_jobs -= 1
                     self._condition.notify_all()

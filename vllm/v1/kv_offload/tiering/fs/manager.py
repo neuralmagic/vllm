@@ -71,11 +71,19 @@ logger = init_logger(__name__)
 class FsThreadPoolMetrics:
     """Metric names for FileSystemTierManager's thread pool."""
 
-    JOB_DURATION = "vllm:kv_offload_fs_job_duration_seconds"
+    JOB_DURATION_READ = "vllm:kv_offload_fs_job_duration_read_seconds"
+    JOB_DURATION_WRITE = "vllm:kv_offload_fs_job_duration_write_seconds"
     JOB_QUEUEING_DELAY = "vllm:kv_offload_fs_job_queueing_delay_seconds"
-    JOBS_IN_FLIGHT = "vllm:kv_offload_fs_jobs_in_flight"
+    JOB_EXECUTION_TIME_READ = "vllm:kv_offload_fs_job_execution_time_read_seconds"
+    JOB_EXECUTION_TIME_WRITE = "vllm:kv_offload_fs_job_execution_time_write_seconds"
+    JOBS_IN_FLIGHT_READ = "vllm:kv_offload_fs_jobs_in_flight_read"
+    JOBS_IN_FLIGHT_WRITE = "vllm:kv_offload_fs_jobs_in_flight_write"
     ACTIVE_READ_THREADS = "vllm:kv_offload_fs_active_read_threads"
     ACTIVE_WRITE_THREADS = "vllm:kv_offload_fs_active_write_threads"
+    ACTIVE_READ_JOBS = "vllm:kv_offload_fs_active_read_jobs"
+    ACTIVE_WRITE_JOBS = "vllm:kv_offload_fs_active_write_jobs"
+    READ_BANDWIDTH_BYTES_PER_SEC = "vllm:kv_offload_fs_read_bandwidth_bytes_per_sec"
+    WRITE_BANDWIDTH_BYTES_PER_SEC = "vllm:kv_offload_fs_write_bandwidth_bytes_per_sec"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -146,26 +154,59 @@ class FileSystemTierManager(SecondaryTierManager):
             20,
         )
         return {
-            FsThreadPoolMetrics.JOB_DURATION: OffloadingHistogramMetadata(
+            FsThreadPoolMetrics.JOB_DURATION_READ: OffloadingHistogramMetadata(
                 documentation=(
-                    "Histogram of FS thread-pool job duration: time from a "
-                    "job being enqueued to the thread pool until its last "
-                    "task completes, in seconds."
+                    "Histogram of FS thread-pool load job duration: time "
+                    "from a load job being enqueued to the thread pool "
+                    "until its last task completes, in seconds."
+                ),
+                buckets=buckets,
+            ),
+            FsThreadPoolMetrics.JOB_DURATION_WRITE: OffloadingHistogramMetadata(
+                documentation=(
+                    "Histogram of FS thread-pool store job duration: time "
+                    "from a store job being enqueued to the thread pool "
+                    "until its last task completes, in seconds."
                 ),
                 buckets=buckets,
             ),
             FsThreadPoolMetrics.JOB_QUEUEING_DELAY: OffloadingHistogramMetadata(
                 documentation=(
-                    "Histogram of FS thread-pool queueing delay: time from "
-                    "a job being enqueued until a worker thread picks up "
-                    "its first batch, in seconds."
+                    "Histogram of FS thread-pool queueing delay (load and "
+                    "store jobs combined): time from a job being enqueued "
+                    "until a worker thread picks up its first batch, in "
+                    "seconds."
                 ),
                 buckets=buckets,
             ),
-            FsThreadPoolMetrics.JOBS_IN_FLIGHT: OffloadingGaugeMetadata(
+            FsThreadPoolMetrics.JOB_EXECUTION_TIME_READ: OffloadingHistogramMetadata(
                 documentation=(
-                    "Number of FS thread-pool jobs submitted but not yet "
-                    "fully completed (queued plus currently executing)."
+                    "Histogram of FS thread-pool load job execution time: "
+                    "time from a worker thread picking up the job's first "
+                    "batch until its last task completes (excludes "
+                    "queueing delay), in seconds."
+                ),
+                buckets=buckets,
+            ),
+            FsThreadPoolMetrics.JOB_EXECUTION_TIME_WRITE: OffloadingHistogramMetadata(
+                documentation=(
+                    "Histogram of FS thread-pool store job execution time: "
+                    "time from a worker thread picking up the job's first "
+                    "batch until its last task completes (excludes "
+                    "queueing delay), in seconds."
+                ),
+                buckets=buckets,
+            ),
+            FsThreadPoolMetrics.JOBS_IN_FLIGHT_READ: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of FS thread-pool load jobs submitted but not "
+                    "yet fully completed (queued plus currently executing)."
+                ),
+            ),
+            FsThreadPoolMetrics.JOBS_IN_FLIGHT_WRITE: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of FS thread-pool store jobs submitted but not "
+                    "yet fully completed (queued plus currently executing)."
                 ),
             ),
             FsThreadPoolMetrics.ACTIVE_READ_THREADS: OffloadingGaugeMetadata(
@@ -179,6 +220,42 @@ class FileSystemTierManager(SecondaryTierManager):
                     "Number of FS thread-pool worker threads currently "
                     "executing a store (write) batch."
                 ),
+            ),
+            FsThreadPoolMetrics.ACTIVE_READ_JOBS: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of distinct FS thread-pool load jobs currently "
+                    "executing. Unlike active_read_threads, a job whose "
+                    "batches are running on multiple threads is only "
+                    "counted once."
+                ),
+            ),
+            FsThreadPoolMetrics.ACTIVE_WRITE_JOBS: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of distinct FS thread-pool store jobs currently "
+                    "executing. Unlike active_write_threads, a job whose "
+                    "batches are running on multiple threads is only "
+                    "counted once."
+                ),
+            ),
+            FsThreadPoolMetrics.READ_BANDWIDTH_BYTES_PER_SEC: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "Average FS load bandwidth (bytes/sec) of load jobs "
+                        "that finished since the last collection, computed "
+                        "from each job's execution time (excludes queueing "
+                        "delay)."
+                    ),
+                )
+            ),
+            FsThreadPoolMetrics.WRITE_BANDWIDTH_BYTES_PER_SEC: (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "Average FS store bandwidth (bytes/sec) of store "
+                        "jobs that finished since the last collection, "
+                        "computed from each job's execution time (excludes "
+                        "queueing delay)."
+                    ),
+                )
             ),
         }
 
@@ -226,8 +303,13 @@ class FileSystemTierManager(SecondaryTierManager):
         self._store_job_keys: dict[JobId, list[OffloadKey]] = {}
 
         # Per-job thread-pool timings, buffered between get_stats() calls.
-        self._job_durations: list[float] = []
+        self._job_durations_read: list[float] = []
+        self._job_durations_write: list[float] = []
         self._job_queueing_delays: list[float] = []
+        self._job_execution_times_read: list[float] = []
+        self._job_execution_times_write: list[float] = []
+        self._job_bandwidths_read: list[float] = []
+        self._job_bandwidths_write: list[float] = []
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -337,12 +419,25 @@ class FileSystemTierManager(SecondaryTierManager):
         Collect completed jobs from the finished-jobs queue.
         """
         results = []
-        for job_id, success, job_duration, queueing_delay in self._pool.get_finished():
-            self._job_durations.append(job_duration)
-            self._job_queueing_delays.append(queueing_delay)
+        for job in self._pool.get_finished():
+            if job.is_load:
+                self._job_durations_read.append(job.job_duration)
+                self._job_execution_times_read.append(job.execution_time)
+            else:
+                self._job_durations_write.append(job.job_duration)
+                self._job_execution_times_write.append(job.execution_time)
+            self._job_queueing_delays.append(job.queueing_delay)
+
+            if job.n_tasks > 0 and job.execution_time > 0:
+                bandwidth = job.n_tasks * self._block_size / job.execution_time
+                if job.is_load:
+                    self._job_bandwidths_read.append(bandwidth)
+                else:
+                    self._job_bandwidths_write.append(bandwidth)
+
             if self.events is not None:
-                keys = self._store_job_keys.pop(job_id, None)
-                if success and keys:
+                keys = self._store_job_keys.pop(job.job_id, None)
+                if job.success and keys:
                     self.events.append(
                         OffloadingEvent(
                             keys=keys,
@@ -351,14 +446,19 @@ class FileSystemTierManager(SecondaryTierManager):
                             locality=self.locality,
                         )
                     )
-            results.append(JobResult(job_id=job_id, success=success))
+            results.append(JobResult(job_id=job.job_id, success=job.success))
         return results
 
     @override
     def get_stats(self) -> "OffloadingConnectorStats | None":
         stats = OffloadingConnectorStats()
         stats.set_gauge(
-            FsThreadPoolMetrics.JOBS_IN_FLIGHT, self._pool.num_inflight_jobs
+            FsThreadPoolMetrics.JOBS_IN_FLIGHT_READ,
+            self._pool.num_inflight_read_jobs,
+        )
+        stats.set_gauge(
+            FsThreadPoolMetrics.JOBS_IN_FLIGHT_WRITE,
+            self._pool.num_inflight_write_jobs,
         )
         stats.set_gauge(
             FsThreadPoolMetrics.ACTIVE_READ_THREADS,
@@ -368,12 +468,48 @@ class FileSystemTierManager(SecondaryTierManager):
             FsThreadPoolMetrics.ACTIVE_WRITE_THREADS,
             self._pool.num_active_write_threads,
         )
-        for duration in self._job_durations:
-            stats.observe_histogram(FsThreadPoolMetrics.JOB_DURATION, duration)
+        stats.set_gauge(
+            FsThreadPoolMetrics.ACTIVE_READ_JOBS,
+            self._pool.num_active_read_jobs,
+        )
+        stats.set_gauge(
+            FsThreadPoolMetrics.ACTIVE_WRITE_JOBS,
+            self._pool.num_active_write_jobs,
+        )
+
+        for duration in self._job_durations_read:
+            stats.observe_histogram(FsThreadPoolMetrics.JOB_DURATION_READ, duration)
+        for duration in self._job_durations_write:
+            stats.observe_histogram(FsThreadPoolMetrics.JOB_DURATION_WRITE, duration)
         for delay in self._job_queueing_delays:
             stats.observe_histogram(FsThreadPoolMetrics.JOB_QUEUEING_DELAY, delay)
-        self._job_durations.clear()
+        for execution_time in self._job_execution_times_read:
+            stats.observe_histogram(
+                FsThreadPoolMetrics.JOB_EXECUTION_TIME_READ, execution_time
+            )
+        for execution_time in self._job_execution_times_write:
+            stats.observe_histogram(
+                FsThreadPoolMetrics.JOB_EXECUTION_TIME_WRITE, execution_time
+            )
+
+        if self._job_bandwidths_read:
+            stats.set_gauge(
+                FsThreadPoolMetrics.READ_BANDWIDTH_BYTES_PER_SEC,
+                sum(self._job_bandwidths_read) / len(self._job_bandwidths_read),
+            )
+        if self._job_bandwidths_write:
+            stats.set_gauge(
+                FsThreadPoolMetrics.WRITE_BANDWIDTH_BYTES_PER_SEC,
+                sum(self._job_bandwidths_write) / len(self._job_bandwidths_write),
+            )
+
+        self._job_durations_read.clear()
+        self._job_durations_write.clear()
         self._job_queueing_delays.clear()
+        self._job_execution_times_read.clear()
+        self._job_execution_times_write.clear()
+        self._job_bandwidths_read.clear()
+        self._job_bandwidths_write.clear()
         return stats
 
     @override
