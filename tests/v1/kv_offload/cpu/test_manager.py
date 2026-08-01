@@ -224,6 +224,57 @@ def test_filter_reused_manager_reports_stores_skipped_counter():
     assert stats.reduce()[CPUOffloadingMetrics.STORES_SKIPPED] == 0
 
 
+def test_unused_eviction_metric_counts_block_evicted_without_load():
+    """A block stored and evicted without ever being loaded/read counts as
+    an unused eviction: the store work was wasted."""
+    manager = make_cpu_manager(num_blocks=1)
+
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+
+    # Storing a new block forces block 1 out; it was never read.
+    manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX)
+
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.UNUSED_EVICTIONS] == 1
+
+
+def test_unused_eviction_metric_excludes_block_that_was_loaded():
+    """A block that was read via prepare_load/complete_load before eviction
+    is not counted as wasted, even though it is later evicted."""
+    manager = make_cpu_manager(num_blocks=1)
+
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)
+
+    # Storing a new block forces block 1 out; it was already read once.
+    manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX)
+
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.UNUSED_EVICTIONS] == 0
+
+
+def test_unused_eviction_metric_resets_after_get_stats():
+    manager = make_cpu_manager(num_blocks=1)
+
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX)
+
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.UNUSED_EVICTIONS] == 1
+
+    # No new evictions since the previous get_stats() call.
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.UNUSED_EVICTIONS] == 0
+
+
 def test_cpu_manager_reports_cache_usage_gauge():
     def check_usage_stats(manager: CPUOffloadingManager, value: float):
         stats = manager.get_stats()

@@ -39,6 +39,7 @@ from vllm.v1.kv_offload.base import (
     LookupResult,
     Medium,
     OffloadingEvent,
+    OffloadingGaugeMetadata,
     OffloadingHistogramMetadata,
     OffloadingMetricMetadata,
     OffloadKey,
@@ -72,6 +73,7 @@ class FsThreadPoolMetrics:
 
     JOB_DURATION = "vllm:kv_offload_fs_job_duration_seconds"
     JOB_QUEUEING_DELAY = "vllm:kv_offload_fs_job_queueing_delay_seconds"
+    JOBS_IN_FLIGHT = "vllm:kv_offload_fs_jobs_in_flight"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -152,6 +154,12 @@ class FileSystemTierManager(SecondaryTierManager):
                     "its first batch, in seconds."
                 ),
                 buckets=buckets,
+            ),
+            FsThreadPoolMetrics.JOBS_IN_FLIGHT: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of FS thread-pool jobs submitted but not yet "
+                    "fully completed (queued plus currently executing)."
+                ),
             ),
         }
 
@@ -329,9 +337,10 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def get_stats(self) -> "OffloadingConnectorStats | None":
-        if not self._job_durations and not self._job_queueing_delays:
-            return None
         stats = OffloadingConnectorStats()
+        stats.set_gauge(
+            FsThreadPoolMetrics.JOBS_IN_FLIGHT, self._pool.num_inflight_jobs
+        )
         for duration in self._job_durations:
             stats.observe_histogram(FsThreadPoolMetrics.JOB_DURATION, duration)
         for delay in self._job_queueing_delays:

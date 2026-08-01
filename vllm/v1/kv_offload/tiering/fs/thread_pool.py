@@ -226,6 +226,16 @@ class DualQueueThreadPool:
             jobs.append(self._finished_q.popleft())
         return jobs
 
+    @property
+    def num_inflight_jobs(self) -> int:
+        """Number of jobs submitted but not yet fully completed.
+
+        Includes jobs still waiting in the load/store queues as well as
+        jobs currently being executed by a worker thread.
+        """
+        with self._condition:
+            return self._inflight_jobs
+
     def wait_idle(self) -> None:
         """Block until there are no in-flight jobs.
 

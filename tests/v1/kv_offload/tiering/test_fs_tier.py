@@ -23,6 +23,7 @@ from vllm.v1.kv_offload.base import (
     LookupResult,
     Medium,
     OffloadingEvent,
+    OffloadingGaugeMetadata,
     OffloadingHistogramMetadata,
     OffloadingKVEventsConfig,
     OffloadKey,
@@ -477,6 +478,43 @@ def test_wait_idle_blocks_until_tasks_complete(monkeypatch):
         waiter.join(timeout=5.0)
 
 
+def test_num_inflight_jobs_tracks_queued_and_executing_jobs(monkeypatch):
+    """num_inflight_jobs counts a submitted job until its last task
+    completes, then drops back to zero."""
+
+    import vllm.v1.kv_offload.tiering.fs.manager as mgr_mod
+
+    gate = threading.Event()
+
+    def blocking_batch_store_block(*args, **kwargs):
+        gate.wait(timeout=5.0)
+
+    monkeypatch.setattr(mgr_mod, "batch_store_block", blocking_batch_store_block)
+    task = Task(path="unused", offset=0)
+
+    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+    try:
+        assert pool.num_inflight_jobs == 0
+
+        pool.enqueue_store(
+            job_id=1,
+            n_tasks=1,
+            tasks=[task],
+            make_batch_fn=lambda batch: mgr_mod.batch_store_block,
+        )
+        deadline = time.monotonic() + 5.0
+        while pool.num_inflight_jobs == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pool.num_inflight_jobs == 1
+
+        gate.set()
+        pool.wait_idle()
+        assert pool.num_inflight_jobs == 0
+    finally:
+        gate.set()
+        pool.shutdown(wait=True)
+
+
 def test_batch_lookup_c_extension(tmp_path):
     """Validates batch_lookup_C: empty, single, all-existing, all-missing,
     mixed ordering, and input type validation."""
@@ -820,6 +858,14 @@ def test_build_metric_definitions_registers_job_timing_histograms():
     )
 
 
+def test_build_metric_definitions_registers_jobs_in_flight_gauge():
+    definitions = FileSystemTierManager.build_metric_definitions({})
+    assert FsThreadPoolMetrics.JOBS_IN_FLIGHT in definitions
+    assert isinstance(
+        definitions[FsThreadPoolMetrics.JOBS_IN_FLIGHT], OffloadingGaugeMetadata
+    )
+
+
 def test_get_stats_reports_job_duration_and_queueing_delay(fs_tier):
     """A drained job's timing shows up as one observation in each histogram."""
     tier, _ = fs_tier
@@ -848,14 +894,24 @@ def test_get_stats_accumulates_across_multiple_jobs(fs_tier):
     assert reduced[f"{FsThreadPoolMetrics.JOB_QUEUEING_DELAY}_count"] == 2
 
 
-def test_get_stats_returns_none_without_new_jobs(fs_tier):
-    """get_stats() only reports newly observed jobs since the last call."""
+def test_get_stats_reports_jobs_in_flight_gauge_without_new_jobs(fs_tier):
+    """The in-flight gauge is always reported, even with no completed jobs."""
     tier, _ = fs_tier
-    assert tier.get_stats() is None
+    stats = tier.get_stats()
+    assert stats is not None
+    reduced = stats.reduce()
+    assert reduced[FsThreadPoolMetrics.JOBS_IN_FLIGHT] == 0
+    assert f"{FsThreadPoolMetrics.JOB_DURATION}_count" not in reduced
 
     tier.submit_store(make_job(1, [key(1)], [0]))
     assert all(r.success for r in drain(tier))
-    assert tier.get_stats() is not None
+    reduced = tier.get_stats().reduce()
+    assert reduced[f"{FsThreadPoolMetrics.JOB_DURATION}_count"] == 1
 
-    # Buffers were drained by the previous call; nothing new happened since.
-    assert tier.get_stats() is None
+    # Job timing buffers were drained by the previous call; the gauge is
+    # still reported even though nothing new happened since.
+    reduced = tier.get_stats().reduce()
+    assert reduced[FsThreadPoolMetrics.JOBS_IN_FLIGHT] == 0
+    assert f"{FsThreadPoolMetrics.JOB_DURATION}_count" not in reduced
+
+

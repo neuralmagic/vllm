@@ -60,6 +60,13 @@ class CPUOffloadingSpec(OffloadingSpec):
                 ),
                 buckets=(1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144),
             ),
+            CPUOffloadingMetrics.UNUSED_EVICTIONS: OffloadingCounterMetadata(
+                documentation=(
+                    "Number of CPU offload blocks evicted without ever being "
+                    "read after their store completed (wasted store/"
+                    "promotion work)."
+                ),
+            ),
         }
         store_threshold = int(extra_config.get("store_threshold", 0))
         if store_threshold >= 2:

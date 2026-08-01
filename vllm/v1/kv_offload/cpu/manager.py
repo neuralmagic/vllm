@@ -81,6 +81,7 @@ class CPUOffloadingManager(OffloadingManager):
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
         self.stores_skipped_in_current_batch: int = 0
+        self.unused_evictions_in_current_batch: int = 0
         self.allocation_sizes_in_current_batch: list[int] = []
 
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
@@ -224,6 +225,7 @@ class CPUOffloadingManager(OffloadingManager):
             for key, block in evicted:
                 if block.use_count == 1:
                     self._num_singleton_stores += 1
+                    self.unused_evictions_in_current_batch += 1
                 self._free_block(block)
                 to_evict.append(key)
 
@@ -347,6 +349,12 @@ class CPUOffloadingManager(OffloadingManager):
                 self.stores_skipped_in_current_batch,
             )
             self.stores_skipped_in_current_batch = 0
+
+        stats.increase_counter(
+            CPUOffloadingMetrics.UNUSED_EVICTIONS,
+            self.unused_evictions_in_current_batch,
+        )
+        self.unused_evictions_in_current_batch = 0
 
         gb_used_once = self._num_singleton_stores * self._bytes_per_block / 1e9
         logger.info(
