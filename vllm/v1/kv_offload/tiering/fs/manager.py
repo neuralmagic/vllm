@@ -137,6 +137,11 @@ class FileSystemTierManager(SecondaryTierManager):
             1,
             5,
             10,
+            12,
+            14,
+            16,
+            18,
+            20,
         )
         return {
             FsThreadPoolMetrics.JOB_DURATION: OffloadingHistogramMetadata(
