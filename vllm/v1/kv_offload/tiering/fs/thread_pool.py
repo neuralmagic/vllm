@@ -326,6 +326,18 @@ class DualQueueThreadPool:
         with self._condition:
             return self._active_write_jobs
 
+    @property
+    def num_queued_read_batches(self) -> int:
+        """Number of load batches waiting in the queue for a worker thread."""
+        with self._condition:
+            return len(self._load_q)
+
+    @property
+    def num_queued_write_batches(self) -> int:
+        """Number of store batches waiting in the queue for a worker thread."""
+        with self._condition:
+            return len(self._store_q)
+
     def wait_idle(self) -> None:
         """Block until there are no in-flight jobs.
 

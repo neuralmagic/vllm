@@ -84,6 +84,8 @@ class FsThreadPoolMetrics:
     ACTIVE_WRITE_JOBS = "vllm:kv_offload_fs_active_write_jobs"
     READ_BANDWIDTH_BYTES_PER_SEC = "vllm:kv_offload_fs_read_bandwidth_bytes_per_sec"
     WRITE_BANDWIDTH_BYTES_PER_SEC = "vllm:kv_offload_fs_write_bandwidth_bytes_per_sec"
+    READ_QUEUE_DEPTH = "vllm:kv_offload_fs_read_queue_depth"
+    WRITE_QUEUE_DEPTH = "vllm:kv_offload_fs_write_queue_depth"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -256,6 +258,18 @@ class FileSystemTierManager(SecondaryTierManager):
                         "queueing delay)."
                     ),
                 )
+            ),
+            FsThreadPoolMetrics.READ_QUEUE_DEPTH: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of load batches waiting in the FS thread-pool "
+                    "load queue for a worker thread to pick up."
+                ),
+            ),
+            FsThreadPoolMetrics.WRITE_QUEUE_DEPTH: OffloadingGaugeMetadata(
+                documentation=(
+                    "Number of store batches waiting in the FS thread-pool "
+                    "store queue for a worker thread to pick up."
+                ),
             ),
         }
 
@@ -475,6 +489,14 @@ class FileSystemTierManager(SecondaryTierManager):
         stats.set_gauge(
             FsThreadPoolMetrics.ACTIVE_WRITE_JOBS,
             self._pool.num_active_write_jobs,
+        )
+        stats.set_gauge(
+            FsThreadPoolMetrics.READ_QUEUE_DEPTH,
+            self._pool.num_queued_read_batches,
+        )
+        stats.set_gauge(
+            FsThreadPoolMetrics.WRITE_QUEUE_DEPTH,
+            self._pool.num_queued_write_batches,
         )
 
         for duration in self._job_durations_read:
