@@ -137,7 +137,7 @@ class CPUOffloadingManager(OffloadingManager):
     def prepare_load(
         self,
         keys: Collection[OffloadKey],
-        req_context: ReqContext,
+        req_context: ReqContext | None = None,
     ) -> LoadStoreSpec:
         blocks = []
         for key in keys:
@@ -158,7 +158,9 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def complete_load(
-        self, keys: Collection[OffloadKey], req_context: ReqContext
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext | None = None,
     ) -> None:
         for key in keys:
             block = self._policy.get(key)

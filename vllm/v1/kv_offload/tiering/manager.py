@@ -218,6 +218,8 @@ class TieringOffloadingManager(OffloadingManager):
             for tier in self.secondary_tiers
         }
 
+        self._dummy_primary_jobs: dict[str, set[OffloadKey]] = {}
+
         # Buffers manager-level observations (e.g. lookup delay) between
         # get_stats() calls; merged in and reset each time get_stats() runs.
         self._stats = OffloadingConnectorStats()
@@ -227,6 +229,19 @@ class TieringOffloadingManager(OffloadingManager):
         job_id = self._job_id_counter
         self._job_id_counter += 1
         return job_id
+
+    def _prepare_dummy_load(self, req_id: str, keys: Collection[OffloadKey]):
+        state = self._req_state.get(req_id)
+        if state is None or state.is_finished:
+            return
+        self.primary_tier.prepare_load(keys, None)
+        self._dummy_primary_jobs.setdefault(req_id, set()).update(keys)
+
+    def _complete_dummy_load(self, req_id: str):
+        if req_id not in self._dummy_primary_jobs:
+            return
+        keys = self._dummy_primary_jobs.pop(req_id)
+        self.primary_tier.complete_load(keys, None)
 
     def _maybe_process_finished_jobs(self):
         """
@@ -269,6 +284,12 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+                    if completed_job.success:
+                        # Lock in the CPU blocks until the primary_tier -> GPU
+                        # transfers is triggered.
+                        self._prepare_dummy_load(
+                            job_metadata.req_context.req_id, job_metadata.keys
+                        )
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
@@ -468,6 +489,7 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
+        self._complete_dummy_load(req_context.req_id)
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
@@ -711,6 +733,7 @@ class TieringOffloadingManager(OffloadingManager):
         state = self._req_state[req_id]
         if not state.is_finished:
             return
+        self._complete_dummy_load(req_id)
         if state.pending_primary_stores != 0:
             return
 
@@ -798,6 +821,10 @@ class TieringOffloadingManager(OffloadingManager):
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
+
+        # complete all dummy loads
+        for req_id in list(self._dummy_primary_jobs):
+            self._complete_dummy_load(req_id)
 
         finished_req_ids = []
         for req_id, state in self._req_state.items():
