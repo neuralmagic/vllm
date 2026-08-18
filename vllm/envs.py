@@ -1648,9 +1648,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # offload tier's thread pool (see fs/timing_debug.py). Unset (default)
     # disables the instrumentation entirely. Diagnostic-only; not meant to be
     # enabled in production.
-    "VLLM_KV_OFFLOAD_FS_TIMING_LOG": lambda: os.getenv(
-        "VLLM_KV_OFFLOAD_FS_TIMING_LOG"
-    ),
+    "VLLM_KV_OFFLOAD_FS_TIMING_LOG": lambda: os.getenv("VLLM_KV_OFFLOAD_FS_TIMING_LOG"),
     # Number of parallel KV-load receive threads per worker rank. Lets the
     # per-request control overhead (Python prep + master key lookup) of one
     # request overlap with the RDMA transfer of another, keeping the transfer
