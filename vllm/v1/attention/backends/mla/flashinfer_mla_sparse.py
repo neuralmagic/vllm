@@ -84,6 +84,10 @@ class FlashInferMLASparseTRTLLMBackend(_FlashInferMLASparseBackendBase):
     def get_impl_cls() -> type[MLAAttentionImpl]:
         return FlashInferMLASparseImpl
 
+    @staticmethod
+    def get_builder_cls() -> type["FlashInferMLASparseTRTLLMMetadataBuilder"]:
+        return FlashInferMLASparseTRTLLMMetadataBuilder
+
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major == 10
@@ -282,6 +286,18 @@ class FlashInferMLASparseMetadataBuilder(
         metadata.physical_topk_indices = self.physical_topk_indices
         metadata.physical_topk_valid_counts = self.physical_topk_valid_counts
         return metadata
+
+
+class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilder):
+    """Metadata builder for the SM100 TRT-LLM sparse MLA kernel."""
+
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+    def _build_req_id_per_token(
+        self,
+        common_attn_metadata: "CommonAttentionMetadata",
+    ) -> torch.Tensor:
+        return common_attn_metadata.token_to_req_indices(self.req_id_per_token_buffer)
 
 
 # Global workspace buffer (lazily initialized)
