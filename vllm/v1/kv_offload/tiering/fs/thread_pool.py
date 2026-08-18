@@ -79,16 +79,22 @@ class DualQueueThreadPool:
     Load-priority threads drain the load queue first, then fall back to the
     store queue.  Store-priority threads do the reverse.  Both queues share
     a single condition variable.
+
+    n_job_fanout_threads, determines how a job (set of tasks) is distributed
+    among read/write threads. A value of None, leaves the batching decision
+    to the implementation.
     """
 
     def __init__(
         self,
         n_read_threads: int,
         n_write_threads: int,
+        n_job_fanout_threads: int | None = None,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
         self._n_read_threads = n_read_threads
         self._n_write_threads = n_write_threads
+        self._n_job_fanout_threads = n_job_fanout_threads
         self._load_q: deque = deque()
         self._store_q: deque = deque()
         self._condition = threading.Condition(threading.Lock())
@@ -98,6 +104,7 @@ class DualQueueThreadPool:
         self._inflight_jobs = 0  # guarded by _condition
 
         assert self.total_threads > 0, "ThreadPool needs at least one thread"
+        assert self._n_job_fanout_threads != 0, "Number of Job fanout cannot be 0"
 
         for i in range(self._n_read_threads):
             t = threading.Thread(
@@ -176,15 +183,20 @@ class DualQueueThreadPool:
     ) -> None:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
 
+        n_threads = (
+            self._n_read_threads if self._n_read_threads > 0 else self.total_threads
+        )
+        if self._n_job_fanout_threads:
+            # override
+            n_threads = self._n_job_fanout_threads
+
         self._enqueue(
             self._load_q,
             make_batch_fn,
             job_id,
             tasks,
             n_tasks=n_tasks,
-            n_threads=self._n_read_threads
-            if self._n_read_threads > 0
-            else self.total_threads,
+            n_threads=n_threads,
         )
 
     def enqueue_store(
@@ -196,15 +208,20 @@ class DualQueueThreadPool:
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
 
+        n_threads = (
+            self._n_write_threads if self._n_write_threads > 0 else self.total_threads
+        )
+        if self._n_job_fanout_threads:
+            # override
+            n_threads = self._n_job_fanout_threads
+
         self._enqueue(
             self._store_q,
             make_batch_fn,
             job_id,
             tasks,
             n_tasks=n_tasks,
-            n_threads=self._n_write_threads
-            if self._n_write_threads > 0
-            else self.total_threads,
+            n_threads=n_threads,
         )
 
     def get_finished(self) -> list[tuple[JobId, bool, float]]:

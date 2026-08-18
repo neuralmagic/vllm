@@ -478,23 +478,40 @@ def test_wait_idle_blocks_until_tasks_complete():
 
 
 @pytest.mark.parametrize(
-    ("n_tasks", "n_threads", "expected_sizes"),
+    ("n_tasks", "n_threads", "n_fanout_threads", "expected_sizes"),
     [
-        (7, 3, [3, 2, 2]),
-        (6, 3, [2, 2, 2]),
-        (2, 5, [1, 1]),
-        (0, 3, []),
+        (7, 3, None, [3, 2, 2]),
+        (6, 3, None, [2, 2, 2]),
+        (2, 5, None, [1, 1]),
+        (0, 3, None, []),
+        (7, 3, 2, [4, 3]),
+        (6, 3, 5, [2, 1, 1, 1, 1]),
+        (2, 5, 2, [1, 1]),
+        (0, 3, 3, []),
     ],
 )
-def test_batch_tasks_distribution(n_tasks, n_threads, expected_sizes):
-    """_batch_tasks splits tasks evenly across n_threads (largest remainder
-    first), preserving order and accounting for every task."""
-    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+def test_batch_tasks_distribution(n_tasks, n_threads, n_fanout_threads, expected_sizes):
+    """_batch_tasks splits tasks evenly across n_threads / n_fanout_threads (largest
+    remainder first), preserving order and accounting for every task."""
+    pool = DualQueueThreadPool(
+        n_read_threads=n_threads,
+        n_write_threads=n_threads,
+        n_job_fanout_threads=n_fanout_threads,
+    )
     try:
         tasks = [Task(key=key(i), path=str(i), offset=i) for i in range(n_tasks)]
-        batches = list(pool._batch_tasks(tasks, n_threads))
-        assert [len(b) for b in batches] == expected_sizes
-        assert [t for b in batches for t in b] == tasks
+        # enqueue_* batch tasks synchronously before queuing, so batches can
+        # be inspected without waiting for worker threads to run them.
+        for enqueue in (pool.enqueue_store, pool.enqueue_load):
+            batches: list[list[Task]] = []
+
+            def make_batch_fn(batch, batches=batches):
+                batches.append(list(batch))
+                return lambda: None
+
+            enqueue(job_id=1, n_tasks=n_tasks, tasks=tasks, make_batch_fn=make_batch_fn)
+            assert [len(b) for b in batches] == expected_sizes
+            assert [t for b in batches for t in b] == tasks
     finally:
         pool.shutdown(wait=True)
 

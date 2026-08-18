@@ -115,6 +115,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        n_job_fanout_threads: int | None = None,
         enable_kv_events: bool = False,
         locality: str | None = None,
     ):
@@ -127,6 +128,8 @@ class FileSystemTierManager(SecondaryTierManager):
             root_dir: Root directory for block files.
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
+            n_job_fanout_threads: Number of threads that should work on a
+                single job. If None, the decision is left to the implementation.
             enable_kv_events: Emit BlockStored KV events for blocks
                 successfully stored to this tier. Effective only when KV
                 cache events are enabled globally (kv_events_config).
@@ -196,6 +199,7 @@ class FileSystemTierManager(SecondaryTierManager):
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
+            n_job_fanout_threads,
             thread_name_prefix="vllm_kv_py_fs",
         )
 
