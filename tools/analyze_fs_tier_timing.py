@@ -200,7 +200,9 @@ def _batch_intervals_per_job(
 ) -> dict[str, list[tuple[float, float]]]:
     """job_id -> [(dequeue_t, finish_t), ...], one interval per batch,
     matched on (job_id, batch_no)."""
-    starts: dict[tuple[str, int], float] = {(d.job_id, d.batch_no): d.t for d in dequeues}
+    starts: dict[tuple[str, int], float] = {
+        (d.job_id, d.batch_no): d.t for d in dequeues
+    }
     intervals: dict[str, list[tuple[float, float]]] = {}
     for f in finishes:
         start = starts.get((f.job_id, f.batch_no))
@@ -254,9 +256,7 @@ def plot_load_job_bars(
     job_by_id = {j.job_id: j for j in jobs if j.kind == "load"}
     max_batch_by_id = _max_batch_size_per_job(dequeues)
 
-    load_enq = sorted(
-        (e for e in enqueues if e.job_id in job_by_id), key=lambda e: e.t
-    )
+    load_enq = sorted((e for e in enqueues if e.job_id in job_by_id), key=lambda e: e.t)
     if not load_enq:
         print("No load jobs found; nothing to plot.")
         return
@@ -357,9 +357,7 @@ def plot_thread_count_chronological(
     n_threads_by_id = _distinct_thread_count_per_job(
         [d for d in dequeues if d.job_id in job_by_id]
     )
-    load_enq = sorted(
-        (e for e in enqueues if e.job_id in job_by_id), key=lambda e: e.t
-    )
+    load_enq = sorted((e for e in enqueues if e.job_id in job_by_id), key=lambda e: e.t)
     if not load_enq:
         print("No load jobs found; nothing to plot.")
         return
@@ -391,14 +389,29 @@ def plot_thread_count_chronological(
 
     bar_width = chunk_size * 0.8
     ax2 = axes[1]
-    ax2.bar(chunk_x, chunk_mean, width=bar_width, color="tab:purple", alpha=0.7, label="mean distinct threads")
+    ax2.bar(
+        chunk_x,
+        chunk_mean,
+        width=bar_width,
+        color="tab:purple",
+        alpha=0.7,
+        label="mean distinct threads",
+    )
     ax2.set_ylabel("mean distinct threads")
     ax2.set_ylim(0, 17)
-    ax2.set_xlabel(f"Load job index, chunked into {len(chunk_x)} windows of ~{chunk_size} jobs")
+    ax2.set_xlabel(
+        f"Load job index, chunked into {len(chunk_x)} windows of ~{chunk_size} jobs"
+    )
     ax2.set_title("Per-window mean thread count and fraction reaching all 16 threads")
 
     ax3 = ax2.twinx()
-    ax3.plot(chunk_x, [100 * f for f in chunk_full16_frac], color="tab:orange", marker="o", label="% jobs using all 16 threads")
+    ax3.plot(
+        chunk_x,
+        [100 * f for f in chunk_full16_frac],
+        color="tab:orange",
+        marker="o",
+        label="% jobs using all 16 threads",
+    )
     ax3.set_ylabel("% jobs using all 16 threads")
     ax3.set_ylim(0, 105)
 
@@ -486,8 +499,10 @@ def print_worst_span_timeline(
     for d in dequeues:
         deq_by_job.setdefault(d.job_id, []).append(d)
 
-    print(f"\n=== Batch pickup times, normalized to job lifetime (0-100), "
-          f"for the {len(worst)} worst-span jobs ===")
+    print(
+        f"\n=== Batch pickup times, normalized to job lifetime (0-100), "
+        f"for the {len(worst)} worst-span jobs ==="
+    )
     for j in worst:
         rows = sorted(deq_by_job.get(j.job_id, []), key=lambda d: d.t)
         if not rows:
@@ -499,10 +514,7 @@ def print_worst_span_timeline(
         )
         for d in rows:
             norm = 100.0 * (d.t - t_first) / j.span if j.span > 0 else 0.0
-            print(
-                f"    t={norm:6.2f}/100  batch_no={d.batch_no:<3} "
-                f"thread={d.thread}"
-            )
+            print(f"    t={norm:6.2f}/100  batch_no={d.batch_no:<3} thread={d.thread}")
 
 
 def _global_batch_intervals(
@@ -526,7 +538,7 @@ _THREAD_POOL_RE = re.compile(r"_(l|s)\d+$")
 
 
 def _thread_pool(thread: str) -> str:
-    """"load" or "store" based on the worker thread's name suffix (`..._l<i>`
+    """ "load" or "store" based on the worker thread's name suffix (`..._l<i>`
     for read/load-priority threads, `..._s<i>` for write/store-priority
     threads; see ``DualQueueThreadPool``). "unknown" if it doesn't match."""
     m = _THREAD_POOL_RE.search(thread)
@@ -724,13 +736,17 @@ def plot_idle_threads(
         bucket_starts = [i * bucket_width for i in range(len(depth))]
         ax_depth.step(bucket_starts, depth, where="post", color=color)
         ax_depth.set_ylabel("queue depth (mean)")
-        ax_depth.set_title(f"{kind.capitalize()} queue depth per {bucket_width:g}s bucket")
+        ax_depth.set_title(
+            f"{kind.capitalize()} queue depth per {bucket_width:g}s bucket"
+        )
 
     for ax in axes[-1]:
         ax.set_xlabel(f"Time since run start (s), bucket_width={bucket_width:g}s")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
-    print(f"Wrote idle-threads/queue-depth plot (bucket_width={bucket_width:g}s) to {output_path}")
+    print(
+        f"Wrote idle-threads/queue-depth plot (bucket_width={bucket_width:g}s) to {output_path}"
+    )
 
 
 def print_concurrency_vs_duration_report(
@@ -764,7 +780,16 @@ def print_concurrency_vs_duration_report(
         rows.append((concurrency, t_end - t_start, batch_size))
         heapq.heappush(heap, t_end)
 
-    buckets = [(0, 4), (5, 8), (9, 12), (13, 16), (17, 20), (21, 24), (25, 28), (29, 64)]
+    buckets = [
+        (0, 4),
+        (5, 8),
+        (9, 12),
+        (13, 16),
+        (17, 20),
+        (21, 24),
+        (25, 28),
+        (29, 64),
+    ]
     print("\n=== Per-block duration vs. system-wide concurrency at batch start ===")
     print(
         f"  {'concurrency':<14}{'n_batches':>10}{'mean_dur(ms)':>14}"
@@ -776,9 +801,7 @@ def print_concurrency_vs_duration_report(
             continue
         mean_dur = statistics.fmean(d for d, _ in sel)
         mean_bs = statistics.fmean(bs for _, bs in sel)
-        mean_dur_per_block = statistics.fmean(
-            (d / bs) for d, bs in sel if bs > 0
-        )
+        mean_dur_per_block = statistics.fmean((d / bs) for d, bs in sel if bs > 0)
         label = f"{lo}-{hi}"
         print(
             f"  {label:<14}{len(sel):>10}{mean_dur * 1000:>14.3f}"

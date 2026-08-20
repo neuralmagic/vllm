@@ -170,6 +170,7 @@ def batch_store_block(
     view: memoryview,
     offsets: list[int],
     block_size: int,
+    thread_name: str = "",
     use_o_direct: bool = True,
 ) -> None:
     """
@@ -177,6 +178,10 @@ def batch_store_block(
 
     Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
     to dest_paths[i] via a temp-file rename.  Raises on first error.
+
+    ``thread_name`` is diagnostic-only: the C extension path uses it to tag a
+    GIL-reacquisition-wait record (see ``VLLM_KV_OFFLOAD_FS_TIMING_LOG``) and
+    is otherwise unused.
     """
     _validate_offsets(view, offsets, block_size)
 
@@ -184,7 +189,9 @@ def batch_store_block(
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
-        return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
+        return batch_store_block_C(
+            tmp_paths, paths, view_slices, thread_name, use_o_direct
+        )
     else:
         for path, offset in zip(paths, offsets):
             _store_block(path, view, offset, block_size, use_o_direct)
@@ -195,6 +202,7 @@ def batch_load_block(
     view: memoryview,
     offsets: list[int],
     block_size: int,
+    thread_name: str = "",
     use_o_direct: bool = True,
 ) -> None:
     """
@@ -204,13 +212,17 @@ def batch_load_block(
     Raises on first error (see _load_block for the delete-on-short-read policy).
     On failure the raised OSError carries ``num_succeeded`` = the number of
     blocks loaded before the failing one, so the tier can keep them.
+
+    ``thread_name`` is diagnostic-only: the C extension path uses it to tag a
+    GIL-reacquisition-wait record (see ``VLLM_KV_OFFLOAD_FS_TIMING_LOG``) and
+    is otherwise unused.
     """
     _validate_offsets(view, offsets, block_size)
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
-        return batch_load_block_C(paths, view_slices, use_o_direct)
+        return batch_load_block_C(paths, view_slices, thread_name, use_o_direct)
     else:
         for i, (path, offset) in enumerate(zip(paths, offsets)):
             try:

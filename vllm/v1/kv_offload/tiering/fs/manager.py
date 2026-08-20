@@ -15,9 +15,9 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
 """
 
-import functools
 import json
 import os
+import threading
 from collections.abc import Callable, Iterable
 from queue import SimpleQueue
 from typing import TYPE_CHECKING, ClassVar
@@ -227,14 +227,22 @@ class FileSystemTierManager(SecondaryTierManager):
             self._store_job_keys[job_metadata.job_id] = keys
 
         def make_batch_fn(batch: list[Task]) -> Callable[[], None]:
-            return functools.partial(
-                batch_store_block,
-                paths=[t.path for t in batch],
-                offsets=[t.offset for t in batch],
-                view=self._primary_kv_view,
-                block_size=self._block_size,
-                use_o_direct=self._use_o_direct,
-            )
+            paths = [t.path for t in batch]
+            offsets = [t.offset for t in batch]
+
+            def store_task() -> None:
+                # Resolved on the worker thread that runs this task (not the
+                # thread that enqueued it), for GIL-contention diagnostics.
+                batch_store_block(
+                    paths=paths,
+                    offsets=offsets,
+                    view=self._primary_kv_view,
+                    block_size=self._block_size,
+                    use_o_direct=self._use_o_direct,
+                    thread_name=threading.current_thread().name,
+                )
+
+            return store_task
 
         self._pool.enqueue_store(
             job_metadata.job_id,
@@ -259,6 +267,7 @@ class FileSystemTierManager(SecondaryTierManager):
                         view=self._primary_kv_view,
                         block_size=self._block_size,
                         use_o_direct=self._use_o_direct,
+                        thread_name=threading.current_thread().name,
                     )
                 except Exception as exc:
                     # Record number of successful loads.

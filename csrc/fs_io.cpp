@@ -5,9 +5,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -155,6 +159,53 @@ inline void release_buffer_list(std::vector<Py_buffer>& buffers) {
   }
 }
 
+// Diagnostic-only: how long a worker thread waited to reacquire the GIL
+// after its batch I/O loop finished (see VLLM_KV_OFFLOAD_FS_TIMING_LOG in
+// vllm/v1/kv_offload/tiering/fs/timing_debug.py). Writes directly to the
+// same log file via raw syscalls, bypassing Python entirely, so it costs no
+// extra GIL acquisition on top of what the caller already pays.
+int g_gil_wait_log_fd = -1;
+std::once_flag g_gil_wait_log_once_flag;
+
+void open_gil_wait_log_once() {
+  const char* path = std::getenv("VLLM_KV_OFFLOAD_FS_TIMING_LOG");
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  g_gil_wait_log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+}
+
+// Logs "G,<t_after>,<thread_name>,<kind>,<gil_wait>\n". `t_before` is a
+// CLOCK_MONOTONIC timestamp taken just before Py_END_ALLOW_THREADS (while
+// the GIL is still released); `t_after` is taken just after (GIL just
+// reacquired), so gil_wait isolates GIL-reacquisition wait from actual I/O
+// time. CLOCK_MONOTONIC matches CPython's time.monotonic() on Linux, so
+// these timestamps line up with the existing D/F Python-side records.
+inline void log_gil_wait(const char* kind, const char* thread_name,
+                         const struct timespec& t_before,
+                         const struct timespec& t_after) {
+  std::call_once(g_gil_wait_log_once_flag, open_gil_wait_log_once);
+  if (g_gil_wait_log_fd < 0) {
+    return;
+  }
+  const double t_after_s =
+      t_after.tv_sec + static_cast<double>(t_after.tv_nsec) * 1e-9;
+  const double gil_wait_s =
+      (t_after.tv_sec - t_before.tv_sec) +
+      static_cast<double>(t_after.tv_nsec - t_before.tv_nsec) * 1e-9;
+  char line[256];
+  const int len = snprintf(line, sizeof(line), "G,%.9f,%s,%s,%.9f\n",
+                           t_after_s, thread_name, kind, gil_wait_s);
+  if (len > 0) {
+    // A single write() of a short line is atomic on POSIX for sizes under
+    // PIPE_BUF, so concurrent threads' records don't interleave.
+    const size_t write_len = static_cast<size_t>(
+        len < static_cast<int>(sizeof(line)) ? len
+                                              : static_cast<int>(sizeof(line)) - 1);
+    (void)write(g_gil_wait_log_fd, line, write_len);
+  }
+}
+
 }  // namespace
 
 /// @brief Check file existence for a batch of paths.
@@ -204,11 +255,12 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
   PyObject* tmp_paths_obj = nullptr;
   PyObject* dest_paths_obj = nullptr;
   PyObject* buffers_obj = nullptr;
+  const char* thread_name = "";
   int use_o_direct = 1;
 
-  if (!PyArg_ParseTuple(args, "O!O!O!|p", &PyList_Type, &tmp_paths_obj,
+  if (!PyArg_ParseTuple(args, "O!O!O!s|p", &PyList_Type, &tmp_paths_obj,
                         &PyList_Type, &dest_paths_obj, &PyList_Type,
-                        &buffers_obj, &use_o_direct)) {
+                        &buffers_obj, &thread_name, &use_o_direct)) {
     return nullptr;
   }
 
@@ -233,6 +285,8 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
 
   Py_ssize_t failed_index = -1;
   int failure_errno = 0;
+  struct timespec t_before {};
+  struct timespec t_after {};
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
@@ -246,8 +300,11 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
         break;
       }
     }
+    clock_gettime(CLOCK_MONOTONIC, &t_before);
     Py_END_ALLOW_THREADS
   }
+  clock_gettime(CLOCK_MONOTONIC, &t_after);
+  log_gil_wait("store", thread_name, t_before, t_after);
 
   release_buffer_list(buffers);
 
@@ -272,10 +329,12 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
 static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
   PyObject* source_paths_obj = nullptr;
   PyObject* buffers_obj = nullptr;
+  const char* thread_name = "";
   int use_o_direct = 1;
 
-  if (!PyArg_ParseTuple(args, "O!O!|p", &PyList_Type, &source_paths_obj,
-                        &PyList_Type, &buffers_obj, &use_o_direct)) {
+  if (!PyArg_ParseTuple(args, "O!O!s|p", &PyList_Type, &source_paths_obj,
+                        &PyList_Type, &buffers_obj, &thread_name,
+                        &use_o_direct)) {
     return nullptr;
   }
 
@@ -296,6 +355,8 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
 
   Py_ssize_t failed_index = -1;
   int failure_errno = 0;
+  struct timespec t_before {};
+  struct timespec t_after {};
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
@@ -309,8 +370,11 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
         break;
       }
     }
+    clock_gettime(CLOCK_MONOTONIC, &t_before);
     Py_END_ALLOW_THREADS
   }
+  clock_gettime(CLOCK_MONOTONIC, &t_after);
+  log_gil_wait("load", thread_name, t_before, t_after);
 
   release_buffer_list(buffers);
 
@@ -344,18 +408,22 @@ static PyMethodDef fs_io_C_methods[] = {
      "Check file existence for a batch of paths."},
     {"batch_store_block", batch_store_block, METH_VARARGS,
      "batch_store_block(tmp_paths: list[str], dest_paths: list[str],\n"
-     "                  buffers: list[bytes-like],\n"
+     "                  buffers: list[bytes-like], thread_name: str,\n"
      "                  use_o_direct: bool = True) -> None\n"
      "\n"
      "Store a batch of blocks, each from its own buffer, to disk. Raises on "
-     "first error."},
+     "first error. thread_name is diagnostic-only, used to tag a "
+     "GIL-reacquisition-wait record when VLLM_KV_OFFLOAD_FS_TIMING_LOG is "
+     "set."},
     {"batch_load_block", batch_load_block, METH_VARARGS,
      "batch_load_block(source_paths: list[str],\n"
-     "                 buffers: list[writable bytes-like],\n"
+     "                 buffers: list[writable bytes-like], thread_name: str,\n"
      "                 use_o_direct: bool = True) -> None\n"
      "\n"
      "Load a batch of blocks from disk into corresponding buffers. "
-     "Raises on first error."},
+     "Raises on first error. thread_name is diagnostic-only, used to tag a "
+     "GIL-reacquisition-wait record when VLLM_KV_OFFLOAD_FS_TIMING_LOG is "
+     "set."},
     {nullptr, nullptr, 0, nullptr},
 };
 
