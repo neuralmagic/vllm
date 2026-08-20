@@ -13,9 +13,11 @@ Usage:
     python tools/analyze_fs_tier_timing.py /path/to/timing.log
     python tools/analyze_fs_tier_timing.py /path/to/timing.log --kind load --top 20
     python tools/analyze_fs_tier_timing.py /path/to/timing.log --job-id 12345
+    python tools/analyze_fs_tier_timing.py /path/to/timing.log --idle-threads --bucket-width 0.2
 """
 
 import argparse
+import re
 import statistics
 from dataclasses import dataclass
 
@@ -520,6 +522,217 @@ def _global_batch_intervals(
     return out
 
 
+_THREAD_POOL_RE = re.compile(r"_(l|s)\d+$")
+
+
+def _thread_pool(thread: str) -> str:
+    """"load" or "store" based on the worker thread's name suffix (`..._l<i>`
+    for read/load-priority threads, `..._s<i>` for write/store-priority
+    threads; see ``DualQueueThreadPool``). "unknown" if it doesn't match."""
+    m = _THREAD_POOL_RE.search(thread)
+    if not m:
+        return "unknown"
+    return "load" if m.group(1) == "l" else "store"
+
+
+def _matched_thread_intervals(
+    dequeues: list[DequeueRecord], finishes: list[FinishRecord]
+) -> list[tuple[float, float, str]]:
+    """All (t_start, t_end, thread) busy intervals, matched on
+    (job_id, batch_no) (unique within a job, and each batch_no is only ever
+    dispatched once)."""
+    starts = {(d.job_id, d.batch_no): (d.t, d.thread) for d in dequeues}
+    out = []
+    for f in finishes:
+        s = starts.get((f.job_id, f.batch_no))
+        if s is None:
+            continue
+        t_start, thread = s
+        out.append((t_start, f.t, thread))
+    return out
+
+
+def _bucketed_idle_threads(
+    intervals: list[tuple[float, float, str]],
+    n_threads: int,
+    t0: float,
+    t_end: float,
+    bucket_width: float,
+) -> list[int]:
+    """Number of idle threads per fixed-width time bucket.
+
+    A thread counts as active for a bucket if it was busy for any part of
+    that bucket (not time-weighted), so ``idle = n_threads - active``.
+    """
+    n_buckets = max(1, int((t_end - t0) // bucket_width) + 1)
+    active_by_bucket: list[set[str]] = [set() for _ in range(n_buckets)]
+    for s, e, thread in intervals:
+        s -= t0
+        e -= t0
+        first = max(0, int(s // bucket_width))
+        # Epsilon avoids a batch finishing exactly on a bucket edge from
+        # spuriously marking the next bucket active.
+        last = min(n_buckets - 1, int((e - 1e-9) // bucket_width))
+        for b in range(first, last + 1):
+            active_by_bucket[b].add(thread)
+    return [n_threads - len(active) for active in active_by_bucket]
+
+
+def _distribute_interval(
+    acc: list[float],
+    s: float,
+    e: float,
+    value: float,
+    bucket_width: float,
+    n_buckets: int,
+) -> None:
+    """Add ``value * overlap`` to every bucket that the (s, e) interval
+    (already relative to t0) overlaps, where overlap is the fraction of the
+    bucket covered by the interval."""
+    if e <= s:
+        return
+    first = max(0, int(s // bucket_width))
+    last = min(n_buckets - 1, int((e - 1e-9) // bucket_width))
+    for b in range(first, last + 1):
+        b_start, b_end = b * bucket_width, (b + 1) * bucket_width
+        overlap = min(e, b_end) - max(s, b_start)
+        if overlap > 0:
+            acc[b] += overlap * value
+
+
+def _queue_depth_events_by_kind(
+    enqueues: list[EnqueueRecord], dequeues: list[DequeueRecord]
+) -> dict[str, list[tuple[float, int]]]:
+    """(t, delta) queue-depth events per queue kind ("load"/"store"): +1 per
+    batch at enqueue time (from E's n_batches), -1 per batch dequeue (from
+    D, keyed by looking up the batch's job's kind from its E record) --
+    i.e. the queue the job's tasks were originally appended to, regardless
+    of which thread type actually picked a given batch up (load-priority
+    and store-priority threads can both drain either queue)."""
+    kind_by_job = {e.job_id: e.kind for e in enqueues}
+    events: dict[str, list[tuple[float, int]]] = {"load": [], "store": []}
+    for e in enqueues:
+        if e.kind in events and e.n_batches:
+            events[e.kind].append((e.t, e.n_batches))
+    for d in dequeues:
+        kind = kind_by_job.get(d.job_id)
+        if kind in events:
+            events[kind].append((d.t, -1))
+    return events
+
+
+def _bucketed_queue_depth(
+    events: list[tuple[float, int]],
+    t0: float,
+    t_end: float,
+    bucket_width: float,
+) -> list[float]:
+    """Time-weighted average queue depth per fixed-width time bucket,
+    reconstructed by replaying +/- depth events in time order."""
+    n_buckets = max(1, int((t_end - t0) // bucket_width) + 1)
+    depth_seconds = [0.0] * n_buckets
+    if not events:
+        return depth_seconds
+
+    ordered = sorted(events, key=lambda ev: ev[0])
+    cur_depth = 0
+    cur_t = t0
+    for t, delta in ordered:
+        t = max(t, t0)
+        if t > cur_t:
+            _distribute_interval(
+                depth_seconds, cur_t - t0, t - t0, cur_depth, bucket_width, n_buckets
+            )
+        cur_depth = max(0, cur_depth + delta)
+        cur_t = t
+    if cur_t < t_end:
+        _distribute_interval(
+            depth_seconds, cur_t - t0, t_end - t0, cur_depth, bucket_width, n_buckets
+        )
+
+    return [ds / bucket_width for ds in depth_seconds]
+
+
+def plot_idle_threads(
+    enqueues: list[EnqueueRecord],
+    dequeues: list[DequeueRecord],
+    finishes: list[FinishRecord],
+    output_path: str,
+    bucket_width: float = 1.0,
+    n_read_threads: int | None = None,
+    n_write_threads: int | None = None,
+) -> None:
+    """Save a 2x2 plot: idle thread count and queue depth (mean, per
+    fixed-width time bucket), one row for the load (read) thread pool /
+    load queue and one for the store (write) thread pool / store queue.
+
+    A thread counts as active for a bucket if it was busy for any part of
+    it (not time-weighted), so ``idle = n_threads - active``. Queue depth
+    is the time-weighted average backlog during the bucket, reconstructed
+    from enqueue/dequeue events.
+
+    If ``n_read_threads``/``n_write_threads`` aren't given, they're inferred
+    as the number of distinct thread names observed for that pool in the
+    log (a lower bound if some threads never picked up any batch).
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    intervals = _matched_thread_intervals(dequeues, finishes)
+    if not intervals:
+        print("No matched batch intervals found; nothing to plot.")
+        return
+
+    load_intervals = [iv for iv in intervals if _thread_pool(iv[2]) == "load"]
+    store_intervals = [iv for iv in intervals if _thread_pool(iv[2]) == "store"]
+
+    n_read = n_read_threads or len({t for _, _, t in load_intervals})
+    n_write = n_write_threads or len({t for _, _, t in store_intervals})
+
+    queue_events = _queue_depth_events_by_kind(enqueues, dequeues)
+
+    t0 = min(s for s, _, _ in intervals)
+    t_end = max(e for _, e, _ in intervals)
+
+    fig, axes = plt.subplots(2, 2, figsize=(22, 8), sharex=True)
+
+    for row, (pool_intervals, n_threads, kind, label, color) in enumerate(
+        (
+            (load_intervals, n_read, "load", "load (read) threads", "tab:blue"),
+            (store_intervals, n_write, "store", "store (write) threads", "tab:orange"),
+        )
+    ):
+        ax_idle, ax_depth = axes[row]
+
+        if n_threads == 0:
+            ax_idle.set_title(f"No {label} observed")
+        else:
+            idle = _bucketed_idle_threads(
+                pool_intervals, n_threads, t0, t_end, bucket_width
+            )
+            bucket_starts = [i * bucket_width for i in range(len(idle))]
+            ax_idle.step(bucket_starts, idle, where="post", color=color)
+            ax_idle.set_ylim(-0.5, n_threads + 0.5)
+            ax_idle.set_ylabel("idle threads")
+            ax_idle.set_title(
+                f"Idle {label} per {bucket_width:g}s bucket (n_threads={n_threads})"
+            )
+
+        depth = _bucketed_queue_depth(queue_events[kind], t0, t_end, bucket_width)
+        bucket_starts = [i * bucket_width for i in range(len(depth))]
+        ax_depth.step(bucket_starts, depth, where="post", color=color)
+        ax_depth.set_ylabel("queue depth (mean)")
+        ax_depth.set_title(f"{kind.capitalize()} queue depth per {bucket_width:g}s bucket")
+
+    for ax in axes[-1]:
+        ax.set_xlabel(f"Time since run start (s), bucket_width={bucket_width:g}s")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    print(f"Wrote idle-threads/queue-depth plot (bucket_width={bucket_width:g}s) to {output_path}")
+
+
 def print_concurrency_vs_duration_report(
     dequeues: list[DequeueRecord], finishes: list[FinishRecord]
 ) -> None:
@@ -864,6 +1077,42 @@ def main() -> None:
         "buckets are distributed chronologically over the run, to PNG_PATH "
         "(default: fs_tier_thread_count_chronological.png).",
     )
+    parser.add_argument(
+        "--idle-threads",
+        nargs="?",
+        const="fs_tier_idle_threads.png",
+        default=None,
+        metavar="PNG_PATH",
+        help="Save a 2x2 plot (load/store rows x idle-threads/queue-depth "
+        "columns) per fixed-width time bucket, to PNG_PATH (default: "
+        "fs_tier_idle_threads.png). A thread counts as active for a bucket "
+        "if it was busy for any part of it; queue depth is the "
+        "time-weighted mean backlog. Combine with --bucket-width.",
+    )
+    parser.add_argument(
+        "--bucket-width",
+        type=float,
+        default=1.0,
+        metavar="SECONDS",
+        help="Bucket width in seconds for --idle-threads (default: 1.0; "
+        "try 0.5 or 0.2 for finer granularity).",
+    )
+    parser.add_argument(
+        "--n-read-threads",
+        type=int,
+        default=None,
+        help="Override the inferred number of load (read) threads for "
+        "--idle-threads (default: inferred from distinct thread names seen "
+        "in the log).",
+    )
+    parser.add_argument(
+        "--n-write-threads",
+        type=int,
+        default=None,
+        help="Override the inferred number of store (write) threads for "
+        "--idle-threads (default: inferred from distinct thread names seen "
+        "in the log).",
+    )
     args = parser.parse_args()
 
     enqueues, dequeues, finishes, jobs = parse(args.log_path)
@@ -900,6 +1149,18 @@ def main() -> None:
 
     if args.bucket_timeline is not None:
         plot_thread_count_chronological(enqueues, dequeues, jobs, args.bucket_timeline)
+        return
+
+    if args.idle_threads is not None:
+        plot_idle_threads(
+            enqueues,
+            dequeues,
+            finishes,
+            args.idle_threads,
+            bucket_width=args.bucket_width,
+            n_read_threads=args.n_read_threads,
+            n_write_threads=args.n_write_threads,
+        )
         return
 
     if args.job_id is not None:
