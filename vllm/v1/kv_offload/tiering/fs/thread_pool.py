@@ -69,6 +69,58 @@ class JobState:
             return self._completed == self._n_tasks, self._success, self._transfer_time
 
 
+class _IdleEwma:
+    """Time-weighted exponentially-weighted moving average of a live
+    idle-thread count.
+
+    A single popping thread only ever observes the *instantaneous* idle
+    count -- in a steady stream of small jobs, threads finish staggered
+    one at a time, so that instantaneous count is almost always "just me"
+    even when the pool has real spare capacity on average. Sizing batch
+    splits off this smoothed signal instead avoids that: a thread that
+    just became idle sees "typically N have been idle recently" rather
+    than "only I am idle right now", so it takes a smaller slice and
+    leaves the rest for the next (possibly also-staggered) idle thread to
+    pick up, instead of swallowing an entire job by itself.
+
+    Time-weighted (not sample-weighted): decay is applied based on
+    wall-clock time elapsed since the last update, so a count that's been
+    held steady for a while contributes proportionally more than one that
+    just changed a moment ago -- same idea as Linux's per-entity load
+    tracking (PELT).
+    """
+
+    __slots__ = ("_tau", "_value", "_raw", "_last_t")
+
+    def __init__(self, initial: int, tau: float) -> None:
+        self._tau = tau
+        self._value = float(initial)
+        self._raw = initial
+        self._last_t = time.monotonic()
+
+    def _decay_to_now(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_t
+        if elapsed > 0:
+            decay = math.exp(-elapsed / self._tau)
+            self._value = self._value * decay + self._raw * (1 - decay)
+            self._last_t = now
+
+    def update(self, new_raw: int) -> None:
+        """Must be called while holding the pool's lock, right after the
+        underlying idle-thread counter changes to `new_raw`. Decays the
+        average up to now using the *previous* raw level (i.e. how long
+        that previous level was actually held), then starts tracking the
+        new level going forward."""
+        self._decay_to_now()
+        self._raw = new_raw
+
+    def value(self) -> float:
+        """Must be called while holding the pool's lock."""
+        self._decay_to_now()
+        return self._value
+
+
 class DualQueueThreadPool:
     """
     Thread pool with two task queues (load and store) and two thread groups.
@@ -83,6 +135,7 @@ class DualQueueThreadPool:
         n_read_threads: int,
         n_write_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
+        idle_ewma_tau_s: float = 0.2,
     ) -> None:
         self._load_q: deque = deque()
         self._store_q: deque = deque()
@@ -93,6 +146,10 @@ class DualQueueThreadPool:
         self._inflight_jobs = 0  # guarded by _condition
         self._idle_read_threads = n_read_threads
         self._idle_write_threads = n_write_threads
+        # Smoothed idle-thread signal used to size batch splits -- see
+        # _IdleEwma. Guarded by _condition, like the raw counts above.
+        self._idle_read_ewma = _IdleEwma(n_read_threads, tau=idle_ewma_tau_s)
+        self._idle_write_ewma = _IdleEwma(n_write_threads, tau=idle_ewma_tau_s)
 
         for i in range(n_read_threads):
             t = threading.Thread(
@@ -117,6 +174,11 @@ class DualQueueThreadPool:
     @property
     def _idle_threads(self):
         return self._idle_read_threads + self._idle_write_threads
+
+    def _idle_ewma_total(self) -> float:
+        """Combined (read+write) smoothed idle-thread count. Must be called
+        while holding _condition."""
+        return self._idle_read_ewma.value() + self._idle_write_ewma.value()
 
     def enqueue_load(
         self,
@@ -211,15 +273,20 @@ class DualQueueThreadPool:
             if load_priority:
                 primary, secondary = self._load_q, self._store_q
                 queue = primary if primary else secondary
-                idle_threads = (
-                    self._idle_read_threads if primary else self._idle_threads
+                idle_ewma = (
+                    self._idle_read_ewma.value() if primary else self._idle_ewma_total()
                 )
             else:
                 primary, secondary = self._store_q, self._load_q
                 queue = primary if primary else secondary
-                idle_threads = (
-                    self._idle_write_threads if primary else self._idle_threads
+                idle_ewma = (
+                    self._idle_write_ewma.value()
+                    if primary
+                    else self._idle_ewma_total()
                 )
+            # Smoothed, not instantaneous (see _IdleEwma), and never less
+            # than 1 -- the calling thread itself is always "available".
+            idle_threads = max(1, round(idle_ewma))
 
             # peek without popping
             work = queue[0]
@@ -246,8 +313,10 @@ class DualQueueThreadPool:
 
                 if load_priority:
                     self._idle_read_threads -= 1
+                    self._idle_read_ewma.update(self._idle_read_threads)
                 else:
                     self._idle_write_threads -= 1
+                    self._idle_write_ewma.update(self._idle_write_threads)
             try:
                 start_time = time.monotonic()
                 fn()
@@ -275,5 +344,7 @@ class DualQueueThreadPool:
             with self._condition:
                 if load_priority:
                     self._idle_read_threads += 1
+                    self._idle_read_ewma.update(self._idle_read_threads)
                 else:
                     self._idle_write_threads += 1
+                    self._idle_write_ewma.update(self._idle_write_threads)
