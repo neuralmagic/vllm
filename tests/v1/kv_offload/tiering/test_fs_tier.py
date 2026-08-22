@@ -40,7 +40,7 @@ from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
 )
-from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool, Task
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -447,7 +447,16 @@ def test_wait_idle_blocks_until_tasks_complete():
     """wait_idle must not return while a task is still in flight."""
     pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
     gate = threading.Event()
-    pool.enqueue_store(job_id=1, n_tasks=1, tasks=[lambda: gate.wait(timeout=5.0)])
+
+    def make_batch_fn(tasks):
+        return lambda: gate.wait(timeout=5.0)
+
+    pool.enqueue_store(
+        job_id=1,
+        make_batch_fn=make_batch_fn,
+        n_tasks=1,
+        tasks=[Task(key=key(1), path="unused", offset=0)],
+    )
 
     waiter = threading.Thread(target=pool.wait_idle)
     waiter.start()
