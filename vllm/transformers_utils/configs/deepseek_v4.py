@@ -21,3 +21,15 @@ class DeepseekV4Config(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_parameters = rope_scaling or rope_parameters
         super().__init__(**kwargs)
+        if not hasattr(self, "num_hash_layers"):
+            mlp_layer_types = getattr(self, "mlp_layer_types", None)
+            if mlp_layer_types is not None:
+                count = 0
+                for t in mlp_layer_types:
+                    if t == "hash_moe":
+                        count += 1
+                    else:
+                        break
+                self.num_hash_layers = count
+            else:
+                self.num_hash_layers = 0

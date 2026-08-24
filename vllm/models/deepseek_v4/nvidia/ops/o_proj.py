@@ -25,6 +25,29 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     return einsum_recipe, tma_aligned_scales
 
 
+def _has_fp8_weight(module: nn.Module) -> bool:
+    return hasattr(module, "weight_scale") or hasattr(module, "weight_scale_inv")
+
+
+def _inv_rope_bf16(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    half_rope = rope_dim // 2
+    nope = o[..., :nope_dim]
+    rope_part = o[..., nope_dim:]
+    cos = cos_sin_cache[positions, :half_rope].unsqueeze(1)
+    sin = cos_sin_cache[positions, half_rope:].unsqueeze(1)
+    x1 = rope_part[..., :half_rope]
+    x2 = rope_part[..., half_rope:]
+    rx1 = x1 * cos + x2 * sin
+    rx2 = -x1 * sin + x2 * cos
+    return torch.cat([nope, rx1, rx2], dim=-1)
+
+
 def deep_gemm_fp8_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -45,6 +68,16 @@ def deep_gemm_fp8_o_proj(
     Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
     """
+    if not _has_fp8_weight(wo_a):
+        o_unroped = _inv_rope_bf16(o, positions, cos_sin_cache, nope_dim,
+                                   rope_dim)
+        # o_unroped: (tokens, heads, head_dim) → reshape for group matmul
+        t, h, d = o_unroped.shape
+        o_grouped = o_unroped.reshape(t, n_groups, heads_per_group * d)
+        w = wo_a.weight.reshape(n_groups, o_lora_rank, heads_per_group * d)
+        z = torch.einsum("bgr,gdr->bgd", o_grouped.to(w.dtype), w)
+        return wo_b(z.reshape(t, -1))
+
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
         positions,
@@ -61,7 +94,9 @@ def deep_gemm_fp8_o_proj(
         dtype=torch.bfloat16,
     )
     weight_scale = (
-        wo_a.weight_scale if hasattr(wo_a, "weight_scale") else wo_a.weight_scale_inv
+        wo_a.weight_scale
+        if hasattr(wo_a, "weight_scale")
+        else wo_a.weight_scale_inv
     )
     fp8_einsum(
         "bhr,hdr->bhd",

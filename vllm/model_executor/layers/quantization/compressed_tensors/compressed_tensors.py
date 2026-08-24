@@ -248,6 +248,18 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         ignore: list[str] = cast(list[str], config.get("ignore", []))
         quant_format = cast(str, config.get("format"))
+
+        # Some checkpoints use "mlp" in target regexes but the vllm model
+        # may use "ffn" (e.g. DeepSeek V4). Expand targets to match both.
+        if "config_groups" in config:
+            for group in config["config_groups"].values():
+                expanded: list[str] = []
+                for t in group.get("targets", []):
+                    expanded.append(t)
+                    if t.startswith("re:") and "mlp" in t and "ffn" not in t:
+                        expanded.append(t.replace("mlp", "ffn"))
+                group["targets"] = expanded
+
         target_scheme_map = cls._quantization_scheme_map_from_config(config=config)
 
         # Check for deprecated sparsity config

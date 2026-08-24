@@ -33,15 +33,32 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         # RoutedExperts was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
-        unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
-        ]
+        proj_suffixes = [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        unfused_names = [layer_name + proj_name for proj_name in proj_suffixes]
         # TODO: refactor this to use expert_mapping and check all layer numbers
         all_scheme_dicts = [
             quant_config.get_scheme_dict(layer, name) for name in unfused_names
         ]
         scheme_dict = all_scheme_dicts.pop()
+
+        if scheme_dict is None:
+            alt_names = {
+                ".ffn.experts": ".mlp",
+                ".ffn.": ".mlp.",
+            }
+            for old, new in alt_names.items():
+                if old in layer_name:
+                    alt_layer = layer_name.replace(old, new)
+                    alt_unfused = [
+                        alt_layer + s for s in proj_suffixes
+                    ]
+                    all_scheme_dicts = [
+                        quant_config.get_scheme_dict(layer, n)
+                        for n in alt_unfused
+                    ]
+                    scheme_dict = all_scheme_dicts.pop()
+                    if scheme_dict is not None:
+                        break
 
         # multiple schemes found
         if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
