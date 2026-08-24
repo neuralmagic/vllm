@@ -923,6 +923,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     has_lora=self.lora_config is not None,
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    prepare_dummy_attn=self.prepare_dummy_attn,
                 )
                 if self.speculator is not None:
                     with use_workspace_lane(self._draft_workspace_lane):
