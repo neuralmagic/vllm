@@ -254,10 +254,15 @@ static PyObject* batch_lookup(PyObject* /*self*/, PyObject* args) {
   return result;
 }
 
-/// @brief Take a race-free snapshot of a status array shared with in-flight
-///        batch_store_block / batch_load_block calls.
+/// @brief Take a race-free snapshot of the resolved prefix of a status array
+///        shared with in-flight batch_store_block / batch_load_block calls,
+///        starting at `start`.
 /// @param status readable int8 array of any length n.
-/// @return list[int] – a plain-Python copy of status[0:n], safe to inspect
+/// @param start   index to begin scanning from; the caller has already
+///                consumed/observed everything before this index.
+/// @return list[int] – a plain-Python copy of status[start:end], where `end`
+///                     is the first index >= start holding -1 (still
+///                     pending), or n if none is pending. Safe to inspect
 ///                     freely since it no longer aliases the shared buffer.
 /// @note Callers must never read the status array directly from Python (the
 ///       underlying memory is concurrently written by native worker threads
@@ -265,10 +270,14 @@ static PyObject* batch_lookup(PyObject* /*self*/, PyObject* args) {
 ///       observe it. Each element is read with an acquire load, pairing
 ///       with the release store in set_status, so once an element reads
 ///       back as kStatusSuccess/kStatusFailed, the corresponding block's
-///       data is guaranteed visible to this thread.
+///       data is guaranteed visible to this thread. Status within a batch
+///       is resolved strictly in index order, so a contiguous run of -1 at
+///       the tail is the only possible layout -- scanning can stop at the
+///       first -1.
 static PyObject* get_status_snapshot(PyObject* /*self*/, PyObject* args) {
   PyObject* status_obj = nullptr;
-  if (!PyArg_ParseTuple(args, "O", &status_obj)) {
+  Py_ssize_t start = 0;
+  if (!PyArg_ParseTuple(args, "On", &status_obj, &start)) {
     return nullptr;
   }
 
@@ -282,26 +291,35 @@ static PyObject* get_status_snapshot(PyObject* /*self*/, PyObject* args) {
     return nullptr;
   }
   const Py_ssize_t n = status_buf.len;
-  int8_t* status = static_cast<int8_t*>(status_buf.buf);
-
-  PyObject* result = PyList_New(n);
-  if (result == nullptr) {
+  if (start < 0 || start > n) {
     PyBuffer_Release(&status_buf);
+    PyErr_SetString(PyExc_ValueError, "start out of range");
     return nullptr;
   }
-  for (Py_ssize_t i = 0; i < n; i++) {
+  int8_t* status = static_cast<int8_t*>(status_buf.buf);
+
+  std::vector<int8_t> resolved;
+  resolved.reserve(n - start);
+  for (Py_ssize_t i = start; i < n; i++) {
     const int8_t value =
         std::atomic_ref<int8_t>(status[i]).load(std::memory_order_acquire);
-    PyObject* item = PyLong_FromLong(value);
+    if (value == -1) break;
+    resolved.push_back(value);
+  }
+  PyBuffer_Release(&status_buf);  // Done touching shared memory.
+
+  PyObject* result = PyList_New(static_cast<Py_ssize_t>(resolved.size()));
+  if (result == nullptr) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < resolved.size(); i++) {
+    PyObject* item = PyLong_FromLong(resolved[i]);
     if (item == nullptr) {
       Py_DECREF(result);
-      PyBuffer_Release(&status_buf);
       return nullptr;
     }
-    PyList_SET_ITEM(result, i, item);  // Steals the reference to item.
+    PyList_SET_ITEM(result, static_cast<Py_ssize_t>(i), item);  // Steals ref.
   }
-
-  PyBuffer_Release(&status_buf);
   return result;
 }
 
