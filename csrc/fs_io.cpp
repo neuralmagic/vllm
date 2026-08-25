@@ -318,7 +318,7 @@ static PyObject* get_status_snapshot(PyObject* /*self*/, PyObject* args) {
       Py_DECREF(result);
       return nullptr;
     }
-    PyList_SET_ITEM(result, static_cast<Py_ssize_t>(i), item);  // Steals ref.
+    PyList_SetItem(result, static_cast<Py_ssize_t>(i), item);  // Steals ref.
   }
   return result;
 }

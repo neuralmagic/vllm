@@ -93,7 +93,7 @@ class BatchResultsTracker:
         def update(self) -> np.ndarray | list[int] | None:
             if _HAS_FSIO_C:
                 try:
-                    return get_status_snapshot_C(self._results)
+                    return get_status_snapshot_C(self._results, self.processed)
                 except Exception as exc:
                     logger.error(
                         "Failed to receive I/O results asynchronously %s",
@@ -101,7 +101,7 @@ class BatchResultsTracker:
                     )
                     return None
             else:
-                return self._results
+                return self._results[self.processed :]
 
     def __init__(self):
         self.batch_id = 0
@@ -132,9 +132,11 @@ class BatchResultsTracker:
             # handle the error case
             results = tracker.update()
             assert results is not None  # TODO(varun) : Handle none case
-            while tracker.processed < len(results) and results[tracker.processed] != -1:
+            for r in results:
+                if r == -1:
+                    break
                 task = tracker.tasks[tracker.processed]
-                success = results[tracker.processed] == 0
+                success = r == 0
                 tracker.processed += 1
                 yield task, success
 
