@@ -64,9 +64,11 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.metrics.stats import HiSparseStats
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
+    KVConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
@@ -154,8 +156,9 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
+    DeviceKVCacheBlockCopier,
     KVBlockZeroer,
-    copy_kv_cache_blocks_inplace,
+    build_kv_block_zeroers,
     get_uniform_decode_token_count,
 )
 from vllm.v1.worker.workspace import use_workspace_lane
@@ -191,7 +194,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Lazily initialized in _init_kv_zero_meta() when the KV cache needs
         # zeroing (e.g. hybrid models with fp8 KV cache).
-        self.kv_block_zeroer: KVBlockZeroer | None = None
+        self.kv_block_zeroers: dict[int, KVBlockZeroer] = {}
 
         self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
@@ -551,12 +554,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             # Preserve each cache type's alignment requirements after applying
             # its topology-aware block-table width.
-            if isinstance(spec, MambaSpec):
-                max_num_blocks = get_block_table_width(
-                    max_num_blocks, spec.block_size, token_alignment=None
-                )
-            else:
-                max_num_blocks = get_block_table_width(max_num_blocks, spec.block_size)
+            max_num_blocks = get_block_table_width(
+                max_num_blocks,
+                spec.block_size,
+                token_alignment=spec.block_table_token_alignment,
+            )
             max_num_blocks_per_group.append(max_num_blocks)
 
         target_attn_layer_names = None
@@ -649,26 +651,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
         self.kv_caches: list[torch.Tensor] = []
-        kv_caches_dict = init_kv_cache(
+        kv_caches_dict, kv_cache_runtime = init_kv_cache(
             self.kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
             self.device,
             self.kernel_block_sizes,
             self.vllm_config,
+            self.block_tables,
+        )
+        self.device_kv_cache_block_copier = DeviceKVCacheBlockCopier(
+            self.kv_cache_config, kv_caches_dict
         )
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
-            self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+            self.kv_connector = get_kv_connector(
+                self.vllm_config, kv_caches_dict, kv_cache_runtime
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
-        self.kv_block_zeroer = KVBlockZeroer(
-            self.device,
-            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
+        self.kv_block_zeroers = build_kv_block_zeroers(
+            device=self.device,
+            attn_groups=self.attn_groups,
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
+            kv_cache_config=self.kv_cache_config,
         )
 
     @torch.inference_mode()
@@ -919,6 +928,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
                 )
+                self.kv_connector.reset_capture_state()
                 if self.speculator is not None:
                     with use_workspace_lane(self._draft_workspace_lane):
                         self.speculator.capture()
@@ -1048,13 +1058,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
+        table_updates = scheduler_output.block_table_updates or {}
+        self.block_tables.update_block_ids(
+            table_updates, self.req_states.req_id_to_index
+        )
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
-            if req_new_block_ids is not None:
+            if req_new_block_ids is not None and req_id not in table_updates:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
@@ -1069,16 +1083,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            for pool_id, ids_to_zero in scheduler_output.new_block_ids_to_zero.items():
+                self.kv_block_zeroers[pool_id].zero_block_ids(ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
-            copy_kv_cache_blocks_inplace(
-                self.kv_caches,
-                self.kv_cache_config.num_blocks,
-                scheduler_output.kv_cache_block_copies,
+            self.device_kv_cache_block_copier.copy(
+                scheduler_output.kv_cache_block_copies
             )
 
     def gather_batch_req_state(
@@ -1704,7 +1716,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
+            self.kv_connector.pre_forward(scheduler_output, input_batch.idx_mapping)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -1725,7 +1737,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
-                self.kv_connector.pre_forward(scheduler_output)
+                self.kv_connector.pre_forward(scheduler_output, input_batch.idx_mapping)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
@@ -1737,6 +1749,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if not dummy_run:
+            self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1809,9 +1824,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
 
             # Post-step KV connector related operations.
-            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            kv_connector_output, hisparse_stats = self._finish_step(finished_req_ids)
             # The first PP rank holds the encoder cache, so pass its EC output on.
-            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_worker_output_only(
+                kv_connector_output, hisparse_stats
+            )
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
@@ -1927,8 +1944,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        kv_connector_output, hisparse_stats = self._finish_step(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+        model_runner_output.hisparse_stats = hisparse_stats
         model_runner_output.ec_connector_output = ec_connector_output
 
         return async_output
@@ -1950,11 +1968,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        kv_connector_output, hisparse_stats = self._finish_step(finished_req_ids)
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
-            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_worker_output_only(
+                kv_connector_output, hisparse_stats
+            )
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         assert self.pooling_runner is not None
@@ -1967,6 +1987,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
+            hisparse_stats=hisparse_stats,
             ec_connector_output=ec_connector_output,
         )
         async_output = AsyncPoolingOutput(
@@ -1979,6 +2000,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.postprocess_num_computed_tokens(input_batch)
         return async_output
+
+    def _finish_step(
+        self, finished_req_ids: set[str]
+    ) -> tuple[KVConnectorOutput | None, HiSparseStats | None]:
+        return (
+            self.kv_connector.post_forward(finished_req_ids),
+            self.kv_connector.finish_step(),
+        )
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:
         # Update the number of computed tokens.
@@ -1993,6 +2022,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
         self.cudagraph_manager = None
+        if hasattr(self, "device_kv_cache_block_copier"):
+            del self.device_kv_cache_block_copier
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):

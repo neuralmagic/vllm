@@ -12,6 +12,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.stats import HiSparseStats
 
 if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata
@@ -288,6 +289,9 @@ class KVConnectorOutput:
     # IDs of externally computed KV blocks that failed to load.
     # Requests referencing these blocks should be rescheduled to recompute them
     invalid_block_ids: set[int] = field(default_factory=set)
+    # Receive failures keyed by request identity. This remains unambiguous for
+    # hybrid/multi-pool cache layouts where numeric block IDs overlap.
+    failed_recving: set[str] = field(default_factory=set)
     # Configuration describing how many finished sending/receiving
     # notifications should be expected for each request. This allows
     # handshake-based connectors like Nixl to update the KVOutputAggregator.
@@ -302,6 +306,7 @@ class KVConnectorOutput:
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids
+            and not self.failed_recving
             and not self.kv_connector_worker_meta
         )
 
@@ -354,6 +359,8 @@ class ModelRunnerOutput:
 
     kv_connector_output: KVConnectorOutput | None = None
 
+    hisparse_stats: HiSparseStats | None = None
+
     ec_connector_output: ECConnectorOutput | None = None
 
     # req_id -> num_nans_in_logits
@@ -387,6 +394,19 @@ class ModelRunnerOutput:
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+        return output
+
+    @staticmethod
+    def with_worker_output_only(
+        kv_connector_output: KVConnectorOutput | None,
+        hisparse_stats: HiSparseStats | None,
+    ) -> "ModelRunnerOutput":
+        if hisparse_stats is None:
+            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+        output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        if kv_connector_output is not None and not kv_connector_output.is_empty():
+            output.kv_connector_output = kv_connector_output
+        output.hisparse_stats = hisparse_stats
         return output
 
     @staticmethod
