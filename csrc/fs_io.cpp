@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -162,6 +163,14 @@ enum TaskStatus : int8_t {
   kStatusFailed = 1,
 };
 
+// Publishes status[i] with release semantics: everything the calling thread
+// wrote before this call (in particular, the block's data via _store_block /
+// _load_block) is guaranteed visible to any thread that later reads
+// status[i] with an acquire load and observes this value.
+inline void set_status(int8_t* status, Py_ssize_t i, TaskStatus value) {
+  std::atomic_ref<int8_t>(status[i]).store(value, std::memory_order_release);
+}
+
 // Helper: acquire a writable int8, length-n buffer for the status array.
 // Returns false and sets a Python exception on error.
 inline bool extract_status_buffer(PyObject* status_obj, Py_ssize_t n,
@@ -311,9 +320,9 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
                        static_cast<size_t>(buffers[i].len), use_o_direct);
 
       if (err == 0) {
-        status[i] = kStatusSuccess;
+        set_status(status, i, kStatusSuccess);
       } else {
-        status[i] = kStatusFailed;
+        set_status(status, i, kStatusFailed);
         failures.push_back({i, err});
       }
     }
@@ -385,9 +394,9 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
           _load_block(source_paths[i], buf, static_cast<size_t>(buffers[i].len),
                       use_o_direct);
       if (err == 0) {
-        status[i] = kStatusSuccess;
+        set_status(status, i, kStatusSuccess);
       } else {
-        status[i] = kStatusFailed;
+        set_status(status, i, kStatusFailed);
         failures.push_back({i, err});
       }
     }
