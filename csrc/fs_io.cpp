@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -177,6 +178,41 @@ inline bool extract_status_buffer(PyObject* status_obj, Py_ssize_t n,
   return true;
 }
 
+// A single failed task's OS-level error, recorded without touching the
+// Python C-API so it can be populated while the GIL is released.
+struct Failure {
+  Py_ssize_t index;
+  int err;
+};
+
+// Set once in PyInit_fs_io_C; a subclass of OSError raised when one or more
+// tasks in a batch fail. The message summarizes every failure (path, errno,
+// strerror) so a single log line captures the whole batch.
+PyObject* g_batch_io_error = nullptr;
+
+// Raises g_batch_io_error with a message summarizing every failure. Always
+// returns nullptr so callers can `return raise_batch_io_error(...);`.
+inline PyObject* raise_batch_io_error(const std::vector<const char*>& paths,
+                                      const std::vector<Failure>& failures) {
+  std::string message = "batch I/O failed for " +
+                        std::to_string(failures.size()) + "/" +
+                        std::to_string(paths.size()) + " blocks: ";
+  for (size_t i = 0; i < failures.size(); i++) {
+    const Failure& f = failures[i];
+    if (i > 0) {
+      message += ", ";
+    }
+    message += paths[f.index];
+    message += " (errno ";
+    message += std::to_string(f.err);
+    message += ": ";
+    message += strerror(f.err);
+    message += ")";
+  }
+  PyErr_SetString(g_batch_io_error, message.c_str());
+  return nullptr;
+}
+
 }  // namespace
 
 /// @brief Check file existence for a batch of paths.
@@ -224,7 +260,9 @@ static PyObject* batch_lookup(PyObject* /*self*/, PyObject* args) {
 ///                     must pre-initialize every entry (e.g. to -1); this
 ///                     call updates each entry with a TaskStatus value as the
 ///                     function processes it.
-/// @note Releases the GIL for the entire batch.
+/// @note Releases the GIL for the entire batch. Processes every block even
+///       if some fail; raises BatchIOError (see raise_batch_io_error) if any
+///       block failed, after status has been fully populated.
 static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
   PyObject* tmp_paths_obj = nullptr;
   PyObject* dest_paths_obj = nullptr;
@@ -263,6 +301,7 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
     return nullptr;
   }
   int8_t* status = static_cast<int8_t*>(status_buf.buf);
+  std::vector<Failure> failures;
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
@@ -275,6 +314,7 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
         status[i] = kStatusSuccess;
       } else {
         status[i] = kStatusFailed;
+        failures.push_back({i, err});
       }
     }
     Py_END_ALLOW_THREADS
@@ -283,13 +323,9 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
   PyBuffer_Release(&status_buf);
   release_buffer_list(buffers);
 
-  //// Need to update this
-  // if (failed_index >= 0) {
-  //   // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
-  //   errno = failure_errno;
-  //   return PyErr_SetFromErrnoWithFilename(PyExc_OSError,
-  //   dest_paths[failed_index]);
-  // }
+  if (!failures.empty()) {
+    return raise_batch_io_error(dest_paths, failures);
+  }
 
   Py_RETURN_NONE;
 }
@@ -304,7 +340,9 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
 ///                     Caller must pre-initialize every entry (e.g. to -1);
 ///                     this call updates each entry with a TaskStatus value
 ///                     as the function processes it.
-/// @note Releases the GIL for the entire batch.
+/// @note Releases the GIL for the entire batch. Processes every block even
+///       if some fail; raises BatchIOError (see raise_batch_io_error) if any
+///       block failed, after status has been fully populated.
 static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
   PyObject* source_paths_obj = nullptr;
   PyObject* buffers_obj = nullptr;
@@ -338,6 +376,7 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
     return nullptr;
   }
   int8_t* status = static_cast<int8_t*>(status_buf.buf);
+  std::vector<Failure> failures;
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
@@ -349,6 +388,7 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
         status[i] = kStatusSuccess;
       } else {
         status[i] = kStatusFailed;
+        failures.push_back({i, err});
       }
     }
     Py_END_ALLOW_THREADS
@@ -357,25 +397,9 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
   PyBuffer_Release(&status_buf);
   release_buffer_list(buffers);
 
-  // Update error reporting
-  // if (failed_index >= 0) {
-  //  // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
-  //  errno = failure_errno;
-  //  PyErr_SetFromErrnoWithFilename(PyExc_OSError, source_paths[failed_index]);
-  //  // Attach the number of blocks that loaded before the failure so the tier
-  //  // can keep them (partial success). failed_index == count of blocks read
-  //  OK. PyObject *etype, *evalue, *etb; PyErr_Fetch(&etype, &evalue, &etb);
-  //  PyErr_NormalizeException(&etype, &evalue, &etb);
-  //  if (evalue != nullptr) {
-  //    PyObject* num = PyLong_FromSsize_t(failed_index);
-  //    if (num != nullptr) {
-  //      PyObject_SetAttrString(evalue, "num_succeeded", num);
-  //      Py_DECREF(num);
-  //    }
-  //  }
-  //  PyErr_Restore(etype, evalue, etb);
-  //  return nullptr;
-  // }
+  if (!failures.empty()) {
+    return raise_batch_io_error(source_paths, failures);
+  }
 
   Py_RETURN_NONE;
 }
@@ -392,7 +416,9 @@ static PyMethodDef fs_io_C_methods[] = {
      "                  status: writable int8 array of length n) -> None\n"
      "\n"
      "Store a batch of blocks, each from its own buffer, to disk. Writes 0 "
-     "(success) or 1 (failed) into status[i] as block i completes."},
+     "(success) or 1 (failed) into status[i] as block i completes. Processes "
+     "the whole batch even if some blocks fail; if any failed, raises "
+     "BatchIOError summarizing every failed (path, errno, strerror)."},
     {"batch_load_block", batch_load_block, METH_VARARGS,
      "batch_load_block(source_paths: list[str],\n"
      "                 buffers: list[writable bytes-like],\n"
@@ -400,7 +426,9 @@ static PyMethodDef fs_io_C_methods[] = {
      "                 status: writable int8 array of length n) -> None\n"
      "\n"
      "Load a batch of blocks from disk into corresponding buffers. Writes 0 "
-     "(success) or 1 (failed) into status[i] as block i completes."},
+     "(success) or 1 (failed) into status[i] as block i completes. Processes "
+     "the whole batch even if some blocks fail; if any failed, raises "
+     "BatchIOError summarizing every failed (path, errno, strerror)."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -409,6 +437,25 @@ static struct PyModuleDef fs_io_C_module = {
     fs_io_C_methods,
 };
 
-PyMODINIT_FUNC PyInit_fs_io_C(void) { return PyModule_Create(&fs_io_C_module); }
+PyMODINIT_FUNC PyInit_fs_io_C(void) {
+  PyObject* m = PyModule_Create(&fs_io_C_module);
+  if (m == nullptr) {
+    return nullptr;
+  }
+
+  PyObject* exc_type =
+      PyErr_NewException("fs_io_C.BatchIOError", PyExc_OSError, nullptr);
+  // PyModule_AddObjectRef takes its own reference instead of stealing ours,
+  // so exc_type stays valid for our own cache below on success.
+  if (exc_type == nullptr ||
+      PyModule_AddObjectRef(m, "BatchIOError", exc_type) < 0) {
+    Py_XDECREF(exc_type);
+    Py_DECREF(m);
+    return nullptr;
+  }
+  g_batch_io_error = exc_type;  // Cached ref, used by raise_batch_io_error.
+
+  return m;
+}
 
 }  // extern "C"
