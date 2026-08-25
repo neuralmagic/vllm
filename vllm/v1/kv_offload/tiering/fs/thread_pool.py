@@ -10,7 +10,7 @@ Thread pool:
 
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TypeAlias
 
 import numpy as np
@@ -88,19 +88,20 @@ class BatchResultsTracker:
     class Tracker:
         tasks: list[Task]
         _results: np.ndarray
-        py_results: list[int] | None = field(default_factory=list)
         processed: int = 0
 
-        def update(self):
-            self.py_results = None  # failure fallback
+        def update(self) -> np.ndarray | list[int] | None:
             if _HAS_FSIO_C:
                 try:
-                    self.py_results = get_status_snapshot_C(self._results)
+                    return get_status_snapshot_C(self._results)
                 except Exception as exc:
                     logger.error(
                         "Failed to receive I/O results asynchronously %s",
                         exc,
                     )
+                    return None
+            else:
+                return self._results
 
     def __init__(self):
         self.batch_id = 0
@@ -126,20 +127,18 @@ class BatchResultsTracker:
                 list(self._batch_results.keys()),
                 list(self._batch_results.values()),
             )
-        for tracker in trackers:
-            tracker.update()
 
         for bid, tracker in zip(batch_ids, trackers):
             # handle the error case
-            results = tracker.py_results
-            assert results is not None
+            results = tracker.update()
+            assert results is not None  # TODO(varun) : Handle none case
             while tracker.processed < len(results) and results[tracker.processed] != -1:
                 task = tracker.tasks[tracker.processed]
-                success = results[tracker.processed] == 1
+                success = results[tracker.processed] == 0
                 tracker.processed += 1
                 yield task, success
 
-            if tracker.processed == len(results):
+            if tracker.processed == len(tracker.tasks):
                 with self._lock:
                     self._batch_results.pop(bid)
 
