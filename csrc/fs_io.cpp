@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -155,6 +156,27 @@ inline void release_buffer_list(std::vector<Py_buffer>& buffers) {
   }
 }
 
+enum TaskStatus : int8_t {
+  kStatusSuccess = 0,
+  kStatusFailed = 1,
+};
+
+// Helper: acquire a writable int8, length-n buffer for the status array.
+// Returns false and sets a Python exception on error.
+inline bool extract_status_buffer(PyObject* status_obj, Py_ssize_t n,
+                                  Py_buffer& out) {
+  if (PyObject_GetBuffer(status_obj, &out, PyBUF_WRITABLE) != 0) {
+    return false;
+  }
+  if (out.len != n || out.itemsize != 1) {
+    PyBuffer_Release(&out);
+    PyErr_SetString(PyExc_ValueError,
+                    "status buffer must be a writable int8 array of length n");
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 /// @brief Check file existence for a batch of paths.
@@ -196,19 +218,23 @@ static PyObject* batch_lookup(PyObject* /*self*/, PyObject* args) {
 /// @param tmp_paths    list[str] – one temp path per block.
 /// @param dest_paths   list[str] – one destination path per block.
 /// @param buffers      list[bytes-like] – one source buffer per block.
-/// @param use_o_direct bool – whether to open files with O_DIRECT
-///                     (default True). Ignored where O_DIRECT is unsupported
-///                     by the platform.
-/// @note Releases the GIL for the entire batch. Raises on first error.
+/// @param use_o_direct bool – whether to open files with O_DIRECT. Ignored
+///                     where O_DIRECT is unsupported by the platform.
+/// @param status       writable int8 array, length == len(tmp_paths). Caller
+///                     must pre-initialize every entry (e.g. to -1); this
+///                     call updates each entry with a TaskStatus value as the
+///                     function processes it.
+/// @note Releases the GIL for the entire batch.
 static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
   PyObject* tmp_paths_obj = nullptr;
   PyObject* dest_paths_obj = nullptr;
   PyObject* buffers_obj = nullptr;
+  PyObject* status_obj = nullptr;
   int use_o_direct = 1;
 
-  if (!PyArg_ParseTuple(args, "O!O!O!|p", &PyList_Type, &tmp_paths_obj,
+  if (!PyArg_ParseTuple(args, "O!O!O!pO", &PyList_Type, &tmp_paths_obj,
                         &PyList_Type, &dest_paths_obj, &PyList_Type,
-                        &buffers_obj, &use_o_direct)) {
+                        &buffers_obj, &use_o_direct, &status_obj)) {
     return nullptr;
   }
 
@@ -231,8 +257,12 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
     return nullptr;
   }
 
-  Py_ssize_t failed_index = -1;
-  int failure_errno = 0;
+  Py_buffer status_buf;
+  if (!extract_status_buffer(status_obj, n, status_buf)) {
+    release_buffer_list(buffers);
+    return nullptr;
+  }
+  int8_t* status = static_cast<int8_t*>(status_buf.buf);
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
@@ -240,23 +270,26 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
       const int err =
           _store_block(tmp_paths[i], dest_paths[i], buf,
                        static_cast<size_t>(buffers[i].len), use_o_direct);
-      if (err != 0) {
-        failed_index = i;
-        failure_errno = err;
-        break;
+
+      if (err == 0) {
+        status[i] = kStatusSuccess;
+      } else {
+        status[i] = kStatusFailed;
       }
     }
     Py_END_ALLOW_THREADS
   }
 
+  PyBuffer_Release(&status_buf);
   release_buffer_list(buffers);
 
-  if (failed_index >= 0) {
-    // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
-    errno = failure_errno;
-    return PyErr_SetFromErrnoWithFilename(PyExc_OSError,
-                                          dest_paths[failed_index]);
-  }
+  //// Need to update this
+  // if (failed_index >= 0) {
+  //   // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
+  //   errno = failure_errno;
+  //   return PyErr_SetFromErrnoWithFilename(PyExc_OSError,
+  //   dest_paths[failed_index]);
+  // }
 
   Py_RETURN_NONE;
 }
@@ -265,17 +298,22 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
 /// @param source_paths list[str] – one source path per block.
 /// @param buffers      list[writable bytes-like] – one destination buffer
 ///                     per block.
-/// @param use_o_direct bool – whether to open files with O_DIRECT
-///                     (default True). Ignored where O_DIRECT is unsupported
-///                     by the platform.
-/// @note Releases the GIL for the entire batch. Raises on first error.
+/// @param use_o_direct bool – whether to open files with O_DIRECT. Ignored
+///                     where O_DIRECT is unsupported by the platform.
+/// @param status       writable int8 array, length == len(source_paths).
+///                     Caller must pre-initialize every entry (e.g. to -1);
+///                     this call updates each entry with a TaskStatus value
+///                     as the function processes it.
+/// @note Releases the GIL for the entire batch.
 static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
   PyObject* source_paths_obj = nullptr;
   PyObject* buffers_obj = nullptr;
+  PyObject* status_obj = nullptr;
   int use_o_direct = 1;
 
-  if (!PyArg_ParseTuple(args, "O!O!|p", &PyList_Type, &source_paths_obj,
-                        &PyList_Type, &buffers_obj, &use_o_direct)) {
+  if (!PyArg_ParseTuple(args, "O!O!pO", &PyList_Type, &source_paths_obj,
+                        &PyList_Type, &buffers_obj, &use_o_direct,
+                        &status_obj)) {
     return nullptr;
   }
 
@@ -294,8 +332,12 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
     return nullptr;
   }
 
-  Py_ssize_t failed_index = -1;
-  int failure_errno = 0;
+  Py_buffer status_buf;
+  if (!extract_status_buffer(status_obj, n, status_buf)) {
+    release_buffer_list(buffers);
+    return nullptr;
+  }
+  int8_t* status = static_cast<int8_t*>(status_buf.buf);
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
@@ -303,36 +345,37 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
       const int err =
           _load_block(source_paths[i], buf, static_cast<size_t>(buffers[i].len),
                       use_o_direct);
-      if (err != 0) {
-        failed_index = i;
-        failure_errno = err;
-        break;
+      if (err == 0) {
+        status[i] = kStatusSuccess;
+      } else {
+        status[i] = kStatusFailed;
       }
     }
     Py_END_ALLOW_THREADS
   }
 
+  PyBuffer_Release(&status_buf);
   release_buffer_list(buffers);
 
-  if (failed_index >= 0) {
-    // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
-    errno = failure_errno;
-    PyErr_SetFromErrnoWithFilename(PyExc_OSError, source_paths[failed_index]);
-    // Attach the number of blocks that loaded before the failure so the tier
-    // can keep them (partial success). failed_index == count of blocks read OK.
-    PyObject *etype, *evalue, *etb;
-    PyErr_Fetch(&etype, &evalue, &etb);
-    PyErr_NormalizeException(&etype, &evalue, &etb);
-    if (evalue != nullptr) {
-      PyObject* num = PyLong_FromSsize_t(failed_index);
-      if (num != nullptr) {
-        PyObject_SetAttrString(evalue, "num_succeeded", num);
-        Py_DECREF(num);
-      }
-    }
-    PyErr_Restore(etype, evalue, etb);
-    return nullptr;
-  }
+  // Update error reporting
+  // if (failed_index >= 0) {
+  //  // PyErr_SetFromErrnoWithFilename() reads the errno to format exception.
+  //  errno = failure_errno;
+  //  PyErr_SetFromErrnoWithFilename(PyExc_OSError, source_paths[failed_index]);
+  //  // Attach the number of blocks that loaded before the failure so the tier
+  //  // can keep them (partial success). failed_index == count of blocks read
+  //  OK. PyObject *etype, *evalue, *etb; PyErr_Fetch(&etype, &evalue, &etb);
+  //  PyErr_NormalizeException(&etype, &evalue, &etb);
+  //  if (evalue != nullptr) {
+  //    PyObject* num = PyLong_FromSsize_t(failed_index);
+  //    if (num != nullptr) {
+  //      PyObject_SetAttrString(evalue, "num_succeeded", num);
+  //      Py_DECREF(num);
+  //    }
+  //  }
+  //  PyErr_Restore(etype, evalue, etb);
+  //  return nullptr;
+  // }
 
   Py_RETURN_NONE;
 }
@@ -345,17 +388,19 @@ static PyMethodDef fs_io_C_methods[] = {
     {"batch_store_block", batch_store_block, METH_VARARGS,
      "batch_store_block(tmp_paths: list[str], dest_paths: list[str],\n"
      "                  buffers: list[bytes-like],\n"
-     "                  use_o_direct: bool = True) -> None\n"
+     "                  use_o_direct: bool,\n"
+     "                  status: writable int8 array of length n) -> None\n"
      "\n"
-     "Store a batch of blocks, each from its own buffer, to disk. Raises on "
-     "first error."},
+     "Store a batch of blocks, each from its own buffer, to disk. Writes 0 "
+     "(success) or 1 (failed) into status[i] as block i completes."},
     {"batch_load_block", batch_load_block, METH_VARARGS,
      "batch_load_block(source_paths: list[str],\n"
      "                 buffers: list[writable bytes-like],\n"
-     "                 use_o_direct: bool = True) -> None\n"
+     "                 use_o_direct: bool,\n"
+     "                 status: writable int8 array of length n) -> None\n"
      "\n"
-     "Load a batch of blocks from disk into corresponding buffers. "
-     "Raises on first error."},
+     "Load a batch of blocks from disk into corresponding buffers. Writes 0 "
+     "(success) or 1 (failed) into status[i] as block i completes."},
     {nullptr, nullptr, 0, nullptr},
 };
 
