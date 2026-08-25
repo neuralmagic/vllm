@@ -41,7 +41,7 @@ class TPDeque(_TPDeque):
     def submit(
         self, tasks: list[Any], make_batch_fn: Callable[[list[Any]], Callable[[], None]]
     ):
-        self.q.append((make_batch_fn(tasks), len(tasks)))
+        self.q.append((make_batch_fn(tasks), tasks))
 
     def fetch(self):
         return self.q.popleft()
@@ -117,7 +117,7 @@ class TPDequeBalancedBatch(_TPDeque):
         # pop a queue
         tasks = self._pop()
         assert self._make_batch_fn is not None
-        return (self._make_batch_fn(tasks), len(tasks))
+        return (self._make_batch_fn(tasks), tasks)
 
     def clear(self):
         for i in range(self._n_threads):

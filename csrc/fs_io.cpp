@@ -194,13 +194,8 @@ struct Failure {
   int err;
 };
 
-// Set once in PyInit_fs_io_C; a subclass of OSError raised when one or more
-// tasks in a batch fail. The message summarizes every failure (path, errno,
-// strerror) so a single log line captures the whole batch.
-PyObject* g_batch_io_error = nullptr;
-
-// Raises g_batch_io_error with a message summarizing every failure. Always
-// returns nullptr so callers can `return raise_batch_io_error(...);`.
+// Raises OSError with a message summarizing every failure. Always returns
+// nullptr so callers can `return raise_batch_io_error(...);`.
 inline PyObject* raise_batch_io_error(const std::vector<const char*>& paths,
                                       const std::vector<Failure>& failures) {
   std::string message = "batch I/O failed for " +
@@ -218,7 +213,7 @@ inline PyObject* raise_batch_io_error(const std::vector<const char*>& paths,
     message += strerror(f.err);
     message += ")";
   }
-  PyErr_SetString(g_batch_io_error, message.c_str());
+  PyErr_SetString(PyExc_OSError, message.c_str());
   return nullptr;
 }
 
@@ -321,7 +316,7 @@ static PyObject* get_status_snapshot(PyObject* /*self*/, PyObject* args) {
 ///                     call updates each entry with a TaskStatus value as the
 ///                     function processes it.
 /// @note Releases the GIL for the entire batch. Processes every block even
-///       if some fail; raises BatchIOError (see raise_batch_io_error) if any
+///       if some fail; raises OSError (see raise_batch_io_error) if any
 ///       block failed, after status has been fully populated.
 static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
   PyObject* tmp_paths_obj = nullptr;
@@ -401,7 +396,7 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
 ///                     this call updates each entry with a TaskStatus value
 ///                     as the function processes it.
 /// @note Releases the GIL for the entire batch. Processes every block even
-///       if some fail; raises BatchIOError (see raise_batch_io_error) if any
+///       if some fail; raises OSError (see raise_batch_io_error) if any
 ///       block failed, after status has been fully populated.
 static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
   PyObject* source_paths_obj = nullptr;
@@ -485,7 +480,7 @@ static PyMethodDef fs_io_C_methods[] = {
      "Store a batch of blocks, each from its own buffer, to disk. Writes 0 "
      "(success) or 1 (failed) into status[i] as block i completes. Processes "
      "the whole batch even if some blocks fail; if any failed, raises "
-     "BatchIOError summarizing every failed (path, errno, strerror)."},
+     "OSError summarizing every failed (path, errno, strerror)."},
     {"batch_load_block", batch_load_block, METH_VARARGS,
      "batch_load_block(source_paths: list[str],\n"
      "                 buffers: list[writable bytes-like],\n"
@@ -495,7 +490,7 @@ static PyMethodDef fs_io_C_methods[] = {
      "Load a batch of blocks from disk into corresponding buffers. Writes 0 "
      "(success) or 1 (failed) into status[i] as block i completes. Processes "
      "the whole batch even if some blocks fail; if any failed, raises "
-     "BatchIOError summarizing every failed (path, errno, strerror)."},
+     "OSError summarizing every failed (path, errno, strerror)."},
     {nullptr, nullptr, 0, nullptr},
 };
 
@@ -504,25 +499,6 @@ static struct PyModuleDef fs_io_C_module = {
     fs_io_C_methods,
 };
 
-PyMODINIT_FUNC PyInit_fs_io_C(void) {
-  PyObject* m = PyModule_Create(&fs_io_C_module);
-  if (m == nullptr) {
-    return nullptr;
-  }
-
-  PyObject* exc_type =
-      PyErr_NewException("fs_io_C.BatchIOError", PyExc_OSError, nullptr);
-  // PyModule_AddObjectRef takes its own reference instead of stealing ours,
-  // so exc_type stays valid for our own cache below on success.
-  if (exc_type == nullptr ||
-      PyModule_AddObjectRef(m, "BatchIOError", exc_type) < 0) {
-    Py_XDECREF(exc_type);
-    Py_DECREF(m);
-    return nullptr;
-  }
-  g_batch_io_error = exc_type;  // Cached ref, used by raise_batch_io_error.
-
-  return m;
-}
+PyMODINIT_FUNC PyInit_fs_io_C(void) { return PyModule_Create(&fs_io_C_module); }
 
 }  // extern "C"

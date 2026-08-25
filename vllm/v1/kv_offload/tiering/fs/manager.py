@@ -151,13 +151,6 @@ class FileSystemTierManager(SecondaryTierManager):
         # Keys of in-flight load (promotion) jobs, so a failed load can mark
         # its own cached lookup verdicts False (see get_finished_jobs).
         self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
-        # Per load job: how many blocks loaded before a failure (partial keep).
-        # Written by the pool worker inside the load task before it raises (so
-        # before task_done publishes the job); read on the scheduler thread in
-        # get_finished_jobs only for job ids the finished queue returned. Under
-        # the GIL that read cannot observe the finished job without the prior
-        # write, so no extra lock is needed (get_finished is itself lock-free).
-        self._load_progress: dict[JobId, int] = {}
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -238,8 +231,6 @@ class FileSystemTierManager(SecondaryTierManager):
                 batch_store_block,
                 paths=[t.path for t in tasks],
                 offsets=[t.offset for t in tasks],
-                # TODO (varun) : Fix call arg
-                job_ids=[t.job_id for t in tasks],  # type: ignore[call-arg]
                 view=self._primary_kv_view,
                 block_size=self._block_size,
                 use_o_direct=self._use_o_direct,
@@ -253,13 +244,13 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
+        self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+
         def make_batch_fn(tasks: list[Task]) -> Callable[[], None]:
             return functools.partial(
                 batch_load_block,
                 paths=[t.path for t in tasks],
                 offsets=[t.offset for t in tasks],
-                # TODO (varun) : Fix call arg
-                job_ids=[t.job_id for t in tasks],  # type: ignore[call-arg]
                 view=self._primary_kv_view,
                 block_size=self._block_size,
                 use_o_direct=self._use_o_direct,
@@ -276,7 +267,7 @@ class FileSystemTierManager(SecondaryTierManager):
         """Collect finished jobs; a failed promotion marks only its failed keys
         as a miss here (scheduler thread)."""
         results = []
-        for job_id, success, transfer_time in self._pool.get_finished():
+        for job_id, success, transfer_time, failed_keys in self._pool.get_finished():
             if self.events is not None:
                 keys = self._store_job_keys.pop(job_id, None)
                 if success and keys:
@@ -289,15 +280,9 @@ class FileSystemTierManager(SecondaryTierManager):
                         )
                     )
             load_keys = self._load_job_keys.pop(job_id, None)
-            num_succeeded = self._load_progress.pop(job_id, 0)
             if load_keys is not None and not success:
-                # A batched load stops at the first bad block and reports how
-                # many loaded before it. Those earlier blocks are kept in the
-                # primary tier (reported via successful_keys); only this block
-                # and the ones after it are marked a miss and recomputed.
-                successful = load_keys[:num_succeeded]
-                failed = load_keys[num_succeeded:]
-                self._lookup_manager.mark_miss(failed)
+                successful = set(load_keys) - set(failed_keys)
+                self._lookup_manager.mark_miss(failed_keys)
                 results.append(
                     JobResult(
                         job_id=job_id,
