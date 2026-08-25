@@ -259,6 +259,57 @@ static PyObject* batch_lookup(PyObject* /*self*/, PyObject* args) {
   return result;
 }
 
+/// @brief Take a race-free snapshot of a status array shared with in-flight
+///        batch_store_block / batch_load_block calls.
+/// @param status readable int8 array of any length n.
+/// @return list[int] – a plain-Python copy of status[0:n], safe to inspect
+///                     freely since it no longer aliases the shared buffer.
+/// @note Callers must never read the status array directly from Python (the
+///       underlying memory is concurrently written by native worker threads
+///       without holding the GIL); this is the only race-free way to
+///       observe it. Each element is read with an acquire load, pairing
+///       with the release store in set_status, so once an element reads
+///       back as kStatusSuccess/kStatusFailed, the corresponding block's
+///       data is guaranteed visible to this thread.
+static PyObject* get_status_snapshot(PyObject* /*self*/, PyObject* args) {
+  PyObject* status_obj = nullptr;
+  if (!PyArg_ParseTuple(args, "O", &status_obj)) {
+    return nullptr;
+  }
+
+  Py_buffer status_buf;
+  if (PyObject_GetBuffer(status_obj, &status_buf, PyBUF_SIMPLE) != 0) {
+    return nullptr;
+  }
+  if (status_buf.itemsize != 1) {
+    PyBuffer_Release(&status_buf);
+    PyErr_SetString(PyExc_ValueError, "status must be an int8 array");
+    return nullptr;
+  }
+  const Py_ssize_t n = status_buf.len;
+  int8_t* status = static_cast<int8_t*>(status_buf.buf);
+
+  PyObject* result = PyList_New(n);
+  if (result == nullptr) {
+    PyBuffer_Release(&status_buf);
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < n; i++) {
+    const int8_t value =
+        std::atomic_ref<int8_t>(status[i]).load(std::memory_order_acquire);
+    PyObject* item = PyLong_FromLong(value);
+    if (item == nullptr) {
+      Py_DECREF(result);
+      PyBuffer_Release(&status_buf);
+      return nullptr;
+    }
+    PyList_SET_ITEM(result, i, item);  // Steals the reference to item.
+  }
+
+  PyBuffer_Release(&status_buf);
+  return result;
+}
+
 /// @brief Store a batch of blocks, each from its own buffer, to disk.
 /// @param tmp_paths    list[str] – one temp path per block.
 /// @param dest_paths   list[str] – one destination path per block.
@@ -418,6 +469,13 @@ static PyMethodDef fs_io_C_methods[] = {
      "batch_lookup(paths: list[str]) -> list[bool]\n"
      "\n"
      "Check file existence for a batch of paths."},
+    {"get_status_snapshot", get_status_snapshot, METH_VARARGS,
+     "get_status_snapshot(status: readable int8 array of length n) "
+     "-> list[int]\n"
+     "\n"
+     "Take a race-free snapshot of a status array shared with in-flight "
+     "batch_store_block / batch_load_block calls. Python must never read "
+     "the array directly; call this instead."},
     {"batch_store_block", batch_store_block, METH_VARARGS,
      "batch_store_block(tmp_paths: list[str], dest_paths: list[str],\n"
      "                  buffers: list[bytes-like],\n"
