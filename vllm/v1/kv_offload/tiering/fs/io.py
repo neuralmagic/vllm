@@ -181,7 +181,11 @@ def batch_store_block(
     Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
     to dest_paths[i] via a temp-file rename.  Raises on first error.
     """
-    _validate_offsets(view, offsets, block_size)
+    try:
+        _validate_offsets(view, offsets, block_size)
+    except Exception:
+        results.fill(1)
+        raise
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
@@ -189,8 +193,17 @@ def batch_store_block(
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
         return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct, results)
     else:
-        for path, offset in zip(paths, offsets):
-            _store_block(path, view, offset, block_size, use_o_direct)
+        failure: str = ""
+        for i, (path, offset) in enumerate(zip(paths, offsets)):
+            try:
+                _store_block(path, view, offset, block_size, use_o_direct)
+                results[i] = 0
+            except Exception as exc:
+                failure += f"{path} : {exc}, "
+                results[i] = 1
+
+        if failure:
+            raise OSError(failure)
 
 
 def batch_load_block(
@@ -209,18 +222,25 @@ def batch_load_block(
     On failure the raised OSError carries ``num_succeeded`` = the number of
     blocks loaded before the failing one, so the tier can keep them.
     """
-    _validate_offsets(view, offsets, block_size)
+    try:
+        _validate_offsets(view, offsets, block_size)
+    except Exception:
+        results.fill(1)
+        raise
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
         return batch_load_block_C(paths, view_slices, use_o_direct, results)
     else:
+        failure: str = ""
         for i, (path, offset) in enumerate(zip(paths, offsets)):
             try:
                 _load_block(path, view, offset, block_size, use_o_direct)
-            except OSError as exc:
-                # Blocks 0..i-1 loaded fine; record the count for partial keep.
-                # The C path sets the same attribute via PyObject_SetAttrString.
-                exc.num_succeeded = i  # type: ignore[attr-defined]
-                raise
+                results[i] = 0
+            except Exception as exc:
+                failure += f"{path} : {exc}, "
+                results[i] = 1
+
+        if failure:
+            raise OSError(failure)
