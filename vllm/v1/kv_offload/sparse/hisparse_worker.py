@@ -144,10 +144,17 @@ class HiSparseWorker:
         hot_caches, host_caches = zip(*entries)
         self.host_caches = (*host_caches, *(source for source, _ in self.cache_pairs))
 
+        def host_layout(cache: torch.Tensor) -> tuple[int, int, int]:
+            if cache.ndim not in (2, 3):
+                raise RuntimeError("HiSparse host caches must be 2D or 3D.")
+            block_size = cache.shape[1] if cache.ndim == 3 else 1
+            rows = cache.numel() // cache.shape[-1]
+            return rows, block_size, cache.stride(0) * cache.element_size()
+
         layouts = []
-        for hot_cache, host_cache in zip(hot_caches, host_caches):
-            if host_cache.ndim != 2 or not host_cache.is_contiguous():
-                raise RuntimeError("HiSparse host caches must be contiguous 2D.")
+        for cache_handle, hot_cache, host_cache in zip(
+            self.cache_handles, hot_caches, host_caches
+        ):
             row_bytes = hot_cache.shape[-1] * hot_cache.element_size()
             layouts.append(
                 (
@@ -155,7 +162,8 @@ class HiSparseWorker:
                     hot_cache.shape[1],
                     hot_cache.stride(0) * hot_cache.element_size(),
                     hot_cache.shape[0] * hot_cache.shape[1],
-                    host_cache.shape[0],
+                    *host_layout(host_cache),
+                    cache_handle.runtime.row_value_bytes or 0,
                 )
             )
         if any(layout != layouts[0] for layout in layouts[1:]):
@@ -163,6 +171,7 @@ class HiSparseWorker:
                 "HiSparse all-layer backup requires a uniform cache layout."
             )
         src_block_size, src_block_stride, src_rows = layouts[0][1:4]
+        row_value_bytes = layouts[0][-1]
         backing_ptr = self.hot_backing.data_ptr()
 
         self.backup_layer_offsets = torch.tensor(
@@ -179,6 +188,7 @@ class HiSparseWorker:
         self.backup_src_block_stride = src_block_stride
         self.backup_src_block_size = src_block_size
         self.backup_src_rows = src_rows
+        self.backup_row_value_bytes = row_value_bytes
         self.host_write_event = torch.Event()
         self.spill_row_capacity = max_model_len
         spill_staging_count = max_concurrent_batches + 1
@@ -360,6 +370,7 @@ class HiSparseWorker:
                 self.backup_src_block_stride,
                 self.backup_src_block_size,
                 self.backup_src_rows,
+                self.backup_row_value_bytes,
             )
             self.host_write_event.record(current_stream)
             transfer_ids = tuple(transfer.transfer_id for transfer in batch)

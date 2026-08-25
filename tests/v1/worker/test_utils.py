@@ -87,11 +87,12 @@ def test_hisparse_worker_includes_indexer_sources_in_host_cow_copies():
     """Host copy-on-write must read indexer pages from the source cache."""
     worker = object.__new__(HiSparseWorker)
     hot = torch.empty((2, 4, 2))
-    host = torch.empty((8, 2))
+    host = torch.empty_like(hot)
     source = torch.empty_like(hot)
     indexer = torch.empty_like(hot)
     runtime = SimpleNamespace(
         backup_caches=lambda: (hot, host),
+        row_value_bytes=hot.shape[-1] * hot.element_size(),
     )
     worker.cache_handles = [SimpleNamespace(runtime=runtime)]
     worker.cache_pairs = [(source, indexer)]
@@ -129,6 +130,7 @@ def test_hisparse_spill_batches_wait_for_reused_staging(monkeypatch):
     worker.backup_src_block_stride = 1
     worker.backup_src_block_size = 1
     worker.backup_src_rows = 1
+    worker.backup_row_value_bytes = 1
     worker.host_write_event = MagicMock()
     worker._pending_transfer_events = []
     worker._enqueued_transfer_ids = []
