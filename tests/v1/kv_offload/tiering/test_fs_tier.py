@@ -455,7 +455,9 @@ def test_wait_idle_blocks_until_tasks_complete():
     # dummy task
     task = Task(key=key(0), path="0", offset=0)
 
-    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+    pool = DualQueueThreadPool(
+        n_read_threads=1, n_write_threads=1, n_write_excl_threads=1
+    )
     pool.enqueue_store(
         job_id=1,
         n_tasks=1,
@@ -489,7 +491,9 @@ def test_wait_idle_blocks_until_tasks_complete():
 def test_batch_tasks_distribution(n_tasks, n_threads, expected_sizes):
     """_batch_tasks splits tasks evenly across n_threads (largest remainder
     first), preserving order and accounting for every task."""
-    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+    pool = DualQueueThreadPool(
+        n_read_threads=1, n_write_threads=1, n_write_excl_threads=1
+    )
     try:
         tasks = [Task(key=key(i), path=str(i), offset=i) for i in range(n_tasks)]
         batches = list(pool._batch_tasks(tasks, n_threads))
@@ -515,7 +519,9 @@ def test_store_job_parallelized_across_threads():
 
         return run
 
-    pool = DualQueueThreadPool(n_read_threads=0, n_write_threads=n_threads)
+    pool = DualQueueThreadPool(
+        n_read_threads=0, n_write_threads=n_threads, n_write_excl_threads=1
+    )
     try:
         tasks = [Task(key=key(i), path=str(i), offset=i) for i in range(n_threads)]
         pool.enqueue_store(

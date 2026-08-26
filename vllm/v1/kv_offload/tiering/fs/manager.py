@@ -115,6 +115,7 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir: str,
         n_read_threads: int = 16,
         n_write_threads: int = 16,
+        n_write_excl_threads: int = 4,
         enable_kv_events: bool = False,
         locality: str | None = None,
     ):
@@ -196,6 +197,7 @@ class FileSystemTierManager(SecondaryTierManager):
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
+            n_write_excl_threads,
             thread_name_prefix="vllm_kv_py_fs",
         )
 

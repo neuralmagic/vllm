@@ -13,12 +13,19 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from enum import Enum
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.base import JobId
 
 logger = init_logger(__name__)
+
+
+class Priority(Enum):
+    READ = 1
+    WRITE = 2
+    WRITE_EXCL = 3
 
 
 @dataclass
@@ -85,10 +92,12 @@ class DualQueueThreadPool:
         self,
         n_read_threads: int,
         n_write_threads: int,
+        n_write_excl_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
         self._n_read_threads = n_read_threads
         self._n_write_threads = n_write_threads
+        self._n_write_excl_threads = n_write_excl_threads
         self._load_q: deque = deque()
         self._store_q: deque = deque()
         self._condition = threading.Condition(threading.Lock())
@@ -102,7 +111,7 @@ class DualQueueThreadPool:
         for i in range(self._n_read_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(True,),
+                args=(Priority.READ,),
                 name=f"{thread_name_prefix}_l{i}",
                 daemon=True,
             )
@@ -112,7 +121,17 @@ class DualQueueThreadPool:
         for i in range(self._n_write_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(False,),
+                args=(Priority.WRITE,),
+                name=f"{thread_name_prefix}_s{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        for i in range(self._n_write_excl_threads):
+            t = threading.Thread(
+                target=self._worker,
+                args=(Priority.WRITE_EXCL,),
                 name=f"{thread_name_prefix}_s{i}",
                 daemon=True,
             )
@@ -239,20 +258,25 @@ class DualQueueThreadPool:
             for t in self._threads:
                 t.join()
 
-    def _worker(self, load_priority: bool) -> None:
+    def _worker(self, priority: Priority) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
+
+        def _get_work_queue():
+            if priority == Priority.WRITE_EXCL:
+                return self._store_q
+            primary = self._load_q if priority == Priority.READ else self._store_q
+            secondary = self._store_q if priority == Priority.READ else self._load_q
+            return primary or secondary
+
+        def _has_work():
+            return bool(_get_work_queue())
+
         while True:
             with self._condition:
-                self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
-                )
+                self._condition.wait_for(lambda: self._stop or _has_work())
                 if self._stop:
                     return
-                primary = self._load_q if load_priority else self._store_q
-                secondary = self._store_q if load_priority else self._load_q
-                fn, batch_size, state = (
-                    primary.popleft() if primary else secondary.popleft()
-                )
+                fn, batch_size, state = _get_work_queue().popleft()
             try:
                 start_time = time.monotonic()
                 fn()
