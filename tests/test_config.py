@@ -12,13 +12,18 @@ import pydantic
 import pytest
 from huggingface_hub import ResolvedRevision
 from pydantic import ValidationError
+from vllm.compilation.backends import VllmBackend
+from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionCGSupport
 
 import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
-from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
+    DeviceConfig,
     KernelConfig,
+    KVTransferConfig,
     ModelConfig,
     ObservabilityConfig,
     ParallelConfig,
@@ -35,8 +40,6 @@ from vllm.config.mamba import MambaBackendEnum
 from vllm.config.speculative import _validate_qwen3_omni_dspark
 from vllm.config.utils import get_field
 from vllm.config.vllm import OPTIMIZATION_LEVEL_TO_CONFIG, OptimizationLevel
-from vllm.platforms import current_platform
-from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -98,6 +101,32 @@ def test_per_request_spec_decode_metrics_requires_spec_decode():
                     per_request_spec_decode_metrics=level
                 )
             )
+
+
+def test_pd_dcp_interleave_size_is_adjusted_to_block_size(caplog):
+    config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=3,
+            distributed_executor_backend="mp",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_both",
+        ),
+    )
+
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    )
+    with caplog.at_level(logging.INFO):
+        config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+
+    assert config.parallel_config.cp_kv_cache_interleave_size == 16
+    assert "automatically adjusted from 3 to block_size 16" in caplog.text
 
 
 def test_compile_config_repr_succeeds():
@@ -163,11 +192,12 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
 
 def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):
     """ROCm keeps DeepSeek V3.2 and V4 on their compiled MRV1 paths."""
+    from vllm.platforms import current_platform
+
     from vllm.config.vllm import (
         default_breakable_cudagraph_architectures,
         default_v2_model_runner_architectures,
     )
-    from vllm.platforms import current_platform
 
     monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
     # The lookup is lru_cached against a fixed platform.
@@ -201,11 +231,12 @@ def test_dsa_models_default_to_mrv2_and_breakable_cudagraph(
     from vllm.compilation.breakable_cudagraph import (
         is_breakable_cudagraph_enabled,
     )
+    from vllm.platforms import current_platform
+
     from vllm.config.vllm import (
         default_breakable_cudagraph_architectures,
         default_v2_model_runner_architectures,
     )
-    from vllm.platforms import current_platform
 
     monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
@@ -267,8 +298,9 @@ def test_dsa_models_default_to_mrv2_and_breakable_cudagraph(
 def test_dsa_breakable_cudagraph_platform_default(
     monkeypatch, architecture, is_rocm, expected
 ):
-    from vllm.config.vllm import default_breakable_cudagraph_architectures
     from vllm.platforms import current_platform
+
+    from vllm.config.vllm import default_breakable_cudagraph_architectures
 
     monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
     monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
@@ -635,8 +667,9 @@ def test_resolve_cudagraph_mode_skips_mamba_block_check_while_profiling():
     ],
 )
 def test_is_default_v2_model_runner_model(model_config, expected, monkeypatch):
-    from vllm.config.vllm import default_v2_model_runner_architectures
     from vllm.platforms import current_platform
+
+    from vllm.config.vllm import default_v2_model_runner_architectures
 
     # The expectations below are the platform-independent defaults; ROCm's
     # DeepSeek V4 carve-out is covered by test_rocm_defaults_deepseek_v4_to_mrv1.
@@ -1735,6 +1768,7 @@ def test_validate_mamba_align_subblock_prefill():
             long_prefill_token_threshold=4096,
             disable_chunked_mm_input=False,
         ),
+        kv_transfer_config=None,
     )
 
     VllmConfig.validate_block_size(config)

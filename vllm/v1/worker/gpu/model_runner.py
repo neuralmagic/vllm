@@ -526,6 +526,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, is_profiling: bool = False
     ) -> None:
+        # GPUWorker finalizes the PD interleave before KV cache initialization.
+        self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
@@ -1554,9 +1556,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # PCP target verification does not yet replay correctly under PIECEWISE
         # CUDA graphs. Keep those target forwards eager while preserving graphs
         # for ordinary PCP prefill and the separately captured speculator.
-        pcp_spec_decode = (
-            self.pcp_manager is not None
-            and bool(scheduler_output.scheduled_spec_decode_tokens)
+        pcp_spec_decode = self.pcp_manager is not None and bool(
+            scheduler_output.scheduled_spec_decode_tokens
         )
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
