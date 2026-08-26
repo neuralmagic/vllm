@@ -494,7 +494,14 @@ class DeepseekV32Attention(MLAAttention):
             )
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-        if num_actual == 0:
+        # DCP spanning the PCP group: every rank must join the token-gather
+        # collectives even when it holds no tokens this step.
+        pcp_token_sharded = (
+            self.use_pcp
+            and self.impl.dcp_world_size > 1
+            and self.impl.dcp_world_size == self.impl.pcp_world_size
+        )
+        if num_actual == 0 and not pcp_token_sharded:
             output.zero_()
             return
 
@@ -508,11 +515,7 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
-        if (
-            self.use_pcp
-            and self.impl.dcp_world_size > 1
-            and self.impl.dcp_world_size == self.impl.pcp_world_size
-        ):
+        if pcp_token_sharded:
             # DCP spans the PCP group: queries are token-partitioned and the KV
             # cache is block-sharded, so gather along tokens, attend to the local
             # shard and reduce-scatter the LSE-merged output (no head gather).
@@ -527,6 +530,9 @@ class DeepseekV32Attention(MLAAttention):
             attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
                 mqa_q_full, kv_cache, attn_metadata, pcp_group, num_padded
             )
+            if num_actual == 0:
+                output.zero_()
+                return
         else:
             if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
                 if isinstance(mqa_q_arg, tuple):
