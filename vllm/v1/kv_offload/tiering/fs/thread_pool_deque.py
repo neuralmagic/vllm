@@ -99,7 +99,7 @@ class TPDequeBalancedBatch(_TPDeque):
     def submit(
         self, tasks: list[Any], make_batch_fn: Callable[[list[Any]], Callable[[], None]]
     ):
-        if self._make_batch_fn is not None:
+        if self._make_batch_fn is None:
             self._make_batch_fn = make_batch_fn
         # Balanced batching requires all make_batch_fn be the same as
         # jobs across submit calls may be batched together

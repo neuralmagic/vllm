@@ -220,46 +220,46 @@ class FileSystemTierManager(SecondaryTierManager):
             for key, bid in zip(keys, bids)
         ]
 
+    def _make_store_batch_fn(self, tasks: list[Task]) -> Callable[[], None]:
+        return functools.partial(
+            batch_store_block,
+            paths=[t.path for t in tasks],
+            offsets=[t.offset for t in tasks],
+            view=self._primary_kv_view,
+            block_size=self._block_size,
+            use_o_direct=self._use_o_direct,
+        )
+
+    def _make_load_batch_fn(self, tasks: list[Task]) -> Callable[[], None]:
+        return functools.partial(
+            batch_load_block,
+            paths=[t.path for t in tasks],
+            offsets=[t.offset for t in tasks],
+            view=self._primary_kv_view,
+            block_size=self._block_size,
+            use_o_direct=self._use_o_direct,
+        )
+
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
 
-        def make_batch_fn(tasks: list[Task]) -> Callable[[], None]:
-            return functools.partial(
-                batch_store_block,
-                paths=[t.path for t in tasks],
-                offsets=[t.offset for t in tasks],
-                view=self._primary_kv_view,
-                block_size=self._block_size,
-                use_o_direct=self._use_o_direct,
-            )
-
         self._pool.enqueue_store(
             job_metadata.job_id,
             self._tasks_from_jobmetadata(job_metadata),
-            make_batch_fn,
+            self._make_store_batch_fn,
         )
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
         self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
 
-        def make_batch_fn(tasks: list[Task]) -> Callable[[], None]:
-            return functools.partial(
-                batch_load_block,
-                paths=[t.path for t in tasks],
-                offsets=[t.offset for t in tasks],
-                view=self._primary_kv_view,
-                block_size=self._block_size,
-                use_o_direct=self._use_o_direct,
-            )
-
         self._pool.enqueue_load(
             job_metadata.job_id,
             self._tasks_from_jobmetadata(job_metadata),
-            make_batch_fn,
+            self._make_load_batch_fn,
         )
 
     @override

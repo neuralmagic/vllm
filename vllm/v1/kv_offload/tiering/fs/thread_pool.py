@@ -18,7 +18,10 @@ import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.base import JobId
-from vllm.v1.kv_offload.tiering.fs.thread_pool_deque import TPDeque
+from vllm.v1.kv_offload.tiering.fs.thread_pool_deque import (
+    TPDequeBalancedBatch,
+    _TPDeque,
+)
 
 try:
     from vllm.fs_io_C import get_status_snapshot as get_status_snapshot_C
@@ -160,8 +163,8 @@ class DualQueueThreadPool:
         n_write_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
-        self._load_q: TPDeque = TPDeque(n_read_threads)
-        self._store_q: TPDeque = TPDeque(n_write_threads)
+        self._load_q: TPDequeBalancedBatch = TPDequeBalancedBatch(n_read_threads)
+        self._store_q: TPDequeBalancedBatch = TPDequeBalancedBatch(n_write_threads)
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
@@ -195,7 +198,7 @@ class DualQueueThreadPool:
 
     def _enqueue(
         self,
-        q: TPDeque,
+        q: _TPDeque,
         job_id: JobId,
         tasks: list[Task],
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
