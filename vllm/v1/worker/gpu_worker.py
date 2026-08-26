@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import regex as re
 import torch
-from vllm.utils.mem_trace import mem_trace, mem_trace_once
+from vllm.utils.mem_trace import mem_record_start, mem_trace, mem_trace_once
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -463,6 +463,7 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
             mem_trace("worker:after_load_model")
+            mem_record_start()
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(

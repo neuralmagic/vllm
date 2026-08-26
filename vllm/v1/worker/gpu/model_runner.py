@@ -25,7 +25,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
-from vllm.utils.mem_trace import mem_trace, mem_trace_once
+from vllm.utils.mem_trace import mem_snapshot_report, mem_trace, mem_trace_once
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -873,6 +873,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.reset_encoder_cache()
         gc.collect()
         mem_trace("profile_run:end")
+        mem_snapshot_report("profile_run:end")
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()
