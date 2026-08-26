@@ -1537,11 +1537,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.lora_config, self.lora_state, req_ids, dummy_run
             )
 
-        # PCP PIECEWISE graphs do not yet preserve correctness for speculative
-        # multi-token target verification batches. This leaves prefill graph
-        # execution enabled while the replicated verification forward runs eager.
-        pcp_spec_decode = self.pcp_manager is not None and bool(
-            scheduler_output.scheduled_spec_decode_tokens
+        # PCP target verification does not yet replay correctly under PIECEWISE
+        # CUDA graphs. Keep those target forwards eager while preserving graphs
+        # for ordinary PCP prefill and the separately captured speculator.
+        pcp_spec_decode = (
+            self.pcp_manager is not None
+            and bool(scheduler_output.scheduled_spec_decode_tokens)
         )
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
@@ -1942,7 +1943,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = hidden_states
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                if self.pcp_manager is not None:
+                if (
+                    self.pcp_manager is not None
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                ):
                     pre_hc_hidden_states = self.pcp_manager.restore_hidden_state_buffer(
                         pre_hc_hidden_states
                     )

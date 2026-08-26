@@ -75,7 +75,12 @@ class DraftModelSpeculator(BaseSpeculator):
         # over the global batch on every PCP rank: its attention groups,
         # forward context, and cudagraphs must not see PCP.
         target_parallel_config = vllm_config.parallel_config
-        self.replicated_pcp = target_parallel_config.prefill_context_parallel_size > 1
+        speculative_config = vllm_config.speculative_config
+        self.replicated_pcp = (
+            target_parallel_config.prefill_context_parallel_size > 1
+            and speculative_config is not None
+            and speculative_config.method == "mtp"
+        )
         if self.replicated_pcp:
             vllm_config = replace(
                 vllm_config,
