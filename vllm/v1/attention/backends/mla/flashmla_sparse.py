@@ -863,6 +863,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
+        topk_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # q shape: (batch, seq_len, num_heads, head_dim)
         actual_num_heads = q.size(2)
@@ -888,6 +889,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             is_fp8_kvcache=True,
             indices=topk_indices,
             softmax_scale=self.softmax_scale,
+            topk_length=topk_length,
         )
 
         # Slice output and lse back to actual head count if we padded
@@ -1036,8 +1038,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             req_all = gathered_req_id[:, start:stop].reshape(-1).contiguous()
             num_all = n * world_size
 
-            # Keep this rank's shard of every token's top-k, mapped to local slots.
-            topk_all = triton_filter_and_convert_dcp_index(
+            # Keep this rank's shard of every token's top-k, compacted to a prefix
+            # and mapped to local slots. Only ~1/dcp of each row lives here, so
+            # tell the kernel the longest valid prefix instead of scanning all
+            # `topk` slots (device-side, no host sync).
+            topk_all, valid_counts = triton_filter_and_convert_dcp_index(
                 req_all,
                 global_block_table,
                 topk_all,
@@ -1046,8 +1051,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 cp_kv_cache_interleave_size=attn_metadata.cp_kv_cache_interleave_size,
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk,
-                compact_valid_to_front=False,
+                return_valid_counts=True,
+                compact_valid_to_front=True,
             )
+            topk_length = valid_counts.amax().clamp_(min=1).view(1).to(torch.int32)
             kernel_meta = sched_cache.get(num_all)
             if kernel_meta is None:
                 scheduler_metadata, _ = get_mla_metadata(
@@ -1069,14 +1076,16 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
                 topk_indices=topk_all.unsqueeze(0),
                 kernel_metadata=kernel_meta,
+                topk_length=topk_length,
             )
             out = _out.squeeze(0)
-            lse = _lse.squeeze(0).transpose(0, 1)
+            lse = _lse.squeeze(0).transpose(0, 1).contiguous()
             # Rows with no selected token on this shard: (0, -inf) is the identity
             # of the cross-rank LSE merge.
-            empty_rows = (topk_all == -1).all(dim=-1)
-            out = out.masked_fill(empty_rows.view(-1, 1, 1), 0.0).contiguous()
-            lse = lse.masked_fill(empty_rows.view(-1, 1), float("-inf")).contiguous()
+            empty_rows = valid_counts == 0
+            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            out = out.contiguous()
             if simulate:
                 lses = lse.unsqueeze(0).expand(world_size, -1, -1).contiguous()
             else:
