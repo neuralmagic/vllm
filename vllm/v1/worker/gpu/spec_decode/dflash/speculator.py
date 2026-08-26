@@ -100,6 +100,7 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self._pcp_context_kv_precomputed = False
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -108,6 +109,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         config.attention_config = replace(
             self.vllm_config.attention_config,
             use_non_causal=self.requires_non_causal,
+            disable_pcp=(
+                self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+            ),
         )
         return config
 
@@ -216,6 +220,42 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+
+    @torch.inference_mode()
+    def precompute_pcp_context_kv(
+        self,
+        input_batch: InputBatch,
+        aux_hidden_states: list[torch.Tensor],
+        slot_mappings: dict[str, torch.Tensor],
+    ) -> None:
+        """Build rank-local context KV and publish its rows to every PCP peer."""
+        if self._pcp_context_kv_precomputed:
+            raise RuntimeError("DSpark PCP context KV was already precomputed")
+        if not aux_hidden_states:
+            raise RuntimeError("DSpark PCP precompute requires auxiliary hidden states")
+        if not hasattr(self.model, "get_draft_kv_cache_layer_names"):
+            raise RuntimeError("DSpark model does not expose draft KV-cache layers")
+
+        num_tokens = input_batch.num_tokens
+        layer_names = self.model.get_draft_kv_cache_layer_names()
+        missing = [name for name in layer_names if name not in slot_mappings]
+        if missing:
+            raise RuntimeError(
+                "Missing DSpark PCP slot mappings for: " + ", ".join(missing)
+            )
+        context_slot_mappings = [
+            slot_mappings[name][:num_tokens] for name in layer_names
+        ]
+        context_states = self.model.combine_hidden_states(
+            torch.cat(aux_hidden_states, dim=-1)
+        )
+        self.model.precompute_and_store_context_kv(
+            context_states[:num_tokens],
+            input_batch.positions[:num_tokens],
+            context_slot_mappings,
+            publish_to_pcp=True,
+        )
+        self._pcp_context_kv_precomputed = True
 
     @torch.inference_mode()
     def _run_model(
@@ -341,6 +381,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        context_kv_precomputed = self._pcp_context_kv_precomputed
+        self._pcp_context_kv_precomputed = False
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -353,13 +395,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+        if not context_kv_precomputed:
+            if aux_hidden_states:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                hidden_states = last_hidden_states
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
             )
-        else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -431,11 +476,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+        if not context_kv_precomputed:
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(

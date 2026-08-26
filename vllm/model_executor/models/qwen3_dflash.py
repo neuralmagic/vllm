@@ -594,6 +594,7 @@ class DFlashQwen3Model(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        publish_to_pcp: bool = False,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -646,6 +647,7 @@ class DFlashQwen3Model(nn.Module):
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
+        published_rows = False
         for i in range(L):
             slot_mapping = (
                 context_slot_mapping[i] if per_layer else context_slot_mapping
@@ -661,6 +663,26 @@ class DFlashQwen3Model(nn.Module):
                 kv_cache,
                 slot_mapping,
             )
+            if publish_to_pcp:
+                from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                    publish_pcp_cache_rows,
+                )
+
+                publish_pcp_cache_rows(
+                    attn.layer_name,
+                    kv_cache,
+                    slot_mapping,
+                    kv_cache.shape[1],
+                )
+                published_rows = True
+        if publish_to_pcp:
+            if not published_rows:
+                raise RuntimeError("DFlash PCP precompute published no cache rows")
+            from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                publish_pcp_direct_kv,
+            )
+
+            publish_pcp_direct_kv()
 
     def forward(
         self,
@@ -787,10 +809,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        publish_to_pcp: bool = False,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
-            context_states, context_positions, context_slot_mapping
+            context_states,
+            context_positions,
+            context_slot_mapping,
+            publish_to_pcp=publish_to_pcp,
         )
 
     def combine_hidden_states(

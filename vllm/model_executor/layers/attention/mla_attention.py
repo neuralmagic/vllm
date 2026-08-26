@@ -558,7 +558,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
-        self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.use_pcp = (
+            parallel_config.prefill_context_parallel_size > 1
+            and not vllm_config.attention_config.disable_pcp
+        )
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -2151,7 +2154,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.compilation_config = vllm_config.compilation_config
         self.vllm_config = vllm_config
         self.device = device
-        self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.use_pcp = (
+            parallel_config.prefill_context_parallel_size > 1
+            and not vllm_config.attention_config.disable_pcp
+        )
         self.non_causal_multi_token_decode = getattr(
             kv_cache_spec, "non_causal_multi_token_decode", False
         )

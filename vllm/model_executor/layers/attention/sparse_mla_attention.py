@@ -124,7 +124,10 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             device=device,
         )
         parallel_config = vllm_config.parallel_config
-        self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.use_pcp = (
+            parallel_config.prefill_context_parallel_size > 1
+            and not vllm_config.attention_config.disable_pcp
+        )
         try:
             self.dcp_world_size = get_dcp_group().world_size
         except AssertionError:

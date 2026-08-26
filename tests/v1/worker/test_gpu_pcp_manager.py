@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
+from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
@@ -106,4 +109,31 @@ def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
             is_prefilling=np.zeros(3, dtype=np.bool_),
             query_start_loc_np=np.arange(4, dtype=np.int32),
             padded_num_tokens=2,
+        )
+
+
+def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
+    def make_config(cudagraph_mode: CUDAGraphMode):
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=4,
+                pipeline_parallel_size=1,
+            ),
+            model_config=SimpleNamespace(
+                use_mla=True,
+                is_encoder_decoder=False,
+                hf_text_config=SimpleNamespace(index_topk=2048),
+            ),
+            lora_config=None,
+            speculative_config=None,
+            compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
+        )
+
+    PCPManager.validate_config(
+        make_config(CUDAGraphMode.PIECEWISE), supports_mm_inputs=False
+    )
+
+    with pytest.raises(NotImplementedError, match="PIECEWISE CUDA graphs only"):
+        PCPManager.validate_config(
+            make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )

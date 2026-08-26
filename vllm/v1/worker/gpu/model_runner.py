@@ -1826,10 +1826,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
+        # Pure prefill retains PCP-local target auxiliary states and slot mappings.
+        # Project only this rank's shard, then publish those physical draft-cache
+        # rows to every PCP peer. Mixed/decode batches use the restored full-context
+        # fallback because rejected speculative suffixes must be filtered first.
+        if (
+            self.pcp_manager is not None
+            and self.speculator is not None
+            and aux_hidden_states is not None
+            and slot_mappings_by_layer is not None
+            and input_batch.has_prefill
+            and input_batch.is_prefilling_np.all()
+            and hasattr(self.speculator, "precompute_pcp_context_kv")
+        ):
+            with use_workspace_lane(self._draft_workspace_lane):
+                self.speculator.precompute_pcp_context_kv(
+                    input_batch,
+                    aux_hidden_states,
+                    slot_mappings_by_layer,
+                )
+            aux_hidden_states = None
+
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
         )
+        if self.pcp_manager is not None and aux_hidden_states is not None:
+            # Draft attention is replicated. Preserve existing DSpark semantics
+            # for mixed/decode batches by restoring its target auxiliary states.
+            aux_hidden_states = [
+                self.pcp_manager.restore_hidden_states(states)
+                for states in aux_hidden_states
+            ]
 
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output

@@ -160,6 +160,7 @@ class DSparkDeepseekV4Model(nn.Module):
         main_x: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mappings: list[torch.Tensor | None] | None = None,
+        publish_to_pcp: bool = False,
     ) -> None:
         """Insert the sliding-window context KV for every draft layer.
 
@@ -173,6 +174,13 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
+        if publish_to_pcp:
+            from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                publish_pcp_cache_rows,
+                publish_pcp_direct_kv,
+            )
+
+        published_rows = False
         for i, layer in enumerate(self.layers):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
@@ -186,6 +194,18 @@ class DSparkDeepseekV4Model(nn.Module):
             if slot_mapping is None:
                 continue
             _insert_context_kv(attn, kv, context_positions, slot_mapping)
+            if publish_to_pcp:
+                publish_pcp_cache_rows(
+                    attn.swa_cache_layer.prefix,
+                    attn.swa_cache_layer.kv_cache,
+                    slot_mapping,
+                    attn.swa_cache_layer.block_size,
+                )
+                published_rows = True
+        if publish_to_pcp:
+            if not published_rows:
+                raise RuntimeError("DSpark PCP precompute published no cache rows")
+            publish_pcp_direct_kv()
 
     def forward(
         self,
@@ -345,9 +365,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mappings: list[torch.Tensor | None] | None = None,
+        publish_to_pcp: bool = False,
     ) -> None:
         self.model.precompute_and_store_context_kv(
-            context_states, context_positions, context_slot_mappings
+            context_states,
+            context_positions,
+            context_slot_mappings,
+            publish_to_pcp=publish_to_pcp,
         )
 
     def forward(

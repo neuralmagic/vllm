@@ -47,15 +47,21 @@ def _trap_if_nonzero(value):
 
 
 @triton.jit
-def _publish_fence_kernel(
+def _peer_cache_fence_kernel(
     peer_ptrs,
-    epoch,
-    parity,
+    local_signal_ptr,
+    epoch_ptr,
     source_rank: tl.constexpr,
     world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_SPINS: tl.constexpr,
 ):
-    destination_rank = tl.program_id(0)
-    if destination_rank < world_size:
+    # Keep the epoch on device so CUDA graph replay advances it on every launch.
+    epoch = tl.atomic_add(epoch_ptr, 1, sem="relaxed", scope="gpu") + 1
+    parity = epoch & 1
+
+    # System-scope release publishes this rank's preceding peer-cache writes.
+    for destination_rank in tl.static_range(0, world_size):
         dest_base = tl.load(peer_ptrs + destination_rank).to(tl.pointer_type(tl.int32))
         tl.atomic_xchg(
             dest_base + parity * world_size + source_rank,
@@ -64,19 +70,10 @@ def _publish_fence_kernel(
             scope="sys",
         )
 
-
-@triton.jit
-def _wait_fence_kernel(
-    local_signal_ptr,
-    epoch,
-    parity,
-    world_size: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    MAX_SPINS: tl.constexpr,
-):
-    source_rank = tl.arange(0, BLOCK_SIZE)
-    mask = source_rank < world_size
-    signal_ptr = local_signal_ptr + parity * world_size + source_rank
+    # System-scope acquire waits until every peer has published the same epoch.
+    peer_rank = tl.arange(0, BLOCK_SIZE)
+    mask = peer_rank < world_size
+    signal_ptr = local_signal_ptr + parity * world_size + peer_rank
     observed = tl.atomic_add(signal_ptr, 0, mask=mask, sem="acquire", scope="sys")
     pending = tl.max(tl.where(mask & (observed != epoch), 1, 0))
     spins = 0
@@ -87,14 +84,37 @@ def _wait_fence_kernel(
     _trap_if_nonzero(pending)
 
 
+@triton.jit
+def _copy_cache_rows_to_peers_kernel(
+    peer_ptrs,
+    slot_mapping,
+    row_nbytes,
+    source_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    byte_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    slot = tl.load(slot_mapping + token_idx)
+    mask = (slot >= 0) & (byte_offset < row_nbytes)
+    source_base = tl.load(peer_ptrs + source_rank).to(tl.pointer_type(tl.uint8))
+    source = source_base + slot * row_nbytes + byte_offset
+    value = tl.load(source, mask=mask, other=0)
+    for peer in tl.static_range(0, world_size):
+        if peer != source_rank:
+            destination_base = tl.load(peer_ptrs + peer).to(tl.pointer_type(tl.uint8))
+            destination = destination_base + slot * row_nbytes + byte_offset
+            tl.store(destination, value, mask=mask)
+
+
 class PCPPeerCacheFence:
-    """Two-kernel release/acquire publication for one PCP group."""
+    """Device-epoch release/acquire publication for one PCP group."""
 
     def __init__(self, group: ProcessGroup, device: torch.device) -> None:
         self._group = group
         self._world_size = group.size()
         self._rank = group.rank()
-        self._epoch = 0
+        self._epoch = torch.zeros((1,), dtype=torch.int32, device=device)
         self._allocation = allocate_symm_mem_peer(
             (2, self._world_size),
             dtype=torch.int32,
@@ -106,19 +126,11 @@ class PCPPeerCacheFence:
         dist.barrier(group=group)
 
     def __call__(self) -> None:
-        self._epoch = self._epoch % 0x7FFFFFFE + 1
-        parity = self._epoch & 1
-        _publish_fence_kernel[(self._world_size,)](
+        _peer_cache_fence_kernel[(1,)](
             self._allocation.peer_ptrs,
-            self._epoch,
-            parity,
-            source_rank=self._rank,
-            world_size=self._world_size,
-        )
-        _wait_fence_kernel[(1,)](
             self._allocation.storage,
             self._epoch,
-            parity,
+            source_rank=self._rank,
             world_size=self._world_size,
             BLOCK_SIZE=triton.next_power_of_2(self._world_size),
             MAX_SPINS=_MAX_FENCE_SPINS,
@@ -126,7 +138,9 @@ class PCPPeerCacheFence:
 
     def close(self) -> None:
         torch.accelerator.synchronize(self._allocation.storage.device)
-        dist.barrier(group=self._group)
+        # Cleanup must remain non-collective: a peer may already have failed
+        # while another worker is unwinding. A process-group barrier here can
+        # deadlock the entire executor on any asynchronous worker failure.
         self._allocation.close()
 
 
@@ -169,6 +183,71 @@ def get_layer_peer_ptrs(layer_name: str) -> torch.Tensor | None:
     if not _STATE.enabled:
         return None
     return _STATE.layer_peer_ptrs.get(layer_name)
+
+
+def copy_pcp_cache_rows_to_peers(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    peer_ptrs: torch.Tensor,
+    source_rank: int,
+    block_size: int,
+) -> None:
+    """Copy locally produced physical cache rows to every PCP peer.
+
+    The cache must be a contiguous paged tensor whose first two logical
+    dimensions are ``[num_blocks, block_size]``. The copy is byte-oriented,
+    so it preserves BF16, FP8 and packed cache row layouts unchanged.
+    """
+    if not cache.is_cuda or not slot_mapping.is_cuda or not peer_ptrs.is_cuda:
+        raise ValueError("PCP cache-row publication requires CUDA tensors")
+    if not cache.is_contiguous():
+        raise ValueError("PCP cache-row publication requires a contiguous cache")
+    if cache.ndim < 2 or cache.shape[1] != block_size:
+        raise ValueError(
+            "Expected paged cache shape [num_blocks, block_size, ...], got "
+            f"{tuple(cache.shape)} with block_size={block_size}"
+        )
+    if slot_mapping.ndim != 1:
+        raise ValueError("PCP cache-row slot mapping must be one-dimensional")
+    world_size = peer_ptrs.numel()
+    if world_size <= 1 or slot_mapping.numel() == 0:
+        return
+    if not 0 <= source_rank < world_size:
+        raise ValueError(
+            f"PCP source rank {source_rank} is outside world size {world_size}"
+        )
+    num_physical_rows = cache.shape[0] * block_size
+    cache_nbytes = cache.numel() * cache.element_size()
+    if cache_nbytes % num_physical_rows != 0:
+        raise ValueError("Cache byte size is not divisible by its physical rows")
+    row_nbytes = cache_nbytes // num_physical_rows
+    block = 256
+    _copy_cache_rows_to_peers_kernel[
+        (slot_mapping.numel(), triton.cdiv(row_nbytes, block))
+    ](
+        peer_ptrs,
+        slot_mapping,
+        row_nbytes,
+        source_rank=source_rank,
+        world_size=world_size,
+        BLOCK_SIZE=block,
+    )
+
+
+def publish_pcp_cache_rows(
+    layer_name: str,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+) -> None:
+    if not _STATE.enabled:
+        raise RuntimeError("PCP direct-KV is not active")
+    peer_ptrs = _STATE.layer_peer_ptrs.get(layer_name)
+    if peer_ptrs is None:
+        raise RuntimeError(f"No PCP peer cache pointers registered for {layer_name}")
+    copy_pcp_cache_rows_to_peers(
+        cache, slot_mapping, peer_ptrs, _STATE.rank, block_size
+    )
 
 
 def publish_pcp_direct_kv() -> None:

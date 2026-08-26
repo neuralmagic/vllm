@@ -213,10 +213,15 @@ def init_kv_cache(
     from vllm.distributed.parallel_state import get_pcp_group
     from vllm.model_executor.layers.attention.pcp_direct_kv import (
         allocate_pcp_direct_backing,
+        close_pcp_direct_kv,
         pcp_direct_kv_requested,
     )
 
     if pcp_direct_kv_requested():
+        # Memory profiling initializes a temporary KV cache before the serving
+        # cache. Release its symmetric-memory state before allocating the
+        # replacement so both allocations are not retained.
+        close_pcp_direct_kv()
         pcp_group = get_pcp_group()
         if pcp_group.world_size <= 1:
             raise RuntimeError(
@@ -248,7 +253,6 @@ def init_kv_cache(
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
     from vllm.model_executor.layers.attention.pcp_direct_kv import (
         bind_pcp_direct_layer_views,
-        close_pcp_direct_kv,
         pcp_direct_kv_active,
         should_allocate_pcp_direct_kv,
     )

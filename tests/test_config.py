@@ -113,6 +113,38 @@ def test_compile_config_repr_succeeds():
 
 
 @pytest.mark.parametrize(
+    "mode",
+    [
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    ],
+)
+def test_pcp_downgrades_full_cudagraph_modes_to_piecewise(mode):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=4),
+        compilation_config=CompilationConfig(cudagraph_mode=mode),
+    )
+
+    VllmConfig._maybe_override_pcp_cudagraph_mode(config)
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+
+
+def test_pcp_cudagraph_override_leaves_non_pcp_config_unchanged():
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+    )
+
+    VllmConfig._maybe_override_pcp_cudagraph_mode(config)
+
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+@pytest.mark.parametrize(
     ("env_value", "expected"),
     [
         (None, None),

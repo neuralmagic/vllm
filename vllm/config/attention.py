@@ -77,6 +77,12 @@ class AttentionConfig:
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""
 
+    disable_pcp: bool = False
+    """Disable PCP inside auxiliary attention stacks while preserving the
+    process topology for expert parallelism. This is used by replicated draft
+    attention whose context KV is populated from PCP-sharded target prefills.
+    """
+
     sparse_mla_force_mqa: bool = False
     """Force sparse MLA to use forward_mqa for all requests, including prefill.
     When False (default), pure prefill batches use forward_mha when implemented.

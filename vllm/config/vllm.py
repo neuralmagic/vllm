@@ -976,6 +976,20 @@ class VllmConfig:
         )
         self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+    def _maybe_override_pcp_cudagraph_mode(self) -> None:
+        if (
+            self.parallel_config.prefill_context_parallel_size <= 1
+            or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            return
+
+        logger.warning_once(
+            "Prefill context parallelism does not support full CUDA graphs. "
+            "Overriding cudagraph_mode from %s to PIECEWISE.",
+            self.compilation_config.cudagraph_mode.name,
+        )
+        self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
     def _maybe_disable_dynamic_sd_for_data_parallel(self) -> None:
         speculative_config = self.speculative_config
         if (
@@ -1237,6 +1251,26 @@ class VllmConfig:
             and self.parallel_config.enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
+        if envs.VLLM_USE_PCP_DIRECT_KV:
+            if self.scheduler_config.async_scheduling is True:
+                raise ValueError(
+                    "VLLM_USE_PCP_DIRECT_KV=1 is incompatible with explicitly "
+                    "enabled async scheduling. Use --no-async-scheduling."
+                )
+            if self.scheduler_config.async_scheduling is None:
+                logger.info_once(
+                    "Disabling async scheduling because PCP direct-KV is enabled."
+                )
+                self.scheduler_config.async_scheduling = False
+            if (
+                self.cache_config is not None
+                and self.cache_config.enable_prefix_caching
+            ):
+                logger.warning_once(
+                    "Disabling prefix caching because PCP direct-KV does not yet "
+                    "support copy-on-write."
+                )
+                self.cache_config.enable_prefix_caching = False
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
@@ -1475,6 +1509,7 @@ class VllmConfig:
 
         self._maybe_disable_dynamic_sd_for_data_parallel()
         self._maybe_override_dynamic_sd_cudagraph_mode()
+        self._maybe_override_pcp_cudagraph_mode()
 
         if (
             self.compilation_config.cudagraph_mode.requires_piecewise_compilation()

@@ -1,10 +1,66 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import vllm.v1.worker.cp_utils as cp_utils
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
-from vllm.v1.worker.cp_utils import should_skip_dcp_context_attention
+from vllm.v1.worker.cp_utils import (
+    check_attention_cp_compatibility,
+    should_skip_dcp_context_attention,
+)
+
+
+class _NoPCPBackend:
+    @staticmethod
+    def supports_pcp() -> bool:
+        return False
+
+    @staticmethod
+    def get_name() -> str:
+        return "NO_PCP"
+
+
+class _AttentionLayer:
+    def __init__(self, use_pcp: bool):
+        self.use_pcp = use_pcp
+        self.impl = None
+
+    @staticmethod
+    def get_attn_backend():
+        return _NoPCPBackend
+
+
+def _pcp_config():
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+
+
+def test_cp_compatibility_skips_replicated_draft_attention(monkeypatch):
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"draft": _AttentionLayer(use_pcp=False)},
+    )
+    check_attention_cp_compatibility(_pcp_config())
+
+
+def test_cp_compatibility_still_validates_pcp_attention(monkeypatch):
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"target": _AttentionLayer(use_pcp=True)},
+    )
+    with pytest.raises(AssertionError, match="NO_PCP"):
+        check_attention_cp_compatibility(_pcp_config())
 
 
 def test_skip_gate_only_for_zero_context():

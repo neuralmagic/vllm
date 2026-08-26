@@ -268,6 +268,36 @@ def _worker_fused_direct_matches_gather_insert(env: dict[str, str]) -> None:
     dist.destroy_process_group()
 
 
+def _worker_peer_fence_cudagraph(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    rank = int(env["RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl", rank=rank, world_size=int(env["WORLD_SIZE"])
+    )
+    from vllm.model_executor.layers.attention.pcp_direct_kv import PCPPeerCacheFence
+
+    device = torch.device(f"cuda:{rank}")
+    fence = PCPPeerCacheFence(dist.group.WORLD, device)
+    fence()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fence()
+    dist.barrier()
+    for _ in range(4):
+        graph.replay()
+    torch.cuda.synchronize()
+    # Capture records but does not execute the increment. Four replays follow
+    # the eager warmup, so the device-resident epoch must now be five.
+    assert int(fence._epoch.item()) == 5
+
+    del graph
+    fence.close()
+    dist.destroy_process_group()
+
+
 def _worker_fused_direct_tp2_pcp2(env: dict[str, str]) -> None:
     update_environment_variables(env)
     global_rank = int(env["RANK"])
@@ -313,6 +343,11 @@ def _worker_fused_direct_tp2_pcp2(env: dict[str, str]) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
+def test_pcp_peer_cache_fence_cudagraph_replay():
+    _distributed_run(_worker_peer_fence_cudagraph, world_size=2)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
 def test_fused_direct_fp8_ds_mla_indexer_pcp2():
     _distributed_run(_worker_fused_direct_matches_gather_insert, world_size=2)
 
@@ -325,3 +360,57 @@ def test_fused_direct_fp8_ds_mla_indexer_pcp4():
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
 def test_fused_direct_fp8_ds_mla_indexer_tp2_pcp2_subgroups():
     _distributed_run(_worker_fused_direct_tp2_pcp2, world_size=4)
+
+
+def _worker_copy_cache_rows_to_peers(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    rank = int(env["RANK"])
+    world_size = int(env["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    from vllm.distributed.device_communicators.symm_mem import allocate_symm_mem_peer
+    from vllm.model_executor.layers.attention.pcp_direct_kv import (
+        PCPPeerCacheFence,
+        copy_pcp_cache_rows_to_peers,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    block_size, num_blocks, row_nbytes = 4, 4, 17
+    prefix_nbytes = 37
+    cache_nbytes = block_size * num_blocks * row_nbytes
+    allocation = allocate_symm_mem_peer(
+        (prefix_nbytes + cache_nbytes,), torch.uint8, device, dist.group.WORLD
+    )
+    allocation.storage.zero_()
+    cache = allocation.storage[prefix_nbytes:].view(num_blocks, block_size, row_nbytes)
+    slots = torch.tensor([rank * 2, rank * 2 + 1, -1], dtype=torch.int64, device=device)
+    flat_cache = cache.view(-1, row_nbytes)
+    flat_cache[slots[0]].fill_(rank * 10 + 1)
+    flat_cache[slots[1]].fill_(rank * 10 + 2)
+    dist.barrier()
+
+    copy_pcp_cache_rows_to_peers(
+        cache,
+        slots,
+        allocation.peer_ptrs_for_view(cache),
+        rank,
+        block_size,
+    )
+    fence = PCPPeerCacheFence(dist.group.WORLD, device)
+    fence()
+    torch.cuda.synchronize()
+
+    expected = torch.zeros_like(flat_cache)
+    for source_rank in range(world_size):
+        expected[source_rank * 2].fill_(source_rank * 10 + 1)
+        expected[source_rank * 2 + 1].fill_(source_rank * 10 + 2)
+    assert torch.equal(flat_cache, expected)
+    assert bool((allocation.storage[:prefix_nbytes] == 0).all().item())
+    fence.close()
+    allocation.close()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
+def test_copy_cache_rows_to_peers_two_gpu():
+    _distributed_run(_worker_copy_cache_rows_to_peers, world_size=2)
