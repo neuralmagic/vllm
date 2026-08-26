@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
@@ -77,13 +78,18 @@ class DraftModelSpeculator(BaseSpeculator):
         target_parallel_config = vllm_config.parallel_config
         self.replicated_pcp = target_parallel_config.prefill_context_parallel_size > 1
         if self.replicated_pcp:
-            vllm_config = replace(
-                vllm_config,
-                parallel_config=replace(
-                    target_parallel_config,
-                    prefill_context_parallel_size=1,
-                ),
+            # Shallow-copy rather than dataclasses.replace: re-validation would
+            # reject DCP spanning the PCP group (dcp = tp * pcp > tp) once PCP
+            # is cleared, but the drafter must keep the target's DCP view since
+            # its context KV is written through the runner's DCP-sharded block
+            # tables and its attention reduces over the same DCP group.
+            draft_parallel_config = copy.copy(target_parallel_config)
+            draft_parallel_config.prefill_context_parallel_size = 1
+            draft_parallel_config.world_size = (
+                target_parallel_config.pipeline_parallel_size
+                * target_parallel_config.tensor_parallel_size
             )
+            vllm_config = replace(vllm_config, parallel_config=draft_parallel_config)
         self.vllm_config = vllm_config
         self.device = device
 
