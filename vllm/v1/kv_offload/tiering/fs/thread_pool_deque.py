@@ -124,6 +124,7 @@ class TPDequeBalancedBatch(_TPDeque):
             self._qs[i] = []
         self._fetch_cursor = 0
         self._make_batch_fn = None
+        self._len = 0
 
     def __len__(self) -> int:
         return self._len
