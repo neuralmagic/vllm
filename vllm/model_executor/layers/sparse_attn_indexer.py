@@ -455,10 +455,9 @@ def sparse_attn_indexer(
         topk_indices_buffer[: hidden_states.shape[0]] = -1
     local_topk_indices_buffer = topk_indices_buffer
     if pcp_token_sharded:
-        if has_decode:
-            raise NotImplementedError(
-                "PCP x DCP sparse indexer does not support decode tokens yet."
-            )
+        # Decode rows are replicated on every PCP rank and ordered first in both
+        # the local and the global batch, so the global-order gather below keeps
+        # them consistent with the existing DCP decode path.
         pcp_group = get_pcp_group()
         restore_idx = attn_metadata_narrowed.pcp_restore_idx
         assert restore_idx is not None
