@@ -1536,6 +1536,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     batch_req_state.num_scheduled_tokens,
                     batch_req_state.is_prefilling_np,
                 )
+        elif dummy_run and self.pcp_manager is not None:
+            # Dummy/profile runs size each PCP rank like a real step would: the
+            # global chunk is partitioned across the PCP ranks, so the per-rank
+            # activation peak is ~num_toks / pcp, not the whole chunk.
+            dummy_nst = np.fromiter(
+                scheduler_output.num_scheduled_tokens.values(), dtype=np.int32
+            )
+            num_toks = self.pcp_manager.get_num_tokens_for_dispatch(
+                dummy_nst, np.ones(len(dummy_nst), dtype=np.bool_)
+            )
 
         num_active_loras = 0
         if self.lora_config:
@@ -1597,7 +1607,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
-            dummy_num_reqs = batch_desc.num_reqs or num_reqs
+            dummy_num_reqs = min(batch_desc.num_reqs or num_reqs, batch_desc.num_tokens)
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
                 batch_desc.num_tokens,
