@@ -9,7 +9,7 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -508,15 +508,39 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
-        if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
-            if isinstance(mqa_q_arg, tuple):
-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-            mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
-        attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
-            mqa_q_arg, kv_cache, attn_metadata, self
-        )
+        if (
+            self.use_pcp
+            and self.impl.dcp_world_size > 1
+            and self.impl.dcp_world_size == self.impl.pcp_world_size
+        ):
+            # DCP spans the PCP group: queries are token-partitioned and the KV
+            # cache is block-sharded, so gather along tokens, attend to the local
+            # shard and reduce-scatter the LSE-merged output (no head gather).
+            pcp_group = get_pcp_group()
+            num_padded = layer_slot_mapping.shape[0] // pcp_group.world_size
+            if self._fp8_query:
+                mqa_q_full: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = mqa_q[
+                    :num_padded
+                ]
+            else:
+                mqa_q_full = (ql_nope[:num_padded], mqa_q[:num_padded])
+            attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
+                mqa_q_full, kv_cache, attn_metadata, pcp_group, num_padded
+            )
+        else:
+            if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
+                if isinstance(mqa_q_arg, tuple):
+                    mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+                mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+            attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                mqa_q_arg, kv_cache, attn_metadata, self
+            )
 
-        if self.use_pcp and self.impl.dcp_world_size > 1:
+        if (
+            self.use_pcp
+            and self.impl.dcp_world_size > 1
+            and self.impl.dcp_world_size != self.impl.pcp_world_size
+        ):
             assert lse is not None and self.dcp_manager is not None
             seq_lens = (
                 attn_metadata.decode.seq_lens
