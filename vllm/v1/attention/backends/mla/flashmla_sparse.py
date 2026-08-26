@@ -942,6 +942,36 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         lse = lse[:, :actual_num_heads]
         return output, lse
 
+    def _token_sharded_kernel_meta(
+        self,
+        num_all: int,
+        width: int,
+        padded_heads: int,
+        base_meta: "FlashMLASparseMetadata.FP8KernelMetadata",
+        device: torch.device,
+    ) -> "FlashMLASparseMetadata.FP8KernelMetadata":
+        cache = getattr(self, "_token_sharded_meta_cache", None)
+        if cache is None:
+            cache = self._token_sharded_meta_cache = {}
+        key = (num_all, width)
+        meta = cache.get(key)
+        if meta is None:
+            scheduler_metadata, _ = get_mla_metadata(
+                cache_seqlens=torch.full((1,), width, dtype=torch.int32, device=device),
+                num_q_tokens_per_head_k=num_all * padded_heads,
+                topk=width,
+                num_heads_q=padded_heads,
+                num_heads_k=1,
+                is_fp8_kvcache=True,
+            )
+            meta = FlashMLASparseMetadata.FP8KernelMetadata(
+                scheduler_metadata=scheduler_metadata,
+                cache_lens=base_meta.cache_lens,
+                dummy_block_table=base_meta.dummy_block_table,
+            )
+            cache[key] = meta
+        return meta
+
     # Rows per rank gathered per kernel launch on the token-sharded PCP x DCP path;
     # bounds the transient (q, top-k, out, lse) footprint to ~0.5 GiB at 8 ranks.
     TOKEN_SHARDED_ROWS_PER_RANK = 512
@@ -1017,13 +1047,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         else:
             gathered_req_id = gathered_req_id.view(world_size, num_padded_tokens)
         topk = topk_local.shape[1]
-        topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
         if not hasattr(self, "_token_sharded_cp_ctx"):
             self._token_sharded_cp_ctx = CPTritonContext()
 
         out_chunks = []
         rows = self.TOKEN_SHARDED_ROWS_PER_RANK
-        sched_cache: dict[int, FlashMLASparseMetadata.FP8KernelMetadata] = {}
         for start in range(0, num_padded_tokens, rows):
             stop = min(start + rows, num_padded_tokens)
             n = stop - start
@@ -1054,29 +1082,20 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 return_valid_counts=True,
                 compact_valid_to_front=True,
             )
-            topk_length = valid_counts.amax().clamp_(min=1).view(1).to(torch.int32)
-            kernel_meta = sched_cache.get(num_all)
-            if kernel_meta is None:
-                scheduler_metadata, _ = get_mla_metadata(
-                    cache_seqlens=topk_tensor,
-                    num_q_tokens_per_head_k=num_all * padded_heads,
-                    topk=topk,
-                    num_heads_q=padded_heads,
-                    num_heads_k=1,
-                    is_fp8_kvcache=True,
-                )
-                kernel_meta = FlashMLASparseMetadata.FP8KernelMetadata(
-                    scheduler_metadata=scheduler_metadata,
-                    cache_lens=base_meta.cache_lens,
-                    dummy_block_table=base_meta.dummy_block_table,
-                )
-                sched_cache[num_all] = kernel_meta
+            # The fp8 sparse kernel has no per-row length; narrow the index tensor
+            # to the longest valid prefix in this chunk instead (rounded up to
+            # 128 columns). One small device->host sync per layer-step.
+            width = int(valid_counts.amax().item())
+            width = min(topk, max(128, (width + 127) // 128 * 128))
+            topk_all = topk_all[:, :width]
+            kernel_meta = self._token_sharded_kernel_meta(
+                num_all, width, padded_heads, base_meta, q.device
+            )
             _out, _lse = self._fp8_flash_mla_kernel(
                 q=q_all.unsqueeze(0),
                 kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
-                topk_indices=topk_all.unsqueeze(0),
+                topk_indices=topk_all.contiguous().unsqueeze(0),
                 kernel_metadata=kernel_meta,
-                topk_length=topk_length,
             )
             out = _out.squeeze(0)
             lse = _lse.squeeze(0).transpose(0, 1).contiguous()
