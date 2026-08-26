@@ -91,6 +91,7 @@ class DSparkSpeculator(DFlashSpeculator):
         target_model: torch.nn.Module,
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
+        self._validate_query_capacity()
         model = load_dspark_model(target_model, self.vllm_config)
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a

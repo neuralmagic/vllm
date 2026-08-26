@@ -160,7 +160,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
+        self._validate_query_capacity()
         return load_dflash_model(target_model, self.vllm_config)
+
+    def _validate_query_capacity(self) -> None:
+        """Fail fast when the draft query buffers cannot hold a full batch.
+
+        Every request emits ``num_query_per_req`` draft query tokens per step, but
+        the drafter's input buffers are sized at ``max_num_batched_tokens``. A
+        batch of ``max_num_seqs`` requests (e.g. the profile run, or many short
+        chunks on a prefill-heavy instance) then indexes past the end of those
+        buffers and dies with a device-side assert instead of a clear error.
+        """
+        needed = self.max_num_reqs * self.num_query_per_req
+        if needed <= self.max_num_tokens:
+            return
+        raise ValueError(
+            f"{self._speculator_name} drafts {self.num_query_per_req} query tokens "
+            f"per request, so max_num_seqs ({self.max_num_reqs}) x "
+            f"{self.num_query_per_req} = {needed} draft tokens per step, which "
+            f"exceeds max_num_batched_tokens ({self.max_num_tokens}). Set "
+            f"--max-num-seqs <= {self.max_num_tokens // self.num_query_per_req} "
+            "or raise --max-num-batched-tokens."
+        )
 
     def set_attn(
         self,
