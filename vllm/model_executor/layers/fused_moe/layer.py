@@ -257,6 +257,12 @@ def FusedMoEFactory(
         )
 
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    # Under PCP the scheduler's chunk is partitioned across the PCP ranks, so no
+    # rank ever feeds more than ceil(chunk / pcp) tokens into its MoE layers;
+    # sizing the dispatch buffers/workspaces by the whole chunk wastes pcp x memory.
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    if pcp_size > 1:
+        max_num_batched_tokens = -(-max_num_batched_tokens // pcp_size)
 
     # Create ExpertMapManager to handle expert mapping and placement for EP.
     # See ExpertMapManager for a detailed description of what it does and when
