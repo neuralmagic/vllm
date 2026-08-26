@@ -983,8 +983,14 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         attn_metadata: FlashMLASparseMetadata,
         cp_group: GroupCoordinator,
         num_padded_tokens: int,
+        w_uv: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sparse MQA attention when DCP spans the PCP group (dcp == pcp, tp == 1).
+
+        If `w_uv` ([H, kv_lora_rank, v_head_dim]) is given, the per-rank partial
+        outputs are projected through it *before* the LSE merge and the
+        reduce-scatter (both are linear in the output), which shrinks the
+        reduce-scatter 4x; the returned tensor is then [num_actual, H, v_head_dim].
 
         Queries are token-partitioned across the group while the KV cache is
         block-sharded, so no rank can attend to its own queries alone. In row
@@ -1034,9 +1040,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Dummy runs carry no global request map: simulate the gathered batch
         # from local rows (same kernel shapes and transient memory, no NCCL).
         simulate = gathered_req_id is None or global_block_table is None
+        out_dim = 512 if w_uv is None else w_uv.shape[-1]
         if simulate:
             if num_actual == 0:
-                return q.new_zeros((0, num_heads, 512), dtype=torch.bfloat16)
+                return q.new_zeros((0, num_heads, out_dim), dtype=torch.bfloat16)
             local_req = attn_metadata.req_id_per_token[:num_padded_tokens]
             if local_req.shape[0] < num_padded_tokens:
                 local_req = torch.nn.functional.pad(
@@ -1059,9 +1066,23 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 q_all = q[start:stop].repeat(world_size, 1, 1)
                 topk_all = topk_local[start:stop].repeat(world_size, 1)
             else:
-                q_all = cp_group.all_gather(q[start:stop].contiguous(), dim=0)
-                topk_all = cp_group.all_gather(
-                    topk_local[start:stop].contiguous(), dim=0
+                # One all-gather for q (fp8 bytes) and the top-k (int32 bytes):
+                # these collectives are latency-bound, so pack them.
+                q_bytes = q[start:stop].reshape(n, -1).view(torch.uint8)
+                topk_bytes = topk_local[start:stop].view(torch.uint8)
+                packed = torch.cat((q_bytes, topk_bytes), dim=1)
+                packed_all = cp_group.all_gather(packed, dim=0)
+                q_all = (
+                    packed_all[:, : q_bytes.shape[1]]
+                    .contiguous()
+                    .view(q.dtype)
+                    .view(num_all, num_heads, q.shape[-1])
+                )
+                topk_all = (
+                    packed_all[:, q_bytes.shape[1] :]
+                    .contiguous()
+                    .view(torch.int32)
+                    .view(num_all, topk)
                 )
             req_all = gathered_req_id[:, start:stop].reshape(-1).contiguous()
             num_all = n * world_size
@@ -1100,6 +1121,9 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 kernel_metadata=kernel_meta,
             )
             out = _out.squeeze(0)
+            if w_uv is not None:
+                # [rows, H, 512] -> [H, rows, 512] @ [H, 512, v] -> [rows, H, v]
+                out = torch.bmm(out.transpose(0, 1), w_uv).transpose(0, 1).contiguous()
             lse = _lse.squeeze(0).transpose(0, 1).contiguous()
             # Rows with no selected token on this shard: (0, -inf) is the identity
             # of the cross-rank LSE merge. Rare for real prefills (top-k spans all

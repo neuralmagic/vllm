@@ -528,11 +528,21 @@ class DeepseekV32Attention(MLAAttention):
             else:
                 mqa_q_full = (ql_nope[:num_padded], mqa_q[:num_padded])
             attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
-                mqa_q_full, kv_cache, attn_metadata, pcp_group, num_padded
+                mqa_q_full,
+                kv_cache,
+                attn_metadata,
+                pcp_group,
+                num_padded,
+                w_uv=self.W_UV,
             )
-            if num_actual == 0:
-                output.zero_()
-                return
+            # Already projected through W_UV (before the cross-rank merge).
+            if num_actual > 0:
+                output[:num_actual].view(
+                    num_actual, self.num_local_heads, self.v_head_dim
+                ).copy_(attn_out)
+            if num_actual < output.shape[0]:
+                output[num_actual:].zero_()
+            return
         else:
             if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
                 if isinstance(mqa_q_arg, tuple):

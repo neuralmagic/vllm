@@ -49,6 +49,7 @@ def _pcp_dcp_log(msg: str) -> None:
     if _PCP_DCP_DEBUG:
         logger.info("[pcp-dcp] %s", msg)
 
+
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
@@ -470,12 +471,23 @@ def sparse_attn_indexer(
         )
         # Gather this rank's (padded) rows from every rank, then reorder the
         # rank-major result into global batch order.
-        q_quant = pcp_group.all_gather(q_quant[:num_tokens].contiguous(), dim=0)[
-            restore_idx
-        ]
-        weights = pcp_group.all_gather(weights[:num_tokens].contiguous(), dim=0)[
-            restore_idx
-        ]
+        # One packed all-gather for q (fp8 bytes) and the fp32 weights.
+        q_shape = q_quant.shape[1:]
+        q_bytes = q_quant[:num_tokens].reshape(num_tokens, -1).view(torch.uint8)
+        w_bytes = weights[:num_tokens].contiguous().view(torch.uint8)
+        packed = pcp_group.all_gather(torch.cat((q_bytes, w_bytes), dim=1), dim=0)
+        q_quant = (
+            packed[:, : q_bytes.shape[1]]
+            .contiguous()
+            .view(q_quant.dtype)
+            .view(-1, *q_shape)[restore_idx]
+        )
+        weights = (
+            packed[:, q_bytes.shape[1] :]
+            .contiguous()
+            .view(weights.dtype)
+            .view(-1, weights.shape[1])[restore_idx]
+        )
         if q_scale is not None:
             q_scale = pcp_group.all_gather(q_scale[:num_tokens].contiguous(), dim=0)[
                 restore_idx
