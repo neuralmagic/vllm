@@ -1085,8 +1085,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             # The fp8 sparse kernel has no per-row length; narrow the index tensor
             # to the longest valid prefix in this chunk instead (rounded up to
             # 128 columns). One small device->host sync per layer-step.
-            width = int(valid_counts.amax().item())
-            width = min(topk, max(128, (width + 127) // 128 * 128))
+            min_valid, max_valid = torch.stack(
+                (valid_counts.amin(), valid_counts.amax())
+            ).tolist()
+            width = min(topk, max(128, (int(max_valid) + 127) // 128 * 128))
             topk_all = topk_all[:, :width]
             kernel_meta = self._token_sharded_kernel_meta(
                 num_all, width, padded_heads, base_meta, q.device
@@ -1100,10 +1102,12 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             out = _out.squeeze(0)
             lse = _lse.squeeze(0).transpose(0, 1).contiguous()
             # Rows with no selected token on this shard: (0, -inf) is the identity
-            # of the cross-rank LSE merge.
-            empty_rows = valid_counts == 0
-            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            # of the cross-rank LSE merge. Rare for real prefills (top-k spans all
+            # shards), so only pay for the 268 MB pass when it happens.
+            if int(min_valid) == 0:
+                empty_rows = valid_counts == 0
+                out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+                lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
             out = out.contiguous()
             if simulate:
                 lses = lse.unsqueeze(0).expand(world_size, -1, -1).contiguous()
