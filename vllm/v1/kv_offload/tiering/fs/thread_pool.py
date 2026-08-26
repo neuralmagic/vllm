@@ -167,6 +167,9 @@ class DualQueueThreadPool:
         self._threads: list[threading.Thread] = []
         self._inflight_jobs = 0  # guarded by _condition
         self._job_state: dict[JobId, JobState] = {}
+        # Finished-but-not-yet-reported jobs, guarded by _condition. Populated
+        # by _pump(), drained by get_finished().
+        self._finished_q: list[tuple[JobId, bool, float, list[OffloadKey]]] = []
 
         self._tracker: BatchResultsTracker = BatchResultsTracker()
 
@@ -197,6 +200,11 @@ class DualQueueThreadPool:
         tasks: list[Task],
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
+        if len(tasks) == 0:
+            with self._condition:
+                self._finished_q.append((job_id, True, 0.0, []))
+                return
+
         state = JobState(job_id, len(tasks))
         with self._condition:
             self._inflight_jobs += 1
@@ -221,28 +229,52 @@ class DualQueueThreadPool:
     ) -> None:
         self._enqueue(self._store_q, job_id, tasks, make_batch_fn)
 
-    def get_finished(self) -> Iterable[tuple[JobId, bool, float, list[OffloadKey]]]:
-        finished_jobs = 0
+    def _pump(self) -> None:
+        """Discover newly finished jobs and buffer their results in
+        ``_finished_q`` for ``get_finished()`` to hand back later.
+
+        Nothing else drives completion discovery on its own -- I/O results
+        only become visible by actively polling ``self._tracker``. Safe to
+        call from any thread, repeatedly; a call that finds nothing new is
+        a cheap no-op.
+        """
+        newly_finished: list[tuple[JobId, bool, float, list[OffloadKey]]] = []
         for task, success in self._tracker.drain():
             state = self._job_state[task.job_id]
             finished, success, transfer_time = state.task_done(task, success, 0.0)
             if finished:
                 self._job_state.pop(task.job_id)
-                finished_jobs += 1
-                yield task.job_id, success, transfer_time, state._failed_keys
-        with self._condition:
-            self._inflight_jobs -= finished_jobs
+                newly_finished.append(
+                    (task.job_id, success, transfer_time, state._failed_keys)
+                )
+        if newly_finished:
+            with self._condition:
+                self._finished_q.extend(newly_finished)
+                self._inflight_jobs -= len(newly_finished)
+                self._condition.notify_all()
 
-    def wait_idle(self) -> None:
+    def get_finished(self) -> Iterable[tuple[JobId, bool, float, list[OffloadKey]]]:
+        self._pump()
+        with self._condition:
+            finished, self._finished_q = self._finished_q, []
+        yield from finished
+
+    def wait_idle(self, poll_interval: float = 0.001) -> None:
         """Block until there are no in-flight jobs.
 
+        Actively pumps I/O-completion status itself -- nothing else does
+        so on its own -- so this is always safe to call and will not hang.
         After this returns, every submitted job has had its last task
         finish, so no worker thread is still copying data. Note:
         completed jobs may still be sitting in ``_finished_q`` waiting
         for ``get_finished()`` to drain them.
         """
-        with self._condition:
-            self._condition.wait_for(lambda: self._inflight_jobs == 0)
+        while True:
+            self._pump()
+            with self._condition:
+                if self._inflight_jobs == 0:
+                    return
+                self._condition.wait(timeout=poll_interval)
 
     def shutdown(self, wait: bool = True) -> None:
         with self._condition:
@@ -252,6 +284,7 @@ class DualQueueThreadPool:
             # Cancelled tasks will not decrement _inflight_jobs; reset it so a
             # subsequent wait_idle() returns instead of hanging.
             self._inflight_jobs = 0
+            self._finished_q.clear()
             self._condition.notify_all()
         if wait:
             for t in self._threads:
@@ -277,3 +310,8 @@ class DualQueueThreadPool:
                     "Block I/O failed: %s",
                     exc,
                 )
+            finally:
+                # Wake any wait_idle() poller so it re-pumps promptly instead
+                # of waiting out its poll_interval.
+                with self._condition:
+                    self._condition.notify_all()
