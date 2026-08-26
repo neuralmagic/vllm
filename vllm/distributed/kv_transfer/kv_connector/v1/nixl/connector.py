@@ -165,11 +165,14 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.kv_transfer_config.kv_role == "kv_producer"
             and parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.decode_context_parallel_size == 1
         ):
+            # Replicated-KV PCP producer: only PCP rank 0 takes part in transfers.
             return (
                 parallel_config.tensor_parallel_size
                 * parallel_config.pipeline_parallel_size
             )
+        # DCP-sharded PCP producers report from every PCP x TP rank (world_size).
         return None
 
     def get_num_new_matched_tokens(
