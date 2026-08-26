@@ -162,6 +162,14 @@ class DualQueueThreadPool:
             yield tasks[start : start + bs]
             start += bs
 
+    def _add_barrier(self, q: deque):
+        "must hold self._condition"
+        q.append((None, None, None))
+
+    def _pop_barrier(self, q: deque):
+        if q and q[0][0] is None:
+            q.popleft()
+
     def _enqueue(
         self,
         queue: deque,
@@ -170,6 +178,7 @@ class DualQueueThreadPool:
         tasks: Iterable[Task],
         n_tasks: int,
         n_threads: int,
+        add_barrier: bool = True,
     ) -> None:
         """Batch `tasks` and append (fn, state, batch_size) entries to `queue`."""
         if n_tasks == 0:
@@ -184,6 +193,9 @@ class DualQueueThreadPool:
             for batch in self._batch_tasks(task_lst, n_threads):
                 queue.append((make_batch_fn(batch), len(batch), state))
                 n_batches += 1
+
+            if add_barrier:
+                self._add_barrier(queue)
             self._condition.notify(n_batches)
 
     def enqueue_load(
@@ -261,22 +273,33 @@ class DualQueueThreadPool:
     def _worker(self, priority: Priority) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
 
+        # Has work predicate
+        def _q_has_work(q: deque):
+            return q and q[0][0] is not None
+
+        def _has_work():
+            if priority == Priority.WRITE_EXCL:
+                return _q_has_work(self._store_q)
+            return _q_has_work(self._load_q) or _q_has_work(self._store_q)
+
         def _get_work_queue():
             if priority == Priority.WRITE_EXCL:
                 return self._store_q
             primary = self._load_q if priority == Priority.READ else self._store_q
             secondary = self._store_q if priority == Priority.READ else self._load_q
-            return primary or secondary
-
-        def _has_work():
-            return bool(_get_work_queue())
+            if _q_has_work(primary):
+                return primary
+            assert _q_has_work(secondary)
+            return secondary
 
         while True:
             with self._condition:
                 self._condition.wait_for(lambda: self._stop or _has_work())
                 if self._stop:
                     return
-                fn, batch_size, state = _get_work_queue().popleft()
+                q = _get_work_queue()
+                fn, batch_size, state = q.popleft()
+                assert fn is not None
             try:
                 start_time = time.monotonic()
                 fn()
@@ -298,5 +321,6 @@ class DualQueueThreadPool:
             if job_finished:
                 with self._condition:
                     self._finished_q.append((state.job_id, success, total_time))
+                    self._pop_barrier(q)
                     self._inflight_jobs -= 1
                     self._condition.notify_all()
