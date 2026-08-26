@@ -999,10 +999,21 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             topk_local[num_actual:].fill_(-1)
         gathered_req_id = attn_metadata.pcp_gathered_req_id
         global_block_table = attn_metadata.pcp_global_block_table
-        assert gathered_req_id is not None and global_block_table is not None, (
-            "PCP x DCP sparse attention needs the global request map from the PCP manager"
-        )
-        gathered_req_id = gathered_req_id.view(world_size, num_padded_tokens)
+        # Dummy runs carry no global request map: simulate the gathered batch
+        # from local rows (same kernel shapes and transient memory, no NCCL).
+        simulate = gathered_req_id is None or global_block_table is None
+        if simulate:
+            if num_actual == 0:
+                return q.new_zeros((0, num_heads, 512), dtype=torch.bfloat16)
+            local_req = attn_metadata.req_id_per_token[:num_padded_tokens]
+            if local_req.shape[0] < num_padded_tokens:
+                local_req = torch.nn.functional.pad(
+                    local_req, (0, num_padded_tokens - local_req.shape[0])
+                )
+            gathered_req_id = local_req.unsqueeze(0).expand(world_size, -1)
+            global_block_table = attn_metadata.block_table
+        else:
+            gathered_req_id = gathered_req_id.view(world_size, num_padded_tokens)
         topk = topk_local.shape[1]
         topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
         if not hasattr(self, "_token_sharded_cp_ctx"):
@@ -1014,8 +1025,14 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         for start in range(0, num_padded_tokens, rows):
             stop = min(start + rows, num_padded_tokens)
             n = stop - start
-            q_all = cp_group.all_gather(q[start:stop].contiguous(), dim=0)
-            topk_all = cp_group.all_gather(topk_local[start:stop].contiguous(), dim=0)
+            if simulate:
+                q_all = q[start:stop].repeat(world_size, 1, 1)
+                topk_all = topk_local[start:stop].repeat(world_size, 1)
+            else:
+                q_all = cp_group.all_gather(q[start:stop].contiguous(), dim=0)
+                topk_all = cp_group.all_gather(
+                    topk_local[start:stop].contiguous(), dim=0
+                )
             req_all = gathered_req_id[:, start:stop].reshape(-1).contiguous()
             num_all = n * world_size
 
@@ -1060,7 +1077,12 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             empty_rows = (topk_all == -1).all(dim=-1)
             out = out.masked_fill(empty_rows.view(-1, 1, 1), 0.0).contiguous()
             lse = lse.masked_fill(empty_rows.view(-1, 1), float("-inf")).contiguous()
-            lses = cp_group.all_gather(lse, dim=0).view(world_size, num_all, num_heads)
+            if simulate:
+                lses = lse.unsqueeze(0).expand(world_size, -1, -1).contiguous()
+            else:
+                lses = cp_group.all_gather(lse, dim=0).view(
+                    world_size, num_all, num_heads
+                )
             out, _ = correct_attn_out(
                 out,
                 lses,
@@ -1070,7 +1092,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             )
             # Rows are ordered by rank, so a token-dim reduce-scatter hands every
             # rank the merged output of exactly its own slice of this chunk.
-            out_chunks.append(cp_group.reduce_scatter(out, dim=0))
+            if simulate:
+                out_chunks.append(out[:n].contiguous())
+            else:
+                out_chunks.append(cp_group.reduce_scatter(out, dim=0))
         out_local = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
         _pcp_dcp_log(f"attn rank={rank} done chunks={len(out_chunks)}")
         return out_local[:num_actual]

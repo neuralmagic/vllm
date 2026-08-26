@@ -674,6 +674,11 @@ class PCPManager:
             or self._hidden_restore_idx is None
         ):
             return attn_metadata
+        if dummy_run:
+            # Dummy batches are built directly (not partitioned), so there is no
+            # global batch to describe. The sparse paths then run a local-only
+            # simulation with the same shapes/memory and no cross-rank gathers.
+            return attn_metadata
         indexer_groups = [
             [g for g in groups if g.backend.get_name() == "DEEPSEEK_V32_INDEXER"]
             for groups in attn_groups
