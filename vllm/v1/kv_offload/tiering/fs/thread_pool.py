@@ -11,6 +11,7 @@ Thread pool:
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
 from typing import TypeAlias
 
 import numpy as np
@@ -19,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.base import JobId
 from vllm.v1.kv_offload.tiering.fs.thread_pool_deque import (
+    TPDeque,
     TPDequeBalancedBatch,
     _TPDeque,
 )
@@ -31,6 +33,12 @@ except ImportError:
     _HAS_FSIO_C = False
 
 logger = init_logger(__name__)
+
+
+class Priority(Enum):
+    READ = 1
+    WRITE = 2
+    WRITE_EXCL = 3
 
 
 @dataclass
@@ -161,10 +169,11 @@ class DualQueueThreadPool:
         self,
         n_read_threads: int,
         n_write_threads: int,
+        n_write_excl_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
         self._load_q: TPDequeBalancedBatch = TPDequeBalancedBatch(n_read_threads)
-        self._store_q: TPDequeBalancedBatch = TPDequeBalancedBatch(n_write_threads)
+        self._store_q: TPDeque = TPDeque(n_write_threads)
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
@@ -179,7 +188,7 @@ class DualQueueThreadPool:
         for i in range(n_read_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(True,),
+                args=(Priority.READ,),
                 name=f"{thread_name_prefix}_l{i}",
                 daemon=True,
             )
@@ -189,8 +198,18 @@ class DualQueueThreadPool:
         for i in range(n_write_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(False,),
+                args=(Priority.WRITE,),
                 name=f"{thread_name_prefix}_s{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        for i in range(n_write_excl_threads):
+            t = threading.Thread(
+                target=self._worker,
+                args=(Priority.WRITE_EXCL,),
+                name=f"{thread_name_prefix}_se{i}",
                 daemon=True,
             )
             t.start()
@@ -213,7 +232,7 @@ class DualQueueThreadPool:
             self._inflight_jobs += 1
             self._job_state[job_id] = state
             q.submit(tasks, make_batch_fn)
-            self._condition.notify(len(tasks))
+            self._condition.notify_all()
 
     def enqueue_load(
         self,
@@ -262,7 +281,7 @@ class DualQueueThreadPool:
             finished, self._finished_q = self._finished_q, []
         yield from finished
 
-    def wait_idle(self, poll_interval: float = 0.001) -> None:
+    def wait_idle(self, poll_interval: float = 0.01) -> None:
         """Block until there are no in-flight jobs.
 
         Actively pumps I/O-completion status itself -- nothing else does
@@ -293,18 +312,34 @@ class DualQueueThreadPool:
             for t in self._threads:
                 t.join()
 
-    def _worker(self, load_priority: bool) -> None:
+    def _worker(self, priority: Priority) -> None:
+        # Has work predicate
+        def _q_has_work(q: _TPDeque):
+            return len(q) > 0
+
+        def _has_work():
+            if priority == Priority.WRITE_EXCL:
+                return _q_has_work(self._store_q)
+            return _q_has_work(self._load_q) or _q_has_work(self._store_q)
+
+        def _get_work_queue() -> _TPDeque:
+            if priority == Priority.WRITE_EXCL:
+                return self._store_q
+            primary = self._load_q if priority == Priority.READ else self._store_q
+            secondary = self._store_q if priority == Priority.READ else self._load_q
+            if _q_has_work(primary):
+                return primary
+            assert _q_has_work(secondary)
+            return secondary
+
         # Wait for tasks, process from primary queue first, fall back to secondary.
         while True:
             with self._condition:
-                self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
-                )
+                self._condition.wait_for(lambda: self._stop or _has_work())
                 if self._stop:
                     return
-                primary = self._load_q if load_priority else self._store_q
-                secondary = self._store_q if load_priority else self._load_q
-                fn, tasks = primary.fetch() if primary else secondary.fetch()
+                q = _get_work_queue()
+                fn, tasks = q.fetch()
             try:
                 _, results = self._tracker.new_tracker(tasks)
                 fn(results=results)

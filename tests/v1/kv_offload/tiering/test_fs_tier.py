@@ -445,7 +445,9 @@ def test_store_load_roundtrip_without_o_direct(tmp_path, monkeypatch):
 
 def test_wait_idle_blocks_until_tasks_complete():
     """wait_idle must not return while a task is still in flight."""
-    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+    pool = DualQueueThreadPool(
+        n_read_threads=1, n_write_threads=1, n_write_excl_threads=1
+    )
     gate = threading.Event()
 
     def make_batch_fn(x):
