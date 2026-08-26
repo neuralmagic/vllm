@@ -61,6 +61,7 @@ def _pcp_dcp_log(msg: str) -> None:
     if _PCP_DCP_DEBUG:
         logger.info("[pcp-dcp] %s", msg)
 
+
 # For FP8 sparse attention we have two implementations:
 # 1. Mixed batch mode: use the FP8 decode kernel for both prefill and decode this is
 #    done by treating all tokens as single batch.
@@ -160,6 +161,11 @@ class FlashMLASparseMetadata(AttentionMetadata):
     num_prefills: int = 0
     num_decode_tokens: int = 0
     seq_lens: torch.Tensor | None = None
+    # DCP spanning the PCP group (dcp == pcp): global request id per gathered row
+    # (rank-major, pcp x padded rows) and the global-batch block table, filled in
+    # by the PCP manager. Per-rank request ids/block tables are local under PCP.
+    pcp_gathered_req_id: torch.Tensor | None = None
+    pcp_global_block_table: torch.Tensor | None = None
     prefill_max_seq_len: int = 0
     prefill: MLACommonPrefillMetadata | None = None
     cp_kv_cache_interleave_size: int = 1
@@ -986,14 +992,17 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
 
         _pcp_dcp_log(
             f"attn rank={rank} num_padded={num_padded_tokens} num_actual={num_actual} "
-            f"q={tuple(q.shape)} topk_buf={tuple(self.topk_indices_buffer.shape)} "
-            f"req={tuple(attn_metadata.req_id_per_token.shape)}"
+            f"q={tuple(q.shape)} topk_buf={tuple(self.topk_indices_buffer.shape)}"
         )
         topk_local = self.topk_indices_buffer[:num_padded_tokens]
-        req_local = attn_metadata.req_id_per_token[:num_padded_tokens].clone()
         if num_actual < num_padded_tokens:
             topk_local[num_actual:].fill_(-1)
-            req_local[num_actual:] = 0
+        gathered_req_id = attn_metadata.pcp_gathered_req_id
+        global_block_table = attn_metadata.pcp_global_block_table
+        assert gathered_req_id is not None and global_block_table is not None, (
+            "PCP x DCP sparse attention needs the global request map from the PCP manager"
+        )
+        gathered_req_id = gathered_req_id.view(world_size, num_padded_tokens)
         topk = topk_local.shape[1]
         topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
         if not hasattr(self, "_token_sharded_cp_ctx"):
@@ -1007,13 +1016,13 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             n = stop - start
             q_all = cp_group.all_gather(q[start:stop].contiguous(), dim=0)
             topk_all = cp_group.all_gather(topk_local[start:stop].contiguous(), dim=0)
-            req_all = cp_group.all_gather(req_local[start:stop].contiguous(), dim=0)
+            req_all = gathered_req_id[:, start:stop].reshape(-1).contiguous()
             num_all = n * world_size
 
             # Keep this rank's shard of every token's top-k, mapped to local slots.
             topk_all = triton_filter_and_convert_dcp_index(
                 req_all,
-                attn_metadata.block_table,
+                global_block_table,
                 topk_all,
                 dcp_size=self.dcp_world_size,
                 dcp_rank=self.dcp_rank,

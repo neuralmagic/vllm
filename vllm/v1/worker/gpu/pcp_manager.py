@@ -678,7 +678,11 @@ class PCPManager:
             [g for g in groups if g.backend.get_name() == "DEEPSEEK_V32_INDEXER"]
             for groups in attn_groups
         ]
-        if not any(indexer_groups):
+        sparse_mla_groups = [
+            [g for g in groups if g.backend.get_name() == "FLASHMLA_SPARSE"]
+            for groups in attn_groups
+        ]
+        if not any(indexer_groups) and not any(sparse_mla_groups):
             return attn_metadata
         assert self._block_tables is not None
         global_batch = self._global_batch
@@ -706,6 +710,32 @@ class PCPManager:
             kv_cache_config,
         )
         num_padded = self._num_local_tokens_padded
+        # Global request id per gathered (rank-major, padded) row for the sparse
+        # MLA token-sharded attention; padding rows map to request 0 and carry
+        # top-k -1, so they never touch the cache.
+        global_req_id = torch.repeat_interleave(
+            torch.arange(global_batch.num_reqs, device=self.device, dtype=torch.int32),
+            torch.from_numpy(
+                global_batch.num_scheduled_tokens[: global_batch.num_reqs].astype(
+                    np.int64
+                )
+            ).to(self.device, non_blocking=True),
+        )
+        if global_req_id.shape[0] < num_global_tokens:
+            global_req_id = torch.nn.functional.pad(
+                global_req_id, (0, num_global_tokens - global_req_id.shape[0])
+            )
+        gathered_req_id = global_req_id[self._padded_gather_idx]
+        for i, groups in enumerate(sparse_mla_groups):
+            for g in groups:
+                for layer_name in g.layer_names:
+                    meta = attn_metadata.get(layer_name)
+                    if meta is None:
+                        continue
+                    meta.pcp_gathered_req_id = gathered_req_id
+                    meta.pcp_global_block_table = block_tables[i]
+        if not any(indexer_groups):
+            return attn_metadata
         _pcp_dcp_log(
             f"meta rank={self.pcp_rank} dummy={dummy_run} num_padded={num_padded} "
             f"local_tokens={input_batch.num_tokens} global_tokens={num_global_tokens} "
