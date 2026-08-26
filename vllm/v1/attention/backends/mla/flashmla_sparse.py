@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -51,6 +52,14 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 logger = init_logger(__name__)
+
+
+_PCP_DCP_DEBUG = os.environ.get("VLLM_PCP_DCP_DEBUG", "0") == "1"
+
+
+def _pcp_dcp_log(msg: str) -> None:
+    if _PCP_DCP_DEBUG:
+        logger.info("[pcp-dcp] %s", msg)
 
 # For FP8 sparse attention we have two implementations:
 # 1. Mixed batch mode: use the FP8 decode kernel for both prefill and decode this is
@@ -975,6 +984,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         padded_heads = self.fp8_decode_padded_heads
         num_heads = q.shape[1]
 
+        _pcp_dcp_log(
+            f"attn rank={rank} num_padded={num_padded_tokens} num_actual={num_actual} "
+            f"q={tuple(q.shape)} topk_buf={tuple(self.topk_indices_buffer.shape)} "
+            f"req={tuple(attn_metadata.req_id_per_token.shape)}"
+        )
         topk_local = self.topk_indices_buffer[:num_padded_tokens]
         req_local = attn_metadata.req_id_per_token[:num_padded_tokens].clone()
         if num_actual < num_padded_tokens:
@@ -1049,6 +1063,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             # rank the merged output of exactly its own slice of this chunk.
             out_chunks.append(cp_group.reduce_scatter(out, dim=0))
         out_local = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
+        _pcp_dcp_log(f"attn rank={rank} done chunks={len(out_chunks)}")
         return out_local[:num_actual]
 
     def forward_mqa(

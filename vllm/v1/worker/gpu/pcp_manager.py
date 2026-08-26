@@ -4,6 +4,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Any
 
+import os
+
 import numpy as np
 import torch
 
@@ -23,6 +25,14 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
+
+
+_PCP_DCP_DEBUG = os.environ.get("VLLM_PCP_DCP_DEBUG", "0") == "1"
+
+
+def _pcp_dcp_log(msg: str) -> None:
+    if _PCP_DCP_DEBUG:
+        logger.info("[pcp-dcp] %s", msg)
 
 
 @dataclass(frozen=True)
@@ -697,6 +707,11 @@ class PCPManager:
             kv_cache_config,
         )
         num_padded = self._num_local_tokens_padded
+        _pcp_dcp_log(
+            f"meta rank={self.pcp_rank} dummy={dummy_run} num_padded={num_padded} "
+            f"local_tokens={input_batch.num_tokens} global_tokens={num_global_tokens} "
+            f"global_reqs={global_batch.num_reqs} layers={list(global_metadata)[:1]}"
+        )
         start = self.pcp_rank * num_padded
         local_rows = self._padded_gather_idx[start : start + input_batch.num_tokens]
         for layer_name, meta in global_metadata.items():

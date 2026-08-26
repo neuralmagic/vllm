@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -38,6 +40,14 @@ from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+_PCP_DCP_DEBUG = os.environ.get("VLLM_PCP_DCP_DEBUG", "0") == "1"
+
+
+def _pcp_dcp_log(msg: str) -> None:
+    if _PCP_DCP_DEBUG:
+        logger.info("[pcp-dcp] %s", msg)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
@@ -452,6 +462,13 @@ def sparse_attn_indexer(
         pcp_group = get_pcp_group()
         restore_idx = attn_metadata_narrowed.pcp_restore_idx
         assert restore_idx is not None
+        _pcp_dcp_log(
+            f"indexer rank={pcp_group.rank_in_group} num_tokens={num_tokens} "
+            f"local_actual={pcp_local_num_actual} global={restore_idx.shape[0]} "
+            f"q={tuple(q_quant.shape)} w={tuple(weights.shape)} "
+            f"prefills={attn_metadata_narrowed.num_prefills} "
+            f"decodes={attn_metadata_narrowed.num_decodes}"
+        )
         # Gather this rank's (padded) rows from every rank, then reorder the
         # rank-major result into global batch order.
         q_quant = pcp_group.all_gather(q_quant[:num_tokens].contiguous(), dim=0)[
@@ -570,6 +587,7 @@ def sparse_attn_indexer(
     if pcp_token_sharded:
         local_rows = attn_metadata_narrowed.pcp_local_rows
         assert local_rows is not None
+        _pcp_dcp_log(f"indexer rank={get_pcp_group().rank_in_group} done")
         local_topk_indices_buffer[: local_rows.shape[0], :topk_tokens] = (
             topk_indices_buffer[local_rows, :topk_tokens]
         )
