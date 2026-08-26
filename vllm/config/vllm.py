@@ -1186,14 +1186,15 @@ class VllmConfig:
             self.kv_transfer_config is not None
             and self.kv_transfer_config.has_connector("NixlConnector")
         ):
-            assert self.parallel_config.prefill_context_parallel_size == 1, (
-                "NIXL does not support prefill context parallelism."
-            )
             dcp_size = self.parallel_config.decode_context_parallel_size
             tp_size = self.parallel_config.tensor_parallel_size
-            assert dcp_size in (1, tp_size), (
+            pcp_size = self.parallel_config.prefill_context_parallel_size
+            # A PCP producer's KV is replicated across PCP ranks unless DCP spans
+            # the PCP group, in which case it is sharded like a TP x DCP producer.
+            assert dcp_size in (1, tp_size * pcp_size), (
                 f"decode_context_parallel_size={dcp_size} must be 1 or equal "
-                f"to tensor_parallel_size={tp_size} when using NixlConnector."
+                f"to tensor_parallel_size={tp_size} x prefill_context_parallel_size="
+                f"{pcp_size} when using NixlConnector."
             )
             if self.model_config is not None:
                 assert self.model_config.use_mla or dcp_size == 1, (

@@ -307,6 +307,9 @@ class FlashMLASparseMetadataBuilder(
         self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
 
         if parallel_config.decode_context_parallel_size > 1:
+            # The DCP merge needs an LSE for every token, which only the mixed-batch
+            # fp8 path returns; force it under DCP regardless of the head count.
+            self.fp8_use_mixed_batch = True
             if parallel_config.dcp_comm_backend != "ag_rs":
                 raise NotImplementedError(
                     "DCP for FlashMLA sparse is only validated with the "
@@ -324,8 +327,11 @@ class FlashMLASparseMetadataBuilder(
             # Head padding (and the tile-scheduler metadata sized from it) is
             # computed from the local head count, but the kernel runs on the
             # DCP-gathered heads.
-            gathered_num_heads = (
-                self.num_heads * parallel_config.decode_context_parallel_size
+            # Heads are only all-gathered across the TP slice of the DCP group; when
+            # DCP spans the PCP group (dcp == pcp, tp == 1) no head gather happens.
+            gathered_num_heads = self.num_heads * (
+                parallel_config.decode_context_parallel_size
+                // max(parallel_config.prefill_context_parallel_size, 1)
             )
             gathered_padded_heads = FlashMLASparseImpl._compute_fp8_decode_padded_heads(
                 gathered_num_heads

@@ -390,8 +390,17 @@ class NixlBaseConnectorWorker:
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        # When DCP spans the PCP group the KV cache is block-sharded across all
+        # PCP x TP ranks (DCP ranks span PCP first, then TP). Present the instance
+        # to NIXL peers as a flat pcp*tp-wide "TP" group so every rank serves its
+        # shard; with dcp_size == 1 the PCP ranks hold replicated KV and only PCP
+        # rank 0 takes part in transfers.
+        self.pcp_sharded = self.pcp_size > 1 and self.dcp_size > 1
+        if self.pcp_sharded:
+            self.tp_rank = self.pcp_rank * self.world_size + self.tp_rank
+            self.world_size = self.world_size * self.pcp_size
 
-        # DCP support is scoped to MLA, with dcp_size in (1, tp_size): either fully
+        # DCP support is scoped to MLA, with dcp_size in (1, world_size): either fully
         # replicated or fully sharded. A DCP rank is always derivable this way.
         self.dcp_rank = self.tp_rank % self.dcp_size
         if self._has_mamba and self.dcp_size > 1:
@@ -603,12 +612,10 @@ class NixlBaseConnectorWorker:
         local_dcp_size = self.dcp_size
         remote_pcp_size = agent_metadata.pcp_size
         remote_dcp_size = agent_metadata.dcp_size
-        if (local_pcp_size > 1 and remote_dcp_size > 1) or (
-            remote_pcp_size > 1 and local_dcp_size > 1
-        ):
+        if local_pcp_size > 1 and remote_dcp_size > 1:
             raise NotImplementedError(
-                "NixlConnector PCP requires decode_context_parallel_size=1 "
-                "on both instances. "
+                "NixlConnector PCP consumers require decode_context_parallel_size=1 "
+                "on the remote instance. "
                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
             )

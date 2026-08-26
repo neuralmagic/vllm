@@ -650,6 +650,16 @@ class Worker(WorkerBase):
 
         pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.decode_context_parallel_size > 1
+        ):
+            # DCP-sharded PCP producer: every PCP x TP rank serves its own KV shard,
+            # so key the side-channel metadata by the flat pcp*tp rank.
+            from vllm.distributed.parallel_state import get_pcp_group
+
+            tp_rank += get_pcp_group().rank_in_group * get_tp_group().world_size
         return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
