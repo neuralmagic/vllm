@@ -1062,6 +1062,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         for start in range(0, num_padded_tokens, rows):
             stop = min(start + rows, num_padded_tokens)
             n = stop - start
+            num_all = n * world_size
             if simulate:
                 q_all = q[start:stop].repeat(world_size, 1, 1)
                 topk_all = topk_local[start:stop].repeat(world_size, 1)
@@ -1085,7 +1086,6 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     .view(num_all, topk)
                 )
             req_all = gathered_req_id[:, start:stop].reshape(-1).contiguous()
-            num_all = n * world_size
 
             # Keep this rank's shard of every token's top-k, compacted to a prefix
             # and mapped to local slots. Only ~1/dcp of each row lives here, so
