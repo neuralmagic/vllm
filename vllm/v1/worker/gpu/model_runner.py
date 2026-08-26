@@ -1856,6 +1856,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
         )
+        if self.pcp_manager is not None and aux_hidden_states is not None:
+            # The drafter runs replicated over the global batch under PCP, so
+            # its aux hidden states (e.g. DFlash/DSpark target-layer taps) must
+            # be restored to the global token layout like the final states.
+            aux_hidden_states = [
+                self.pcp_manager.restore_hidden_states(aux) for aux in aux_hidden_states
+            ]
 
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
