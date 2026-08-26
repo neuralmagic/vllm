@@ -143,6 +143,19 @@ class DualQueueThreadPool:
             yield tasks[start : start + bs]
             start += bs
 
+    def _add_barrier(self, q: deque):
+        """
+        should be under self._condition
+        """
+        q.append((None, None, None))
+
+    def _pop_barrier(self, q: deque):
+        """
+        should be under self._condition
+        """
+        n1, n2, n3 = q.popleft()
+        assert all([x is None for x in [n1, n2, n3]])
+
     def _enqueue(
         self,
         queue: deque,
@@ -165,6 +178,7 @@ class DualQueueThreadPool:
             for batch in self._batch_tasks(task_lst, n_threads):
                 queue.append((make_batch_fn(batch), len(batch), state))
                 n_batches += 1
+            self._add_barrier(queue)
             self._condition.notify(n_batches)
 
     def enqueue_load(
@@ -241,18 +255,23 @@ class DualQueueThreadPool:
 
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
+        def _is_ready(q):
+            return q and q[0][0] is not None
+
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
+                    lambda: self._stop
+                    or _is_ready(self._load_q)
+                    or _is_ready(self._store_q)
                 )
                 if self._stop:
                     return
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
-                fn, batch_size, state = (
-                    primary.popleft() if primary else secondary.popleft()
-                )
+                q = primary if _is_ready(primary) else secondary
+                fn, batch_size, state = q.popleft()
+                assert fn is not None
             try:
                 start_time = time.monotonic()
                 fn()
@@ -274,5 +293,6 @@ class DualQueueThreadPool:
             if job_finished:
                 with self._condition:
                     self._finished_q.append((state.job_id, success, total_time))
+                    self._pop_barrier(q)
                     self._inflight_jobs -= 1
                     self._condition.notify_all()
