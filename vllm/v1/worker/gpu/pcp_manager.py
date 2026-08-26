@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-
 from typing import Any
 
 import numpy as np
@@ -688,7 +687,6 @@ class PCPManager:
             )
         else:
             slot_mappings = self._global_batch_slot_mappings[:, :num_global_tokens]
-        from vllm.config import CUDAGraphMode
 
         global_metadata = model_state.prepare_attn(
             global_batch,

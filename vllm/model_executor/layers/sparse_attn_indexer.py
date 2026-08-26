@@ -576,7 +576,6 @@ def sparse_attn_indexer(
         local_topk_indices_buffer[local_rows.shape[0] : pcp_local_num_actual] = -1
         return local_topk_indices_buffer
 
-
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
