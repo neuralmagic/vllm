@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, cast
 
 import torch
+from vllm.utils.mem_trace import mem_trace, mem_trace_once
 import torch.nn as nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
@@ -277,6 +278,7 @@ class DeepseekV32Attention(MLAAttention):
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
         )
 
+    @mem_trace_once("dsa_attention.forward")
     def forward(  # type: ignore[override]
         self,
         positions: torch.Tensor,

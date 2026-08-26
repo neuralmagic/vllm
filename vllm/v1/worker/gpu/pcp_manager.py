@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.utils.mem_trace import mem_trace, mem_trace_once
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
@@ -765,6 +766,7 @@ class PCPManager:
             attn_metadata[layer_name] = meta
         return attn_metadata
 
+    @mem_trace_once("pcp.restore_hidden_states")
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self._global_batch is not None
         if self._hidden_restore_idx is None:

@@ -5,6 +5,7 @@
 import os
 
 import torch
+from vllm.utils.mem_trace import mem_trace, mem_trace_once
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -890,6 +891,7 @@ class SparseAttnIndexer(CustomOp):
                 "CUDA, ROCm and XPU platforms."
             )
 
+    @mem_trace_once("sparse_indexer.forward_cuda")
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,

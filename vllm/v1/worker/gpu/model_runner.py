@@ -25,6 +25,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
+from vllm.utils.mem_trace import mem_trace, mem_trace_once
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -837,6 +838,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        mem_trace("profile_run:start")
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -853,6 +855,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        mem_trace("profile_run:before_dummy_run")
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -869,6 +872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()
+        mem_trace("profile_run:end")
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()

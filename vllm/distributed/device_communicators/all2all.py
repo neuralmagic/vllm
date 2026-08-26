@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.utils.mem_trace import mem_trace, mem_trace_once
 import torch.distributed as dist
 
 import vllm.envs as envs
@@ -170,6 +171,7 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         # reasonable defaults based on profiling.
         self.num_sms = 20
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         raise NotImplementedError
 
@@ -242,6 +244,7 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
         )
         return kwargs
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         assert len(kwargs) == 0, (
             "DeepEPHTAll2AllManager expects no arguments. All the required "
@@ -327,6 +330,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         )
         return kwargs
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         """
         The kwargs for DeepEPLLAll2AllManager is dictated by
@@ -506,6 +510,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         else:
             self.commit_staged_state()
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         with NixlEPAll2AllManager._lock:
             stage = bool(kwargs.get("stage", False))
@@ -676,6 +681,7 @@ class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):
             )
         return self.initialized
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         return self
 
@@ -864,6 +870,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             )
             output.copy_(combined_output)
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         return self
 
@@ -987,6 +994,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         handle = mori.ops.EpDispatchCombineOp(mori_config)
         return handle
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         import mori  # type: ignore[import-not-found]
 
@@ -1059,6 +1067,7 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
                 "requirements."
             )
 
+    @mem_trace_once("all2all.get_handle")
     def get_handle(self, kwargs):
         import deep_ep  # type: ignore[import-not-found]
 
