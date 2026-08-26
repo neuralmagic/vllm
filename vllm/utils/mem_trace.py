@@ -43,47 +43,58 @@ def mem_trace(tag: str, once: bool = False) -> None:
 
 
 def mem_record_start() -> None:
-    """Start recording allocator history (VLLM_MEM_TRACE_SNAPSHOT=1)."""
-    if _ENABLED and _SNAPSHOT and torch.cuda.is_available():
-        torch.cuda.memory._record_memory_history(max_entries=300000)
-        logger.info("MEMTRACE recording allocator history")
+    """No-op kept for call-site compatibility (allocator history recording was
+    far too slow on a 100+ GiB model; the report below walks live tensors)."""
+    return
 
 
-def mem_snapshot_report(tag: str, top: int = 40) -> None:
-    """Log live torch allocations >= VLLM_MEM_TRACE_MIN_MIB grouped by the
-    innermost vllm frames of their allocating stack."""
+def mem_snapshot_report(tag: str, top: int = 30) -> None:
+    """Log live CUDA tensors grouped by shape/dtype (VLLM_MEM_TRACE_SNAPSHOT=1).
+
+    Run at the end of the profile run, after activations are freed, so what is
+    left is the persistent buffers: the ones sized from
+    max_num_batched_tokens are visible directly by their leading dimension.
+    """
     if not (_ENABLED and _SNAPSHOT and torch.cuda.is_available()):
         return
+    import gc
+
     torch.cuda.synchronize()
-    snap = torch.cuda.memory._snapshot()
-    groups: dict[str, list[int]] = {}
+    gc.collect()
+    groups: dict[tuple, list] = {}
+    seen: set[int] = set()
     total = 0
-    for seg in snap.get("segments", []):
-        for blk in seg.get("blocks", []):
-            if blk.get("state") != "active_allocated":
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, torch.Tensor) or not obj.is_cuda:
                 continue
-            size = blk.get("size", 0)
-            total += size
-            if size < _MIN_MIB * 2**20:
+            storage = obj.untyped_storage()
+            ptr = storage.data_ptr()
+            if ptr in seen:
                 continue
-            frames = blk.get("frames") or []
-            vf = [
-                f"{os.path.basename(os.path.dirname(f['filename']))}/"
-                f"{os.path.basename(f['filename'])}:{f['line']}:{f['name']}"
-                for f in frames
-                if "/vllm/" in f.get("filename", "")
-                and "mem_trace" not in f.get("filename", "")
-            ]
-            key = " <- ".join(vf[:4]) if vf else "(no vllm frame)"
-            g = groups.setdefault(key, [0, 0])
-            g[0] += size
-            g[1] += 1
+            seen.add(ptr)
+            nbytes = storage.nbytes()
+        except Exception:
+            continue
+        if nbytes < _MIN_MIB * 2**20:
+            total += nbytes
+            continue
+        total += nbytes
+        key = (tuple(obj.shape), str(obj.dtype), isinstance(obj, torch.nn.Parameter))
+        entry = groups.setdefault(key, [0, 0])
+        entry[0] += nbytes
+        entry[1] += 1
+    ranked = sorted(groups.items(), key=lambda kv: -kv[1][0])[:top]
     logger.info(
-        "MEMSNAP %s live torch allocations: %.2f GiB total; top %d groups (>= %d MiB blocks):",
-        tag, total / 2**30, top, _MIN_MIB,
+        "MEMSNAP %s live CUDA tensors: %.2f GiB total, %d storages; "
+        "top %d groups of blocks >= %d MiB:",
+        tag, total / 2**30, len(seen), len(ranked), _MIN_MIB,
     )
-    for key, (size, n) in sorted(groups.items(), key=lambda kv: -kv[1][0])[:top]:
-        logger.info("MEMSNAP   %7.2f GiB  x%-3d %s", size / 2**30, n, key)
+    for (shape, dtype, is_param), (size, count) in ranked:
+        logger.info(
+            "MEMSNAP   %7.2f GiB  x%-4d %-8s %s %s",
+            size / 2**30, count, "param" if is_param else "buffer", dtype, shape,
+        )
 
 
 def mem_trace_once(tag: str):
