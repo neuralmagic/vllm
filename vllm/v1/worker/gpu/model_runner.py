@@ -526,6 +526,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, is_profiling: bool = False
     ) -> None:
+        # GPUWorker finalizes the PD interleave before KV cache initialization.
+        self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
