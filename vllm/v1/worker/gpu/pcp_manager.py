@@ -152,14 +152,19 @@ class PCPManager:
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None:
-            # NOTE: the drafter runs replicated over the global batch on every
-            # PCP rank. Non-MTP drafters (DFlash/DSpark), sparse MLA and DCP are
-            # allowed here for kv-producer style deployments that only draft;
-            # the verify path under PCP is untested for those combinations.
-            if speculative_config.method not in ("mtp", "dflash", "dspark"):
+            if speculative_config.method not in ("mtp", "dspark"):
                 raise NotImplementedError(
-                    "MRV2 PCP speculative decoding supports MTP/DFlash/DSpark only."
+                    "MRV2 PCP speculative decoding currently supports MTP "
+                    "and DSpark only."
                 )
+            if is_sparse_mla and speculative_config.method == "mtp":
+                raise NotImplementedError(
+                    "MRV2 PCP MTP speculative decoding currently supports "
+                    "dense MLA only."
+                )
+            # NOTE(glm-53-blog): DCP spanning the PCP group is allowed here; the
+            # drafter runs replicated over the global batch and the DCP-sharded
+            # target KV is handled by the attention backends (kv-producer use).
             if speculative_config.enable_adaptive_verification:
                 raise NotImplementedError(
                     "MRV2 PCP speculative decoding does not support adaptive "

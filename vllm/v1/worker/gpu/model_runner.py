@@ -635,7 +635,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
         )
-        check_attention_cp_compatibility(self.vllm_config)
+        check_attention_cp_compatibility(
+            self.vllm_config,
+            exclude_layer_names=(
+                self.speculator.draft_attn_layer_names
+                if isinstance(self.speculator, DraftModelSpeculator)
+                else None
+            ),
+        )
         if isinstance(self.speculator, DraftModelSpeculator):
             # HACK(woosuk)
             self.speculator.set_attn(
@@ -1854,12 +1861,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
         )
+        # Aux hidden states feed the replicated drafter (e.g. DSpark), so
+        # like the main hidden states they are restored from the rank-local
+        # shard to the global batch layout.
         if self.pcp_manager is not None and aux_hidden_states is not None:
-            # The drafter runs replicated over the global batch under PCP, so
-            # its aux hidden states (e.g. DFlash/DSpark target-layer taps) must
-            # be restored to the global token layout like the final states.
             aux_hidden_states = [
-                self.pcp_manager.restore_hidden_states(aux) for aux in aux_hidden_states
+                self.pcp_manager.restore_hidden_states(h) for h in aux_hidden_states
             ]
 
         sampler_output, num_sampled, num_rejected = self.sample(
