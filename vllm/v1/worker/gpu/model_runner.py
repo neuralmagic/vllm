@@ -1537,6 +1537,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.lora_config, self.lora_state, req_ids, dummy_run
             )
 
+        # PCP PIECEWISE graphs do not yet preserve correctness for speculative
+        # multi-token target verification batches. This leaves prefill graph
+        # execution enabled while the replicated verification forward runs eager.
+        pcp_spec_decode = self.pcp_manager is not None and bool(
+            scheduler_output.scheduled_spec_decode_tokens
+        )
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
@@ -1552,7 +1558,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or pcp_spec_decode,
             num_active_loras=num_active_loras,
         )
 
