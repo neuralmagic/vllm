@@ -381,8 +381,21 @@ def sparse_attn_indexer(
     # out-of-bounds reads in the kernel.
     # Keep PCP padding so every rank contributes the same all-gather shape.
     num_tokens = slot_mapping.shape[0]
-    if use_pcp:
+    # DCP spanning the PCP group: the metadata describes the global PCP batch
+    # (see DeepseekV32IndexerMetadata.pcp_*). Queries are gathered to global
+    # order below so every rank scores the same rows against its K shard and the
+    # DCP top-k merge lines up; each rank keeps only its own rows at the end.
+    pcp_token_sharded = use_pcp and attn_metadata_narrowed.pcp_num_padded is not None
+    pcp_local_num_actual = hidden_states.shape[0]
+    if pcp_token_sharded:
+        num_tokens = attn_metadata_narrowed.pcp_num_padded
+        slot_mapping_for_gather = attn_metadata_narrowed.pcp_gathered_slot_mapping
+        assert slot_mapping_for_gather is not None
+    elif use_pcp:
         num_tokens //= get_pcp_group().world_size
+        slot_mapping_for_gather = slot_mapping
+    else:
+        slot_mapping_for_gather = slot_mapping
     if k is not None:
         k = k[:num_tokens]
 
@@ -390,7 +403,7 @@ def sparse_attn_indexer(
         assert k is not None
         k, slot_mapping_for_cache = maybe_gather_indexer_k(
             k,
-            slot_mapping,
+            slot_mapping_for_gather,
             num_decode_tokens,
             use_pcp,
         )
@@ -430,6 +443,34 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
+    local_topk_indices_buffer = topk_indices_buffer
+    if pcp_token_sharded:
+        if has_decode:
+            raise NotImplementedError(
+                "PCP x DCP sparse indexer does not support decode tokens yet."
+            )
+        pcp_group = get_pcp_group()
+        restore_idx = attn_metadata_narrowed.pcp_restore_idx
+        assert restore_idx is not None
+        # Gather this rank's (padded) rows from every rank, then reorder the
+        # rank-major result into global batch order.
+        q_quant = pcp_group.all_gather(q_quant[:num_tokens].contiguous(), dim=0)[
+            restore_idx
+        ]
+        weights = pcp_group.all_gather(weights[:num_tokens].contiguous(), dim=0)[
+            restore_idx
+        ]
+        if q_scale is not None:
+            q_scale = pcp_group.all_gather(q_scale[:num_tokens].contiguous(), dim=0)[
+                restore_idx
+            ]
+        topk_indices_buffer = torch.full(
+            (restore_idx.shape[0], topk_indices_buffer.shape[1]),
+            -1,
+            dtype=topk_indices_buffer.dtype,
+            device=topk_indices_buffer.device,
+        )
+
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -526,6 +567,15 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
+    if pcp_token_sharded:
+        local_rows = attn_metadata_narrowed.pcp_local_rows
+        assert local_rows is not None
+        local_topk_indices_buffer[: local_rows.shape[0], :topk_tokens] = (
+            topk_indices_buffer[local_rows, :topk_tokens]
+        )
+        local_topk_indices_buffer[local_rows.shape[0] : pcp_local_num_actual] = -1
+        return local_topk_indices_buffer
+
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

@@ -1650,6 +1650,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if self.pcp_manager is not None:
+                attn_metadata = self.pcp_manager.add_token_sharded_indexer_metadata(
+                    self.model_state,
+                    input_batch,
+                    attn_metadata,
+                    attn_groups,
+                    self.kv_cache_config,
+                    dummy_run,
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None

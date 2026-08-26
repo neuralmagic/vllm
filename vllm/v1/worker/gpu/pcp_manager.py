@@ -3,6 +3,8 @@
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from typing import Any
+
 import numpy as np
 import torch
 
@@ -65,6 +67,7 @@ class PCPManager:
         self.cp_interleave = cp_interleave
 
         self._global_batch: InputBatch | None = None
+        self._num_local_tokens_padded: int = 0
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
@@ -445,6 +448,7 @@ class PCPManager:
                 "PCP local token count exceeds the MRV2 input buffer size: "
                 f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
             )
+        self._num_local_tokens_padded = num_local_tokens_padded
         rank_token_start = self.pcp_rank * num_local_tokens_padded
         assert self._padded_gather_idx is not None
         local_gather_idx = self._padded_gather_idx[
@@ -640,6 +644,70 @@ class PCPManager:
             out=gathered_kv_slot_mappings,
         )
         return gathered_kv_slot_mappings
+
+    def add_token_sharded_indexer_metadata(
+        self,
+        model_state: Any,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        attn_groups: list[list[Any]],
+        kv_cache_config: Any,
+        dummy_run: bool,
+    ) -> dict[str, Any]:
+        """DCP spanning the PCP group: rebuild the sparse indexer's metadata from
+        the *global* PCP batch so every rank scores identical rows against its K
+        shard (the DCP top-k merge all-gathers per row), and attach the index
+        maps the indexer op needs to gather queries and keep its own rows."""
+        if (
+            self.dcp_world_size <= 1
+            or self.dcp_world_size != self.pcp_world_size
+            or self._global_batch is None
+            or self._padded_gather_idx is None
+            or self._hidden_restore_idx is None
+        ):
+            return attn_metadata
+        indexer_groups = [
+            [g for g in groups if g.backend.get_name() == "DEEPSEEK_V32_INDEXER"]
+            for groups in attn_groups
+        ]
+        if not any(indexer_groups):
+            return attn_metadata
+        assert self._block_tables is not None
+        global_batch = self._global_batch
+        block_tables = self._block_tables.gather_block_tables(
+            global_batch.idx_mapping,
+            global_batch.num_reqs_after_padding,
+        )
+        num_global_tokens = self._hidden_restore_idx.shape[0]
+        if dummy_run or self._global_batch_slot_mappings is None:
+            slot_mappings = torch.full(
+                (self._block_tables.num_kv_cache_groups, num_global_tokens),
+                PAD_SLOT_ID,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            slot_mappings = self._global_batch_slot_mappings[:, :num_global_tokens]
+        from vllm.config import CUDAGraphMode
+
+        global_metadata = model_state.prepare_attn(
+            global_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            slot_mappings,
+            indexer_groups,
+            kv_cache_config,
+        )
+        num_padded = self._num_local_tokens_padded
+        start = self.pcp_rank * num_padded
+        local_rows = self._padded_gather_idx[start : start + input_batch.num_tokens]
+        for layer_name, meta in global_metadata.items():
+            meta.pcp_num_padded = num_padded
+            meta.pcp_restore_idx = self._hidden_restore_idx
+            meta.pcp_local_rows = local_rows
+            meta.pcp_gathered_slot_mapping = attn_metadata[layer_name].slot_mapping
+            attn_metadata[layer_name] = meta
+        return attn_metadata
 
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._hidden_restore_idx is None:

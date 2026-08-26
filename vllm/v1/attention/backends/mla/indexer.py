@@ -458,6 +458,14 @@ class DeepseekV32IndexerMetadata:
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
+    # DCP spanning the PCP group (dcp == pcp): this metadata describes the
+    # *global* PCP batch (every rank's tokens, in global order) so that each
+    # rank's DCP top-k merge sees identical rows. The runner fills these in.
+    pcp_num_padded: int | None = None  # uniform per-rank row count
+    pcp_restore_idx: torch.Tensor | None = None  # global token -> gathered row
+    pcp_local_rows: torch.Tensor | None = None  # local token -> global row
+    pcp_gathered_slot_mapping: torch.Tensor | None = None  # rank-major, DCP-masked
+
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
