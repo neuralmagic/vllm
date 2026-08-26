@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from typing import Any
-
-import os
 
 import numpy as np
 import torch
