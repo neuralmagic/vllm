@@ -925,6 +925,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         lse = lse[:, :actual_num_heads]
         return output, lse
 
+    # Rows per rank gathered per kernel launch on the token-sharded PCP x DCP path;
+    # bounds the transient (q, top-k, out, lse) footprint to ~0.5 GiB at 8 ranks.
+    TOKEN_SHARDED_ROWS_PER_RANK = 512
+
     def forward_mqa_token_sharded(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -936,10 +940,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         """Sparse MQA attention when DCP spans the PCP group (dcp == pcp, tp == 1).
 
         Queries are token-partitioned across the group while the KV cache is
-        block-sharded, so no rank can attend to its own queries alone. Gather the
-        queries, top-k indices and request ids along tokens, run the fp8 sparse
-        kernel over the local KV shard for every gathered token, LSE-merge the
-        partial results across ranks and reduce-scatter them back to the owners.
+        block-sharded, so no rank can attend to its own queries alone. In row
+        chunks: gather the queries, top-k indices and request ids along tokens,
+        run the fp8 sparse kernel over the local KV shard for every gathered
+        token, LSE-merge the partial results across ranks and reduce-scatter
+        them back to the owners.
 
         `num_padded_tokens` is the uniform per-rank row count (the PCP manager pads
         every rank's slice to the same length); rows past
@@ -961,78 +966,89 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             num_actual,
         )
         assert self.topk_indices_buffer is not None
+        assert isinstance(
+            attn_metadata.fp8_extra_metadata, FlashMLASparseMetadata.FP8KernelMetadata
+        )
+        base_meta = attn_metadata.fp8_extra_metadata
         world_size = cp_group.world_size
+        rank = cp_group.rank_in_group
+        padded_heads = self.fp8_decode_padded_heads
+        num_heads = q.shape[1]
 
         topk_local = self.topk_indices_buffer[:num_padded_tokens]
         req_local = attn_metadata.req_id_per_token[:num_padded_tokens].clone()
         if num_actual < num_padded_tokens:
             topk_local[num_actual:].fill_(-1)
             req_local[num_actual:] = 0
-
-        q_all = cp_group.all_gather(q[:num_padded_tokens].contiguous(), dim=0)
-        topk_all = cp_group.all_gather(topk_local.contiguous(), dim=0)
-        req_all = cp_group.all_gather(req_local.contiguous(), dim=0)
-        num_all = num_padded_tokens * world_size
-
-        # Keep this rank's shard of every token's top-k and map to local slots.
-        topk_all = triton_filter_and_convert_dcp_index(
-            req_all,
-            attn_metadata.block_table,
-            topk_all,
-            dcp_size=self.dcp_world_size,
-            dcp_rank=self.dcp_rank,
-            cp_kv_cache_interleave_size=attn_metadata.cp_kv_cache_interleave_size,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_all.shape[1],
-            compact_valid_to_front=False,
-        )
-
-        assert isinstance(
-            attn_metadata.fp8_extra_metadata, FlashMLASparseMetadata.FP8KernelMetadata
-        )
-        base_meta = attn_metadata.fp8_extra_metadata
-        padded_heads = self.fp8_decode_padded_heads
-        topk = topk_all.shape[1]
-        scheduler_metadata, _ = get_mla_metadata(
-            cache_seqlens=torch.full((1,), topk, dtype=torch.int32, device=q.device),
-            num_q_tokens_per_head_k=num_all * padded_heads,
-            topk=topk,
-            num_heads_q=padded_heads,
-            num_heads_k=1,
-            is_fp8_kvcache=True,
-        )
-        kernel_meta = FlashMLASparseMetadata.FP8KernelMetadata(
-            scheduler_metadata=scheduler_metadata,
-            cache_lens=base_meta.cache_lens,
-            dummy_block_table=base_meta.dummy_block_table,
-        )
-        _out, _lse = self._fp8_flash_mla_kernel(
-            q=q_all.unsqueeze(0),
-            kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
-            topk_indices=topk_all.unsqueeze(0),
-            kernel_metadata=kernel_meta,
-        )
-        out = _out.squeeze(0)
-        lse = _lse.squeeze(0).transpose(0, 1)
-        # Rows with no selected token on this shard: (0, -inf) is the identity of
-        # the cross-rank LSE merge.
-        empty_rows = (topk_all == -1).all(dim=-1)
-        out = out.masked_fill(empty_rows.view(-1, 1, 1), 0.0).contiguous()
-        lse = lse.masked_fill(empty_rows.view(-1, 1), float("-inf")).contiguous()
-
-        lses = cp_group.all_gather(lse, dim=0).view(world_size, num_all, lse.shape[1])
+        topk = topk_local.shape[1]
+        topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
         if not hasattr(self, "_token_sharded_cp_ctx"):
             self._token_sharded_cp_ctx = CPTritonContext()
-        out, _ = correct_attn_out(
-            out,
-            lses,
-            cp_group.rank_in_group,
-            self._token_sharded_cp_ctx,
-            is_lse_base_on_e=self.lse_base_on_e,
-        )
-        # Rows are ordered by rank, so a token-dim reduce-scatter hands every rank
-        # the merged output of exactly its own (padded) slice.
-        out_local = cp_group.reduce_scatter(out, dim=0)
+
+        out_chunks = []
+        rows = self.TOKEN_SHARDED_ROWS_PER_RANK
+        sched_cache: dict[int, FlashMLASparseMetadata.FP8KernelMetadata] = {}
+        for start in range(0, num_padded_tokens, rows):
+            stop = min(start + rows, num_padded_tokens)
+            n = stop - start
+            q_all = cp_group.all_gather(q[start:stop].contiguous(), dim=0)
+            topk_all = cp_group.all_gather(topk_local[start:stop].contiguous(), dim=0)
+            req_all = cp_group.all_gather(req_local[start:stop].contiguous(), dim=0)
+            num_all = n * world_size
+
+            # Keep this rank's shard of every token's top-k, mapped to local slots.
+            topk_all = triton_filter_and_convert_dcp_index(
+                req_all,
+                attn_metadata.block_table,
+                topk_all,
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=attn_metadata.cp_kv_cache_interleave_size,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk,
+                compact_valid_to_front=False,
+            )
+            kernel_meta = sched_cache.get(num_all)
+            if kernel_meta is None:
+                scheduler_metadata, _ = get_mla_metadata(
+                    cache_seqlens=topk_tensor,
+                    num_q_tokens_per_head_k=num_all * padded_heads,
+                    topk=topk,
+                    num_heads_q=padded_heads,
+                    num_heads_k=1,
+                    is_fp8_kvcache=True,
+                )
+                kernel_meta = FlashMLASparseMetadata.FP8KernelMetadata(
+                    scheduler_metadata=scheduler_metadata,
+                    cache_lens=base_meta.cache_lens,
+                    dummy_block_table=base_meta.dummy_block_table,
+                )
+                sched_cache[num_all] = kernel_meta
+            _out, _lse = self._fp8_flash_mla_kernel(
+                q=q_all.unsqueeze(0),
+                kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+                topk_indices=topk_all.unsqueeze(0),
+                kernel_metadata=kernel_meta,
+            )
+            out = _out.squeeze(0)
+            lse = _lse.squeeze(0).transpose(0, 1)
+            # Rows with no selected token on this shard: (0, -inf) is the identity
+            # of the cross-rank LSE merge.
+            empty_rows = (topk_all == -1).all(dim=-1)
+            out = out.masked_fill(empty_rows.view(-1, 1, 1), 0.0).contiguous()
+            lse = lse.masked_fill(empty_rows.view(-1, 1), float("-inf")).contiguous()
+            lses = cp_group.all_gather(lse, dim=0).view(world_size, num_all, num_heads)
+            out, _ = correct_attn_out(
+                out,
+                lses,
+                rank,
+                self._token_sharded_cp_ctx,
+                is_lse_base_on_e=self.lse_base_on_e,
+            )
+            # Rows are ordered by rank, so a token-dim reduce-scatter hands every
+            # rank the merged output of exactly its own slice of this chunk.
+            out_chunks.append(cp_group.reduce_scatter(out, dim=0))
+        out_local = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
         return out_local[:num_actual]
 
     def forward_mqa(
