@@ -353,7 +353,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
     def supports_async(self) -> bool:
-        return True
+        return False
 
     def prepare_async(
         self,
