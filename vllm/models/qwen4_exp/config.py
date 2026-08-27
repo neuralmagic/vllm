@@ -64,6 +64,11 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
         rope_scaling = kwargs.get("rope_scaling")
         rope_theta = kwargs.get("rope_theta", 10_000.0)
+        if layer_types is not None:
+            layer_types = [
+                "full_attention" if lt == "qwen_sparse_attention" else lt
+                for lt in layer_types
+            ]
         super().__init__(layer_types=layer_types, **kwargs)
 
         normalized_rope_parameters = self.rope_parameters
