@@ -236,9 +236,9 @@ class DualQueueThreadPool:
                 return
 
         state = JobState(job_id, len(tasks))
+        self._job_state[job_id] = state
         with self._lock:
             self._inflight_jobs += 1
-            self._job_state[job_id] = state
             n_batches = q.submit(tasks, make_batch_fn)
 
             self._dual_cv.notify(n_batches)
