@@ -41,6 +41,26 @@ class RankSegment:
         return self.global_batch_slice.stop - self.global_batch_slice.start
 
 
+def get_max_num_tokens_for_profile(
+    num_tokens: int, num_reqs: int, pcp_world_size: int
+) -> int:
+    """Return the largest rank-local size of an all-prefill profiling batch."""
+    num_reqs = min(num_tokens, num_reqs)
+    tokens_per_req = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
+    tokens_per_req[num_reqs - num_tokens % num_reqs :] += 1
+    num_chunks = 2 * pcp_world_size
+    tokens_per_rank = [0] * pcp_world_size
+    for query_len in tokens_per_req:
+        chunk_size = (int(query_len) + num_chunks - 1) // num_chunks
+        for rank in range(pcp_world_size):
+            for chunk_idx in (rank, num_chunks - 1 - rank):
+                chunk_offset = chunk_idx * chunk_size
+                tokens_per_rank[rank] += max(
+                    0, min(chunk_size, int(query_len) - chunk_offset)
+                )
+    return max(tokens_per_rank)
+
+
 class PCPManager:
     """MRV2 PC batch manager.
 
@@ -957,9 +977,14 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         )
     kv_transfer_config = vllm_config.kv_transfer_config
     if kv_transfer_config is not None and kv_transfer_config.kv_connector is not None:
-        raise NotImplementedError(
-            "Direct PCP KV does not support KV connectors or offloading."
-        )
+        if not (
+            kv_transfer_config.kv_connector == "NixlConnector"
+            and kv_transfer_config.kv_role == "kv_producer"
+        ):
+            raise NotImplementedError(
+                "Direct PCP KV supports only the NixlConnector kv_producer "
+                "path; consumers, other connectors, and offloading are unsupported."
+            )
     if getattr(model_config, "enable_sleep_mode", False):
         raise NotImplementedError("Direct PCP KV does not support sleep mode.")
 

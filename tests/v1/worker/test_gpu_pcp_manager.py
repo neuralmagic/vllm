@@ -93,6 +93,25 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
     assert actual == expected
 
 
+@pytest.mark.parametrize(
+    ("pcp_world_size", "num_tokens", "num_reqs", "expected"),
+    [
+        (4, 32768, 256, 8192),
+        (4, 8192, 256, 2048),
+        (4, 9, 1, 3),
+    ],
+)
+def test_max_num_tokens_for_profile_is_rank_local(
+    pcp_world_size, num_tokens, num_reqs, expected
+):
+    assert (
+        pcp_manager_module.get_max_num_tokens_for_profile(
+            num_tokens, num_reqs, pcp_world_size
+        )
+        == expected
+    )
+
+
 def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
     manager = PCPManager(
         pcp_world_size=2,
@@ -137,3 +156,40 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         PCPManager.validate_config(
             make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+@pytest.mark.parametrize(
+    ("connector", "role", "allowed"),
+    [
+        ("NixlConnector", "kv_producer", True),
+        ("NixlConnector", "kv_consumer", False),
+        ("LMCacheConnectorV1", "kv_producer", False),
+    ],
+)
+def test_direct_pcp_kv_allows_nixl_producer_only(
+    monkeypatch, connector, role, allowed
+):
+    monkeypatch.setattr(pcp_manager_module.current_platform, "is_cuda", lambda: True)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            data_parallel_size=1,
+            use_ubatching=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"),
+            enable_sleep_mode=False,
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        cache_config=SimpleNamespace(
+            cache_dtype="fp8", enable_prefix_caching=False
+        ),
+        kv_transfer_config=SimpleNamespace(kv_connector=connector, kv_role=role),
+    )
+
+    if allowed:
+        pcp_manager_module._validate_pcp_direct_kv_config(config)
+    else:
+        with pytest.raises(NotImplementedError, match="NixlConnector kv_producer"):
+            pcp_manager_module._validate_pcp_direct_kv_config(config)
