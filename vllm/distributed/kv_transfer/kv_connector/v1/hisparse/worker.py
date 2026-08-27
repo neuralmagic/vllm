@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
         HiSparseConnectorMetadata,
     )
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 
 _METRICS_INTERVAL = 2000
@@ -66,15 +67,25 @@ class HiSparseConnectorWorker:
             raise RuntimeError("HiSparse connector found no hot-cache handles.")
         hot_backings: dict[int, torch.Tensor] = {}
         registered_host_pools: dict[int, torch.Tensor] = {}
+        shared_host_regions: dict[int, SharedOffloadRegion] = {}
         for cache in cache_handles:
             hot_backing = cache.runtime.hot_backing
             hot_backings[hot_backing.untyped_storage().data_ptr()] = hot_backing
             registered_pool = cache.runtime.registered_host_pool
             registered_host_pools[registered_pool.data_ptr()] = registered_pool
+            if (region := cache.runtime.shared_host_region) is not None:
+                shared_host_regions[id(region)] = region
         if len(hot_backings) != 1:
             raise RuntimeError("HiSparse hot tensors must share one GPU backing.")
         hot_backing = next(iter(hot_backings.values()))
-        pinned_host_pools = list(registered_host_pools.values())
+        if len(shared_host_regions) > 1:
+            raise RuntimeError("HiSparse caches must share one host region.")
+        shared_host_region = next(iter(shared_host_regions.values()), None)
+        pinned_host_pools = (
+            []
+            if shared_host_region is not None
+            else list(registered_host_pools.values())
+        )
 
         source_group_id = get_unique_kv_cache_group_id(
             self.kv_cache_config, KVCacheGroupRole.HISPARSE_SOURCE
@@ -87,17 +98,26 @@ class HiSparseConnectorWorker:
         assert source_block_size % resident.block_size == 0
         host_num_blocks = self.kv_cache_config.hisparse_host_num_blocks
         assert host_num_blocks is not None
-        self.initialize(
-            cache_handles,
-            hot_backing,
-            self.vllm_config.scheduler_config.max_num_seqs,
-            self.vllm_config.model_config.max_model_len,
-            self.vllm_config.max_concurrent_batches,
-            source_block_size // resident.block_size,
-            host_num_blocks,
-            hot_backing.device,
-            pinned_host_pools,
-        )
+        try:
+            self.initialize(
+                cache_handles,
+                hot_backing,
+                self.vllm_config.scheduler_config.max_num_seqs,
+                self.vllm_config.model_config.max_model_len,
+                self.vllm_config.max_concurrent_batches,
+                source_block_size // resident.block_size,
+                host_num_blocks,
+                hot_backing.device,
+                pinned_host_pools,
+                shared_host_region,
+            )
+        except Exception:
+            release_pinned_state(
+                [cache.runtime for cache in cache_handles],
+                pinned_host_pools,
+                shared_host_region,
+            )
+            raise
 
     def initialize(
         self,
@@ -110,6 +130,7 @@ class HiSparseConnectorWorker:
         host_num_blocks: int,
         device: torch.device,
         pinned_host_pools: list[torch.Tensor],
+        shared_host_region: SharedOffloadRegion | None,
     ) -> None:
         if self._initialized:
             raise RuntimeError("HiSparse connector worker is already initialized.")
@@ -119,6 +140,7 @@ class HiSparseConnectorWorker:
         self.pages_per_host_block = pages_per_host_block
         self.host_num_blocks = host_num_blocks
         self.pinned_host_pools = pinned_host_pools
+        self.shared_host_region = shared_host_region
         self.cache_handles = cache_handles
         self.leader_runtimes = [
             cache.runtime for cache in cache_handles if cache.runtime.is_group_leader
@@ -420,6 +442,8 @@ class HiSparseConnectorWorker:
         if not self._initialized:
             return
         release_pinned_state(
-            [cache.runtime for cache in self.cache_handles], self.pinned_host_pools
+            [cache.runtime for cache in self.cache_handles],
+            self.pinned_host_pools,
+            self.shared_host_region,
         )
         self._initialized = False

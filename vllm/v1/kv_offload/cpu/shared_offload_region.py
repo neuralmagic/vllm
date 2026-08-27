@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import errno
+import fcntl
 import mmap
 import os
 import time
@@ -25,8 +26,13 @@ def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> N
     """Spin-wait until the file reaches expected_size (creator truncated it)."""
     deadline = time.monotonic() + timeout
     while True:
-        if os.fstat(fd).st_size >= expected_size:
+        file_stat = os.fstat(fd)
+        if file_stat.st_size >= expected_size:
             return
+        if file_stat.st_nlink == 0:
+            raise RuntimeError(
+                "Shared offload region creator failed during initialization."
+            )
         if time.monotonic() > deadline:
             raise TimeoutError(
                 f"Timed out waiting for mmap file to reach {expected_size} bytes"
@@ -83,6 +89,9 @@ class SharedOffloadRegion:
         rank: int | None,
         kv_bytes_per_block: int,
         cpu_page_size: int,
+        *,
+        creator_memory_check: Callable[[int], None] | None = None,
+        populate_only_on_creator: bool = False,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_block % self.page_size == 0
@@ -93,6 +102,7 @@ class SharedOffloadRegion:
 
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
+        creator_population_lock = False
         self.rank = rank
         if rank is not None:
             # byte offset to this worker's first slot within each block row
@@ -109,7 +119,7 @@ class SharedOffloadRegion:
             self.fd = os.open(self.mmap_path, os.O_RDWR)
             try:
                 _wait_for_file_size(self.fd, self.total_size_bytes)
-            except (TimeoutError, OSError):
+            except (RuntimeError, TimeoutError, OSError):
                 os.close(self.fd)
                 raise
             logger.info("Opened existing mmap file %s", self.mmap_path)
@@ -119,9 +129,14 @@ class SharedOffloadRegion:
             # land on a 0-byte stub and spin in _wait_for_file_size
             # for the full 30 s timeout.
             try:
+                if populate_only_on_creator:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX)
+                    creator_population_lock = True
+                if creator_memory_check is not None:
+                    creator_memory_check(self.total_size_bytes)
                 check_shm_free_space(self.total_size_bytes)
                 os.ftruncate(self.fd, self.total_size_bytes)
-            except (RuntimeError, OSError):
+            except (ValueError, RuntimeError, OSError):
                 os.unlink(self.mmap_path)
                 os.close(self.fd)
                 raise
@@ -132,43 +147,60 @@ class SharedOffloadRegion:
                 self.total_size_bytes / 1e9,
             )
 
-        self.mmap_obj: mmap.mmap | None = mmap.mmap(
-            self.fd,
-            self.total_size_bytes,
-            flags=mmap.MAP_SHARED,
-            prot=mmap.PROT_READ | mmap.PROT_WRITE,
-        )
+        if populate_only_on_creator and not self._creator:
+            fcntl.flock(self.fd, fcntl.LOCK_SH)
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
 
-        populate_write_fn = _get_populate_write_fn(self.mmap_obj)
-
-        if rank is not None:
-            # Populate only this worker's pages (one slot per block row).
-            worker_offset = rank * cpu_page_size
-            _t0 = time.perf_counter()
-            page_size = self.page_size
-            for block in range(num_blocks):
-                raw_offset = block * self._row_stride + worker_offset
-                aligned_offset = (raw_offset // page_size) * page_size
-                end = raw_offset + cpu_page_size
-                aligned_length = end - aligned_offset
-                populate_write_fn(self.mmap_obj, aligned_offset, aligned_length)
-            logger.debug(
-                "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
-                num_blocks,
-                time.perf_counter() - _t0,
-            )
-        else:
-            # No rank — populate the entire shared region in one call.
-            _t0 = time.perf_counter()
-            populate_write_fn(self.mmap_obj, 0, self.total_size_bytes)
-            logger.debug(
-                "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
+        try:
+            self.mmap_obj: mmap.mmap | None = mmap.mmap(
+                self.fd,
+                self.total_size_bytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
 
-        self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
-        self._views: list[torch.Tensor] = []
-        self._canonical_offset = 0
-        self.is_pinned: bool = False
+            if not populate_only_on_creator or self._creator:
+                populate_write_fn = _get_populate_write_fn(self.mmap_obj)
+
+                if rank is not None:
+                    # Populate only this worker's pages (one slot per block row).
+                    worker_offset = rank * cpu_page_size
+                    _t0 = time.perf_counter()
+                    page_size = self.page_size
+                    for block in range(num_blocks):
+                        raw_offset = block * self._row_stride + worker_offset
+                        aligned_offset = (raw_offset // page_size) * page_size
+                        end = raw_offset + cpu_page_size
+                        aligned_length = end - aligned_offset
+                        populate_write_fn(self.mmap_obj, aligned_offset, aligned_length)
+                    logger.debug(
+                        "MADV_POPULATE_WRITE loop: %d blocks in %.3f s",
+                        num_blocks,
+                        time.perf_counter() - _t0,
+                    )
+                else:
+                    # No rank — populate the entire shared region in one call.
+                    _t0 = time.perf_counter()
+                    populate_write_fn(self.mmap_obj, 0, self.total_size_bytes)
+                    logger.debug(
+                        "MADV_POPULATE_WRITE entire region: %.3f s",
+                        time.perf_counter() - _t0,
+                    )
+
+            self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
+            self._views: list[torch.Tensor] = []
+            self._canonical_offset = 0
+            self.is_pinned: bool = False
+            self.pinned_addresses: list[int] = []
+        finally:
+            if creator_population_lock:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+
+    @property
+    def base_tensor(self) -> torch.Tensor:
+        if self._base is None:
+            raise RuntimeError("Shared offload region has been released.")
+        return self._base
 
     def create_next_worker_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -271,13 +303,18 @@ class SharedOffloadRegion:
         if self.is_pinned and self._base is not None:
             if current_platform.is_cuda_alike():
                 base_ptr = self._base.data_ptr()
-                result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
-                if result.value != 0:
-                    logger.warning(
-                        "cudaHostUnregister failed for rank=%d (code=%d)",
-                        self.rank,
-                        result,
-                    )
+                addresses = self.pinned_addresses or [base_ptr]
+                for address in reversed(addresses):
+                    result = torch.cuda.cudart().cudaHostUnregister(address)
+                    if result.value != 0:
+                        logger.warning(
+                            "cudaHostUnregister failed for rank=%d, "
+                            "address=%#x (code=%d)",
+                            self.rank,
+                            address,
+                            result.value,
+                        )
+                self.pinned_addresses.clear()
             self.is_pinned = False
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts
