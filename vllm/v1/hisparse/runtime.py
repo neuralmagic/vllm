@@ -306,6 +306,7 @@ class HiSparseIndexGroup:
         self.copy_stream = _create_copy_stream(device)
         self.followers: list[HiSparseRuntime] = []
         self.swap_stats = torch.zeros(2, dtype=torch.uint64, device=device)
+        self.swap_stats_host = torch.empty(2, dtype=torch.uint64, pin_memory=True)
         self.stats_row_bytes = 0
 
 

@@ -530,10 +530,8 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
   if (compact_miss_counts != nullptr && tid == 0) {
     compact_miss_counts[batch_row] = total_misses;
   }
-  // Aggregate hit/miss counters (hit rate + PCIe gather volume telemetry).
-  if (stats != nullptr && threadIdx.x == 0) {
-    atomicAdd(&stats[0],
-              static_cast<unsigned long long>(total_hits + s_counters[3]));
+  if (stats != nullptr && tid == 0) {
+    atomicAdd(&stats[0], static_cast<unsigned long long>(total_hits));
     atomicAdd(&stats[1], static_cast<unsigned long long>(total_misses));
   }
 
@@ -1081,10 +1079,10 @@ void hisparse_swap_in(
   if (stats.has_value()) {
     auto const& st = stats.value();
     STD_TORCH_CHECK(
-        st.is_cuda() &&
+        st.is_cuda() && st.is_contiguous() && st.dim() == 1 &&
             st.scalar_type() == torch::headeronly::ScalarType::UInt64 &&
-            st.numel() >= 2,
-        "stats must be a uint64 CUDA tensor with >= 2 elements");
+            st.numel() == 2,
+        "stats must be a contiguous two-element uint64 CUDA tensor");
     stats_ptr = static_cast<unsigned long long*>(st.mutable_data_ptr());
   }
 

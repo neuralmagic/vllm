@@ -6,10 +6,10 @@ from unittest.mock import MagicMock
 
 import torch
 
+import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (
     worker as hisparse_worker_module,
 )
-import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
     HiSparseConnectorWorker,
 )
@@ -19,17 +19,24 @@ from vllm.v1.metrics.stats import HiSparseStats
 from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 
 
-def test_hisparse_worker_finish_step_counts_each_index_group_once():
+def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
     worker = object.__new__(HiSparseConnectorWorker)
     worker._metrics_calls = hisparse_worker_module._METRICS_INTERVAL - 1
-    worker._metrics_last = HiSparseStats()
+    worker._metrics_pending = False
+    worker._metrics_event = MagicMock()
+    worker._metrics_event.query.return_value = True
     group = SimpleNamespace(
-        swap_stats=torch.tensor([7, 3]),
+        swap_stats=torch.tensor([12, 4], dtype=torch.uint64),
+        swap_stats_host=torch.empty(2, dtype=torch.uint64),
         stats_row_bytes=16,
     )
     worker.leader_runtimes = [SimpleNamespace(index_group=group)]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
-    assert worker.finish_step() == HiSparseStats(7, 3, 48)
+    assert worker.finish_step() is None
+    worker._metrics_event.record.assert_called_once_with()
+    assert group.swap_stats.tolist() == [0, 0]
+    assert worker.finish_step() == HiSparseStats(12, 4, 64)
 
 
 def test_copy_cpu_kv_cache_logical_blocks_ignores_storage_padding():
