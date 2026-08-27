@@ -759,7 +759,15 @@ class PCPManager:
         assert self._gathered_kv_slot_mappings is not None
         self._gathered_kv_slot_mappings.fill_(PAD_SLOT_ID)
         if self.direct_kv_enabled:
-            return self._gathered_kv_slot_mappings[:, :num_tokens]
+            gathered_slot_mappings = self._gathered_kv_slot_mappings[
+                :, : num_tokens * self.pcp_world_size
+            ]
+            return select_pcp_direct_slot_row(
+                gathered_slot_mappings,
+                self.pcp_world_size,
+                self.pcp_rank,
+                num_tokens,
+            )
         return self._gathered_kv_slot_mappings[:, : num_tokens * self.pcp_world_size]
 
     def _convert_to_gathered_slot_mappings(

@@ -115,7 +115,20 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     mock_cuda_graph.assert_called_once()
 
 
-def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
+@pytest.mark.parametrize(
+    ("direct_kv", "pcp_rank", "expected_width", "expected_storage_offset"),
+    [
+        (False, 0, 112, 0),
+        (True, 1, 56, 56),
+    ],
+)
+def test_piecewise_capture_uses_pcp_dummy_slot_mappings(
+    monkeypatch,
+    direct_kv: bool,
+    pcp_rank: int,
+    expected_width: int,
+    expected_storage_offset: int,
+):
     num_reqs = 32
     num_tokens = 56
     pcp_world_size = 2
@@ -127,11 +140,16 @@ def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     )
     pcp_manager = PCPManager(
         pcp_world_size=pcp_world_size,
-        pcp_rank=0,
+        pcp_rank=pcp_rank,
         device=torch.device("cpu"),
         max_num_reqs=num_reqs,
         max_num_tokens=num_tokens,
         block_tables=pcp_block_tables,
+        direct_kv_enabled=direct_kv,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.attention.pcp_direct_kv.pcp_direct_kv_active",
+        lambda: direct_kv,
     )
 
     block_tables = MagicMock()
@@ -161,7 +179,8 @@ def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
     )
 
     slot_mappings = model_state.prepare_attn.call_args.args[3]
-    assert slot_mappings.shape == (1, num_tokens * pcp_world_size)
+    assert slot_mappings.shape == (1, expected_width)
+    assert slot_mappings.storage_offset() == expected_storage_offset
     block_tables.get_dummy_slot_mappings.assert_not_called()
 
 
