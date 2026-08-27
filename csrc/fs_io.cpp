@@ -231,25 +231,44 @@ inline void enqueue_items(WorkQueue& q, int64_t job_id,
   }
 }
 
+inline void _pop_all_job_items_locked(WorkQueue& q, int64_t job_id,
+                                      std::vector<WorkItem>& out) {
+  while (!q.items.empty() && q.items.front().job_id == job_id) {
+    out.push_back(std::move(q.items.front()));
+    q.items.pop_front();
+  }
+}
+
 // Pops one item, preferring *primary* then falling back to *secondary*.
 // Sets *is_load* to whichever queue the item actually came from (which may
 // differ from the caller's own priority when falling back).
-inline bool pop_item(WorkQueue& primary, WorkQueue& secondary,
-                     bool primary_is_load, WorkItem& out, bool& is_load) {
+inline bool pop_items(WorkQueue& primary, WorkQueue& secondary,
+                      bool primary_is_load, std::vector<WorkItem>& out,
+                      bool& is_load) {
   {
     std::lock_guard<std::mutex> lock(primary.mutex);
     if (!primary.items.empty()) {
-      out = std::move(primary.items.front());
-      primary.items.pop_front();
       is_load = primary_is_load;
+      bool const is_store = !is_load;
+      if (is_store) {
+        _pop_all_job_items_locked(primary, primary.items.front().job_id, out);
+      } else {
+        out.push_back(std::move(primary.items.front()));
+        primary.items.pop_front();
+      }
       return true;
     }
   }
   std::lock_guard<std::mutex> lock(secondary.mutex);
   if (!secondary.items.empty()) {
-    out = std::move(secondary.items.front());
-    secondary.items.pop_front();
     is_load = !primary_is_load;
+    bool const is_store = !is_load;
+    if (is_store) {
+      _pop_all_job_items_locked(secondary, secondary.items.front().job_id, out);
+    } else {
+      out.push_back(std::move(secondary.items.front()));
+      secondary.items.pop_front();
+    }
     return true;
   }
   return false;
@@ -487,19 +506,23 @@ static PyObject* wait_and_run(PyObject* /*self*/, PyObject* args) {
   Py_BEGIN_ALLOW_THREADS const auto deadline =
       std::chrono::steady_clock::now() + kIdleTimeout;
   while (true) {
-    WorkItem item;
     bool is_load = false;
-    while (pop_item(primary, secondary, load_priority != 0, item, is_load)) {
-      const auto start = std::chrono::steady_clock::now();
-      const int err = do_io(*pool, item, is_load);
-      const double transfer_time = std::chrono::duration<double>(
-                                       std::chrono::steady_clock::now() - start)
-                                       .count();
-      Result result{item.job_id, item.index, err, transfer_time};
-      {
-        std::lock_guard<std::mutex> lock(pool->results.mutex);
-        pool->results.items.push_back(result);
+    std::vector<WorkItem> items;
+    while (pop_items(primary, secondary, load_priority != 0, items, is_load)) {
+      for (auto const& item : items) {
+        const auto start = std::chrono::steady_clock::now();
+        const int err = do_io(*pool, item, is_load);
+        const double transfer_time =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          start)
+                .count();
+        Result result{item.job_id, item.index, err, transfer_time};
+        {
+          std::lock_guard<std::mutex> lock(pool->results.mutex);
+          pool->results.items.push_back(result);
+        }
       }
+      items.clear();
     }
 
     std::unique_lock<std::mutex> signal_lock(pool->signal_mutex);
