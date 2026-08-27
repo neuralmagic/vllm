@@ -78,6 +78,37 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         """
         return True
 
+    def _prepare_prefill_attn(
+        self,
+        input_batch: InputBatch,
+        batch_desc: BatchExecutionDescriptor,
+    ) -> tuple[dict[str, Any] | None, dict[str, torch.Tensor]]:
+        """Build global draft-prefill metadata for a replicated PCP drafter."""
+        num_reqs = input_batch.num_reqs
+        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        self.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=num_reqs_padded,
+        )
+        slot_mappings_tensor = self.block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            input_batch.positions,
+            batch_desc.num_tokens,
+        )
+        slot_mappings = build_slot_mappings_by_layer(
+            slot_mappings_tensor, self.kv_cache_config
+        )
+        attn_metadata = self._build_draft_attn_metadata(
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_padded=batch_desc.num_tokens,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            step=0,
+            query_start_loc_np=input_batch.query_start_loc_np,
+        )
+        return attn_metadata, slot_mappings
+
     def set_attn(
         self,
         model_state: ModelState,
@@ -289,6 +320,16 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             need_eager=is_profile,
         )
 
+        prefill_attn_metadata: dict[str, Any] | None = attn_metadata
+        prefill_slot_mappings: dict[str, torch.Tensor] | None = slot_mappings
+        if self.replicated_pcp:
+            if dummy_run and skip_attn_for_dummy_run:
+                prefill_attn_metadata, prefill_slot_mappings = None, None
+            else:
+                prefill_attn_metadata, prefill_slot_mappings = (
+                    self._prepare_prefill_attn(input_batch, prefill_batch_desc)
+                )
+
         self._prepare_eplb_forward(num_tokens)
 
         self.on_prefill_begin(num_reqs)
@@ -303,8 +344,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self._prefill(
                 num_reqs,
                 prefill_batch_desc.num_tokens,
-                attn_metadata,
-                slot_mappings,
+                prefill_attn_metadata,
+                prefill_slot_mappings,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,

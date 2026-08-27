@@ -53,6 +53,17 @@ def test_cp_compatibility_skips_replicated_draft_attention(monkeypatch):
     check_attention_cp_compatibility(_pcp_config())
 
 
+def test_cp_compatibility_excludes_replicated_draft_layer_names(monkeypatch):
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"draft": _AttentionLayer(use_pcp=True)},
+    )
+    check_attention_cp_compatibility(
+        _pcp_config(), exclude_layer_names={"draft"}
+    )
+
+
 def test_cp_compatibility_still_validates_pcp_attention(monkeypatch):
     monkeypatch.setattr(
         cp_utils,

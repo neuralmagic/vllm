@@ -19,14 +19,21 @@ else:
 logger = init_logger(__name__)
 
 
-def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
+def check_attention_cp_compatibility(
+    vllm_config: VllmConfig,
+    exclude_layer_names: set[str] | None = None,
+) -> None:
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
     if pcp_size * dcp_size > 1:
         layer_type = cast(type[Any], AttentionLayerBase)
         layers = get_layers_from_vllm_config(vllm_config, layer_type)
-        for layer in layers.values():
+        for name, layer in layers.items():
+            # Replicated drafter layers do not execute PCP/DCP-sharded
+            # attention, even though they share the target runner.
+            if exclude_layer_names is not None and name in exclude_layer_names:
+                continue
             get_attn_backend = getattr(layer, "get_attn_backend", None)
             layer_uses_pcp = getattr(layer, "use_pcp", pcp_size > 1)
             if layer_uses_pcp and get_attn_backend is not None:
