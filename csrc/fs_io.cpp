@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -206,6 +207,12 @@ struct Pool {
   // time) still safely deletes the Pool exactly once and skips re-releasing
   // the buffer.
   bool destroyed = false;
+  // Idle signaling only (never guards load_q/store_q/results themselves):
+  // lets a worker with no work block in wait_and_run() instead of spinning,
+  // while still waking instantly on new work or request_stop().
+  std::mutex signal_mutex;
+  std::condition_variable signal_cv;
+  bool stop = false;
 };
 
 constexpr const char* kPoolCapsuleName = "vllm.fs_io_C.Pool";
@@ -419,6 +426,7 @@ static PyObject* push_items(PyObject* args, bool is_load) {
   }
 
   enqueue_items(is_load ? pool->load_q : pool->store_q, job_id, paths, offsets);
+  pool->signal_cv.notify_all();
   Py_RETURN_NONE;
 }
 
@@ -450,13 +458,20 @@ static PyObject* queue_nonempty(PyObject* /*self*/, PyObject* args) {
   Py_RETURN_FALSE;
 }
 
+// How long a worker with no work stays parked inside wait_and_run() before
+// returning to Python, so a steady stream of small jobs doesn't force a
+// GIL acquisition (Python call return + re-invoke) between every one.
+constexpr auto kIdleTimeout = std::chrono::seconds(30);
+
 /// @brief Drain and execute work items for a worker with the given
-///        priority until nothing is left to claim.
-/// @note Releases the GIL once for the entire loop -- no Python API call
+///        priority, blocking (without spinning) whenever both queues run
+///        dry, for up to kIdleTimeout since the last time work was found.
+/// @note Releases the GIL once for the entire call -- no Python API call
 ///       happens between free_gil and acquire_gil. Each item's Result is
 ///       pushed to ResultQueue as soon as that item finishes, so the
 ///       Python scheduler thread can observe partial progress at any time
 ///       via pop_all_results(), independent of when this call returns.
+///       request_stop() wakes an idling worker immediately.
 static PyObject* wait_and_run(PyObject* /*self*/, PyObject* args) {
   PyObject* capsule = nullptr;
   int load_priority = 0;
@@ -469,19 +484,32 @@ static PyObject* wait_and_run(PyObject* /*self*/, PyObject* args) {
   WorkQueue& primary = load_priority ? pool->load_q : pool->store_q;
   WorkQueue& secondary = load_priority ? pool->store_q : pool->load_q;
 
-  Py_BEGIN_ALLOW_THREADS WorkItem item;
-  bool is_load = false;
-  while (pop_item(primary, secondary, load_priority != 0, item, is_load)) {
-    const auto start = std::chrono::steady_clock::now();
-    const int err = do_io(*pool, item, is_load);
-    const double transfer_time =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-            .count();
-    Result result{item.job_id, item.index, err, transfer_time};
-    {
-      std::lock_guard<std::mutex> lock(pool->results.mutex);
-      pool->results.items.push_back(result);
+  Py_BEGIN_ALLOW_THREADS const auto deadline =
+      std::chrono::steady_clock::now() + kIdleTimeout;
+  while (true) {
+    WorkItem item;
+    bool is_load = false;
+    while (pop_item(primary, secondary, load_priority != 0, item, is_load)) {
+      const auto start = std::chrono::steady_clock::now();
+      const int err = do_io(*pool, item, is_load);
+      const double transfer_time = std::chrono::duration<double>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count();
+      Result result{item.job_id, item.index, err, transfer_time};
+      {
+        std::lock_guard<std::mutex> lock(pool->results.mutex);
+        pool->results.items.push_back(result);
+      }
     }
+
+    std::unique_lock<std::mutex> signal_lock(pool->signal_mutex);
+    if (pool->stop) break;
+    const bool woke_for_work_or_stop = pool->signal_cv.wait_until(
+        signal_lock, deadline,
+        [&] { return pool->stop || queue_group_nonempty(primary, secondary); });
+    if (!woke_for_work_or_stop) break;  // idle timeout: nothing to do.
+    if (pool->stop) break;
+    // Otherwise new work arrived within the window -- loop back and drain.
   }
   Py_END_ALLOW_THREADS
 
@@ -542,6 +570,25 @@ static PyObject* clear_work_queue(PyObject* /*self*/, PyObject* args) {
     std::lock_guard<std::mutex> lock(pool->store_q.mutex);
     pool->store_q.items.clear();
   }
+  Py_RETURN_NONE;
+}
+
+/// @brief Wake every worker idling inside wait_and_run() so it returns
+///        immediately instead of waiting out its idle timeout. Used by
+///        shutdown(); does not itself clear the work queues.
+static PyObject* request_stop(PyObject* /*self*/, PyObject* args) {
+  PyObject* capsule = nullptr;
+  if (!PyArg_ParseTuple(args, "O", &capsule)) {
+    return nullptr;
+  }
+  Pool* pool = get_pool(capsule);
+  if (pool == nullptr) return nullptr;
+
+  {
+    std::lock_guard<std::mutex> lock(pool->signal_mutex);
+    pool->stop = true;
+  }
+  pool->signal_cv.notify_all();
   Py_RETURN_NONE;
 }
 
@@ -772,10 +819,12 @@ static PyMethodDef fs_io_C_methods[] = {
     {"wait_and_run", wait_and_run, METH_VARARGS,
      "wait_and_run(pool: capsule, load_priority: bool) -> None\n"
      "\n"
-     "Drain and execute work items for a worker with the given priority "
-     "until nothing is left to claim. Releases the GIL for the whole "
-     "call; results are pushed to the pool's ResultQueue as each item "
-     "finishes."},
+     "Drain and execute work items for a worker with the given priority, "
+     "blocking without spinning whenever both queues run dry, for up to "
+     "a 30s idle timeout since work was last found. Releases the GIL for "
+     "the whole call; results are pushed to the pool's ResultQueue as "
+     "each item finishes. request_stop() wakes an idling call "
+     "immediately."},
     {"pop_all_results", pop_all_results, METH_VARARGS,
      "pop_all_results(pool: capsule) -> list[tuple[int, int, int, float]]\n"
      "\n"
@@ -785,6 +834,11 @@ static PyMethodDef fs_io_C_methods[] = {
      "clear_work_queue(pool: capsule) -> None\n"
      "\n"
      "Clear both the load and store WorkQueues. Used by shutdown()."},
+    {"request_stop", request_stop, METH_VARARGS,
+     "request_stop(pool: capsule) -> None\n"
+     "\n"
+     "Wake every worker idling inside wait_and_run() immediately, "
+     "instead of waiting out its idle timeout. Used by shutdown()."},
     {nullptr, nullptr, 0, nullptr},
 };
 

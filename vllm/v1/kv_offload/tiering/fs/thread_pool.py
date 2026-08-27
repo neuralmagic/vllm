@@ -12,10 +12,14 @@ C extension (see ``csrc/fs_io.cpp``): a ``Pool`` holds a load ``WorkQueue``
 and a store ``WorkQueue`` (each with its own mutex), plus a ``ResultQueue``
 (its own mutex). Worker threads are still plain ``threading.Thread``
 objects; each wake makes one call into ``wait_and_run()``, which releases
-the GIL once and drains items until nothing is left to claim, pushing one
-``Result`` per finished item. Job-level aggregation (``JobState``) stays in
-Python and is driven by ``get_finished()`` draining the C ``ResultQueue`` --
-decoupled from, and asynchronous to, whatever the worker threads are doing.
+the GIL once and drains items, pushing one ``Result`` per finished item.
+Once both queues run dry it blocks (without spinning) on a C-side condition
+variable for up to a 30s idle timeout, so a steady trickle of small jobs
+doesn't force a GIL round-trip between every one; ``shutdown()`` wakes any
+idling worker immediately via ``request_stop()``. Job-level aggregation
+(``JobState``) stays in Python and is driven by ``get_finished()`` draining
+the C ``ResultQueue`` -- decoupled from, and asynchronous to, whatever the
+worker threads are doing.
 """
 
 import threading
@@ -34,6 +38,7 @@ try:
         push_load,
         push_store,
         queue_nonempty,
+        request_stop,
         wait_and_run,
     )
 
@@ -256,6 +261,10 @@ class DualQueueThreadPool:
             self._shutdown_done = True
             self._stop = True
             clear_work_queue(self._pool)
+            # Wake any worker currently idling inside wait_and_run()'s C-side
+            # timeout wait -- without this it would only return once that
+            # timeout elapses.
+            request_stop(self._pool)
             # Cancelled tasks will not decrement _inflight_jobs; reset it so a
             # subsequent wait_idle() returns instead of hanging.
             self._inflight_jobs = 0
