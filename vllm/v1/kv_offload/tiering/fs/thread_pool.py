@@ -9,6 +9,7 @@ Thread pool:
 """
 
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -174,12 +175,14 @@ class DualQueueThreadPool:
     ) -> None:
         self._load_q: TPDequeBalancedBatch = TPDequeBalancedBatch(n_read_threads)
         self._store_q: TPDeque = TPDeque(n_write_threads)
-        self._condition = threading.Condition(threading.Lock())
+        self._lock = threading.Lock()
+        self._dual_cv = threading.Condition(self._lock)
+        self._store_excl_cv = threading.Condition(self._lock)
         self._stop = False
         self._threads: list[threading.Thread] = []
-        self._inflight_jobs = 0  # guarded by _condition
+        self._inflight_jobs = 0  # guarded by _lock
         self._job_state: dict[JobId, JobState] = {}
-        # Finished-but-not-yet-reported jobs, guarded by _condition. Populated
+        # Finished-but-not-yet-reported jobs, guarded by _lock . Populated
         # by _pump(), drained by get_finished().
         self._finished_q: list[tuple[JobId, bool, float, list[OffloadKey]]] = []
 
@@ -215,24 +218,32 @@ class DualQueueThreadPool:
             t.start()
             self._threads.append(t)
 
+    def _notify_all(self):
+        self._dual_cv.notify_all()
+        self._store_excl_cv.notify_all()
+
     def _enqueue(
         self,
         q: _TPDeque,
         job_id: JobId,
         tasks: list[Task],
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
+        is_store: bool,
     ) -> None:
         if len(tasks) == 0:
-            with self._condition:
+            with self._lock:
                 self._finished_q.append((job_id, True, 0.0, []))
                 return
 
         state = JobState(job_id, len(tasks))
-        with self._condition:
+        with self._lock:
             self._inflight_jobs += 1
             self._job_state[job_id] = state
-            q.submit(tasks, make_batch_fn)
-            self._condition.notify_all()
+            n_batches = q.submit(tasks, make_batch_fn)
+
+            self._dual_cv.notify(n_batches)
+            if is_store:
+                self._store_excl_cv.notify(n_batches)
 
     def enqueue_load(
         self,
@@ -241,7 +252,7 @@ class DualQueueThreadPool:
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
         # submit to the queue deque enmasse
-        self._enqueue(self._load_q, job_id, tasks, make_batch_fn)
+        self._enqueue(self._load_q, job_id, tasks, make_batch_fn, is_store=False)
 
     def enqueue_store(
         self,
@@ -249,7 +260,7 @@ class DualQueueThreadPool:
         tasks: list[Task],
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
-        self._enqueue(self._store_q, job_id, tasks, make_batch_fn)
+        self._enqueue(self._store_q, job_id, tasks, make_batch_fn, is_store=True)
 
     def _pump(self) -> None:
         """Discover newly finished jobs and buffer their results in
@@ -270,14 +281,13 @@ class DualQueueThreadPool:
                     (task.job_id, success, transfer_time, state._failed_keys)
                 )
         if newly_finished:
-            with self._condition:
+            with self._lock:
                 self._finished_q.extend(newly_finished)
                 self._inflight_jobs -= len(newly_finished)
-                self._condition.notify_all()
 
     def get_finished(self) -> Iterable[tuple[JobId, bool, float, list[OffloadKey]]]:
         self._pump()
-        with self._condition:
+        with self._lock:
             finished, self._finished_q = self._finished_q, []
         yield from finished
 
@@ -293,13 +303,13 @@ class DualQueueThreadPool:
         """
         while True:
             self._pump()
-            with self._condition:
+            with self._lock:
                 if self._inflight_jobs == 0:
                     return
-                self._condition.wait(timeout=poll_interval)
+            time.sleep(poll_interval)
 
     def shutdown(self, wait: bool = True) -> None:
-        with self._condition:
+        with self._lock:
             self._stop = True
             self._load_q.clear()
             self._store_q.clear()
@@ -307,7 +317,7 @@ class DualQueueThreadPool:
             # subsequent wait_idle() returns instead of hanging.
             self._inflight_jobs = 0
             self._finished_q.clear()
-            self._condition.notify_all()
+            self._notify_all()
         if wait:
             for t in self._threads:
                 t.join()
@@ -332,10 +342,11 @@ class DualQueueThreadPool:
             assert _q_has_work(secondary)
             return secondary
 
+        cv = self._store_excl_cv if priority == Priority.WRITE_EXCL else self._dual_cv
         # Wait for tasks, process from primary queue first, fall back to secondary.
         while True:
-            with self._condition:
-                self._condition.wait_for(lambda: self._stop or _has_work())
+            with cv:
+                cv.wait_for(lambda: self._stop or _has_work())
                 if self._stop:
                     return
                 q = _get_work_queue()
@@ -348,8 +359,3 @@ class DualQueueThreadPool:
                     "Block I/O failed: %s",
                     exc,
                 )
-            finally:
-                # Wake any wait_idle() poller so it re-pumps promptly instead
-                # of waiting out its poll_interval.
-                with self._condition:
-                    self._condition.notify_all()

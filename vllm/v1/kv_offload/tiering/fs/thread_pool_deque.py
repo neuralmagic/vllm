@@ -40,8 +40,9 @@ class TPDeque(_TPDeque):
 
     def submit(
         self, tasks: list[Any], make_batch_fn: Callable[[list[Any]], Callable[[], None]]
-    ):
+    ) -> int:
         self.q.append((make_batch_fn(tasks), tasks))
+        return 1
 
     def fetch(self):
         return self.q.popleft()
@@ -98,7 +99,7 @@ class TPDequeBalancedBatch(_TPDeque):
 
     def submit(
         self, tasks: list[Any], make_batch_fn: Callable[[list[Any]], Callable[[], None]]
-    ):
+    ) -> int:
         if self._make_batch_fn is None:
             self._make_batch_fn = make_batch_fn
         # Balanced batching requires all make_batch_fn be the same as
@@ -106,11 +107,15 @@ class TPDequeBalancedBatch(_TPDeque):
         assert self._make_batch_fn == make_batch_fn
 
         # Split batch equally amongst all threads.
+        n_batches = 0
         for idx, ts in enumerate(self._batch_tasks(tasks)):
             self._qs[idx].extend(ts)
+            n_batches += 1
 
         # update len
         self._len += len(tasks)
+
+        return n_batches
 
     def fetch(self):
         # make batch out of _fetch_cursor and return
