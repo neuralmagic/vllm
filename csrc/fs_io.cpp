@@ -239,16 +239,48 @@ inline void _pop_all_job_items_locked(WorkQueue& q, int64_t job_id,
   }
 }
 
+inline bool is_load_priority(int const priority) { return priority == 1; }
+
+inline bool is_store_priority(int const priority) { return priority == 2; }
+
+inline bool is_store_excl_priority(int const priority) { return priority == 3; }
+
+inline bool is_primary_load(int const priority) {
+  return is_load_priority(priority);
+}
+inline bool is_secondary_load(int const priority) {
+  return is_store_priority(priority);
+}
+
+inline WorkQueue& get_primary_queue(Pool* pool, int const priority) {
+  if (is_load_priority(priority)) {
+    return pool->load_q;
+  } else if (is_store_priority(priority)) {
+    return pool->store_q;
+  } else {
+    return pool->store_q;
+  }
+}
+
+inline WorkQueue& get_secondary_queue(Pool* pool, int const priority) {
+  if (is_load_priority(priority)) {
+    return pool->store_q;
+  } else if (is_store_priority(priority)) {
+    return pool->load_q;
+  } else {
+    return pool->store_q;
+  }
+}
+
 // Pops one item, preferring *primary* then falling back to *secondary*.
 // Sets *is_load* to whichever queue the item actually came from (which may
 // differ from the caller's own priority when falling back).
-inline bool pop_items(WorkQueue& primary, WorkQueue& secondary,
-                      bool primary_is_load, std::vector<WorkItem>& out,
-                      bool& is_load) {
+inline bool pop_items(WorkQueue& primary, WorkQueue& secondary, int priority,
+                      std::vector<WorkItem>& out, bool& is_load) {
   {
     std::lock_guard<std::mutex> lock(primary.mutex);
     if (!primary.items.empty()) {
-      is_load = primary_is_load;
+      is_load = is_primary_load(priority);
       bool const is_store = !is_load;
       if (is_store) {
         _pop_all_job_items_locked(primary, primary.items.front().job_id, out);
@@ -261,7 +293,7 @@ inline bool pop_items(WorkQueue& primary, WorkQueue& secondary,
   }
   std::lock_guard<std::mutex> lock(secondary.mutex);
   if (!secondary.items.empty()) {
-    is_load = !primary_is_load;
+    is_load = is_secondary_load(priority);
     bool const is_store = !is_load;
     if (is_store) {
       _pop_all_job_items_locked(secondary, secondary.items.front().job_id, out);
@@ -463,15 +495,15 @@ static PyObject* push_store(PyObject* /*self*/, PyObject* args) {
 ///       the deques while another thread mutates them would be a data race.
 static PyObject* queue_nonempty(PyObject* /*self*/, PyObject* args) {
   PyObject* capsule = nullptr;
-  int load_priority = 0;
-  if (!PyArg_ParseTuple(args, "Op", &capsule, &load_priority)) {
+  int priority = 0;
+  if (!PyArg_ParseTuple(args, "Op", &capsule, &priority)) {
     return nullptr;
   }
   Pool* pool = get_pool(capsule);
   if (pool == nullptr) return nullptr;
 
-  WorkQueue& primary = load_priority ? pool->load_q : pool->store_q;
-  WorkQueue& secondary = load_priority ? pool->store_q : pool->load_q;
+  WorkQueue& primary = get_primary_queue(pool, priority);
+  WorkQueue& secondary = get_secondary_queue(pool, priority);
   const bool nonempty = queue_group_nonempty(primary, secondary);
   if (nonempty) Py_RETURN_TRUE;
   Py_RETURN_FALSE;
@@ -493,22 +525,22 @@ constexpr auto kIdleTimeout = std::chrono::seconds(30);
 ///       request_stop() wakes an idling worker immediately.
 static PyObject* wait_and_run(PyObject* /*self*/, PyObject* args) {
   PyObject* capsule = nullptr;
-  int load_priority = 0;
-  if (!PyArg_ParseTuple(args, "Op", &capsule, &load_priority)) {
+  int priority = 0;
+  if (!PyArg_ParseTuple(args, "Op", &capsule, &priority)) {
     return nullptr;
   }
   Pool* pool = get_pool(capsule);
   if (pool == nullptr) return nullptr;
 
-  WorkQueue& primary = load_priority ? pool->load_q : pool->store_q;
-  WorkQueue& secondary = load_priority ? pool->store_q : pool->load_q;
+  WorkQueue& primary = get_primary_queue(pool, priority);
+  WorkQueue& secondary = get_secondary_queue(pool, priority);
 
   Py_BEGIN_ALLOW_THREADS const auto deadline =
       std::chrono::steady_clock::now() + kIdleTimeout;
   while (true) {
     bool is_load = false;
     std::vector<WorkItem> items;
-    while (pop_items(primary, secondary, load_priority != 0, items, is_load)) {
+    while (pop_items(primary, secondary, priority, items, is_load)) {
       for (auto const& item : items) {
         const auto start = std::chrono::steady_clock::now();
         const int err = do_io(*pool, item, is_load);
@@ -835,12 +867,12 @@ static PyMethodDef fs_io_C_methods[] = {
      "\n"
      "Enqueue every block of a store job into the pool's store WorkQueue."},
     {"queue_nonempty", queue_nonempty, METH_VARARGS,
-     "queue_nonempty(pool: capsule, load_priority: bool) -> bool\n"
+     "queue_nonempty(pool: capsule, load_priority: int) -> bool\n"
      "\n"
      "Check whether a worker with the given priority has any claimable "
      "work (own queue, or the other queue as fallback)."},
     {"wait_and_run", wait_and_run, METH_VARARGS,
-     "wait_and_run(pool: capsule, load_priority: bool) -> None\n"
+     "wait_and_run(pool: capsule, load_priority: int) -> None\n"
      "\n"
      "Drain and execute work items for a worker with the given priority, "
      "blocking without spinning whenever both queues run dry, for up to "

@@ -485,6 +485,7 @@ def test_wait_idle_blocks_until_tasks_complete(tmp_path, monkeypatch):
     pool = DualQueueThreadPool(
         n_read_threads=1,
         n_write_threads=1,
+        n_write_excl_threads=1,
         primary_kv_view=memoryview(buf),
         block_size=block_size,
     )
@@ -1182,6 +1183,7 @@ def test_stress_wait_idle_liveness_under_concurrent_enqueue(tmp_path):
     pool = DualQueueThreadPool(
         n_read_threads=4,
         n_write_threads=4,
+        n_write_excl_threads=2,
         primary_kv_view=memoryview(buf),
         block_size=block_size,
     )

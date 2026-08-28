@@ -25,6 +25,7 @@ worker threads are doing.
 import threading
 import time
 from collections import deque
+from enum import Enum
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.tiering.base import JobId
@@ -52,6 +53,12 @@ logger = init_logger(__name__)
 # something drains the async ResultQueue, so wait_idle() drains in a loop
 # instead of being notified instantly.
 _WAIT_IDLE_POLL_INTERVAL_S = 0.001
+
+
+class Priority(Enum):
+    READ = 1
+    WRITE = 2
+    WRITE_EXCL = 3
 
 
 class JobState:
@@ -121,6 +128,7 @@ class DualQueueThreadPool:
         self,
         n_read_threads: int,
         n_write_threads: int,
+        n_write_excl_threads: int,
         primary_kv_view: memoryview,
         block_size: int,
         use_o_direct: bool = True,
@@ -143,7 +151,7 @@ class DualQueueThreadPool:
         for i in range(n_read_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(True,),
+                args=(Priority.READ,),
                 name=f"{thread_name_prefix}_l{i}",
                 daemon=True,
             )
@@ -153,8 +161,18 @@ class DualQueueThreadPool:
         for i in range(n_write_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(False,),
+                args=(Priority.WRITE,),
                 name=f"{thread_name_prefix}_s{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        for i in range(n_write_excl_threads):
+            t = threading.Thread(
+                target=self._worker,
+                args=(Priority.WRITE_EXCL,),
+                name=f"{thread_name_prefix}_se{i}",
                 daemon=True,
             )
             t.start()
@@ -280,12 +298,12 @@ class DualQueueThreadPool:
             # use-after-free race with a still-running worker.
             destroy_pool(self._pool)
 
-    def _worker(self, load_priority: bool) -> None:
+    def _worker(self, priority: Priority) -> None:
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stop or queue_nonempty(self._pool, load_priority)
+                    lambda: self._stop or queue_nonempty(self._pool, priority)
                 )
                 if self._stop:
                     return
-            wait_and_run(self._pool, load_priority)
+            wait_and_run(self._pool, priority)
