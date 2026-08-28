@@ -59,6 +59,7 @@ class Priority(Enum):
     READ = 1
     WRITE = 2
     WRITE_EXCL = 3
+    READ_EXCL = 4
 
 
 class JobState:
@@ -128,6 +129,7 @@ class DualQueueThreadPool:
         self,
         n_read_threads: int,
         n_write_threads: int,
+        n_read_excl_threads: int,
         n_write_excl_threads: int,
         primary_kv_view: memoryview,
         block_size: int,
@@ -173,6 +175,16 @@ class DualQueueThreadPool:
                 target=self._worker,
                 args=(Priority.WRITE_EXCL,),
                 name=f"{thread_name_prefix}_se{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        for i in range(n_read_excl_threads):
+            t = threading.Thread(
+                target=self._worker,
+                args=(Priority.READ_EXCL,),
+                name=f"{thread_name_prefix}_le{i}",
                 daemon=True,
             )
             t.start()

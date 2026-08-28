@@ -245,11 +245,13 @@ inline bool is_store_priority(int const priority) { return priority == 2; }
 
 inline bool is_store_excl_priority(int const priority) { return priority == 3; }
 
+inline bool is_load_excl_priority(int const priority) { return priority == 4; }
+
 inline bool is_primary_load(int const priority) {
-  return is_load_priority(priority);
+  return is_load_priority(priority) || is_load_excl_priority(priority);
 }
 inline bool is_secondary_load(int const priority) {
-  return is_store_priority(priority);
+  return is_store_priority(priority) || is_load_excl_priority(priority);
 }
 
 inline WorkQueue& get_primary_queue(Pool* pool, int const priority) {
@@ -257,8 +259,10 @@ inline WorkQueue& get_primary_queue(Pool* pool, int const priority) {
     return pool->load_q;
   } else if (is_store_priority(priority)) {
     return pool->store_q;
-  } else {
+  } else if (is_store_excl_priority(priority)) {
     return pool->store_q;
+  } else {
+    return pool->load_q;
   }
 }
 
@@ -267,8 +271,10 @@ inline WorkQueue& get_secondary_queue(Pool* pool, int const priority) {
     return pool->store_q;
   } else if (is_store_priority(priority)) {
     return pool->load_q;
-  } else {
+  } else if (is_store_excl_priority(priority)) {
     return pool->store_q;
+  } else {
+    return pool->load_q;
   }
 }
 
