@@ -270,14 +270,20 @@ class HiSparseConnectorWorker:
         )
         self._spill_staging_index = 0
         self._spill_staging_events = [torch.Event() for _ in range(spill_staging_count)]
-        # All D->H traffic (per-layer mirrors and spill backups) shares one
-        # stream so it stays mutually ordered while overlapping compute.
-        # VLLM_HISPARSE_SYNC_BACKUP=1 restores compute-stream backups.
+        # Spill backups run on a dedicated stream so page migrations overlap
+        # compute; all D->H shares that one stream to stay mutually ordered.
+        # Per-layer mirrors default to the compute stream: their warp-copy
+        # kernels spinning on PCIe writes steal SMs from prefill compute when
+        # overlapped (~25% slower cold prefill at c4), while inline they
+        # serialize cheaply. VLLM_HISPARSE_SYNC_BACKUP=1 restores
+        # compute-stream spills; VLLM_HISPARSE_ASYNC_MIRROR=1 overlaps
+        # mirrors too.
         self.backup_stream: torch.Stream | None = None
         if os.getenv("VLLM_HISPARSE_SYNC_BACKUP", "0") != "1":
             self.backup_stream = torch.Stream(device=device)
-            for cache in self.cache_handles:
-                cache.runtime.backup_stream = self.backup_stream
+            if os.getenv("VLLM_HISPARSE_ASYNC_MIRROR", "0") == "1":
+                for cache in self.cache_handles:
+                    cache.runtime.backup_stream = self.backup_stream
 
     def start_step(
         self,
