@@ -3,6 +3,7 @@
 """Shared MHA implementation and metadata builder for sparse MLA backends."""
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from shutil import which
@@ -175,6 +176,9 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.model_config = vllm_config.model_config
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens: int = vllm_config.model_config.hf_config.index_topk
+        self.hisparse_allow_dense_mha = (
+            os.getenv("VLLM_HISPARSE_ALLOW_DENSE_MHA", "0") == "1"
+        )
         self.req_id_per_token_buffer = torch.empty(
             (vllm_config.scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
@@ -373,9 +377,19 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 prefill_query_lens_cpu,
             )
             staging_plan = None
-            if (
+            hisparse_enabled = (
                 self.vllm_config.attention_config.hisparse_config is not None
+            )
+            # Under HiSparse, dense MHA (and thus full-context staging) is
+            # disabled: short prefills route to MQA like long ones, and the
+            # staging plan is only needed where masked MHA can consume it.
+            if (
+                hisparse_enabled
                 and chunked_context is not None
+                and (
+                    self.topk_mask_workspace is not None
+                    or self.hisparse_allow_dense_mha
+                )
             ):
                 staging_plan = build_hisparse_prefill_staging_plan(
                     block_table,
@@ -395,6 +409,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 use_dense_mha=(
                     prefill_max_seq_len <= self.topk_tokens
                     and not self.vllm_config.attention_config.sparse_mla_force_mqa
+                    and (not hisparse_enabled or self.hisparse_allow_dense_mha)
                 ),
                 topk_mask_workspace=self.topk_mask_workspace,
                 hisparse_staging_plan=staging_plan,
@@ -660,6 +675,9 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 index_group_builder=hisparse_index_group_builder,
             )
             assert self.hisparse_cache is not None
+        self._hisparse_allow_dense_mha = (
+            os.getenv("VLLM_HISPARSE_ALLOW_DENSE_MHA", "0") == "1"
+        )
         self._hisparse_dummy_batch = False
 
         self._use_flashinfer_concat_mla_k = (
@@ -1255,6 +1273,14 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         topk_tokens = attn_metadata.topk_tokens
         force_dense = getattr(self, "_sparse_mla_force_dense_mha", False)
         force_masked = getattr(self, "_sparse_mla_force_masked_mha", False)
+        if (
+            staging_plan is not None
+            and self.masked_mha_available
+            and not self._hisparse_allow_dense_mha
+        ):
+            # HiSparse: masked MHA is the only staged-cache consumer.
+            force_dense = False
+            force_masked = True
         if force_dense or (prefill_max_seq_len <= topk_tokens and not force_masked):
             return super().forward_mha(
                 q,

@@ -2210,7 +2210,9 @@ def test_hisparse_mixed_batch_bf16_row_split(
         spy_stage, cache_handle.runtime
     )
 
-    backend_output, _ = impl._forward_bf16_kv(q, kv_pool, sparse_indices, metadata)
+    backend_output, _ = impl._forward_bf16_kv(
+        q, kv_pool, sparse_indices, metadata, q.shape[1]
+    )
     torch.accelerator.synchronize()
 
     # Only the prefill rows' blocks were staged: the decode rows' 2048-token
@@ -2387,7 +2389,7 @@ def test_hisparse_mixed_mha_returns_decode_only_mqa_slice():
         block_table=torch.zeros(2, 1, dtype=torch.int32),
         req_id_per_token=torch.arange(5, dtype=torch.int32),
     )
-    output, _ = impl._forward_bf16_kv(q, source_cache, topk, metadata)
+    output, _ = impl._forward_bf16_kv(q, source_cache, topk, metadata, q.shape[1])
     torch.testing.assert_close(output, expected)
 
 
