@@ -300,6 +300,14 @@ class HiSparseConnectorWorker:
         self.defer_prefill_mirror = (
             os.getenv("VLLM_HISPARSE_DEFER_PREFILL_MIRROR", "1") == "1"
         )
+        # Seal-only mirroring: skip per-step row mirrors entirely and rely on
+        # whole-page transfers (plan_prefix_materialization / spills) for host
+        # durability. Pages are only published as host-servable after their
+        # transfer completes, and pages evicted from GPU always go through the
+        # spill path first, so row mirrors are redundant for local serving.
+        # "decode" skips decode-only batches (the measured ~5ms/step tail);
+        # "all" also skips prefill-chunk flushes.
+        self.seal_only_mirror = os.getenv("VLLM_HISPARSE_SEAL_ONLY_MIRROR", "0")
         self.mirror_src_ptrs: torch.Tensor | None = None
         if self.defer_decode_mirror or self.defer_prefill_mirror:
             assert all(cache.slot_mapping is not None for cache in self.cache_handles)
@@ -488,8 +496,12 @@ class HiSparseConnectorWorker:
         num_rows = min(handle.num_actual_tokens, host_slots.numel())
         if num_rows <= 0:
             return
-        compute_stream = torch.accelerator.current_stream(self.hot_backing.device)
         decode_only = handle.num_decode_tokens == handle.num_actual_tokens
+        if self.seal_only_mirror == "all" or (
+            self.seal_only_mirror == "decode" and decode_only
+        ):
+            return
+        compute_stream = torch.accelerator.current_stream(self.hot_backing.device)
         stream = self.backup_stream if decode_only else None
         if stream is not None and not torch.cuda.is_current_stream_capturing():
             stream.wait_stream(compute_stream)

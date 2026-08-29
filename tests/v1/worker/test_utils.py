@@ -248,6 +248,7 @@ def test_hisparse_spill_batches_wait_for_reused_staging(monkeypatch):
     worker.backup_src_block_size = 1
     worker.backup_src_rows = 1
     worker.host_write_event = MagicMock()
+    worker.backup_stream = None
     worker._pending_transfer_events = []
     worker._enqueued_transfer_ids = []
     current_stream = MagicMock()
@@ -274,6 +275,57 @@ def test_hisparse_spill_batches_wait_for_reused_staging(monkeypatch):
     staging_event.synchronize.assert_called_once_with()
     assert worker._enqueued_transfer_ids == [0, 1]
     assert len(worker._pending_transfer_events) == 2
+
+
+def test_hisparse_seal_only_mirror_gates_deferred_flush(monkeypatch):
+    """Seal-only mirroring must skip row flushes for the configured batch
+    kinds and leave the others intact (page transfers provide durability)."""
+    worker = object.__new__(HiSparseConnectorWorker)
+    worker.mirror_src_ptrs = torch.empty(1, dtype=torch.uint64)
+    worker.hot_backing = torch.empty(1)
+    worker.backup_layer_offsets = torch.empty(1)
+    worker.backup_host_anchor = torch.empty(1)
+    worker.backup_host_cache_ptrs = torch.empty(1)
+    worker.backup_src_block_stride = 1
+    worker.backup_src_block_size = 1
+    worker.backup_src_rows = 1
+    worker.backup_stream = None
+    launches: list[int] = []
+    monkeypatch.setattr(
+        torch.ops._C_cache_ops,
+        "hisparse_backup_layers",
+        lambda *args: launches.append(args[6]),
+        raising=False,
+    )
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda device: MagicMock())
+
+    def handle(num_tokens, num_decode):
+        return SimpleNamespace(
+            mirror_deferred=True,
+            host_slot_mapping=torch.zeros(num_tokens, dtype=torch.int64),
+            num_actual_tokens=num_tokens,
+            num_decode_tokens=num_decode,
+        )
+
+    worker.seal_only_mirror = "decode"
+    worker.cache_handles = [handle(4, 4)]
+    worker._flush_deferred_mirrors()
+    assert launches == []
+    worker.cache_handles = [handle(128, 4)]
+    worker._flush_deferred_mirrors()
+    assert launches == [128]
+
+    launches.clear()
+    worker.seal_only_mirror = "all"
+    worker.cache_handles = [handle(128, 4)]
+    worker._flush_deferred_mirrors()
+    assert launches == []
+
+    launches.clear()
+    worker.seal_only_mirror = "0"
+    worker.cache_handles = [handle(4, 4)]
+    worker._flush_deferred_mirrors()
+    assert launches == [4]
 
 
 def test_hisparse_runtime_invalidates_only_scheduled_request_states():
