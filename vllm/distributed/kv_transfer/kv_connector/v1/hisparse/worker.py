@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
@@ -269,12 +270,28 @@ class HiSparseConnectorWorker:
         )
         self._spill_staging_index = 0
         self._spill_staging_events = [torch.Event() for _ in range(spill_staging_count)]
+        # All D->H traffic (per-layer mirrors and spill backups) shares one
+        # stream so it stays mutually ordered while overlapping compute.
+        # VLLM_HISPARSE_SYNC_BACKUP=1 restores compute-stream backups.
+        self.backup_stream: torch.Stream | None = None
+        if os.getenv("VLLM_HISPARSE_SYNC_BACKUP", "0") != "1":
+            self.backup_stream = torch.Stream(device=device)
+            for cache in self.cache_handles:
+                cache.runtime.backup_stream = self.backup_stream
 
     def start_step(
         self,
         metadata: HiSparseConnectorMetadata,
         request_state_indices: torch.Tensor | None,
     ) -> None:
+        if self.backup_stream is not None:
+            # This step's kernels may read host rows written by last step's
+            # backups, and may recycle resident rows those backups read.
+            torch.accelerator.current_stream(self.hot_backing.device).wait_stream(
+                self.backup_stream
+            )
+            for cache in self.cache_handles:
+                cache.runtime.release_backup_retained()
         copy_kv_cache_blocks_inplace(
             self.host_caches,
             self.host_num_blocks,
@@ -362,6 +379,12 @@ class HiSparseConnectorWorker:
         transfers_per_batch = self.spill_row_capacity // self.kernel_block_size
         if transfers_per_batch == 0:
             raise RuntimeError("HiSparse spill staging cannot hold one cache page.")
+        compute_stream = torch.accelerator.current_stream(self.hot_backing.device)
+        stream = self.backup_stream
+        if stream is not None and not torch.cuda.is_current_stream_capturing():
+            stream.wait_stream(compute_stream)
+        else:
+            stream = compute_stream
         offsets = np.arange(self.kernel_block_size, dtype=np.int64)
         for batch_start in range(0, len(transfers), transfers_per_batch):
             batch = transfers[batch_start : batch_start + transfers_per_batch]
@@ -389,42 +412,48 @@ class HiSparseConnectorWorker:
                     + transfer.destination_page_offset
                 )
                 dst[start:end] = host_page * self.kernel_block_size + offsets
-            self.spill_src_gpu[:, :num_rows].copy_(
-                src_staging[:, :num_rows], non_blocking=True
-            )
-            self.spill_dst_gpu[:num_rows].copy_(
-                dst_staging[:num_rows], non_blocking=True
-            )
-            current_stream = torch.accelerator.current_stream(self.hot_backing.device)
-            staging_event.record(current_stream)
-            self._spill_staging_index = (staging_idx + 1) % len(
-                self._spill_staging_events
-            )
-            torch.ops._C_cache_ops.hisparse_backup_layers(
-                self.hot_backing,
-                self.backup_layer_offsets,
-                self.spill_src_indices_ptrs,
-                self.backup_host_anchor,
-                self.backup_host_cache_ptrs,
-                self.spill_dst_gpu,
-                num_rows,
-                self.backup_src_block_stride,
-                self.backup_src_block_size,
-                self.backup_src_rows,
-            )
-            self.host_write_event.record(current_stream)
-            transfer_ids = tuple(transfer.transfer_id for transfer in batch)
-            completion_event = torch.Event()
-            completion_event.record(current_stream)
-            self._pending_transfer_events.append((completion_event, transfer_ids))
-            self._enqueued_transfer_ids.extend(transfer_ids)
+            with stream:
+                self.spill_src_gpu[:, :num_rows].copy_(
+                    src_staging[:, :num_rows], non_blocking=True
+                )
+                self.spill_dst_gpu[:num_rows].copy_(
+                    dst_staging[:num_rows], non_blocking=True
+                )
+                staging_event.record(stream)
+                self._spill_staging_index = (staging_idx + 1) % len(
+                    self._spill_staging_events
+                )
+                torch.ops._C_cache_ops.hisparse_backup_layers(
+                    self.hot_backing,
+                    self.backup_layer_offsets,
+                    self.spill_src_indices_ptrs,
+                    self.backup_host_anchor,
+                    self.backup_host_cache_ptrs,
+                    self.spill_dst_gpu,
+                    num_rows,
+                    self.backup_src_block_stride,
+                    self.backup_src_block_size,
+                    self.backup_src_rows,
+                )
+                self.host_write_event.record(stream)
+                transfer_ids = tuple(transfer.transfer_id for transfer in batch)
+                completion_event = torch.Event()
+                completion_event.record(stream)
+                self._pending_transfer_events.append((completion_event, transfer_ids))
+                self._enqueued_transfer_ids.extend(transfer_ids)
 
     def finish_forward(self) -> None:
         current_stream = torch.accelerator.current_stream(self.hot_backing.device)
         transfers = self._post_forward_transfers
         self._post_forward_transfers = []
         self._enqueue_transfers(transfers)
-        self.host_write_event.record(current_stream)
+        if self.backup_stream is not None:
+            # Cover compute-stream D->H writes too (captured-graph mirrors),
+            # then record once on the backup stream so the event fences both.
+            self.backup_stream.wait_stream(current_stream)
+            self.host_write_event.record(self.backup_stream)
+        else:
+            self.host_write_event.record(current_stream)
 
     def take_transfer_updates(self) -> tuple[list[int], list[int]]:
         enqueued = self._enqueued_transfer_ids

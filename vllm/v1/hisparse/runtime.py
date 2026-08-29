@@ -523,6 +523,16 @@ class HiSparseRuntime:
         self.resident_source_index = -1
         self.request_state_indices: torch.Tensor | None = None
         self.shared_host_region: SharedOffloadRegion | None = None
+        self.backup_stream: torch.Stream | None = None
+        self._backup_retained: list[torch.Tensor] = []
+
+    def retain_for_backup(self, tensor: torch.Tensor) -> None:
+        """Keep a temporary alive while the backup stream may still read it."""
+        self._backup_retained.append(tensor)
+
+    def release_backup_retained(self) -> None:
+        """Drop retained temporaries; call only after fencing the backup stream."""
+        self._backup_retained.clear()
 
     @property
     def host_cache(self) -> torch.Tensor:
@@ -900,11 +910,27 @@ class HiSparseCacheHandle:
                 .to(device=self.runtime.device, dtype=torch.int64)
                 .contiguous()
             )
-            self.runtime.backup_rows(
-                self.view.cache,
-                resident_slots,
-                mirrored_slots,
-            )
+            backup_stream = self.runtime.backup_stream
+            if (
+                backup_stream is not None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                backup_stream.wait_stream(
+                    torch.accelerator.current_stream(self.runtime.device)
+                )
+                with backup_stream:
+                    self.runtime.backup_rows(
+                        self.view.cache,
+                        resident_slots,
+                        mirrored_slots,
+                    )
+                self.runtime.retain_for_backup(mirrored_slots)
+            else:
+                self.runtime.backup_rows(
+                    self.view.cache,
+                    resident_slots,
+                    mirrored_slots,
+                )
             if self.runtime.is_group_leader and self.num_decode_tokens:
                 assert self.req_id_per_token is not None
                 num_decode_tokens = min(self.num_decode_tokens, num_rows)
