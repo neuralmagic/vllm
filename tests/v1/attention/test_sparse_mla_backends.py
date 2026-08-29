@@ -2434,8 +2434,9 @@ def test_hisparse_mirror_stash_is_builder_driven():
     eagerly every step; prepare_for_batch runs inside captured graphs and
     goes stale across full-cudagraph replays."""
     handle = SimpleNamespace(
-        runtime=SimpleNamespace(defer_decode_mirror=True),
+        runtime=SimpleNamespace(defer_decode_mirror=True, defer_prefill_mirror=True),
         host_slot_mapping=None,
+        num_actual_tokens=0,
         num_decode_tokens=0,
         mirror_deferred=False,
     )
@@ -2453,13 +2454,22 @@ def test_hisparse_mirror_stash_is_builder_driven():
     )
     assert handle.mirror_deferred
     assert handle.host_slot_mapping is slot_mapping
+    assert handle.num_actual_tokens == 4
     assert handle.num_decode_tokens == 4
 
     mixed_meta = SimpleNamespace(slot_mapping=slot_mapping, num_actual_tokens=9)
+    handle.runtime.defer_prefill_mirror = False
     SparseMLACommonMetadataBuilder._stash_hisparse_mirror_state(
         builder, mixed_meta, num_decode_tokens=4
     )
     assert not handle.mirror_deferred
+
+    handle.runtime.defer_prefill_mirror = True
+    SparseMLACommonMetadataBuilder._stash_hisparse_mirror_state(
+        builder, mixed_meta, num_decode_tokens=4
+    )
+    assert handle.mirror_deferred
+    assert handle.num_actual_tokens == 9
 
     handle.runtime.defer_decode_mirror = False
     SparseMLACommonMetadataBuilder._stash_hisparse_mirror_state(

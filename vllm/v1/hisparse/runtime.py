@@ -525,6 +525,7 @@ class HiSparseRuntime:
         self.shared_host_region: SharedOffloadRegion | None = None
         self.backup_stream: torch.Stream | None = None
         self.defer_decode_mirror = False
+        self.defer_prefill_mirror = False
         self._backup_retained: list[torch.Tensor] = []
 
     def retain_for_backup(self, tensor: torch.Tensor) -> None:
@@ -867,6 +868,7 @@ class HiSparseCacheHandle:
         self.slot_mapping: torch.Tensor | None = None
         self.runtime = runtime
         self.decode_batch = False
+        self.num_actual_tokens = 0
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None
         self.host_slot_mapping: torch.Tensor | None = None

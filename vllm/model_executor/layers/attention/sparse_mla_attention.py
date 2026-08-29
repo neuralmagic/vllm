@@ -458,13 +458,16 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 if (handle := getattr(ctx[name].impl, "hisparse_cache", None))
                 is not None
             ]
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        decode_only = 0 < num_decode_tokens == num_actual_tokens
         for handle in self._hisparse_handles:
             handle.host_slot_mapping = common_attn_metadata.slot_mapping
+            handle.num_actual_tokens = num_actual_tokens
             handle.num_decode_tokens = num_decode_tokens
-            handle.mirror_deferred = (
+            handle.mirror_deferred = num_actual_tokens > 0 and (
                 handle.runtime.defer_decode_mirror
-                and num_decode_tokens > 0
-                and num_decode_tokens == common_attn_metadata.num_actual_tokens
+                if decode_only
+                else handle.runtime.defer_prefill_mirror
             )
 
     @staticmethod

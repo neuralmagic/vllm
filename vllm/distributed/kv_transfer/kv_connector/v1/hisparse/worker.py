@@ -290,11 +290,18 @@ class HiSparseConnectorWorker:
         # at finish_forward. Slot mappings are persistent per-group buffers,
         # so the source pointer table is static.
         # VLLM_HISPARSE_DEFER_DECODE_MIRROR=0 restores per-layer mirrors.
+        # Prefill batches get the same single-launch treatment, but the flush
+        # stays on the compute stream: its grid is large enough to starve
+        # compute of SMs when overlapped. VLLM_HISPARSE_DEFER_PREFILL_MIRROR=0
+        # restores per-layer prefill mirrors.
         self.defer_decode_mirror = (
             os.getenv("VLLM_HISPARSE_DEFER_DECODE_MIRROR", "1") == "1"
         )
+        self.defer_prefill_mirror = (
+            os.getenv("VLLM_HISPARSE_DEFER_PREFILL_MIRROR", "1") == "1"
+        )
         self.mirror_src_ptrs: torch.Tensor | None = None
-        if self.defer_decode_mirror:
+        if self.defer_decode_mirror or self.defer_prefill_mirror:
             assert all(cache.slot_mapping is not None for cache in self.cache_handles)
             self.mirror_src_ptrs = torch.tensor(
                 [
@@ -305,7 +312,8 @@ class HiSparseConnectorWorker:
                 device=device,
             )
             for cache in self.cache_handles:
-                cache.runtime.defer_decode_mirror = True
+                cache.runtime.defer_decode_mirror = self.defer_decode_mirror
+                cache.runtime.defer_prefill_mirror = self.defer_prefill_mirror
 
     def start_step(
         self,
@@ -477,11 +485,12 @@ class HiSparseConnectorWorker:
         host_slots = handle.host_slot_mapping
         if not handle.mirror_deferred or host_slots is None:
             return
-        num_rows = min(handle.num_decode_tokens, host_slots.numel())
+        num_rows = min(handle.num_actual_tokens, host_slots.numel())
         if num_rows <= 0:
             return
         compute_stream = torch.accelerator.current_stream(self.hot_backing.device)
-        stream = self.backup_stream
+        decode_only = handle.num_decode_tokens == handle.num_actual_tokens
+        stream = self.backup_stream if decode_only else None
         if stream is not None and not torch.cuda.is_current_stream_capturing():
             stream.wait_stream(compute_stream)
         else:
