@@ -2358,6 +2358,76 @@ def test_hisparse_gather_prefill_cache_prefers_resident_rows():
         torch.testing.assert_close(staged_flat[i], expected)
 
 
+def test_hisparse_stage_prefill_cache_uses_resident_rows():
+    """stage_prefill_cache serves shadow-adopted pages device-to-device."""
+    if not _has_hisparse_ops():
+        pytest.skip("hisparse CUDA ops unavailable")
+    device = torch.device("cuda")
+    block_size, resident_block_size, row_width = 4, 2, 16
+    block_table = torch.tensor([[5, 2, 0], [9, 3, 0]], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([5, 8], dtype=torch.int32, device=device)
+    resident_table = torch.tensor(
+        [[11, 12, 0, 13, 0, 0], [21, 0, 22, 23, 0, 0]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    num_host_blocks, num_res_blocks = 10, 24
+    host_cache = (
+        torch.arange(num_host_blocks * block_size * row_width, dtype=torch.float32)
+        .view(num_host_blocks, block_size, row_width)
+        .pin_memory()
+    )
+    resident_cache = (
+        (
+            -torch.arange(
+                num_res_blocks * resident_block_size * row_width, dtype=torch.float32
+            )
+            - 1.0
+        )
+        .view(num_res_blocks, resident_block_size, row_width)
+        .to(device)
+    )
+
+    shim = SimpleNamespace(
+        gather_prefill_cache=lambda kv, plan, resident_cache=None: (
+            HiSparseRuntime.gather_prefill_cache(
+                None, kv, plan, resident_cache=resident_cache
+            )
+        )
+    )
+    staged, staged_bt = HiSparseRuntime.stage_prefill_cache(
+        shim,
+        host_cache,
+        block_table,
+        seq_lens,
+        resident_block_table=resident_table,
+        resident_cache=resident_cache,
+        resident_block_size=resident_block_size,
+    )
+
+    reference_plan = build_hisparse_prefill_staging_plan(
+        block_table, seq_lens, block_size
+    )
+    reference_plan.ensure_gpu_sources(resident_table, resident_block_size)
+    assert reference_plan.gpu_row_ids is not None
+    torch.testing.assert_close(staged_bt, reference_plan.block_table)
+
+    staged_flat = staged.view(-1, row_width).cpu()
+    host_flat = host_cache.view(-1, row_width)
+    resident_flat = resident_cache.reshape(-1, row_width).cpu()
+    gpu_rows = reference_plan.gpu_row_ids[0].cpu()
+    host_rows = reference_plan.row_ids[0].cpu()
+    assert int((gpu_rows >= 0).sum()) > 0, "expected at least one resident hit"
+    for i in range(staged_flat.shape[0]):
+        expected = (
+            resident_flat[int(gpu_rows[i])]
+            if int(gpu_rows[i]) >= 0
+            else host_flat[int(host_rows[i])]
+        )
+        torch.testing.assert_close(staged_flat[i], expected)
+
+
 def test_hisparse_mixed_mha_returns_decode_only_mqa_slice():
     """Dense MHA may consume every prefill token in a mixed batch."""
     impl = object.__new__(FlashMLASparseImpl)

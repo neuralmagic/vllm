@@ -808,12 +808,24 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 if host_resident:
                     assert chunk.seq_lens is not None
                     assert self.hisparse_cache is not None
-                    gather_cache, gather_bt = (
-                        self.hisparse_cache.runtime.stage_prefill_cache(
-                            kv_c_and_k_pe_cache,
-                            chunk.block_table,
-                            chunk.seq_lens,
-                        )
+                    handle = self.hisparse_cache
+                    resident_bt = None
+                    resident_cache = None
+                    resident_block_size = None
+                    if handle.view is not None and handle.block_table is not None:
+                        row_start = fp8_metadata.num_decodes + chunk.req_start_idx
+                        resident_bt = handle.block_table[
+                            row_start : row_start + len(chunk.block_table)
+                        ]
+                        resident_cache = handle.view.cache
+                        resident_block_size = handle.view.block_size
+                    gather_cache, gather_bt = handle.runtime.stage_prefill_cache(
+                        kv_c_and_k_pe_cache,
+                        chunk.block_table,
+                        chunk.seq_lens,
+                        resident_block_table=resident_bt,
+                        resident_cache=resident_cache,
+                        resident_block_size=resident_block_size,
                     )
                 else:
                     gather_cache, gather_bt = kv_c_and_k_pe_cache, chunk.block_table

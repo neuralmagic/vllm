@@ -597,15 +597,29 @@ class HiSparseRuntime:
         kv_cache: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        resident_block_table: torch.Tensor | None = None,
+        resident_cache: torch.Tensor | None = None,
+        resident_block_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather referenced host context blocks into a compact GPU cache."""
+        """Gather referenced host context blocks into a compact GPU cache.
+
+        When the resident view is provided, rows whose pages are GPU-resident
+        (shadow-adopted prefix hits) fill device-to-device; only true misses
+        read from the host pool.
+        """
         block_size = kv_cache.shape[1]
         plan = build_hisparse_prefill_staging_plan(
             block_table,
             seq_lens,
             block_size,
         )
-        return self.gather_prefill_cache(kv_cache, plan), plan.block_table
+        if resident_block_table is not None and resident_cache is not None:
+            assert resident_block_size is not None
+            plan.ensure_gpu_sources(resident_block_table, resident_block_size)
+        return (
+            self.gather_prefill_cache(kv_cache, plan, resident_cache=resident_cache),
+            plan.block_table,
+        )
 
     def gather_prefill_cache(
         self,

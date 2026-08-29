@@ -951,10 +951,21 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
         assert attn_metadata.seq_lens is not None
-        staged_cache, staged_bt = self.hisparse_cache.runtime.stage_prefill_cache(
+        handle = self.hisparse_cache
+        resident_bt = None
+        resident_cache = None
+        resident_block_size = None
+        if handle.view is not None and handle.block_table is not None:
+            resident_bt = handle.block_table[num_decodes:]
+            resident_cache = handle.view.cache
+            resident_block_size = handle.view.block_size
+        staged_cache, staged_bt = handle.runtime.stage_prefill_cache(
             kv_cache,
             attn_metadata.block_table[num_decodes:],
             attn_metadata.seq_lens[num_decodes:],
+            resident_block_table=resident_bt,
+            resident_cache=resident_cache,
+            resident_block_size=resident_block_size,
         )
         prefill_req_ids = attn_metadata.req_id_per_token[num_decode_tokens:]
         if num_decodes > 0:
