@@ -25,6 +25,7 @@ from vllm.model_executor.layers.attention.mla_attention import _use_masked_mha
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     GLOBAL_TOPK_MASK_MAX_BYTES,
     SparseMLACommonImpl,
+    SparseMLACommonMetadataBuilder,
     SparseMLAPrefillMetadata,
     _masked_mha_workspace_fits,
     _topk_mask_shape,
@@ -2426,6 +2427,45 @@ def test_hisparse_stage_prefill_cache_uses_resident_rows():
             else host_flat[int(host_rows[i])]
         )
         torch.testing.assert_close(staged_flat[i], expected)
+
+
+def test_hisparse_mirror_stash_is_builder_driven():
+    """The deferred-mirror flush gate must refresh from build(), which runs
+    eagerly every step; prepare_for_batch runs inside captured graphs and
+    goes stale across full-cudagraph replays."""
+    handle = SimpleNamespace(
+        runtime=SimpleNamespace(defer_decode_mirror=True),
+        host_slot_mapping=None,
+        num_decode_tokens=0,
+        mirror_deferred=False,
+    )
+    builder = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            attention_config=SimpleNamespace(hisparse_config=object())
+        ),
+        _hisparse_handles=[handle],
+    )
+    slot_mapping = torch.arange(8, dtype=torch.int64)
+
+    decode_meta = SimpleNamespace(slot_mapping=slot_mapping, num_actual_tokens=4)
+    SparseMLACommonMetadataBuilder._stash_hisparse_mirror_state(
+        builder, decode_meta, num_decode_tokens=4
+    )
+    assert handle.mirror_deferred
+    assert handle.host_slot_mapping is slot_mapping
+    assert handle.num_decode_tokens == 4
+
+    mixed_meta = SimpleNamespace(slot_mapping=slot_mapping, num_actual_tokens=9)
+    SparseMLACommonMetadataBuilder._stash_hisparse_mirror_state(
+        builder, mixed_meta, num_decode_tokens=4
+    )
+    assert not handle.mirror_deferred
+
+    handle.runtime.defer_decode_mirror = False
+    SparseMLACommonMetadataBuilder._stash_hisparse_mirror_state(
+        builder, decode_meta, num_decode_tokens=4
+    )
+    assert not handle.mirror_deferred
 
 
 def test_hisparse_mixed_mha_returns_decode_only_mqa_slice():

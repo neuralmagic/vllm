@@ -179,6 +179,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.hisparse_allow_dense_mha = (
             os.getenv("VLLM_HISPARSE_ALLOW_DENSE_MHA", "0") == "1"
         )
+        self._hisparse_handles: list[HiSparseCacheHandle] | None = None
         self.req_id_per_token_buffer = torch.empty(
             (vllm_config.scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
@@ -416,6 +417,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             )
             self._prefill_backend.prepare_metadata(prefill)
 
+        self._stash_hisparse_mirror_state(common_attn_metadata, num_decode_tokens)
         return self.metadata_cls(  # type: ignore[call-arg]
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -436,6 +438,34 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             prefill=prefill,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
+
+    def _stash_hisparse_mirror_state(
+        self,
+        common_attn_metadata: "CommonAttentionMetadata",
+        num_decode_tokens: int,
+    ) -> None:
+        # The connector's deferred-mirror flush reads this state eagerly at
+        # finish_forward, while prepare_for_batch runs inside the captured
+        # graph and goes stale across full-cudagraph replays. build() runs
+        # eagerly every step (including capture), so stash it here.
+        if self.vllm_config.attention_config.hisparse_config is None:
+            return
+        if self._hisparse_handles is None:
+            ctx = self.vllm_config.compilation_config.static_forward_context
+            self._hisparse_handles = [
+                handle
+                for name in self.layer_names
+                if (handle := getattr(ctx[name].impl, "hisparse_cache", None))
+                is not None
+            ]
+        for handle in self._hisparse_handles:
+            handle.host_slot_mapping = common_attn_metadata.slot_mapping
+            handle.num_decode_tokens = num_decode_tokens
+            handle.mirror_deferred = (
+                handle.runtime.defer_decode_mirror
+                and num_decode_tokens > 0
+                and num_decode_tokens == common_attn_metadata.num_actual_tokens
+            )
 
     @staticmethod
     def _build_prefill_fields(

@@ -284,6 +284,28 @@ class HiSparseConnectorWorker:
             if os.getenv("VLLM_HISPARSE_ASYNC_MIRROR", "0") == "1":
                 for cache in self.cache_handles:
                     cache.runtime.backup_stream = self.backup_stream
+        # Decode-step mirrors: instead of one warp-copy kernel per layer per
+        # step (~0.6 ms each, latency-bound on PCIe write flushes), skip them
+        # in write_rows and flush all layers in a single backup_layers launch
+        # at finish_forward. Slot mappings are persistent per-group buffers,
+        # so the source pointer table is static.
+        # VLLM_HISPARSE_DEFER_DECODE_MIRROR=0 restores per-layer mirrors.
+        self.defer_decode_mirror = (
+            os.getenv("VLLM_HISPARSE_DEFER_DECODE_MIRROR", "1") == "1"
+        )
+        self.mirror_src_ptrs: torch.Tensor | None = None
+        if self.defer_decode_mirror:
+            assert all(cache.slot_mapping is not None for cache in self.cache_handles)
+            self.mirror_src_ptrs = torch.tensor(
+                [
+                    cache.slot_mapping.data_ptr()  # type: ignore[union-attr]
+                    for cache in self.cache_handles
+                ],
+                dtype=torch.uint64,
+                device=device,
+            )
+            for cache in self.cache_handles:
+                cache.runtime.defer_decode_mirror = True
 
     def start_step(
         self,
@@ -448,10 +470,41 @@ class HiSparseConnectorWorker:
                 self._pending_transfer_events.append((completion_event, transfer_ids))
                 self._enqueued_transfer_ids.extend(transfer_ids)
 
+    def _flush_deferred_mirrors(self) -> None:
+        if self.mirror_src_ptrs is None:
+            return
+        handle = self.cache_handles[0]
+        host_slots = handle.host_slot_mapping
+        if not handle.mirror_deferred or host_slots is None:
+            return
+        num_rows = min(handle.num_decode_tokens, host_slots.numel())
+        if num_rows <= 0:
+            return
+        compute_stream = torch.accelerator.current_stream(self.hot_backing.device)
+        stream = self.backup_stream
+        if stream is not None and not torch.cuda.is_current_stream_capturing():
+            stream.wait_stream(compute_stream)
+        else:
+            stream = compute_stream
+        with stream:
+            torch.ops._C_cache_ops.hisparse_backup_layers(
+                self.hot_backing,
+                self.backup_layer_offsets,
+                self.mirror_src_ptrs,
+                self.backup_host_anchor,
+                self.backup_host_cache_ptrs,
+                host_slots[:num_rows],
+                num_rows,
+                self.backup_src_block_stride,
+                self.backup_src_block_size,
+                self.backup_src_rows,
+            )
+
     def finish_forward(self) -> None:
         current_stream = torch.accelerator.current_stream(self.hot_backing.device)
         transfers = self._post_forward_transfers
         self._post_forward_transfers = []
+        self._flush_deferred_mirrors()
         self._enqueue_transfers(transfers)
         if self.backup_stream is not None:
             # Cover compute-stream D->H writes too (captured-graph mirrors),

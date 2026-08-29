@@ -524,6 +524,7 @@ class HiSparseRuntime:
         self.request_state_indices: torch.Tensor | None = None
         self.shared_host_region: SharedOffloadRegion | None = None
         self.backup_stream: torch.Stream | None = None
+        self.defer_decode_mirror = False
         self._backup_retained: list[torch.Tensor] = []
 
     def retain_for_backup(self, tensor: torch.Tensor) -> None:
@@ -868,6 +869,8 @@ class HiSparseCacheHandle:
         self.decode_batch = False
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None
+        self.host_slot_mapping: torch.Tensor | None = None
+        self.mirror_deferred = False
 
     def bind_cache(
         self,
@@ -919,34 +922,44 @@ class HiSparseCacheHandle:
             scale=k_scale,
         )
         if mirror_to_host or self.runtime.eager_host_mirror:
-            mirrored_slots = (
-                host_slots[:num_rows]
-                .to(device=self.runtime.device, dtype=torch.int64)
-                .contiguous()
+            need_invalidate = bool(
+                self.runtime.is_group_leader and self.num_decode_tokens
             )
-            backup_stream = self.runtime.backup_stream
-            if (
-                backup_stream is not None
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                backup_stream.wait_stream(
-                    torch.accelerator.current_stream(self.runtime.device)
+            mirrored_slots: torch.Tensor | None = None
+            if not self.mirror_deferred or need_invalidate:
+                mirrored_slots = (
+                    host_slots[:num_rows]
+                    .to(device=self.runtime.device, dtype=torch.int64)
+                    .contiguous()
                 )
-                with backup_stream:
+            if not self.mirror_deferred:
+                # The connector flushes deferred decode mirrors in one
+                # all-layer backup at finish_forward.
+                assert mirrored_slots is not None
+                backup_stream = self.runtime.backup_stream
+                if (
+                    backup_stream is not None
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    backup_stream.wait_stream(
+                        torch.accelerator.current_stream(self.runtime.device)
+                    )
+                    with backup_stream:
+                        self.runtime.backup_rows(
+                            self.view.cache,
+                            resident_slots,
+                            mirrored_slots,
+                        )
+                    self.runtime.retain_for_backup(mirrored_slots)
+                else:
                     self.runtime.backup_rows(
                         self.view.cache,
                         resident_slots,
                         mirrored_slots,
                     )
-                self.runtime.retain_for_backup(mirrored_slots)
-            else:
-                self.runtime.backup_rows(
-                    self.view.cache,
-                    resident_slots,
-                    mirrored_slots,
-                )
-            if self.runtime.is_group_leader and self.num_decode_tokens:
+            if need_invalidate:
                 assert self.req_id_per_token is not None
+                assert mirrored_slots is not None
                 num_decode_tokens = min(self.num_decode_tokens, num_rows)
                 self.runtime.invalidate_written_slots(
                     mirrored_slots[:num_decode_tokens],
