@@ -655,6 +655,13 @@ void hisparse_invalidate_written_slots(
     torch::stable::Tensor const& req_id_per_token,
     torch::stable::Tensor const& written_slots);
 
+void hisparse_invalidate_written_slots_layers(
+    torch::stable::Tensor const& device_global_indices_ptrs,
+    torch::stable::Tensor const& request_state_indices,
+    torch::stable::Tensor const& req_id_per_token,
+    torch::stable::Tensor const& written_slots, int64_t num_state_rows,
+    int64_t region_stride);
+
 void hisparse_gather_plan(
     torch::stable::Tensor const& host_cache, torch::stable::Tensor& hot_cache,
     torch::stable::Tensor const& global_indices,

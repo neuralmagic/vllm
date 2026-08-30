@@ -112,6 +112,9 @@ class InputBatch:
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
 
+    # HiSparse can bypass host staging when every scheduled row is resident.
+    hisparse_all_resident: bool = False
+
     @classmethod
     def make_dummy(
         cls,

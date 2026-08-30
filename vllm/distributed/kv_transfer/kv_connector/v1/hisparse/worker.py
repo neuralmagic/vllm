@@ -187,6 +187,21 @@ class HiSparseConnectorWorker:
         self.leader_runtimes = [
             cache.runtime for cache in cache_handles if cache.runtime.is_group_leader
         ]
+        leader_indices = [
+            runtime.index_group.device_global_indices
+            for runtime in self.leader_runtimes
+        ]
+        leader_shapes = {tuple(indices.shape) for indices in leader_indices}
+        if len(leader_shapes) != 1:
+            raise RuntimeError("HiSparse index groups must use one hot-state geometry.")
+        self.invalidate_num_state_rows, self.invalidate_region_stride = next(
+            iter(leader_shapes)
+        )
+        self.invalidate_global_indices_ptrs = torch.tensor(
+            [indices.data_ptr() for indices in leader_indices],
+            dtype=torch.uint64,
+            device=device,
+        )
         request_state_indices = {
             indices.data_ptr(): indices
             for cache in cache_handles
@@ -539,6 +554,7 @@ class HiSparseConnectorWorker:
                 or handle.num_decode_tokens != cache.num_decode_tokens
                 or handle.decode_batch != cache.decode_batch
                 or handle.runtime.eager_host_mirror != cache.runtime.eager_host_mirror
+                or handle.runtime.all_resident != cache.runtime.all_resident
                 or handle.mirror_slot_mapping is None
                 or dst_slots is None
                 or handle.mirror_slot_mapping.data_ptr() != dst_slots.data_ptr()
@@ -552,6 +568,7 @@ class HiSparseConnectorWorker:
                 cache.num_decode_tokens,
                 cache.decode_batch,
                 cache.runtime.eager_host_mirror,
+                cache.runtime.all_resident,
                 None if dst_slots is None else dst_slots.data_ptr(),
             )
             actual = (
@@ -559,6 +576,7 @@ class HiSparseConnectorWorker:
                 handle.num_decode_tokens,
                 handle.decode_batch,
                 handle.runtime.eager_host_mirror,
+                handle.runtime.all_resident,
                 None
                 if handle.mirror_slot_mapping is None
                 else handle.mirror_slot_mapping.data_ptr(),
@@ -567,7 +585,10 @@ class HiSparseConnectorWorker:
                 "HiSparse cache layers disagree on mirror metadata: "
                 f"cache 0={expected}, cache {index}={actual}."
             )
-        if not cache.decode_batch or not cache.runtime.eager_host_mirror:
+        if not (
+            (cache.decode_batch and cache.runtime.eager_host_mirror)
+            or (not cache.decode_batch and cache.runtime.all_resident)
+        ):
             return
         if dst_slots is None:
             raise RuntimeError("HiSparse host mirror has no source slot mapping.")
@@ -594,12 +615,18 @@ class HiSparseConnectorWorker:
         num_decode_tokens = min(cache.num_decode_tokens, num_rows)
         if num_decode_tokens:
             assert cache.req_id_per_token is not None
-            for handle in active_handles:
-                if handle.runtime.is_group_leader:
-                    handle.runtime.invalidate_written_slots(
-                        dst_slots[:num_decode_tokens],
-                        cache.req_id_per_token[:num_decode_tokens],
-                    )
+            num_active_leaders = sum(
+                handle.runtime.is_group_leader for handle in active_handles
+            )
+            if num_active_leaders:
+                torch.ops._C_cache_ops.hisparse_invalidate_written_slots_layers(
+                    self.invalidate_global_indices_ptrs[:num_active_leaders],
+                    self.request_state_indices,
+                    cache.req_id_per_token[:num_decode_tokens],
+                    dst_slots[:num_decode_tokens],
+                    self.invalidate_num_state_rows,
+                    self.invalidate_region_stride,
+                )
 
     def finish_forward(self) -> None:
         current_stream = torch.accelerator.current_stream(self.hot_backing.device)

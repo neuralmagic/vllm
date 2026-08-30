@@ -83,11 +83,21 @@ class ResolvedHiSparseConfig:
         if config is None:
             return None
 
-        # Default 2x top_k: at exactly top_k the LRU has zero slack and
-        # boundary entries thrash between steps.
+        # Keep every speculative step's selected rows live until the batched
+        # attention call. At exactly top_k the LRU has zero slack even without
+        # speculative decoding.
         configured_size = config.device_buffer_size
         if configured_size is None:
-            device_buffer_size = 2 * model_top_k
+            decode_query_len = 1
+            speculative_config = getattr(vllm_config, "speculative_config", None)
+            if (
+                speculative_config is not None
+                and speculative_config.num_speculative_tokens is not None
+            ):
+                decode_query_len += speculative_config.num_speculative_tokens * (
+                    2 if speculative_config.parallel_drafting else 1
+                )
+            device_buffer_size = max(2, decode_query_len) * model_top_k
         else:
             device_buffer_size = configured_size
 
@@ -566,6 +576,7 @@ class HiSparseRuntime:
         index_group.stats_row_bytes += row_bytes
 
         self.eager_host_mirror = False
+        self.all_resident = False
         self.resident_source_index = -1
         self.request_state_indices: torch.Tensor | None = None
         self.shared_host_region: SharedOffloadRegion | None = None
@@ -801,7 +812,12 @@ class HiSparseRuntime:
             0,
         )
 
-        if produce_plan and group.followers and prefetch_followers:
+        if (
+            produce_plan
+            and group.followers
+            and prefetch_followers
+            and not self.all_resident
+        ):
             self._prefetch_group(num_tokens, plan_row_offset)
 
         if not return_valid_counts:
@@ -937,7 +953,9 @@ class HiSparseCacheHandle:
             mirrored_slots = host_slots[:num_rows].to(
                 device=self.runtime.device, dtype=torch.int64
             )
-            if self.defer_host_mirror and not mirror_to_host:
+            if self.defer_host_mirror and (
+                not mirror_to_host or self.runtime.all_resident
+            ):
                 if self.mirror_slot_mapping is None:
                     self.mirror_slot_mapping = mirrored_slots
                 return
@@ -991,6 +1009,18 @@ class HiSparseCacheHandle:
     ) -> HiSparseTopKResult:
         num_tokens = topk_indices.shape[0]
         if not self.runtime.is_group_leader:
+            if self.runtime.all_resident:
+                return self.runtime.swap_in(
+                    resident=self,
+                    req_id_per_token=req_id_per_token[:num_tokens],
+                    block_table=block_table,
+                    topk_indices=topk_indices,
+                    block_size=block_size,
+                    return_valid_counts=return_valid_counts,
+                    produce_plan=False,
+                    plan_row_offset=plan_row_offset,
+                    prefetch_followers=False,
+                )
             return self.runtime.apply_plan(
                 block_size=block_size,
                 num_tokens=num_tokens,

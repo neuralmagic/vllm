@@ -80,6 +80,13 @@ def test_hisparse_device_buffer_size_boundaries():
     assert resolved is not None
     assert resolved.device_buffer_size == 256
 
+    vllm_config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=3, parallel_drafting=False
+    )
+    resolved = ResolvedHiSparseConfig.from_vllm_config(vllm_config, model_top_k=128)
+    assert resolved is not None
+    assert resolved.device_buffer_size == 512
+
     vllm_config.attention_config.hisparse_config = HiSparseConfig(
         host_pool_gib=1.0, device_buffer_size=127
     )

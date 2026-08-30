@@ -132,6 +132,26 @@ def test_block_tables_apply_staged_writes_single_group():
     )
 
 
+def test_block_tables_track_null_blocks_without_reading_gpu():
+    block_tables = BlockTables(
+        block_sizes=[32],
+        max_num_reqs=2,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[4],
+        device=torch.device("cuda"),
+        kernel_block_sizes=[16],
+    )
+
+    block_tables.append_block_ids(0, ([0, 3],), overwrite=True)
+    assert block_tables.num_null_blocks[0, 0] == 2
+
+    block_tables.append_block_ids(0, ([0],), overwrite=False)
+    assert block_tables.num_null_blocks[0, 0] == 4
+
+    block_tables.append_block_ids(0, ([5],), overwrite=True)
+    assert block_tables.num_null_blocks[0, 0] == 0
+
+
 @pytest.mark.parametrize("cp_rank", range(4))
 def test_dcp_slot_mapping_with_smaller_kernel_blocks(cp_rank: int):
     """DCP interleave is expressed in logical-block token coordinates."""

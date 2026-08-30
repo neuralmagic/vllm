@@ -217,6 +217,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             block_table_tensor=cad.block_table_tensor,
             slot_mapping=query_slot_mapping,
             causal=self.dflash_causal,
+            hisparse_all_resident=cad.hisparse_all_resident,
         )
 
         return num_query_total, token_indices_to_sample, new_cad

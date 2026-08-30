@@ -64,7 +64,12 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import HiSparseHotSpec, KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    HiSparseHotSpec,
+    HiSparseResidentSpec,
+    KVCacheConfig,
+    MambaSpec,
+)
 from vllm.v1.metrics.stats import HiSparseStats
 from vllm.v1.outputs import (
     DraftTokenIds,
@@ -570,6 +575,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 token_alignment=spec.block_table_token_alignment,
             )
             max_num_blocks_per_group.append(max_num_blocks)
+
+        self.hisparse_resident_group_id = next(
+            (
+                group_id
+                for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, HiSparseResidentSpec)
+            ),
+            None,
+        )
 
         target_attn_layer_names = None
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1322,6 +1336,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # prompt_lens is only used in R-SWA case.
             prompt_lens = self.req_states.prompt_len.gpu[idx_mapping]
 
+        hisparse_all_resident = False
+        if self.hisparse_resident_group_id is not None:
+            resident_null_counts = self.block_tables.num_null_blocks[
+                self.hisparse_resident_group_id, idx_mapping_np
+            ]
+            hisparse_all_resident = not resident_null_counts.any()
+
         input_batch = InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -1359,6 +1380,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if adaptive_verification is not None
                 else None
             ),
+            hisparse_all_resident=hisparse_all_resident,
         )
         return pcp.maybe_partition_pcp_batch(
             self.pcp_manager,

@@ -223,6 +223,7 @@ class DefaultModelState(ModelState):
             is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
+            hisparse_all_resident=input_batch.hisparse_all_resident,
             rswa_prefix_lens=input_batch.prompt_lens,
         )
         return attn_metadata

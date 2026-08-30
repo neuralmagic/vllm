@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Mapping
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -64,6 +65,9 @@ class BlockTables:
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
             dtype=torch.int32,
+        )
+        self.num_null_blocks = np.zeros(
+            (self.num_kv_cache_groups, self.max_num_reqs), dtype=np.int32
         )
         self.fused_writer: FusedStagedWriter | None = None
         if self.num_kv_cache_groups > 1:
@@ -128,6 +132,11 @@ class BlockTables:
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
             bpk = self.blocks_per_kv_block[i]
+            if overwrite:
+                self.num_null_blocks[i, req_index] = 0
+            self.num_null_blocks[i, req_index] += (
+                sum(block_id == 0 for block_id in block_ids) * bpk
+            )
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
             end = start + len(block_ids)

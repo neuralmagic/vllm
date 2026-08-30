@@ -980,6 +980,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                                   Tensor written_slots) -> ()");
 
   ops.def(
+      "hisparse_invalidate_written_slots_layers("
+      "    Tensor device_global_indices_ptrs,"
+      "    Tensor request_state_indices,"
+      "    Tensor req_id_per_token,"
+      "    Tensor written_slots,"
+      "    int num_state_rows,"
+      "    int region_stride) -> ()");
+
+  ops.def(
       "hisparse_gather_plan(Tensor host_cache,"
       "                     Tensor! hot_cache,"
       "                     Tensor global_indices,"
@@ -1121,6 +1130,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("hisparse_swap_in", TORCH_BOX(&hisparse_swap_in));
   ops.impl("hisparse_invalidate_written_slots",
            TORCH_BOX(&hisparse_invalidate_written_slots));
+  ops.impl("hisparse_invalidate_written_slots_layers",
+           TORCH_BOX(&hisparse_invalidate_written_slots_layers));
   ops.impl("hisparse_gather_plan", TORCH_BOX(&hisparse_gather_plan));
   ops.impl("hisparse_gather_compact", TORCH_BOX(&hisparse_gather_compact));
   ops.impl("hisparse_backup", TORCH_BOX(&hisparse_backup));

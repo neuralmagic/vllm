@@ -209,6 +209,7 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
     const int32_t* __restrict__ request_state_indices,  // [num_rows] or nullptr
     const int64_t host_rows, const int64_t row_bytes,
     const int64_t hot_block_stride, const int64_t hot_table_stride,
+    const int32_t num_state_rows, const int32_t num_request_state_indices,
     const int32_t hot_block_size, const int32_t top_k, const int32_t hot_size,
     const int32_t hash_size, const int64_t region_stride,
     const int64_t attention_block_stride, const int64_t source_bt_stride,
@@ -221,11 +222,15 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
   const int num_token_chunks = (top_k + kWarpSize - 1) / kWarpSize;
 
   const int batch_row = blockIdx.x;
-  const int state_row = request_state_indices != nullptr
-                            ? request_state_indices[batch_row]
-                            : batch_row;
+  const int request_id =
+      request_ids != nullptr ? request_ids[batch_row] : batch_row;
+  const int state_row =
+      request_state_indices != nullptr && request_id >= 0 &&
+              request_id < num_request_state_indices
+          ? request_state_indices[request_id]
+          : (request_state_indices != nullptr ? -1 : batch_row);
   // V2 publishes -1 for CUDA-graph padding rows.
-  if (state_row < 0) {
+  if (state_row < 0 || state_row >= num_state_rows) {
     for (int i = threadIdx.x; i < top_k; i += blockDim.x) {
       const int64_t index = static_cast<int64_t>(batch_row) * top_k + i;
       hot_indices[index] = -1;
@@ -399,7 +404,7 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
       s_topk[found_topk_idx] = kTokenDone;
       store_hot_index(row_out, row_attention, found_topk_idx,
                       static_cast<int32_t>(get_physical_hot_row(
-                          hot_block_table, batch_row, hot_table_stride,
+                          hot_block_table, state_row, hot_table_stride,
                           hot_block_size, slot)),
                       hot_block_size, attention_block_stride);
     }
@@ -508,7 +513,7 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
         // entries are skipped), so writes never overrun pending reads.
         s_topk[m] = g;
         const int32_t physical_row = static_cast<int32_t>(
-            get_physical_hot_row(hot_block_table, batch_row, hot_table_stride,
+            get_physical_hot_row(hot_block_table, state_row, hot_table_stride,
                                  hot_block_size, evict_slot));
         store_hot_index(row_out, row_attention, i, physical_row, hot_block_size,
                         attention_block_stride);
@@ -559,7 +564,7 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
       continue;
     }
     const int64_t physical_row =
-        get_physical_hot_row(hot_block_table, batch_row, hot_table_stride,
+        get_physical_hot_row(hot_block_table, state_row, hot_table_stride,
                              hot_block_size, evict_slot);
     if (g >= 0 && g < host_rows) {
       copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
@@ -738,6 +743,38 @@ __global__ void hisparse_invalidate_written_slots_kernel(
   }
 }
 
+__global__ void hisparse_invalidate_written_slots_layers_kernel(
+    const uint64_t* __restrict__ device_global_indices_ptrs,
+    const int32_t* __restrict__ request_state_indices,
+    const int32_t* __restrict__ req_id_per_token,
+    const int64_t* __restrict__ written_slots, const int64_t num_tokens,
+    const int32_t num_layers, const int64_t num_request_ids,
+    const int64_t num_state_rows, const int64_t region_stride) {
+  const int64_t token_idx = blockIdx.x;
+  const int32_t layer_idx = blockIdx.y;
+  if (token_idx >= num_tokens || layer_idx >= num_layers) {
+    return;
+  }
+  const int32_t req_idx = req_id_per_token[token_idx];
+  if (req_idx < 0 || req_idx >= num_request_ids) {
+    return;
+  }
+  const int32_t state_idx = request_state_indices[req_idx];
+  const int64_t written_slot = written_slots[token_idx];
+  if (state_idx < 0 || state_idx >= num_state_rows || written_slot < 0) {
+    return;
+  }
+  auto* device_global_indices = reinterpret_cast<int32_t*>(
+      static_cast<uintptr_t>(device_global_indices_ptrs[layer_idx]));
+  int32_t* row = device_global_indices + state_idx * region_stride;
+  for (int64_t offset = threadIdx.x; offset < region_stride;
+       offset += blockDim.x) {
+    if (row[offset] == written_slot) {
+      row[offset] = -1;
+    }
+  }
+}
+
 // One warp per (layer, item): scatter the current decode row from every hot
 // cache layer into its pinned host source. Layer metadata is immutable and
 // uploaded once at initialization, so the decode hot path needs one launch and
@@ -853,6 +890,68 @@ void hisparse_invalidate_written_slots(
                   cudaGetErrorString(launch_error));
 }
 
+void hisparse_invalidate_written_slots_layers(
+    torch::stable::Tensor const& device_global_indices_ptrs,
+    torch::stable::Tensor const& request_state_indices,
+    torch::stable::Tensor const& req_id_per_token,
+    torch::stable::Tensor const& written_slots, int64_t num_state_rows,
+    int64_t region_stride) {
+  STD_TORCH_CHECK(
+      device_global_indices_ptrs.is_cuda() &&
+          device_global_indices_ptrs.scalar_type() ==
+              torch::headeronly::ScalarType::UInt64 &&
+          device_global_indices_ptrs.dim() == 1 &&
+          device_global_indices_ptrs.is_contiguous(),
+      "device_global_indices_ptrs must be contiguous 1D uint64 CUDA tensor");
+  STD_TORCH_CHECK(request_state_indices.is_cuda() &&
+                      req_id_per_token.is_cuda() && written_slots.is_cuda(),
+                  "HiSparse invalidation tensors must be on CUDA");
+  STD_TORCH_CHECK(
+      request_state_indices.scalar_type() ==
+              torch::headeronly::ScalarType::Int &&
+          req_id_per_token.scalar_type() ==
+              torch::headeronly::ScalarType::Int &&
+          written_slots.scalar_type() == torch::headeronly::ScalarType::Long,
+      "HiSparse invalidation metadata has invalid dtype");
+  STD_TORCH_CHECK(request_state_indices.is_contiguous() &&
+                      req_id_per_token.is_contiguous() &&
+                      written_slots.is_contiguous(),
+                  "HiSparse invalidation metadata must be contiguous");
+  const int device_index = device_global_indices_ptrs.get_device_index();
+  STD_TORCH_CHECK(
+      request_state_indices.get_device_index() == device_index &&
+          req_id_per_token.get_device_index() == device_index &&
+          written_slots.get_device_index() == device_index,
+      "HiSparse invalidation tensors must be on the same CUDA device");
+  STD_TORCH_CHECK(num_state_rows > 0 && region_stride > 0,
+                  "HiSparse invalidation geometry must be positive");
+  const int64_t num_tokens =
+      std::min(req_id_per_token.numel(), written_slots.numel());
+  const int64_t num_layers = device_global_indices_ptrs.numel();
+  if (num_tokens == 0 || num_layers == 0) {
+    return;
+  }
+  STD_TORCH_CHECK(num_tokens <= UINT32_MAX && num_layers <= 65535,
+                  "HiSparse invalidation launch exceeds CUDA grid limits");
+  const torch::stable::accelerator::DeviceGuard device_guard(device_index);
+  const cudaStream_t stream = get_current_cuda_stream();
+  constexpr int kBlockSize = 256;
+  hisparse_invalidate_written_slots_layers_kernel<<<
+      dim3(static_cast<uint32_t>(num_tokens),
+           static_cast<uint32_t>(num_layers)),
+      kBlockSize, 0, stream>>>(
+      static_cast<const uint64_t*>(device_global_indices_ptrs.const_data_ptr()),
+      request_state_indices.const_data_ptr<int32_t>(),
+      req_id_per_token.const_data_ptr<int32_t>(),
+      written_slots.const_data_ptr<int64_t>(), num_tokens,
+      static_cast<int32_t>(num_layers), request_state_indices.numel(),
+      num_state_rows, region_stride);
+  const cudaError_t launch_error = cudaGetLastError();
+  STD_TORCH_CHECK(launch_error == cudaSuccess,
+                  "HiSparse batched invalidation kernel launch failed: ",
+                  cudaGetErrorString(launch_error));
+}
+
 void hisparse_swap_in(
     torch::stable::Tensor const& host_cache, torch::stable::Tensor& hot_cache,
     torch::stable::Tensor const& hot_block_table,
@@ -932,9 +1031,9 @@ void hisparse_swap_in(
                   "region_stride must match the LRU size");
   STD_TORCH_CHECK(device_global_indices.size(1) == region_stride,
                   "device_global_indices must cover the full hot region");
-  STD_TORCH_CHECK(device_global_indices.size(0) >= num_rows,
-                  "device_global_indices has too few rows");
-  STD_TORCH_CHECK(hot_block_table.size(0) >= num_rows &&
+  const auto num_state_rows =
+      static_cast<int32_t>(device_global_indices.size(0));
+  STD_TORCH_CHECK(hot_block_table.size(0) >= num_state_rows &&
                       hot_block_table.size(1) >=
                           (region_stride + hot_block_size - 1) / hot_block_size,
                   "hot_block_table has too few entries");
@@ -1048,14 +1147,22 @@ void hisparse_swap_in(
   }
 
   const int32_t* request_state_ptr = nullptr;
+  int32_t num_request_state_indices = 0;
   if (request_state_indices.has_value()) {
     auto const& state_indices = request_state_indices.value();
     STD_TORCH_CHECK(
         state_indices.is_cuda() &&
             state_indices.scalar_type() == torch::headeronly::ScalarType::Int &&
-            state_indices.numel() >= num_rows,
-        "request_state_indices must be int32 on CUDA with one entry per row");
+            state_indices.is_contiguous() &&
+            state_indices.numel() >=
+                (request_ids_ptr != nullptr ? source_num_reqs : num_rows),
+        "request_state_indices must be contiguous int32 on CUDA with one "
+        "entry per request");
     request_state_ptr = state_indices.const_data_ptr<int32_t>();
+    num_request_state_indices = static_cast<int32_t>(state_indices.numel());
+  } else {
+    STD_TORCH_CHECK(num_state_rows >= num_rows,
+                    "device_global_indices has too few rows");
   }
 
   // Optional plan output: 1 at columns resolved as a miss (loaded from the
@@ -1136,10 +1243,11 @@ void hisparse_swap_in(
       miss_mask_ptr, device_global_indices.mutable_data_ptr<int32_t>(),
       lru_slots.mutable_data_ptr<int16_t>(), stats_ptr, request_state_ptr,
       host_rows, row_bytes, hot_block_stride, hot_block_table.stride(0),
-      hot_block_size, top_k, hot_size, hash_size, region_stride,
-      attention_block_stride, source_bt_stride, source_num_reqs,
-      source_num_blocks, static_cast<int32_t>(source_block_size),
-      resident_bt_stride, resident_num_reqs, resident_num_blocks,
+      num_state_rows, num_request_state_indices, hot_block_size, top_k,
+      hot_size, hash_size, region_stride, attention_block_stride,
+      source_bt_stride, source_num_reqs, source_num_blocks,
+      static_cast<int32_t>(source_block_size), resident_bt_stride,
+      resident_num_reqs, resident_num_blocks,
       static_cast<int32_t>(resident_block_size),
       static_cast<int32_t>(resident_null_block));
   const cudaError_t launch_error = cudaGetLastError();

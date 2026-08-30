@@ -132,6 +132,7 @@ def _is_masked_mha_available(
 @dataclass
 class SparseMLAPrefillMetadata(MLACommonPrefillMetadata):
     hisparse_staging_plan: HiSparsePrefillStagingPlan | None = None
+    hisparse_all_resident: bool = False
 
 
 @dataclass(kw_only=True)
@@ -144,6 +145,7 @@ class SparseMLACommonMetadata(MLACommonMetadata[MLACommonDecodeMetadata]):
     num_decodes: int = 0
     num_prefills: int = 0
     num_decode_tokens: int = 0
+    hisparse_all_resident: bool = False
     decode_max_query_len: int = 0
     prefill_max_seq_len: int = 0
     prefill: SparseMLAPrefillMetadata | None = None
@@ -373,7 +375,10 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 prefill_query_lens_cpu,
             )
             staging_plan = None
-            if self.vllm_config.attention_config.hisparse_config is not None:
+            if (
+                self.vllm_config.attention_config.hisparse_config is not None
+                and not common_attn_metadata.hisparse_all_resident
+            ):
                 prefill_seq_lens_cpu = seq_lens_cpu[
                     num_decodes : num_decodes + num_prefills
                 ]
@@ -406,6 +411,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 ),
                 topk_mask_workspace=self.topk_mask_workspace,
                 hisparse_staging_plan=staging_plan,
+                hisparse_all_resident=common_attn_metadata.hisparse_all_resident,
             )
             self._prefill_backend.prepare_metadata(prefill)
 
@@ -424,6 +430,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
+            hisparse_all_resident=common_attn_metadata.hisparse_all_resident,
             decode_max_query_len=decode_max_query_len,
             prefill_max_seq_len=prefill_max_seq_len,
             prefill=prefill,
@@ -708,6 +715,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 and attn_metadata.max_query_len == 1
                 and attn_metadata.num_reqs == attn_metadata.num_actual_tokens
             )
+            self.hisparse_cache.runtime.all_resident = bool(
+                attn_metadata is not None
+                and getattr(attn_metadata, "hisparse_all_resident", False)
+            )
 
     def _hisparse_swap_in(
         self,
@@ -744,6 +755,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         run_step: HiSparseMQAStep,
         *,
         uniform: bool = False,
+        run_batch: HiSparseMQAStep | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
@@ -759,6 +771,40 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             req_ids_by_request = attn_metadata.req_id_per_token[
                 :num_decode_tokens
             ].view(num_decodes, max_query_len)
+            if (
+                max_query_len > 1
+                and attn_metadata.hisparse_all_resident
+                and run_batch is not None
+            ):
+                hot_cache, physical_indices, seq_lens = self._hisparse_swap_in(
+                    topk_indices[:num_decode_tokens].contiguous(),
+                    attn_metadata,
+                    return_valid_counts=True,
+                    req_id_per_token=attn_metadata.req_id_per_token[:num_decode_tokens],
+                    prefetch_followers=False,
+                )
+                return run_batch(q, hot_cache, physical_indices, seq_lens)
+            if (
+                max_query_len > 1
+                and run_batch is not None
+                and self.hisparse_cache is not None
+                and self.hisparse_cache.runtime.region_stride
+                >= max_query_len * topk_by_request.shape[-1]
+            ):
+                step_indices = []
+                for step in range(max_query_len):
+                    step_topk = topk_by_request[:, step].contiguous()
+                    hot_cache, physical_indices, seq_lens = self._hisparse_swap_in(
+                        step_topk,
+                        attn_metadata,
+                        return_valid_counts=True,
+                        req_id_per_token=req_ids_by_request[:, step].contiguous(),
+                        plan_row_offset=step * num_decodes,
+                        prefetch_followers=False,
+                    )
+                    step_indices.append(physical_indices)
+                batch_indices = torch.stack(step_indices, dim=1).flatten(0, 1)
+                return run_batch(q, hot_cache, batch_indices, seq_lens)
         else:
             max_query_len = attn_metadata.decode_max_query_len
             query_start_loc = attn_metadata.query_start_loc[: num_decodes + 1]
@@ -944,15 +990,33 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         num_decodes = attn_metadata.num_decodes
         num_decode_tokens = attn_metadata.num_decode_tokens
         prefill = attn_metadata.prefill
-        staging_plan = prefill.hisparse_staging_plan if prefill is not None else None
-        assert staging_plan is not None
-        staged_cache = self.hisparse_cache.runtime.gather_prefill_cache(
-            kv_cache, staging_plan
-        )
-        staged_bt = staging_plan.block_table
+        handle = self.hisparse_cache
         prefill_req_ids = attn_metadata.req_id_per_token[num_decode_tokens:]
         if num_decodes > 0:
             prefill_req_ids = prefill_req_ids - num_decodes
+        if (
+            prefill is not None
+            and prefill.hisparse_all_resident
+            and handle.view is not None
+            and handle.block_table is not None
+        ):
+            return (
+                handle.view.cache,
+                handle.block_table[num_decodes:],
+                prefill_req_ids,
+            )
+        staging_plan = prefill.hisparse_staging_plan if prefill is not None else None
+        assert staging_plan is not None
+        resident_cache = None
+        if handle.view is not None and handle.block_table is not None:
+            staging_plan.ensure_gpu_sources(
+                handle.block_table[num_decodes:], handle.view.block_size
+            )
+            resident_cache = handle.view.cache
+        staged_cache = handle.runtime.gather_prefill_cache(
+            kv_cache, staging_plan, resident_cache=resident_cache
+        )
+        staged_bt = staging_plan.block_table
         return staged_cache, staged_bt, prefill_req_ids
 
     def do_kv_cache_update(
@@ -1248,25 +1312,27 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata is not None
         staging_plan = prefill_metadata.hisparse_staging_plan
-        if (
-            staging_plan is not None
-            and prefill_metadata.chunked_context is not None
-            and kv_c_and_k_pe_cache.device.type == "cpu"
-        ):
+        if kv_c_and_k_pe_cache.device.type == "cpu":
             assert self.hisparse_cache is not None
             handle = self.hisparse_cache
-            resident_cache = None
-            if handle.view is not None and handle.block_table is not None:
-                staging_plan.ensure_gpu_sources(
-                    handle.block_table[attn_metadata.num_decodes :],
-                    handle.view.block_size,
+            if prefill_metadata.hisparse_all_resident and handle.view is not None:
+                kv_c_and_k_pe_cache = handle.view.cache
+            elif (
+                staging_plan is not None
+                and prefill_metadata.chunked_context is not None
+            ):
+                resident_cache = None
+                if handle.view is not None and handle.block_table is not None:
+                    staging_plan.ensure_gpu_sources(
+                        handle.block_table[attn_metadata.num_decodes :],
+                        handle.view.block_size,
+                    )
+                    resident_cache = handle.view.cache
+                kv_c_and_k_pe_cache = handle.runtime.gather_prefill_cache(
+                    kv_c_and_k_pe_cache,
+                    staging_plan,
+                    resident_cache=resident_cache,
                 )
-                resident_cache = handle.view.cache
-            kv_c_and_k_pe_cache = handle.runtime.gather_prefill_cache(
-                kv_c_and_k_pe_cache,
-                staging_plan,
-                resident_cache=resident_cache,
-            )
         prefill_max_seq_len = attn_metadata.prefill_max_seq_len
         topk_tokens = attn_metadata.topk_tokens
         force_dense = getattr(self, "_sparse_mla_force_dense_mha", False)

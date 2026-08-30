@@ -41,6 +41,10 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
+from vllm.v1.hisparse.runtime import (
+    HiSparsePrefillStagingPlan,
+    build_hisparse_prefill_staging_plan,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -176,6 +180,7 @@ class FlashMLASparseMetadata(SparseMLACommonMetadata):
                 workspace_starts: torch.Tensor
                 chunk_tot_seqlen: int
                 seq_lens: torch.Tensor | None = None
+                hisparse_staging_plan: HiSparsePrefillStagingPlan | None = None
 
             chunks: list[Chunk]
 
@@ -467,6 +472,19 @@ class FlashMLASparseMetadataBuilder(
                 chunk_seq_lens = common_attn_metadata.seq_lens[
                     num_decodes + chunk_start : num_decodes + chunk_end
                 ]
+                hisparse_staging_plan = None
+                if self.use_hisparse and not common_attn_metadata.hisparse_all_resident:
+                    block_size = self.kv_cache_spec.block_size
+                    chunk_seq_lens_cpu = prefill_seq_lens_cpu[chunk_start:chunk_end]
+                    staging_block_capacity = int(
+                        ((chunk_seq_lens_cpu + block_size - 1) // block_size).sum()
+                    )
+                    hisparse_staging_plan = build_hisparse_prefill_staging_plan(
+                        chunk_block_table,
+                        chunk_seq_lens,
+                        block_size,
+                        staging_block_capacity,
+                    )
 
                 prefill_chunks.append(
                     FP8Meta.Prefill.Chunk(
@@ -476,6 +494,7 @@ class FlashMLASparseMetadataBuilder(
                         workspace_starts=chunk_workspace_starts,
                         chunk_tot_seqlen=chunk_tot_seqlen,
                         seq_lens=chunk_seq_lens,
+                        hisparse_staging_plan=hisparse_staging_plan,
                     )
                 )
 
@@ -806,15 +825,32 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             for chunk in fp8_metadata.prefill.chunks:
                 chunk_workspace = self.prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
                 if host_resident:
-                    assert chunk.seq_lens is not None
                     assert self.hisparse_cache is not None
-                    gather_cache, gather_bt = (
-                        self.hisparse_cache.runtime.stage_prefill_cache(
+                    handle = self.hisparse_cache
+                    resident_bt = None
+                    if handle.view is not None and handle.block_table is not None:
+                        start = num_decodes + chunk.req_start_idx
+                        resident_bt = handle.block_table[
+                            start : start + chunk.block_table.shape[0]
+                        ]
+                    if attn_metadata.hisparse_all_resident:
+                        assert handle.view is not None and resident_bt is not None
+                        gather_cache, gather_bt = handle.view.cache, resident_bt
+                    else:
+                        staging_plan = chunk.hisparse_staging_plan
+                        assert staging_plan is not None
+                        resident_cache = None
+                        if handle.view is not None and resident_bt is not None:
+                            staging_plan.ensure_gpu_sources(
+                                resident_bt, handle.view.block_size
+                            )
+                            resident_cache = handle.view.cache
+                        gather_cache = handle.runtime.gather_prefill_cache(
                             kv_c_and_k_pe_cache,
-                            chunk.block_table,
-                            chunk.seq_lens,
+                            staging_plan,
+                            resident_cache=resident_cache,
                         )
-                    )
+                        gather_bt = staging_plan.block_table
                 else:
                     gather_cache, gather_bt = kv_c_and_k_pe_cache, chunk.block_table
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
@@ -1039,12 +1075,39 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             )
             return step_output.squeeze(sequence_dim), None
 
+        def run_fp8_batch(
+            batch_q: torch.Tensor,
+            hot_cache: torch.Tensor,
+            batch_topk: torch.Tensor,
+            _seq_lens: torch.Tensor,
+        ) -> tuple[torch.Tensor, None]:
+            if flatten_requests:
+                kernel_q = batch_q.unsqueeze(0)
+                kernel_topk = batch_topk.unsqueeze(0)
+            else:
+                kernel_q = reshape_query_for_spec_decode(
+                    batch_q, attn_metadata.num_decodes
+                )
+                kernel_topk = batch_topk.view(
+                    attn_metadata.num_decodes, kernel_q.shape[1], -1
+                )
+            batch_output, _ = self._fp8_flash_mla_kernel(
+                q=kernel_q,
+                kv_c_and_k_pe_cache=hot_cache,
+                topk_indices=kernel_topk,
+                kernel_metadata=kernel_metadata,
+            )
+            if flatten_requests:
+                return batch_output.squeeze(0), None
+            return reshape_attn_output_for_spec_decode(batch_output), None
+
         output, _ = self._run_hisparse_decode(
             q,
             topk_indices,
             attn_metadata,
             run_fp8_step,
             uniform=True,
+            run_batch=run_fp8_batch,
         )
         return output
 
