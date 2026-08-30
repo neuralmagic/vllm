@@ -409,6 +409,16 @@ class HiSparseCoordinator:
             if pending.release_after and not pending.resident_released
         )
         resident_managers = self.resident_managers
+        num_reclaimable_requests = sum(
+            any(not blocks[i].is_null for i in range(len(blocks) - 2))
+            for blocks in resident_managers[0].req_to_blocks.values()
+        )
+        num_blocks = max(
+            num_blocks,
+            num_reclaimable_requests * self.num_growing_managers,
+        )
+        if shadow_reclaimed + eventual >= num_blocks:
+            return shadow_reclaimed
         spill_plan_budget = max(
             self.max_spill_pages - len(self.spills_to_send),
             0,
@@ -421,10 +431,6 @@ class HiSparseCoordinator:
         by_request: dict[str, list[int]] = {}
         for request_id, block_idx in candidates:
             by_request.setdefault(request_id, []).append(block_idx)
-        num_blocks = max(
-            num_blocks,
-            len(by_request) * self.num_growing_managers,
-        )
 
         reclaimed = shadow_reclaimed
         for request_id, pages in sorted(
