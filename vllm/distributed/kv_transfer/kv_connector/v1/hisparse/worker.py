@@ -495,9 +495,12 @@ class HiSparseConnectorWorker:
                     + transfer.destination_page_offset
                 )
                 dst[start:end] = host_page * self.kernel_block_size + offsets
-            self.spill_src_gpu[:, :num_rows].copy_(
-                src_staging[:, :num_rows], non_blocking=True
-            )
+            # A 2D prefix is strided; copy_ packs it through pageable memory
+            # and blocks despite non_blocking=True. Each row stays pinned.
+            for layer, src_gpu in enumerate(self.spill_src_gpu):
+                src_gpu[:num_rows].copy_(
+                    src_staging[layer, :num_rows], non_blocking=True
+                )
             self.spill_dst_gpu[:num_rows].copy_(
                 dst_staging[:num_rows], non_blocking=True
             )
