@@ -489,6 +489,38 @@ def test_hisparse_materialization_respects_per_step_spill_budget():
     assert first[0].transfer_id != second[0].transfer_id
 
 
+def test_hisparse_transition_survives_early_materialization_completion():
+    """A transition must retain pages completed before its whole batch is ready.
+
+    Production workers can report completion for a previously enqueued prefix
+    page before reporting enqueue for the rest of a later release transition.
+    """
+    manager = make_hisparse_kv_cache_manager(32, 16, enable_caching=True)
+    coordinator = manager.hisparse_coordinator
+    request = make_request(
+        "transition", list(range(5 * HISPARSE_BLOCK_SIZE)), HISPARSE_BLOCK_SIZE, sha256
+    )
+    assert (
+        manager.allocate_slots(request, num_new_tokens=request.num_tokens) is not None
+    )
+    spills = coordinator.build_offload_command().page_transfers
+    assert len(spills) == 5
+
+    first, *rest = spills
+    coordinator.update_spills({first.transfer_id: 1}, {})
+    coordinator.reclaim_resident_blocks(coordinator.block_pool_id, 1)
+    assert coordinator.has_pending_reclamation()
+
+    coordinator.update_spills({}, {first.transfer_id: 1})
+    transition_ids = [spill.transfer_id for spill in rest[:2]]
+    transition_counts = dict.fromkeys(transition_ids, 1)
+    coordinator.update_spills(transition_counts, transition_counts)
+
+    assert not coordinator.has_pending_reclamation()
+    resident_blocks = manager.get_blocks(request.request_id).blocks[2]
+    assert all(block.is_null for block in resident_blocks[:3])
+
+
 def test_hisparse_host_cow_copy_is_drained_without_a_gpu_pool():
     """Host-only copy-on-write work must reach the worker copy queue."""
     manager = make_hisparse_kv_cache_manager(16, 16)

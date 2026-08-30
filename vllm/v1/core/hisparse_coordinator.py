@@ -766,6 +766,7 @@ class HiSparseCoordinator:
             pending
             for pending in self.pending_spills.values()
             if pending.enqueue_applied
+            and (not pending.release_after or pending.resident_released)
             and pending.expected_worker_completions
             and pending.worker_completions >= pending.expected_worker_completions
         ]
