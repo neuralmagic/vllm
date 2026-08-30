@@ -338,6 +338,61 @@ def test_hisparse_reclaims_sealed_resident_pages_before_rejecting_admission():
     assert manager.allocate_slots(first, num_new_tokens=16) is not None
 
 
+def test_hisparse_pending_reclamation_does_not_rescan_resident_pages(monkeypatch):
+    manager = make_hisparse_kv_cache_manager(
+        18,
+        18,
+        max_model_len=160,
+    )
+    first = make_request("first", list(range(128)), HISPARSE_BLOCK_SIZE, sha256)
+    assert manager.allocate_slots(first, num_new_tokens=128) is not None
+
+    second = make_request(
+        "second", list(range(HISPARSE_BLOCK_SIZE)), HISPARSE_BLOCK_SIZE, sha256
+    )
+    assert manager.allocate_slots(second, num_new_tokens=16) is None
+    coordinator = manager.hisparse_coordinator
+    assert coordinator.has_pending_reclamation()
+
+    for resident_manager in coordinator.resident_managers:
+        monkeypatch.setattr(
+            resident_manager,
+            "reclaimable_pages",
+            lambda: pytest.fail("rescanned pages while reclamation was pending"),
+        )
+
+    assert manager.allocate_slots(second, num_new_tokens=16) is None
+
+
+def test_hisparse_reclamation_enumerates_lockstep_pages_once(monkeypatch):
+    config = make_hisparse_kv_cache_config(27, 18)
+    config.kv_cache_groups.insert(
+        -1,
+        replace(config.kv_cache_groups[-2], layer_names=["resident-2"]),
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=160,
+        enable_caching=False,
+        hash_block_size=HISPARSE_BLOCK_SIZE,
+    )
+    first = make_request("first", list(range(128)), HISPARSE_BLOCK_SIZE, sha256)
+    assert manager.allocate_slots(first, num_new_tokens=128) is not None
+
+    second_resident = manager.hisparse_coordinator.resident_managers[1]
+    monkeypatch.setattr(
+        second_resident,
+        "reclaimable_pages",
+        lambda: pytest.fail("enumerated an identical resident page table"),
+    )
+    second = make_request(
+        "second", list(range(HISPARSE_BLOCK_SIZE)), HISPARSE_BLOCK_SIZE, sha256
+    )
+
+    assert manager.allocate_slots(second, num_new_tokens=16) is None
+    assert manager.hisparse_coordinator.has_pending_reclamation()
+
+
 def test_hisparse_materializes_prefix_without_allocating_hot_blocks():
     """A host prefix becomes visible only when every page is durable.
 

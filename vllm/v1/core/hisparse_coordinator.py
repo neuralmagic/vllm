@@ -403,14 +403,21 @@ class HiSparseCoordinator:
             self._apply_enqueued_spills()
             self._complete_host_writes()
             return shadow_reclaimed
+        eventual = sum(
+            len(pending.resident_blocks)
+            for pending in self.pending_spills.values()
+            if pending.release_after and not pending.resident_released
+        )
+        if shadow_reclaimed + eventual >= num_blocks:
+            return shadow_reclaimed
         resident_managers = self.resident_managers
         spill_plan_budget = max(
             self.max_spill_pages - len(self.spills_to_send),
             0,
         )
+        # Resident managers allocate, import, and release pages in lockstep.
+        # The release path below asserts that invariant for selected pages.
         candidates = resident_managers[0].reclaimable_pages()
-        for manager in resident_managers[1:]:
-            candidates.intersection_update(manager.reclaimable_pages())
 
         hot_managers = self.hot_managers
         by_request: dict[str, list[int]] = {}
@@ -422,11 +429,6 @@ class HiSparseCoordinator:
         )
 
         reclaimed = shadow_reclaimed
-        eventual = sum(
-            len(pending.resident_blocks)
-            for pending in self.pending_spills.values()
-            if pending.release_after and not pending.resident_released
-        )
         for request_id, pages in sorted(
             by_request.items(), key=lambda item: len(item[1]), reverse=True
         ):
