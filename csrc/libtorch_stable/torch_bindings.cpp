@@ -971,7 +971,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                 Tensor(h!)? compact_miss_counts=None,"
       "                 Tensor? resident_block_table=None,"
       "                 int resident_block_size=0,"
-      "                 int resident_null_block=0) -> ()");
+      "                 int resident_null_block=0,"
+      "                 Tensor? current_cache=None,"
+      "                 Tensor? query_start_loc=None,"
+      "                 Tensor? seq_lens=None,"
+      "                 Tensor(i!)? compact_miss_currents=None) -> ()");
 
   ops.def(
       "hisparse_invalidate_written_slots(Tensor! device_global_indices,"
@@ -1003,7 +1007,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        Tensor! hot_cache,"
       "                        Tensor miss_global_indices,"
       "                        Tensor miss_hot_indices,"
-      "                        Tensor miss_counts) -> ()");
+      "                        Tensor miss_counts,"
+      "                        Tensor? current_cache=None,"
+      "                        Tensor? miss_current_indices=None,"
+      "                        bool current_only=False) -> ()");
 
   ops.def(
       "hisparse_gather_compact_layers(Tensor host_anchor,"
@@ -1012,7 +1019,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                               Tensor hot_cache_ptrs,"
       "                               Tensor miss_global_indices,"
       "                               Tensor miss_hot_indices,"
-      "                               Tensor miss_counts) -> ()");
+      "                               Tensor miss_counts,"
+      "                               Tensor? miss_current_indices=None) -> "
+      "()");
 
   ops.def(
       "hisparse_backup(Tensor src_cache,"

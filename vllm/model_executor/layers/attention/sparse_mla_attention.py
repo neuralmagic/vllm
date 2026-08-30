@@ -745,6 +745,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             return_valid_counts=return_valid_counts,
             plan_row_offset=plan_row_offset,
             prefetch_followers=prefetch_followers,
+            query_start_loc=attn_metadata.query_start_loc,
+            seq_lens=attn_metadata.seq_lens,
         )
 
     def _run_hisparse_decode(
@@ -1011,6 +1013,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             )
         staging_plan = prefill.hisparse_staging_plan if prefill is not None else None
         assert staging_plan is not None
+        assert handle.mirror_slot_mapping is not None
+        staging_plan.ensure_current_sources(
+            handle.mirror_slot_mapping[
+                num_decode_tokens : attn_metadata.num_actual_tokens
+            ],
+            num_decode_tokens,
+        )
         resident_cache = None
         if handle.view is not None and handle.block_table is not None:
             staging_plan.ensure_gpu_sources(
@@ -1018,7 +1027,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             )
             resident_cache = handle.view.cache
         staged_cache = handle.runtime.gather_prefill_cache(
-            kv_cache, staging_plan, resident_cache=resident_cache
+            kv_cache,
+            staging_plan,
+            resident_cache=resident_cache,
+            current_cache=handle.mirror_staging_cache,
         )
         staged_bt = staging_plan.block_table
         return staged_cache, staged_bt, prefill_req_ids
@@ -1325,6 +1337,14 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 staging_plan is not None
                 and prefill_metadata.chunked_context is not None
             ):
+                assert handle.mirror_slot_mapping is not None
+                prefill_start = attn_metadata.num_decode_tokens
+                staging_plan.ensure_current_sources(
+                    handle.mirror_slot_mapping[
+                        prefill_start : attn_metadata.num_actual_tokens
+                    ],
+                    prefill_start,
+                )
                 resident_cache = None
                 if handle.view is not None and handle.block_table is not None:
                     staging_plan.ensure_gpu_sources(
@@ -1336,6 +1356,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                     kv_c_and_k_pe_cache,
                     staging_plan,
                     resident_cache=resident_cache,
+                    current_cache=handle.mirror_staging_cache,
                 )
         prefill_max_seq_len = attn_metadata.prefill_max_seq_len
         topk_tokens = attn_metadata.topk_tokens

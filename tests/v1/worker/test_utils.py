@@ -404,7 +404,7 @@ def test_hisparse_cache_mirrors_nonresident_prefill_before_attention(monkeypatch
     torch.testing.assert_close(mirror_dst, host_slots)
 
 
-def test_hisparse_shared_host_reader_skips_prefill_mirror(monkeypatch):
+def test_hisparse_shared_host_reader_stages_without_host_mirror(monkeypatch):
     runtime = SimpleNamespace(
         device=torch.device("cpu"),
         eager_host_mirror=True,
@@ -435,9 +435,48 @@ def test_hisparse_shared_host_reader_skips_prefill_mirror(monkeypatch):
         mirror_to_host=True,
     )
 
-    assert concat_and_cache.call_count == 1
-    assert concat_and_cache.call_args.args[2] is cache.view.cache
+    assert concat_and_cache.call_count == 2
+    assert concat_and_cache.call_args_list[0].args[2] is cache.view.cache
+    assert concat_and_cache.call_args_list[1].args[2] is cache.mirror_staging_cache
     runtime.backup_rows.assert_not_called()
+
+
+def test_hisparse_trailing_draft_stages_current_rows(monkeypatch):
+    runtime = SimpleNamespace(
+        device=torch.device("cpu"),
+        eager_host_mirror=True,
+        max_num_reqs=4,
+        backup_rows=MagicMock(),
+        is_group_leader=False,
+        all_resident=False,
+    )
+    cache = hisparse_runtime_module.HiSparseCacheHandle(runtime)
+    cache.view = SimpleNamespace(cache=torch.empty((2, 2, 4)), block_size=2)
+    cache.slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
+    cache.num_actual_tokens = 2
+    cache.decode_batch = True
+    cache.defer_host_mirror = False
+    cache.use_current_staging = True
+    cache.host_mirror_writer = True
+    cache.mirror_staging_cache = torch.empty((2, 2, 4))
+    cache.mirror_staging_slots = torch.tensor([0, 1], dtype=torch.int64)
+    concat_and_cache = MagicMock()
+    monkeypatch.setattr(
+        hisparse_runtime_module.ops, "concat_and_cache_mla", concat_and_cache
+    )
+
+    cache.write_rows(
+        torch.empty((2, 2)),
+        torch.empty((2, 1, 2)),
+        torch.tensor([4, 5], dtype=torch.int64),
+        "auto",
+        torch.tensor(1.0),
+        mirror_to_host=False,
+    )
+
+    assert concat_and_cache.call_count == 2
+    assert concat_and_cache.call_args_list[1].args[2] is cache.mirror_staging_cache
+    runtime.backup_rows.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -542,6 +581,7 @@ def test_hisparse_finish_forward_excludes_trailing_mtp_cache(monkeypatch):
         runtime=runtime,
         decode_batch=False,
         defer_host_mirror=True,
+        use_current_staging=False,
         num_actual_tokens=0,
         num_decode_tokens=0,
         req_id_per_token=None,
@@ -585,6 +625,7 @@ def test_hisparse_finish_forward_excludes_trailing_mtp_cache(monkeypatch):
     assert backup_layers.call_args.args[2].numel() == 1
     assert backup_layers.call_args.args[4].numel() == 1
     assert not mtp.defer_host_mirror
+    assert mtp.use_current_staging
 
 
 def test_hisparse_shared_host_reader_skips_mirror(monkeypatch):

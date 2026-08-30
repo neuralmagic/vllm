@@ -647,7 +647,11 @@ void hisparse_swap_in(
     std::optional<torch::stable::Tensor> const& compact_miss_hots,
     std::optional<torch::stable::Tensor> const& compact_miss_counts,
     std::optional<torch::stable::Tensor> const& resident_block_table,
-    int64_t resident_block_size, int64_t resident_null_block);
+    int64_t resident_block_size, int64_t resident_null_block,
+    std::optional<torch::stable::Tensor> const& current_cache,
+    std::optional<torch::stable::Tensor> const& query_start_loc,
+    std::optional<torch::stable::Tensor> const& seq_lens,
+    std::optional<torch::stable::Tensor> const& compact_miss_currents);
 
 void hisparse_invalidate_written_slots(
     torch::stable::Tensor& device_global_indices,
@@ -671,11 +675,14 @@ void hisparse_gather_plan(
     std::optional<torch::stable::Tensor> const& attention_indices,
     int64_t attention_block_stride);
 
-void hisparse_gather_compact(torch::stable::Tensor const& host_cache,
-                             torch::stable::Tensor& hot_cache,
-                             torch::stable::Tensor const& miss_global_indices,
-                             torch::stable::Tensor const& miss_hot_indices,
-                             torch::stable::Tensor const& miss_counts);
+void hisparse_gather_compact(
+    torch::stable::Tensor const& host_cache, torch::stable::Tensor& hot_cache,
+    torch::stable::Tensor const& miss_global_indices,
+    torch::stable::Tensor const& miss_hot_indices,
+    torch::stable::Tensor const& miss_counts,
+    std::optional<torch::stable::Tensor> const& current_cache,
+    std::optional<torch::stable::Tensor> const& miss_current_indices,
+    bool current_only);
 
 void hisparse_gather_compact_layers(
     torch::stable::Tensor const& host_anchor, torch::stable::Tensor& hot_anchor,
@@ -683,7 +690,8 @@ void hisparse_gather_compact_layers(
     torch::stable::Tensor const& hot_cache_ptrs,
     torch::stable::Tensor const& miss_global_indices,
     torch::stable::Tensor const& miss_hot_indices,
-    torch::stable::Tensor const& miss_counts);
+    torch::stable::Tensor const& miss_counts,
+    std::optional<torch::stable::Tensor> const& miss_current_indices);
 
 void hisparse_backup(torch::stable::Tensor const& src_cache,
                      torch::stable::Tensor const& src_indices,

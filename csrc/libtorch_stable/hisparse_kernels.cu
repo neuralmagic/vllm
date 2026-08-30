@@ -199,6 +199,7 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
     int32_t* __restrict__ valid_counts,             // [num_rows] or nullptr
     int32_t* __restrict__ compact_miss_globals,     // [num_rows, top_k]
     int32_t* __restrict__ compact_miss_hots,        // [num_rows, top_k]
+    int32_t* __restrict__ compact_miss_currents,    // [num_rows, top_k]
     int32_t* __restrict__ compact_miss_counts,      // [num_rows]
     int32_t* __restrict__ hot_indices,              // [num_rows, top_k]
     int32_t* __restrict__ attention_indices,        // [num_rows, top_k]
@@ -207,16 +208,20 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
     int16_t* __restrict__ lru_slots,              // [max_rows, hot_size]
     unsigned long long* __restrict__ stats,       // [2] hits,misses or nullptr
     const int32_t* __restrict__ request_state_indices,  // [num_rows] or nullptr
-    const int64_t host_rows, const int64_t row_bytes,
-    const int64_t hot_block_stride, const int64_t hot_table_stride,
-    const int32_t num_state_rows, const int32_t num_request_state_indices,
-    const int32_t hot_block_size, const int32_t top_k, const int32_t hot_size,
-    const int32_t hash_size, const int64_t region_stride,
-    const int64_t attention_block_stride, const int64_t source_bt_stride,
-    const int32_t source_num_reqs, const int32_t source_num_blocks,
-    const int32_t source_block_size, const int64_t resident_bt_stride,
-    const int32_t resident_num_reqs, const int32_t resident_num_blocks,
-    const int32_t resident_block_size, const int32_t resident_null_block) {
+    const char* __restrict__ current_cache,
+    const int32_t* __restrict__ query_start_loc,
+    const int32_t* __restrict__ seq_lens, const int64_t host_rows,
+    const int64_t row_bytes, const int64_t current_rows,
+    const int32_t current_num_reqs, const int64_t hot_block_stride,
+    const int64_t hot_table_stride, const int32_t num_state_rows,
+    const int32_t num_request_state_indices, const int32_t hot_block_size,
+    const int32_t top_k, const int32_t hot_size, const int32_t hash_size,
+    const int64_t region_stride, const int64_t attention_block_stride,
+    const int64_t source_bt_stride, const int32_t source_num_reqs,
+    const int32_t source_num_blocks, const int32_t source_block_size,
+    const int64_t resident_bt_stride, const int32_t resident_num_reqs,
+    const int32_t resident_num_blocks, const int32_t resident_block_size,
+    const int32_t resident_null_block) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
   const int num_token_chunks = (top_k + kWarpSize - 1) / kWarpSize;
@@ -404,7 +409,7 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
       s_topk[found_topk_idx] = kTokenDone;
       store_hot_index(row_out, row_attention, found_topk_idx,
                       static_cast<int32_t>(get_physical_hot_row(
-                          hot_block_table, state_row, hot_table_stride,
+                          hot_block_table, request_id, hot_table_stride,
                           hot_block_size, slot)),
                       hot_block_size, attention_block_stride);
     }
@@ -507,13 +512,14 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
               static_cast<int64_t>(batch_row) * top_k + m;
           compact_miss_globals[compact_index] = g;
           compact_miss_hots[compact_index] = -1;
+          compact_miss_currents[compact_index] = -1;
         }
       } else {
         // Reuse s_topk as compacted miss scratch: m < i always holds (done
         // entries are skipped), so writes never overrun pending reads.
         s_topk[m] = g;
         const int32_t physical_row = static_cast<int32_t>(
-            get_physical_hot_row(hot_block_table, state_row, hot_table_stride,
+            get_physical_hot_row(hot_block_table, request_id, hot_table_stride,
                                  hot_block_size, evict_slot));
         store_hot_index(row_out, row_attention, i, physical_row, hot_block_size,
                         attention_block_stride);
@@ -522,6 +528,20 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
               static_cast<int64_t>(batch_row) * top_k + m;
           compact_miss_globals[compact_index] = g;
           compact_miss_hots[compact_index] = physical_row;
+          int32_t current_row = -1;
+          if (current_cache != nullptr && request_id >= 0 &&
+              request_id < current_num_reqs) {
+            const int32_t token_index = row_topk[i];
+            const int32_t query_begin = query_start_loc[request_id];
+            const int32_t query_end = query_start_loc[request_id + 1];
+            const int32_t logical_begin =
+                seq_lens[request_id] - (query_end - query_begin);
+            const int32_t query_offset = token_index - logical_begin;
+            if (query_offset >= 0 && query_begin + query_offset < query_end) {
+              current_row = query_begin + query_offset;
+            }
+          }
+          compact_miss_currents[compact_index] = current_row;
         }
         if (row_miss != nullptr) row_miss[i] = 1;
         row_dgi[evict_slot] = g;
@@ -564,9 +584,20 @@ __global__ __launch_bounds__(1024) void hisparse_swap_in_kernel(
       continue;
     }
     const int64_t physical_row =
-        get_physical_hot_row(hot_block_table, state_row, hot_table_stride,
+        get_physical_hot_row(hot_block_table, request_id, hot_table_stride,
                              hot_block_size, evict_slot);
-    if (g >= 0 && g < host_rows) {
+    const int64_t compact_index = static_cast<int64_t>(batch_row) * top_k + m;
+    const int32_t current_row = compact_miss_currents != nullptr
+                                    ? compact_miss_currents[compact_index]
+                                    : -1;
+    if (current_row >= 0 && current_row < current_rows) {
+      copy_row_warp(
+          lane_id,
+          current_cache + static_cast<int64_t>(current_row) * row_bytes,
+          cache_row_ptr(hot_cache, physical_row, hot_block_size,
+                        hot_block_stride, row_bytes),
+          row_bytes);
+    } else if (g >= 0 && g < host_rows) {
       copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
                     cache_row_ptr(hot_cache, physical_row, hot_block_size,
                                   hot_block_stride, row_bytes),
@@ -655,12 +686,14 @@ __global__ void hisparse_gather_plan_kernel(
 // so hits require no work here.
 __global__ void hisparse_gather_compact_kernel(
     const char* __restrict__ host_cache, char* __restrict__ hot_cache,
+    const char* __restrict__ current_cache,
     const int32_t* __restrict__ miss_global_indices,
     const int32_t* __restrict__ miss_hot_indices,
+    const int32_t* __restrict__ miss_current_indices,
     const int32_t* __restrict__ miss_counts, const int64_t host_rows,
-    const int64_t hot_rows, const int64_t row_bytes,
-    const int64_t hot_block_stride, const int32_t hot_block_size,
-    const int32_t top_k) {
+    const int64_t current_rows, const bool current_only, const int64_t hot_rows,
+    const int64_t row_bytes, const int64_t hot_block_stride,
+    const int32_t hot_block_size, const int32_t top_k) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   const int row = blockIdx.x;
   const int warp_id = threadIdx.x / kWarpSize;
@@ -672,10 +705,25 @@ __global__ void hisparse_gather_compact_kernel(
   for (int col = col_start; col < miss_count; col += col_stride) {
     const int32_t g = miss_global_indices[base + col];
     const int32_t dst = miss_hot_indices[base + col];
+    const int32_t current =
+        miss_current_indices != nullptr ? miss_current_indices[base + col] : -1;
     if (g < 0 || dst < 0 || dst >= hot_rows) {
       continue;
     }
-    if (g < host_rows) {
+    if (current >= 0) {
+      if (current < current_rows) {
+        copy_row_warp(lane_id,
+                      current_cache + static_cast<int64_t>(current) * row_bytes,
+                      cache_row_ptr(hot_cache, dst, hot_block_size,
+                                    hot_block_stride, row_bytes),
+                      row_bytes);
+      } else {
+        zero_cache_row_warp(lane_id, hot_cache, dst, hot_block_size,
+                            hot_block_stride, row_bytes);
+      }
+    } else if (current_only) {
+      continue;
+    } else if (g < host_rows) {
       copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
                     cache_row_ptr(hot_cache, dst, hot_block_size,
                                   hot_block_stride, row_bytes),
@@ -695,6 +743,7 @@ __global__ void hisparse_gather_compact_layers_kernel(
     const uint64_t* __restrict__ hot_cache_ptrs,
     const int32_t* __restrict__ miss_global_indices,
     const int32_t* __restrict__ miss_hot_indices,
+    const int32_t* __restrict__ miss_current_indices,
     const int32_t* __restrict__ miss_counts, const int64_t host_rows,
     const int64_t hot_rows, const int64_t row_bytes,
     const int64_t hot_block_stride, const int32_t hot_block_size,
@@ -714,7 +763,12 @@ __global__ void hisparse_gather_compact_layers_kernel(
   for (int col = col_start; col < miss_count; col += col_stride) {
     const int32_t g = miss_global_indices[base + col];
     const int32_t dst = miss_hot_indices[base + col];
+    const int32_t current =
+        miss_current_indices != nullptr ? miss_current_indices[base + col] : -1;
     if (g < 0 || dst < 0 || dst >= hot_rows) {
+      continue;
+    }
+    if (current >= 0) {
       continue;
     }
     if (g < host_rows) {
@@ -1016,7 +1070,11 @@ void hisparse_swap_in(
     std::optional<torch::stable::Tensor> const& compact_miss_hots,
     std::optional<torch::stable::Tensor> const& compact_miss_counts,
     std::optional<torch::stable::Tensor> const& resident_block_table,
-    int64_t resident_block_size, int64_t resident_null_block) {
+    int64_t resident_block_size, int64_t resident_null_block,
+    std::optional<torch::stable::Tensor> const& current_cache,
+    std::optional<torch::stable::Tensor> const& query_start_loc,
+    std::optional<torch::stable::Tensor> const& seq_lens,
+    std::optional<torch::stable::Tensor> const& compact_miss_currents) {
   STD_TORCH_CHECK(
       host_cache.device().is_cpu() && is_pinned_cpu_tensor(host_cache),
       "host_cache must be pinned CPU memory");
@@ -1161,31 +1219,74 @@ void hisparse_swap_in(
 
   int32_t* compact_miss_globals_ptr = nullptr;
   int32_t* compact_miss_hots_ptr = nullptr;
+  int32_t* compact_miss_currents_ptr = nullptr;
   int32_t* compact_miss_counts_ptr = nullptr;
   const bool has_compact_plan = compact_miss_globals.has_value();
   STD_TORCH_CHECK(has_compact_plan == compact_miss_hots.has_value() &&
-                      has_compact_plan == compact_miss_counts.has_value(),
+                      has_compact_plan == compact_miss_counts.has_value() &&
+                      has_compact_plan == compact_miss_currents.has_value(),
                   "compact miss plan tensors must be provided together");
   if (has_compact_plan) {
     auto const& globals = compact_miss_globals.value();
     auto const& hots = compact_miss_hots.value();
+    auto const& currents = compact_miss_currents.value();
     auto const& counts = compact_miss_counts.value();
     STD_TORCH_CHECK(
-        globals.is_cuda() && hots.is_cuda() && counts.is_cuda() &&
+        globals.is_cuda() && hots.is_cuda() && currents.is_cuda() &&
+            counts.is_cuda() &&
             globals.scalar_type() == torch::headeronly::ScalarType::Int &&
             hots.scalar_type() == torch::headeronly::ScalarType::Int &&
+            currents.scalar_type() == torch::headeronly::ScalarType::Int &&
             counts.scalar_type() == torch::headeronly::ScalarType::Int &&
-            globals.dim() == 2 && hots.dim() == 2 &&
+            globals.dim() == 2 && hots.dim() == 2 && currents.dim() == 2 &&
             globals.size(0) == global_indices.size(0) &&
             globals.size(1) == global_indices.size(1) &&
             hots.size(0) == global_indices.size(0) &&
             hots.size(1) == global_indices.size(1) &&
+            currents.size(0) == global_indices.size(0) &&
+            currents.size(1) == global_indices.size(1) &&
             counts.numel() >= num_rows && globals.is_contiguous() &&
-            hots.is_contiguous() && counts.is_contiguous(),
+            hots.is_contiguous() && currents.is_contiguous() &&
+            counts.is_contiguous(),
         "compact miss plan must be contiguous int32 matching indices");
     compact_miss_globals_ptr = globals.mutable_data_ptr<int32_t>();
     compact_miss_hots_ptr = hots.mutable_data_ptr<int32_t>();
+    compact_miss_currents_ptr = currents.mutable_data_ptr<int32_t>();
     compact_miss_counts_ptr = counts.mutable_data_ptr<int32_t>();
+  }
+
+  const char* current_cache_ptr = nullptr;
+  const int32_t* query_start_loc_ptr = nullptr;
+  const int32_t* seq_lens_ptr = nullptr;
+  int64_t current_rows = 0;
+  int32_t current_num_reqs = 0;
+  const bool has_current_cache = current_cache.has_value();
+  STD_TORCH_CHECK(
+      has_current_cache == query_start_loc.has_value() &&
+          has_current_cache == seq_lens.has_value(),
+      "current_cache, query_start_loc, and seq_lens must be provided together");
+  if (has_current_cache) {
+    auto const& current = current_cache.value();
+    auto const& starts = query_start_loc.value();
+    auto const& lengths = seq_lens.value();
+    STD_TORCH_CHECK(
+        current.is_cuda() && current.dim() == 3 &&
+            current.scalar_type() == hot_cache.scalar_type() &&
+            current.size(-1) == hot_cache.size(-1) &&
+            current.stride(1) * current.element_size() == row_bytes,
+        "current_cache must have contiguous rows matching hot_cache");
+    STD_TORCH_CHECK(
+        starts.is_cuda() && lengths.is_cuda() && starts.is_contiguous() &&
+            lengths.is_contiguous() &&
+            starts.scalar_type() == torch::headeronly::ScalarType::Int &&
+            lengths.scalar_type() == torch::headeronly::ScalarType::Int &&
+            starts.numel() == lengths.numel() + 1,
+        "query_start_loc and seq_lens must be contiguous int32 CUDA tensors");
+    current_cache_ptr = static_cast<const char*>(current.const_data_ptr());
+    query_start_loc_ptr = starts.const_data_ptr<int32_t>();
+    seq_lens_ptr = lengths.const_data_ptr<int32_t>();
+    current_rows = current.size(0) * current.size(1);
+    current_num_reqs = static_cast<int32_t>(lengths.numel());
   }
 
   const int32_t* request_state_ptr = nullptr;
@@ -1280,16 +1381,17 @@ void hisparse_swap_in(
       global_indices.const_data_ptr<int32_t>(), request_ids_ptr,
       source_block_table_ptr, resident_block_table_ptr,
       resolved_global_indices_ptr, valid_counts_ptr, compact_miss_globals_ptr,
-      compact_miss_hots_ptr, compact_miss_counts_ptr,
+      compact_miss_hots_ptr, compact_miss_currents_ptr, compact_miss_counts_ptr,
       hot_indices.mutable_data_ptr<int32_t>(), attention_indices_ptr,
       miss_mask_ptr, device_global_indices.mutable_data_ptr<int32_t>(),
       lru_slots.mutable_data_ptr<int16_t>(), stats_ptr, request_state_ptr,
-      host_rows, row_bytes, hot_block_stride, hot_block_table.stride(0),
-      num_state_rows, num_request_state_indices, hot_block_size, top_k,
-      hot_size, hash_size, region_stride, attention_block_stride,
-      source_bt_stride, source_num_reqs, source_num_blocks,
-      static_cast<int32_t>(source_block_size), resident_bt_stride,
-      resident_num_reqs, resident_num_blocks,
+      current_cache_ptr, query_start_loc_ptr, seq_lens_ptr, host_rows,
+      row_bytes, current_rows, current_num_reqs, hot_block_stride,
+      hot_block_table.stride(0), num_state_rows, num_request_state_indices,
+      hot_block_size, top_k, hot_size, hash_size, region_stride,
+      attention_block_stride, source_bt_stride, source_num_reqs,
+      source_num_blocks, static_cast<int32_t>(source_block_size),
+      resident_bt_stride, resident_num_reqs, resident_num_blocks,
       static_cast<int32_t>(resident_block_size),
       static_cast<int32_t>(resident_null_block));
   const cudaError_t launch_error = cudaGetLastError();
@@ -1405,11 +1507,14 @@ void hisparse_gather_plan(
       hot_block_size, top_k, attention_block_stride);
 }
 
-void hisparse_gather_compact(torch::stable::Tensor const& host_cache,
-                             torch::stable::Tensor& hot_cache,
-                             torch::stable::Tensor const& miss_global_indices,
-                             torch::stable::Tensor const& miss_hot_indices,
-                             torch::stable::Tensor const& miss_counts) {
+void hisparse_gather_compact(
+    torch::stable::Tensor const& host_cache, torch::stable::Tensor& hot_cache,
+    torch::stable::Tensor const& miss_global_indices,
+    torch::stable::Tensor const& miss_hot_indices,
+    torch::stable::Tensor const& miss_counts,
+    std::optional<torch::stable::Tensor> const& current_cache,
+    std::optional<torch::stable::Tensor> const& miss_current_indices,
+    bool current_only) {
   STD_TORCH_CHECK(
       host_cache.device().is_cpu() && is_pinned_cpu_tensor(host_cache),
       "host_cache must be pinned CPU memory");
@@ -1436,6 +1541,31 @@ void hisparse_gather_compact(torch::stable::Tensor const& host_cache,
   STD_TORCH_CHECK(hot_cache.stride(1) * hot_cache.element_size() == row_bytes,
                   "hot-cache rows must be contiguous");
   const int64_t host_rows = check_2d_rows(host_cache, "host_cache", row_bytes);
+  const char* current_cache_ptr = nullptr;
+  int64_t current_rows = 0;
+  STD_TORCH_CHECK(
+      current_cache.has_value() == miss_current_indices.has_value(),
+      "current_cache and miss_current_indices must be provided together");
+  if (current_cache.has_value()) {
+    auto const& current = current_cache.value();
+    auto const& indices = miss_current_indices.value();
+    STD_TORCH_CHECK(
+        current.is_cuda() && current.dim() == 3 &&
+            current.scalar_type() == hot_cache.scalar_type() &&
+            current.size(-1) == hot_cache.size(-1) &&
+            current.stride(1) * current.element_size() == row_bytes,
+        "current_cache must have contiguous rows matching hot_cache");
+    STD_TORCH_CHECK(
+        indices.is_cuda() && indices.is_contiguous() &&
+            indices.scalar_type() == torch::headeronly::ScalarType::Int &&
+            indices.sizes() == miss_global_indices.sizes(),
+        "miss_current_indices must match miss_global_indices");
+    current_cache_ptr = static_cast<const char*>(current.const_data_ptr());
+    current_rows = current.size(0) * current.size(1);
+  } else {
+    STD_TORCH_CHECK(!current_only,
+                    "current_only requires current-cache plan tensors");
+  }
   const auto num_rows = static_cast<int32_t>(miss_global_indices.size(0));
   const auto top_k = static_cast<int32_t>(miss_global_indices.size(1));
   if (num_rows == 0 || top_k == 0) {
@@ -1455,11 +1585,15 @@ void hisparse_gather_compact(torch::stable::Tensor const& host_cache,
   const cudaStream_t stream = get_current_cuda_stream();
   hisparse_gather_compact_kernel<<<grid, kBlockSize, 0, stream>>>(
       static_cast<const char*>(host_cache.const_data_ptr()),
-      static_cast<char*>(hot_cache.mutable_data_ptr()),
+      static_cast<char*>(hot_cache.mutable_data_ptr()), current_cache_ptr,
       miss_global_indices.const_data_ptr<int32_t>(),
       miss_hot_indices.const_data_ptr<int32_t>(),
-      miss_counts.const_data_ptr<int32_t>(), host_rows, hot_rows, row_bytes,
-      hot_block_stride, hot_block_size, top_k);
+      miss_current_indices.has_value()
+          ? miss_current_indices.value().const_data_ptr<int32_t>()
+          : nullptr,
+      miss_counts.const_data_ptr<int32_t>(), host_rows, current_rows,
+      current_only, hot_rows, row_bytes, hot_block_stride, hot_block_size,
+      top_k);
 }
 
 void hisparse_gather_compact_layers(
@@ -1468,7 +1602,8 @@ void hisparse_gather_compact_layers(
     torch::stable::Tensor const& hot_cache_ptrs,
     torch::stable::Tensor const& miss_global_indices,
     torch::stable::Tensor const& miss_hot_indices,
-    torch::stable::Tensor const& miss_counts) {
+    torch::stable::Tensor const& miss_counts,
+    std::optional<torch::stable::Tensor> const& miss_current_indices) {
   STD_TORCH_CHECK(
       host_anchor.device().is_cpu() && is_pinned_cpu_tensor(host_anchor),
       "host_anchor must be pinned CPU memory");
@@ -1498,6 +1633,14 @@ void hisparse_gather_compact_layers(
           miss_global_indices.is_contiguous() &&
           miss_hot_indices.is_contiguous() && miss_counts.is_contiguous(),
       "compact miss plan must be matching contiguous int32 CUDA tensors");
+  if (miss_current_indices.has_value()) {
+    auto const& currents = miss_current_indices.value();
+    STD_TORCH_CHECK(
+        currents.is_cuda() && currents.is_contiguous() &&
+            currents.scalar_type() == torch::headeronly::ScalarType::Int &&
+            currents.sizes() == miss_global_indices.sizes(),
+        "miss_current_indices must match miss_global_indices");
+  }
   STD_TORCH_CHECK(hot_anchor.dim() == 3,
                   "hot_anchor must be [num_blocks, block_size, row_width]");
   const int64_t row_bytes = hot_anchor.size(-1) * hot_anchor.element_size();
@@ -1529,6 +1672,9 @@ void hisparse_gather_compact_layers(
       static_cast<const uint64_t*>(hot_cache_ptrs.const_data_ptr()),
       miss_global_indices.const_data_ptr<int32_t>(),
       miss_hot_indices.const_data_ptr<int32_t>(),
+      miss_current_indices.has_value()
+          ? miss_current_indices.value().const_data_ptr<int32_t>()
+          : nullptr,
       miss_counts.const_data_ptr<int32_t>(), host_rows, hot_rows, row_bytes,
       hot_block_stride, hot_block_size, top_k);
 }

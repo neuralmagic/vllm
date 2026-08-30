@@ -339,6 +339,43 @@ class HiSparsePrefillStagingPlan:
     # resident-cache row to read instead of DMAing from host, -1 for misses.
     gpu_row_ids: torch.Tensor | None = None
     gpu_source_key: tuple[int, int] | None = None
+    current_gpu_row_ids: torch.Tensor | None = None
+    current_source_key: tuple[int, int, int] | None = None
+
+    def _refresh_miss_mask(self) -> None:
+        misses = self.row_ids >= 0
+        if self.gpu_row_ids is not None:
+            misses &= self.gpu_row_ids < 0
+        if self.current_gpu_row_ids is not None:
+            misses &= self.current_gpu_row_ids < 0
+        self.miss_mask = misses.int()
+
+    def ensure_current_sources(
+        self, current_slots: torch.Tensor, current_row_offset: int
+    ) -> None:
+        """Resolve host rows written into the current forward's GPU staging."""
+        source_key = (
+            current_slots.data_ptr(),
+            current_slots.numel(),
+            current_row_offset,
+        )
+        if self.current_source_key == source_key:
+            return
+        if current_slots.numel() == 0:
+            self.current_gpu_row_ids = None
+        else:
+            sorted_slots, sorted_rows = torch.sort(current_slots.to(torch.int32))
+            flat_rows = self.row_ids.flatten()
+            positions = torch.searchsorted(sorted_slots, flat_rows)
+            positions.clamp_(max=sorted_slots.numel() - 1)
+            matches = (flat_rows >= 0) & (sorted_slots[positions] == flat_rows)
+            self.current_gpu_row_ids = torch.where(
+                matches,
+                sorted_rows[positions].to(torch.int32) + current_row_offset,
+                -1,
+            ).view_as(self.row_ids)
+        self.current_source_key = source_key
+        self._refresh_miss_mask()
 
     def ensure_gpu_sources(
         self,
@@ -399,7 +436,7 @@ class HiSparsePrefillStagingPlan:
         valid_rows = self.row_ids.view(num_unique, block_size) >= 0
         hit = (per_off_block > 0) & (host_ids[:, None] > 0) & valid_rows
         self.gpu_row_ids = torch.where(hit, gpu_rows, -1).reshape(1, -1).to(torch.int32)
-        self.miss_mask = ((self.gpu_row_ids < 0) & valid_rows.view(1, -1)).int()
+        self._refresh_miss_mask()
         self.gpu_source_key = source_key
 
 
@@ -470,6 +507,7 @@ class _GroupPlan:
             (max_rows, top_k), dtype=torch.int32, device=device
         )
         self.miss_hot_indices = torch.empty_like(self.miss_global_indices)
+        self.miss_current_indices = torch.empty_like(self.miss_global_indices)
         self.miss_counts = torch.empty(max_rows, dtype=torch.int32, device=device)
         self.valid_counts = torch.empty(max_rows, dtype=torch.int32, device=device)
 
@@ -680,6 +718,7 @@ class HiSparseRuntime:
         kv_cache: torch.Tensor,
         plan: HiSparsePrefillStagingPlan,
         resident_cache: torch.Tensor | None = None,
+        current_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Gather this runtime's host cache using a shared staging plan."""
         if kv_cache.shape[1] != plan.block_size:
@@ -716,6 +755,17 @@ class HiSparseRuntime:
             None,
             0,
         )
+        if plan.current_gpu_row_ids is not None:
+            if current_cache is None:
+                raise RuntimeError("HiSparse current-row staging cache is not bound.")
+            current_rows = plan.current_gpu_row_ids[0].to(torch.long)
+            current = current_cache.view(-1, row_width).index_select(
+                0, current_rows.clamp_min(0)
+            )
+            staged_rows = staged.view(-1, row_width)
+            staged_rows.copy_(
+                torch.where(current_rows[:, None] >= 0, current, staged_rows)
+            )
         return staged
 
     def reset_hot_state(self) -> None:
@@ -790,6 +840,9 @@ class HiSparseRuntime:
         produce_plan: bool = False,
         plan_row_offset: int = 0,
         prefetch_followers: bool = True,
+        current_cache: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> HiSparseTopKResult:
         """Resolve top-k positions against resident, hot, then host storage."""
         num_tokens = topk_indices.shape[0]
@@ -806,15 +859,13 @@ class HiSparseRuntime:
         plan_rows = slice(plan_row_offset, plan_row_offset + num_tokens)
         hot_indices = plan.hot_indices[plan_rows]
         valid_counts = plan.valid_counts[plan_rows] if return_valid_counts else None
+        compact_miss_globals = plan.miss_global_indices[plan_rows]
+        compact_miss_hots = plan.miss_hot_indices[plan_rows]
+        compact_miss_counts = plan.miss_counts[plan_rows]
         if produce_plan:
             group.prefetched_plan_range = None
-            compact_miss_globals = plan.miss_global_indices[plan_rows]
-            compact_miss_hots = plan.miss_hot_indices[plan_rows]
-            compact_miss_counts = plan.miss_counts[plan_rows]
-        else:
-            compact_miss_globals = None
-            compact_miss_hots = None
-            compact_miss_counts = None
+
+        compact_miss_currents = plan.miss_current_indices[plan_rows]
 
         attention_indices = plan.attention_indices[plan_rows]
 
@@ -847,6 +898,10 @@ class HiSparseRuntime:
             if resident is not None and resident.view is not None
             else 0,
             0,
+            current_cache,
+            query_start_loc,
+            seq_lens,
+            compact_miss_currents,
         )
 
         if (
@@ -862,7 +917,12 @@ class HiSparseRuntime:
         assert valid_counts is not None
         return hot.attention_cache, attention_indices, valid_counts
 
-    def _gather_plan_into(self, num_tokens: int, plan_row_offset: int = 0) -> None:
+    def _gather_plan_into(
+        self,
+        num_tokens: int,
+        plan_row_offset: int = 0,
+        current_cache: torch.Tensor | None = None,
+    ) -> None:
         hot = self.hot
         plan = self.index_group.plan
         plan_rows = slice(plan_row_offset, plan_row_offset + num_tokens)
@@ -872,6 +932,13 @@ class HiSparseRuntime:
             plan.miss_global_indices[plan_rows],
             plan.miss_hot_indices[plan_rows],
             plan.miss_counts[plan_rows],
+            current_cache,
+            (
+                plan.miss_current_indices[plan_rows]
+                if current_cache is not None
+                else None
+            ),
+            False,
         )
 
     def _prefetch_group(self, num_tokens: int, plan_row_offset: int = 0) -> None:
@@ -893,6 +960,7 @@ class HiSparseRuntime:
                 plan.miss_global_indices[plan_rows],
                 plan.miss_hot_indices[plan_rows],
                 plan.miss_counts[plan_rows],
+                plan.miss_current_indices[plan_rows],
             )
             for follower in group.followers:
                 if follower._prefetch_event is None:
@@ -918,6 +986,7 @@ class HiSparseRuntime:
         num_tokens: int,
         return_valid_counts: bool = False,
         plan_row_offset: int = 0,
+        current_cache: torch.Tensor | None = None,
     ) -> HiSparseTopKResult:
         """Replay the leader's swap plan for an index-sharing follower."""
         n = num_tokens
@@ -940,7 +1009,18 @@ class HiSparseRuntime:
             )
             self._prefetch_event = None
         if not is_prefetched:
-            self._gather_plan_into(num_tokens, plan_row_offset)
+            self._gather_plan_into(num_tokens, plan_row_offset, current_cache)
+        elif current_cache is not None:
+            torch.ops._C_cache_ops.hisparse_gather_compact(
+                self.host_cache,
+                hot.cache,
+                plan.miss_global_indices[plan_rows],
+                plan.miss_hot_indices[plan_rows],
+                plan.miss_counts[plan_rows],
+                current_cache,
+                plan.miss_current_indices[plan_rows],
+                True,
+            )
         if return_valid_counts:
             return (
                 hot.attention_cache,
@@ -963,6 +1043,7 @@ class HiSparseCacheHandle:
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None
         self.defer_host_mirror = False
+        self.use_current_staging = False
         self.host_mirror_writer = True
         self.mirror_slot_mapping: torch.Tensor | None = None
         self.mirror_staging_cache: torch.Tensor | None = None
@@ -1017,7 +1098,7 @@ class HiSparseCacheHandle:
             kv_cache_dtype=kv_cache_dtype,
             scale=k_scale,
         )
-        if mirror_to_host or self.runtime.eager_host_mirror:
+        if mirror_to_host or self.runtime.eager_host_mirror or self.use_current_staging:
             mirrored_slots = host_slots[:num_rows].to(
                 device=self.runtime.device, dtype=torch.int64
             )
@@ -1030,7 +1111,7 @@ class HiSparseCacheHandle:
             mirrored_slots = mirrored_slots.contiguous()
             mirror_src_cache = self.view.cache
             mirror_src_slots = resident_slots
-            if mirror_to_host and self.host_mirror_writer:
+            if mirror_to_host or self.use_current_staging:
                 staging_cache = self.mirror_staging_cache
                 staging_slots = self.mirror_staging_slots
                 if staging_cache is None or staging_slots is None:
@@ -1074,8 +1155,15 @@ class HiSparseCacheHandle:
         return_valid_counts: bool = False,
         plan_row_offset: int = 0,
         prefetch_followers: bool = True,
+        query_start_loc: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> HiSparseTopKResult:
         num_tokens = topk_indices.shape[0]
+        current_cache = (
+            self.mirror_staging_cache
+            if not self.decode_batch or self.use_current_staging
+            else None
+        )
         if not self.runtime.is_group_leader:
             if self.runtime.all_resident:
                 return self.runtime.swap_in(
@@ -1088,12 +1176,16 @@ class HiSparseCacheHandle:
                     produce_plan=False,
                     plan_row_offset=plan_row_offset,
                     prefetch_followers=False,
+                    current_cache=None,
+                    query_start_loc=None,
+                    seq_lens=None,
                 )
             return self.runtime.apply_plan(
                 block_size=block_size,
                 num_tokens=num_tokens,
                 return_valid_counts=return_valid_counts,
                 plan_row_offset=plan_row_offset,
+                current_cache=current_cache,
             )
         return self.runtime.swap_in(
             resident=self,
@@ -1105,6 +1197,9 @@ class HiSparseCacheHandle:
             produce_plan=bool(self.runtime.index_group.followers),
             plan_row_offset=plan_row_offset,
             prefetch_followers=prefetch_followers,
+            current_cache=current_cache,
+            query_start_loc=query_start_loc if current_cache is not None else None,
+            seq_lens=seq_lens if current_cache is not None else None,
         )
 
 

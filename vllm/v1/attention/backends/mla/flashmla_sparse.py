@@ -839,6 +839,11 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     else:
                         staging_plan = chunk.hisparse_staging_plan
                         assert staging_plan is not None
+                        assert handle.mirror_slot_mapping is not None
+                        staging_plan.ensure_current_sources(
+                            handle.mirror_slot_mapping[chunk.tokens_slice],
+                            chunk.tokens_slice.start,
+                        )
                         resident_cache = None
                         if handle.view is not None and resident_bt is not None:
                             staging_plan.ensure_gpu_sources(
@@ -849,6 +854,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                             kv_c_and_k_pe_cache,
                             staging_plan,
                             resident_cache=resident_cache,
+                            current_cache=handle.mirror_staging_cache,
                         )
                         gather_bt = staging_plan.block_table
                 else:
