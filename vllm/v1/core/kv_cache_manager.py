@@ -910,9 +910,9 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not all(pool.reset_prefix_cache() for pool in self.block_pools):
-            return False
         if not self.hisparse_coordinator.reset_prefix_cache():
+            return False
+        if not all(pool.reset_prefix_cache() for pool in self.block_pools):
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None

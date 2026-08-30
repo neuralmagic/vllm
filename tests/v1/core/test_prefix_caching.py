@@ -330,12 +330,11 @@ def test_hisparse_reclaims_sealed_resident_pages_before_rejecting_admission():
 
     first.num_computed_tokens = 128
     assert manager.allocate_slots(first, num_new_tokens=16) is None
-    assert manager.hisparse_coordinator.has_pending_reclamation()
-    spills = manager.hisparse_coordinator.build_offload_command().page_transfers
-    assert spills
-    spill_counts = {transfer.transfer_id: 1 for transfer in spills}
-    manager.hisparse_coordinator.update_spills(spill_counts, spill_counts)
+    # Only two sealed pages remain. Reclaiming them would consume the same
+    # two blocks to activate the deferred hot region, so this request must wait
+    # instead of starting a transfer with no net capacity gain.
     assert not manager.hisparse_coordinator.has_pending_reclamation()
+    manager.free(second)
     assert manager.allocate_slots(first, num_new_tokens=16) is not None
 
 
@@ -555,6 +554,20 @@ def test_hisparse_shadow_pages_free_under_pool_pressure():
     assert reclaimed >= 2
     assert pool.get_num_free_blocks() == free_before + reclaimed
     assert not coordinator.spills_to_send
+
+
+def test_hisparse_reset_releases_shadow_pages_before_device_cache():
+    """An idle HiSparse server must reset after publishing GPU shadows."""
+    manager = make_hisparse_kv_cache_manager(32, 16, enable_caching=True)
+    tokens = list(range(4 * HISPARSE_BLOCK_SIZE))
+    request = make_request("request", tokens, HISPARSE_BLOCK_SIZE, sha256)
+    assert manager.allocate_slots(request, num_new_tokens=len(tokens)) is not None
+    _publish_hisparse_pages(manager)
+    manager.free(request)
+
+    assert manager.hisparse_coordinator.shadow_pages
+    assert manager.reset_prefix_cache()
+    assert not manager.hisparse_coordinator.shadow_pages
 
 
 def test_hisparse_stale_shadow_entry_is_ignored():
