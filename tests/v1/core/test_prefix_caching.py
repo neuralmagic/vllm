@@ -338,30 +338,32 @@ def test_hisparse_reclaims_sealed_resident_pages_before_rejecting_admission():
     assert manager.allocate_slots(first, num_new_tokens=16) is not None
 
 
-def test_hisparse_pending_reclamation_does_not_rescan_resident_pages(monkeypatch):
+def test_hisparse_pending_reclamation_covers_active_request_growth():
     manager = make_hisparse_kv_cache_manager(
-        18,
-        18,
+        40,
+        40,
         max_model_len=160,
     )
-    first = make_request("first", list(range(128)), HISPARSE_BLOCK_SIZE, sha256)
-    assert manager.allocate_slots(first, num_new_tokens=128) is not None
-
-    second = make_request(
-        "second", list(range(HISPARSE_BLOCK_SIZE)), HISPARSE_BLOCK_SIZE, sha256
-    )
-    assert manager.allocate_slots(second, num_new_tokens=16) is None
     coordinator = manager.hisparse_coordinator
-    assert coordinator.has_pending_reclamation()
-
-    for resident_manager in coordinator.resident_managers:
-        monkeypatch.setattr(
-            resident_manager,
-            "reclaimable_pages",
-            lambda: pytest.fail("rescanned pages while reclamation was pending"),
+    for request_id in ("first", "second"):
+        request = make_request(
+            request_id,
+            list(range(128)),
+            HISPARSE_BLOCK_SIZE,
+            sha256,
         )
+        assert manager.allocate_slots(request, num_new_tokens=128) is not None
 
-    assert manager.allocate_slots(second, num_new_tokens=16) is None
+    assert coordinator._mark_or_plan_release("first", 0)
+    assert coordinator._mark_or_plan_release("first", 1)
+    num_pending = len(coordinator.pending_spills)
+
+    coordinator.reclaim_resident_blocks(coordinator.block_pool_id, num_pending)
+
+    # The immediate shortage is only two blocks, but each active request needs
+    # room to grow. The reclamation plan must cover that larger target rather
+    # than waiting forever on an insufficient in-flight plan.
+    assert len(coordinator.pending_spills) > num_pending
 
 
 def test_hisparse_reclamation_enumerates_lockstep_pages_once(monkeypatch):

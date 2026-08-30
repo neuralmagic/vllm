@@ -408,8 +408,6 @@ class HiSparseCoordinator:
             for pending in self.pending_spills.values()
             if pending.release_after and not pending.resident_released
         )
-        if shadow_reclaimed + eventual >= num_blocks:
-            return shadow_reclaimed
         resident_managers = self.resident_managers
         spill_plan_budget = max(
             self.max_spill_pages - len(self.spills_to_send),
