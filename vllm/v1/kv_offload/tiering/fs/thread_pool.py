@@ -13,6 +13,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from enum import Enum
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
@@ -30,6 +31,117 @@ class Task:
     key: OffloadKey
     path: str
     offset: int
+
+
+@dataclass
+class JobCost:
+    job_id: int
+    cost: int
+
+
+class Phase(Enum):
+    LOAD = 1
+    STORE = 2
+    WAIT = 3
+    NA = 4
+
+
+class PhasedScheduler:
+    def __init__(self, load_q: deque, store_q: deque):
+        self._load_q = load_q
+        self._store_q = store_q
+        self._pending_q: deque = deque()
+        self._processing: set[JobId] = set()
+
+        self._load_costs: deque[JobCost] = deque()
+        self._store_costs: deque[JobCost] = deque()
+        self._phase: Phase = Phase.NA
+
+    def clear(self):
+        self._load_costs.clear()
+        self._store_costs.clear()
+        self._pending_q.clear()
+        self._processing.clear()
+        self._phase = Phase.NA
+
+    def enqueue(self, job_id: int, num_blocks: int, is_load: bool) -> None:
+        if is_load:
+            self._load_costs.append(JobCost(job_id, num_blocks))
+        else:
+            self._store_costs.append(JobCost(job_id, num_blocks))
+
+    # no side effect fn
+    @staticmethod
+    def _next_phase(load_q, store_q, load_costs, store_costs):
+        if not load_q and not store_q:
+            return Phase.NA
+        load_cost = load_costs[0].cost if load_costs else float("inf")
+        store_cost = store_costs[0].cost if store_costs else float("inf")
+        return Phase.LOAD if load_cost <= store_cost else Phase.STORE
+
+    def _populate_pending(self):
+        assert self._phase in [Phase.LOAD, Phase.STORE]
+        if self._phase == Phase.LOAD:
+            costs, other_costs, q = self._load_costs, self._store_costs, self._load_q
+        else:
+            costs, other_costs, q = self._store_costs, self._load_costs, self._store_q
+        cost = costs.popleft()
+        assert q[0][2].job_id == cost.job_id
+        while q and q[0][2].job_id == cost.job_id:
+            self._pending_q.append(q.popleft())
+
+        self._processing.add(cost.job_id)
+
+        # update costs
+        if other_costs:
+            other_costs[0].cost -= cost.cost
+
+    def _phase_update(self):
+        if self._pending_q:
+            # there is still work to be done
+            return
+
+        if self._phase == Phase.WAIT and self._processing:
+            # wait till we drain processing
+            return
+
+        if not self._load_q and not self._store_q:
+            self._phase = Phase.NA
+            return
+
+        # there is definitely somework.
+        next_phase = PhasedScheduler._next_phase(
+            self._load_q, self._store_q, self._load_costs, self._store_costs
+        )
+        assert next_phase in [Phase.LOAD, Phase.STORE]
+        if self._phase in [Phase.WAIT, Phase.NA]:
+            self._phase = next_phase
+        elif self._phase != next_phase:
+            if self._processing:
+                # wait till the processing is finished
+                self._phase = Phase.WAIT
+            else:
+                self._phase = next_phase
+
+        if self._phase == Phase.WAIT:
+            return
+
+        self._populate_pending()
+
+    def has_work_now(self):
+        self._phase_update()
+        if self._pending_q:
+            return True
+
+    def pop(self):
+        return self._pending_q.popleft()
+
+    def finished(self, job_id: int):
+        assert job_id in self._processing
+        self._processing.remove(job_id)
+        if not self._processing and self._phase == Phase.WAIT:
+            self._phase_update()
+            return
 
 
 class JobState:
@@ -96,7 +208,7 @@ class DualQueueThreadPool:
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool, float]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
-
+        self._scheduler = PhasedScheduler(self._load_q, self._store_q)
         assert self.total_threads > 0, "ThreadPool needs at least one thread"
 
         for i in range(self._n_read_threads):
@@ -151,6 +263,7 @@ class DualQueueThreadPool:
         tasks: Iterable[Task],
         n_tasks: int,
         n_threads: int,
+        is_load: bool,
     ) -> None:
         """Batch `tasks` and append (fn, state, batch_size) entries to `queue`."""
         if n_tasks == 0:
@@ -162,6 +275,7 @@ class DualQueueThreadPool:
         n_batches = 0
         with self._condition:
             self._inflight_jobs += 1
+            self._scheduler.enqueue(job_id, len(task_lst), is_load)
             for batch in self._batch_tasks(task_lst, n_threads):
                 queue.append((make_batch_fn(batch), len(batch), state))
                 n_batches += 1
@@ -185,6 +299,7 @@ class DualQueueThreadPool:
             n_threads=self._n_read_threads
             if self._n_read_threads > 0
             else self.total_threads,
+            is_load=True,
         )
 
     def enqueue_store(
@@ -205,6 +320,7 @@ class DualQueueThreadPool:
             n_threads=self._n_write_threads
             if self._n_write_threads > 0
             else self.total_threads,
+            is_load=False,
         )
 
     def get_finished(self) -> list[tuple[JobId, bool, float]]:
@@ -231,6 +347,7 @@ class DualQueueThreadPool:
             self._stop = True
             self._load_q.clear()
             self._store_q.clear()
+            self._scheduler.clear()
             # Cancelled tasks will not decrement _inflight_jobs; reset it so a
             # subsequent wait_idle() returns instead of hanging.
             self._inflight_jobs = 0
@@ -244,15 +361,11 @@ class DualQueueThreadPool:
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
+                    lambda: self._stop or self._scheduler.has_work_now()
                 )
                 if self._stop:
                     return
-                primary = self._load_q if load_priority else self._store_q
-                secondary = self._store_q if load_priority else self._load_q
-                fn, batch_size, state = (
-                    primary.popleft() if primary else secondary.popleft()
-                )
+                fn, batch_size, state = self._scheduler.pop()
             try:
                 start_time = time.monotonic()
                 fn()
@@ -273,6 +386,7 @@ class DualQueueThreadPool:
 
             if job_finished:
                 with self._condition:
+                    self._scheduler.finished(state.job_id)
                     self._finished_q.append((state.job_id, success, total_time))
                     self._inflight_jobs -= 1
                     self._condition.notify_all()
