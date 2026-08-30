@@ -1006,6 +1006,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        Tensor miss_counts) -> ()");
 
   ops.def(
+      "hisparse_gather_compact_layers(Tensor host_anchor,"
+      "                               Tensor! hot_anchor,"
+      "                               Tensor host_cache_ptrs,"
+      "                               Tensor hot_cache_ptrs,"
+      "                               Tensor miss_global_indices,"
+      "                               Tensor miss_hot_indices,"
+      "                               Tensor miss_counts) -> ()");
+
+  ops.def(
       "hisparse_backup(Tensor src_cache,"
       "                Tensor src_indices,"
       "                Tensor! host_cache,"
@@ -1134,6 +1143,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
            TORCH_BOX(&hisparse_invalidate_written_slots_layers));
   ops.impl("hisparse_gather_plan", TORCH_BOX(&hisparse_gather_plan));
   ops.impl("hisparse_gather_compact", TORCH_BOX(&hisparse_gather_compact));
+  ops.impl("hisparse_gather_compact_layers",
+           TORCH_BOX(&hisparse_gather_compact_layers));
   ops.impl("hisparse_backup", TORCH_BOX(&hisparse_backup));
   ops.impl("hisparse_backup_layers", TORCH_BOX(&hisparse_backup_layers));
 #endif  // !USE_ROCM

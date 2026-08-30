@@ -803,6 +803,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                         prefetch_followers=False,
                     )
                     step_indices.append(physical_indices)
+                self.hisparse_cache.runtime.prefetch_followers(num_decode_tokens)
                 batch_indices = torch.stack(step_indices, dim=1).flatten(0, 1)
                 return run_batch(q, hot_cache, batch_indices, seq_lens)
         else:
@@ -865,6 +866,9 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             outputs.append(step_out)
             if step_lse is not None:
                 lses.append(step_lse)
+
+        if max_query_len > 1 and self.hisparse_cache is not None:
+            self.hisparse_cache.runtime.prefetch_followers(max_query_len * num_decodes)
 
         stacked_outputs = torch.stack(outputs, dim=1).flatten(0, 1)
         stacked_lses = torch.stack(lses, dim=1).flatten(0, 1) if lses else None

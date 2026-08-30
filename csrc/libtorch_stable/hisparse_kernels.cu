@@ -687,6 +687,48 @@ __global__ void hisparse_gather_compact_kernel(
   }
 }
 
+// Replay one compact miss plan across every follower in an index-sharing
+// group. The layer dimension shares the launch while each layer keeps its own
+// host and hot storage.
+__global__ void hisparse_gather_compact_layers_kernel(
+    const uint64_t* __restrict__ host_cache_ptrs,
+    const uint64_t* __restrict__ hot_cache_ptrs,
+    const int32_t* __restrict__ miss_global_indices,
+    const int32_t* __restrict__ miss_hot_indices,
+    const int32_t* __restrict__ miss_counts, const int64_t host_rows,
+    const int64_t hot_rows, const int64_t row_bytes,
+    const int64_t hot_block_stride, const int32_t hot_block_size,
+    const int32_t top_k) {
+  const auto* host_cache = reinterpret_cast<const char*>(
+      static_cast<uintptr_t>(host_cache_ptrs[blockIdx.z]));
+  auto* hot_cache = reinterpret_cast<char*>(
+      static_cast<uintptr_t>(hot_cache_ptrs[blockIdx.z]));
+  const int NUM_WARPS = blockDim.x / kWarpSize;
+  const int row = blockIdx.x;
+  const int warp_id = threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+  const int miss_count = min(max(miss_counts[row], 0), top_k);
+  const int col_start = blockIdx.y * NUM_WARPS + warp_id;
+  const int col_stride = gridDim.y * NUM_WARPS;
+  const int64_t base = static_cast<int64_t>(row) * top_k;
+  for (int col = col_start; col < miss_count; col += col_stride) {
+    const int32_t g = miss_global_indices[base + col];
+    const int32_t dst = miss_hot_indices[base + col];
+    if (g < 0 || dst < 0 || dst >= hot_rows) {
+      continue;
+    }
+    if (g < host_rows) {
+      copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
+                    cache_row_ptr(hot_cache, dst, hot_block_size,
+                                  hot_block_stride, row_bytes),
+                    row_bytes);
+    } else {
+      zero_cache_row_warp(lane_id, hot_cache, dst, hot_block_size,
+                          hot_block_stride, row_bytes);
+    }
+  }
+}
+
 // One warp per item: gather `src_cache[src_indices[i]]` into
 // `host_cache[dst_slots[i]]`. Used to scatter KV rows into the pinned host
 // pool fully stream-ordered (no host synchronization).
@@ -1414,6 +1456,77 @@ void hisparse_gather_compact(torch::stable::Tensor const& host_cache,
   hisparse_gather_compact_kernel<<<grid, kBlockSize, 0, stream>>>(
       static_cast<const char*>(host_cache.const_data_ptr()),
       static_cast<char*>(hot_cache.mutable_data_ptr()),
+      miss_global_indices.const_data_ptr<int32_t>(),
+      miss_hot_indices.const_data_ptr<int32_t>(),
+      miss_counts.const_data_ptr<int32_t>(), host_rows, hot_rows, row_bytes,
+      hot_block_stride, hot_block_size, top_k);
+}
+
+void hisparse_gather_compact_layers(
+    torch::stable::Tensor const& host_anchor, torch::stable::Tensor& hot_anchor,
+    torch::stable::Tensor const& host_cache_ptrs,
+    torch::stable::Tensor const& hot_cache_ptrs,
+    torch::stable::Tensor const& miss_global_indices,
+    torch::stable::Tensor const& miss_hot_indices,
+    torch::stable::Tensor const& miss_counts) {
+  STD_TORCH_CHECK(
+      host_anchor.device().is_cpu() && is_pinned_cpu_tensor(host_anchor),
+      "host_anchor must be pinned CPU memory");
+  STD_TORCH_CHECK(hot_anchor.is_cuda(), "hot_anchor must be on CUDA");
+  STD_TORCH_CHECK(
+      host_cache_ptrs.is_cuda() && hot_cache_ptrs.is_cuda() &&
+          host_cache_ptrs.scalar_type() ==
+              torch::headeronly::ScalarType::UInt64 &&
+          hot_cache_ptrs.scalar_type() ==
+              torch::headeronly::ScalarType::UInt64 &&
+          host_cache_ptrs.dim() == 1 && hot_cache_ptrs.dim() == 1 &&
+          host_cache_ptrs.numel() == hot_cache_ptrs.numel() &&
+          host_cache_ptrs.is_contiguous() && hot_cache_ptrs.is_contiguous(),
+      "cache pointer tables must be matching contiguous uint64 CUDA tensors");
+  STD_TORCH_CHECK(
+      miss_global_indices.is_cuda() && miss_hot_indices.is_cuda() &&
+          miss_counts.is_cuda() &&
+          miss_global_indices.scalar_type() ==
+              torch::headeronly::ScalarType::Int &&
+          miss_hot_indices.scalar_type() ==
+              torch::headeronly::ScalarType::Int &&
+          miss_counts.scalar_type() == torch::headeronly::ScalarType::Int &&
+          miss_global_indices.dim() == 2 && miss_hot_indices.dim() == 2 &&
+          miss_global_indices.size(0) == miss_hot_indices.size(0) &&
+          miss_global_indices.size(1) == miss_hot_indices.size(1) &&
+          miss_counts.numel() >= miss_global_indices.size(0) &&
+          miss_global_indices.is_contiguous() &&
+          miss_hot_indices.is_contiguous() && miss_counts.is_contiguous(),
+      "compact miss plan must be matching contiguous int32 CUDA tensors");
+  STD_TORCH_CHECK(hot_anchor.dim() == 3,
+                  "hot_anchor must be [num_blocks, block_size, row_width]");
+  const int64_t row_bytes = hot_anchor.size(-1) * hot_anchor.element_size();
+  STD_TORCH_CHECK(row_bytes % 16 == 0, "KV rows must be 16-byte aligned");
+  STD_TORCH_CHECK(hot_anchor.stride(1) * hot_anchor.element_size() == row_bytes,
+                  "hot-cache rows must be contiguous");
+  const int64_t host_rows =
+      check_2d_rows(host_anchor, "host_anchor", row_bytes);
+  const auto num_rows = static_cast<int32_t>(miss_global_indices.size(0));
+  const auto top_k = static_cast<int32_t>(miss_global_indices.size(1));
+  const auto num_layers = static_cast<int32_t>(host_cache_ptrs.numel());
+  if (num_rows == 0 || top_k == 0 || num_layers == 0) {
+    return;
+  }
+
+  constexpr int kBlockSize = 512;
+  constexpr int kTargetBlocks = 64;
+  const int num_chunks = std::min(8, std::max(1, kTargetBlocks / num_rows));
+  const dim3 grid(num_rows, num_chunks, num_layers);
+  const int32_t hot_block_size = static_cast<int32_t>(hot_anchor.size(1));
+  const int64_t hot_rows = hot_anchor.size(0) * hot_block_size;
+  const int64_t hot_block_stride =
+      hot_anchor.stride(0) * hot_anchor.element_size();
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      hot_anchor.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  hisparse_gather_compact_layers_kernel<<<grid, kBlockSize, 0, stream>>>(
+      static_cast<const uint64_t*>(host_cache_ptrs.const_data_ptr()),
+      static_cast<const uint64_t*>(hot_cache_ptrs.const_data_ptr()),
       miss_global_indices.const_data_ptr<int32_t>(),
       miss_hot_indices.const_data_ptr<int32_t>(),
       miss_counts.const_data_ptr<int32_t>(), host_rows, hot_rows, row_bytes,

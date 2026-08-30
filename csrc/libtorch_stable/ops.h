@@ -677,6 +677,14 @@ void hisparse_gather_compact(torch::stable::Tensor const& host_cache,
                              torch::stable::Tensor const& miss_hot_indices,
                              torch::stable::Tensor const& miss_counts);
 
+void hisparse_gather_compact_layers(
+    torch::stable::Tensor const& host_anchor, torch::stable::Tensor& hot_anchor,
+    torch::stable::Tensor const& host_cache_ptrs,
+    torch::stable::Tensor const& hot_cache_ptrs,
+    torch::stable::Tensor const& miss_global_indices,
+    torch::stable::Tensor const& miss_hot_indices,
+    torch::stable::Tensor const& miss_counts);
+
 void hisparse_backup(torch::stable::Tensor const& src_cache,
                      torch::stable::Tensor const& src_indices,
                      torch::stable::Tensor& host_cache,

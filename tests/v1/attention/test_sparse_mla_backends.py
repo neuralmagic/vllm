@@ -1691,10 +1691,12 @@ def test_hisparse_apply_multi_step_plan_matches_independent():
     req_ids = torch.arange(num_reqs, dtype=torch.int32, device=device)
     seq_len = blocks_per_req * block_size
     producer = make()
-    shared = make(producer.index_group)
+    shared_runtimes = [make(producer.index_group) for _ in range(3)]
+    producer.index_group.finalize_follower_caches()
     indep = make()
     base = torch.arange(top_k, dtype=torch.int32, device=device)
     for iteration in range(2):
+        expected_indices = []
         for step in range(2):
             topk = torch.stack(
                 [
@@ -1717,14 +1719,20 @@ def test_hisparse_apply_multi_step_plan_matches_independent():
                 **kw,
             )
             _, idx_indep = indep.swap_in(topk_indices=topk.clone(), **kw)
-            _, idx_shared = shared.apply_plan(
-                block_size=block_size,
-                num_tokens=num_reqs,
-                plan_row_offset=plan_row_offset,
-            )
-            torch.accelerator.synchronize()
-            torch.testing.assert_close(idx_shared, idx_full, rtol=0, atol=0)
             torch.testing.assert_close(idx_indep, idx_full, rtol=0, atol=0)
+            expected_indices.append(idx_full)
+        producer.prefetch_followers(2 * num_reqs)
+        for step, idx_full in enumerate(expected_indices):
+            plan_row_offset = step * num_reqs
+            for shared in shared_runtimes:
+                _, idx_shared = shared.apply_plan(
+                    block_size=block_size,
+                    num_tokens=num_reqs,
+                    plan_row_offset=plan_row_offset,
+                )
+                torch.testing.assert_close(idx_shared, idx_full, rtol=0, atol=0)
+        torch.accelerator.synchronize()
+        for shared in shared_runtimes:
             torch.testing.assert_close(shared.hot.cache, indep.hot.cache)
 
 
@@ -2528,7 +2536,10 @@ def test_hisparse_fp8_decode_keeps_each_speculative_step_before_batching():
     impl = SimpleNamespace(
         kv_lora_rank=1,
         hisparse_cache=SimpleNamespace(
-            runtime=SimpleNamespace(region_stride=query_len * topk.shape[1])
+            runtime=SimpleNamespace(
+                region_stride=query_len * topk.shape[1],
+                prefetch_followers=MagicMock(),
+            )
         ),
     )
     impl._run_hisparse_decode = MethodType(
@@ -2555,6 +2566,7 @@ def test_hisparse_fp8_decode_keeps_each_speculative_step_before_batching():
     )
 
     assert steps == [0, 1, 2]
+    impl.hisparse_cache.runtime.prefetch_followers.assert_called_once_with(num_tokens)
     assert kernel_shapes == [(1, num_tokens, 2, 4)]
     assert output.shape == (num_tokens, 2, 1)
 

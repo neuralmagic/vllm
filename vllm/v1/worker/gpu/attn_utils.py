@@ -466,6 +466,12 @@ def _bind_hisparse_kv_caches(
     )
     for cache_handle in cache_handles:
         cache_handle.runtime.request_state_indices = request_state_indices
+    index_groups = {
+        id(cache_handle.runtime.index_group): cache_handle.runtime.index_group
+        for cache_handle in cache_handles
+    }
+    for index_group in index_groups.values():
+        index_group.finalize_follower_caches()
     source_group_id = get_unique_kv_cache_group_id(
         kv_cache_config, KVCacheGroupRole.HISPARSE_SOURCE
     )

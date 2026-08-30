@@ -452,6 +452,7 @@ def _has_hisparse_ops() -> bool:
         and hasattr(torch.ops._C_cache_ops, "hisparse_invalidate_written_slots")
         and hasattr(torch.ops._C_cache_ops, "hisparse_gather_plan")
         and hasattr(torch.ops._C_cache_ops, "hisparse_gather_compact")
+        and hasattr(torch.ops._C_cache_ops, "hisparse_gather_compact_layers")
         and hasattr(torch.ops._C_cache_ops, "hisparse_backup")
         and hasattr(torch.ops._C_cache_ops, "hisparse_backup_layers")
     )
@@ -512,11 +513,46 @@ class HiSparseIndexGroup:
         self.plan = _create_group_plan(device, max_swap_rows, top_k)
         self.copy_stream = _create_copy_stream(device)
         self.followers: list[HiSparseRuntime] = []
+        self.follower_host_anchor: torch.Tensor | None = None
+        self.follower_hot_anchor: torch.Tensor | None = None
+        self.follower_host_ptrs: torch.Tensor | None = None
+        self.follower_hot_ptrs: torch.Tensor | None = None
+        self.prefetched_plan_range: tuple[int, int] | None = None
         self.swap_stats = torch.zeros(2, dtype=torch.uint64, device=device)
         self.swap_stats_host = torch.empty(
             2, dtype=torch.uint64, device="cpu", pin_memory=True
         )
         self.stats_row_bytes = 0
+
+    def finalize_follower_caches(self) -> None:
+        if not self.followers:
+            return
+        first = self.followers[0]
+        host_layout = (first.host_cache.shape, first.host_cache.stride())
+        hot_layout = (first.hot.cache.shape, first.hot.cache.stride())
+        for follower in self.followers[1:]:
+            if (
+                follower.host_cache.shape,
+                follower.host_cache.stride(),
+            ) != host_layout or follower.host_cache.dtype != first.host_cache.dtype:
+                raise RuntimeError("HiSparse follower host layouts must match.")
+            if (
+                follower.hot.cache.shape,
+                follower.hot.cache.stride(),
+            ) != hot_layout or follower.hot.cache.dtype != first.hot.cache.dtype:
+                raise RuntimeError("HiSparse follower hot layouts must match.")
+        self.follower_host_anchor = first.host_cache
+        self.follower_hot_anchor = first.hot.cache
+        self.follower_host_ptrs = torch.tensor(
+            [follower.host_cache.data_ptr() for follower in self.followers],
+            dtype=torch.uint64,
+            device=first.device,
+        )
+        self.follower_hot_ptrs = torch.tensor(
+            [follower.hot.cache.data_ptr() for follower in self.followers],
+            dtype=torch.uint64,
+            device=first.device,
+        )
 
 
 class HiSparseRuntime:
@@ -771,6 +807,7 @@ class HiSparseRuntime:
         hot_indices = plan.hot_indices[plan_rows]
         valid_counts = plan.valid_counts[plan_rows] if return_valid_counts else None
         if produce_plan:
+            group.prefetched_plan_range = None
             compact_miss_globals = plan.miss_global_indices[plan_rows]
             compact_miss_hots = plan.miss_hot_indices[plan_rows]
             compact_miss_counts = plan.miss_counts[plan_rows]
@@ -839,14 +876,40 @@ class HiSparseRuntime:
 
     def _prefetch_group(self, num_tokens: int, plan_row_offset: int = 0) -> None:
         group = self.index_group
+        assert group.follower_host_anchor is not None
+        assert group.follower_hot_anchor is not None
+        assert group.follower_host_ptrs is not None
+        assert group.follower_hot_ptrs is not None
         compute = torch.accelerator.current_stream(self.device)
         group.copy_stream.wait_stream(compute)
         with group.copy_stream:
+            plan = group.plan
+            plan_rows = slice(plan_row_offset, plan_row_offset + num_tokens)
+            torch.ops._C_cache_ops.hisparse_gather_compact_layers(
+                group.follower_host_anchor,
+                group.follower_hot_anchor,
+                group.follower_host_ptrs,
+                group.follower_hot_ptrs,
+                plan.miss_global_indices[plan_rows],
+                plan.miss_hot_indices[plan_rows],
+                plan.miss_counts[plan_rows],
+            )
             for follower in group.followers:
-                follower._gather_plan_into(num_tokens, plan_row_offset)
                 if follower._prefetch_event is None:
                     follower._prefetch_event = torch.Event()
                 follower._prefetch_event.record(group.copy_stream)
+        group.prefetched_plan_range = (
+            plan_row_offset,
+            plan_row_offset + num_tokens,
+        )
+
+    def prefetch_followers(self, num_tokens: int, plan_row_offset: int = 0) -> None:
+        if (
+            self.is_group_leader
+            and self.index_group.followers
+            and not self.all_resident
+        ):
+            self._prefetch_group(num_tokens, plan_row_offset)
 
     def apply_plan(
         self,
@@ -866,12 +929,17 @@ class HiSparseRuntime:
         assert hot.attention_block_stride == leader.hot.attention_block_stride
         plan_rows = slice(plan_row_offset, plan_row_offset + n)
         attention_indices = plan.attention_indices[plan_rows]
+        prefetched_range = group.prefetched_plan_range
+        is_prefetched = prefetched_range is not None and (
+            prefetched_range[0] <= plan_row_offset
+            and plan_row_offset + n <= prefetched_range[1]
+        )
         if self._prefetch_event is not None:
             torch.accelerator.current_stream(self.device).wait_event(
                 self._prefetch_event
             )
             self._prefetch_event = None
-        else:
+        if not is_prefetched:
             self._gather_plan_into(num_tokens, plan_row_offset)
         if return_valid_counts:
             return (
