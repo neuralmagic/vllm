@@ -347,6 +347,7 @@ def test_hisparse_cache_defers_required_host_mirror(monkeypatch):
     cache.slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
     cache.num_actual_tokens = 2
     cache.defer_host_mirror = True
+    cache.host_mirror_writer = True
     host_slots = torch.tensor([4, 5], dtype=torch.int64)
     monkeypatch.setattr(
         hisparse_runtime_module.ops, "concat_and_cache_mla", MagicMock()
@@ -399,6 +400,41 @@ def test_hisparse_cache_mirrors_prefill_before_attention(monkeypatch):
     assert mirror_cache is cache.mirror_staging_cache
     torch.testing.assert_close(mirror_src, cache.mirror_staging_slots)
     torch.testing.assert_close(mirror_dst, host_slots)
+
+
+def test_hisparse_shared_host_reader_skips_prefill_mirror(monkeypatch):
+    runtime = SimpleNamespace(
+        device=torch.device("cpu"),
+        eager_host_mirror=True,
+        max_num_reqs=4,
+        backup_rows=MagicMock(),
+        is_group_leader=False,
+    )
+    cache = hisparse_runtime_module.HiSparseCacheHandle(runtime)
+    cache.view = SimpleNamespace(cache=torch.empty((2, 2, 4)), block_size=2)
+    cache.slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
+    cache.num_actual_tokens = 2
+    cache.defer_host_mirror = True
+    cache.host_mirror_writer = False
+    cache.mirror_staging_cache = torch.empty((2, 2, 4))
+    cache.mirror_staging_slots = torch.tensor([0, 1], dtype=torch.int64)
+    concat_and_cache = MagicMock()
+    monkeypatch.setattr(
+        hisparse_runtime_module.ops, "concat_and_cache_mla", concat_and_cache
+    )
+
+    cache.write_rows(
+        torch.empty((2, 2)),
+        torch.empty((2, 1, 2)),
+        torch.tensor([4, 5], dtype=torch.int64),
+        "auto",
+        torch.tensor(1.0),
+        mirror_to_host=True,
+    )
+
+    assert concat_and_cache.call_count == 1
+    assert concat_and_cache.call_args.args[2] is cache.view.cache
+    runtime.backup_rows.assert_not_called()
 
 
 def test_hisparse_finish_forward_mirrors_all_layers_once(monkeypatch):

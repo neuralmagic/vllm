@@ -879,6 +879,7 @@ class HiSparseCacheHandle:
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None
         self.defer_host_mirror = False
+        self.host_mirror_writer = True
         self.mirror_slot_mapping: torch.Tensor | None = None
         self.mirror_staging_cache: torch.Tensor | None = None
         self.mirror_staging_slots: torch.Tensor | None = None
@@ -943,7 +944,7 @@ class HiSparseCacheHandle:
             mirrored_slots = mirrored_slots.contiguous()
             mirror_src_cache = self.view.cache
             mirror_src_slots = resident_slots
-            if mirror_to_host:
+            if mirror_to_host and self.host_mirror_writer:
                 staging_cache = self.mirror_staging_cache
                 staging_slots = self.mirror_staging_slots
                 if staging_cache is None or staging_slots is None:
@@ -963,11 +964,12 @@ class HiSparseCacheHandle:
                     scale=k_scale,
                 )
                 mirror_src_cache = staging_cache
-            self.runtime.backup_rows(
-                mirror_src_cache,
-                mirror_src_slots,
-                mirrored_slots,
-            )
+            if self.host_mirror_writer:
+                self.runtime.backup_rows(
+                    mirror_src_cache,
+                    mirror_src_slots,
+                    mirrored_slots,
+                )
             if self.runtime.is_group_leader and self.num_decode_tokens:
                 assert self.req_id_per_token is not None
                 num_decode_tokens = min(self.num_decode_tokens, num_rows)

@@ -183,6 +183,7 @@ class HiSparseConnectorWorker:
         self.cache_handles = cache_handles
         for cache in cache_handles:
             cache.defer_host_mirror = True
+            cache.host_mirror_writer = is_host_writer
         self.leader_runtimes = [
             cache.runtime for cache in cache_handles if cache.runtime.is_group_leader
         ]
