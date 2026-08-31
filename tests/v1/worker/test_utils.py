@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
+import vllm.v1.attention.backends.mla.index_group as index_group_module
 import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (
@@ -1024,29 +1025,36 @@ def test_hisparse_cache_handles_join_index_groups_during_construction(monkeypatc
         "from_vllm_config",
         classmethod(lambda cls, vllm_config, model_top_k: resolved),
     )
-    plans: list[object] = []
+    shared_states: list[object] = []
     streams: list[object] = []
 
-    def create_plan(_device, _max_rows, _top_k):
-        plans.append(object())
-        return plans[-1]
+    def create_shared_state(_device, _max_rows, _top_k):
+        shared_states.append(object())
+        return shared_states[-1]
 
     def create_stream(_device):
         streams.append(object())
         return streams[-1]
 
-    monkeypatch.setattr(hisparse_runtime_module, "_create_group_plan", create_plan)
+    monkeypatch.setattr(
+        hisparse_runtime_module, "_create_shared_topk_state", create_shared_state
+    )
     monkeypatch.setattr(hisparse_runtime_module, "_create_copy_stream", create_stream)
-    index_group_builder = hisparse_runtime_module.HiSparseIndexGroupBuilder()
+    monkeypatch.setattr(index_group_module, "_create_side_stream", lambda _: object())
+    monkeypatch.setattr(index_group_module, "_create_event", lambda: object())
+    index_group_builder = index_group_module.SparseMLAIndexGroupBuilder(
+        torch.empty((2, 4), dtype=torch.int32)
+    )
 
     def make_cache_handle(is_leader: bool):
+        index_group, _ = index_group_builder.register_layer(is_leader)
         cache_handle = hisparse_runtime_module.create_hisparse_cache_handle(
             config,
             model_top_k=4,
             is_index_group_leader=is_leader,
             row_width=8,
             kv_dtype=torch.float32,
-            index_group_builder=index_group_builder,
+            index_group=index_group,
             device="cpu",
         )
         assert cache_handle is not None
@@ -1060,7 +1068,8 @@ def test_hisparse_cache_handles_join_index_groups_during_construction(monkeypatc
     assert first_follower.runtime.index_group is first_leader.runtime.index_group
     assert second_follower.runtime.index_group is second_leader.runtime.index_group
     assert first_leader.runtime.index_group is not second_leader.runtime.index_group
-    assert len(plans) == len(streams) == 2
+    assert len(shared_states) == 2
+    assert streams == []
 
 
 @pytest.mark.parametrize(

@@ -103,10 +103,13 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backends.mla.index_group import (
+    SparseMLAIndexGroupBuilder,
+    get_sparse_mla_index_group_max_rows,
+)
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
 )
-from vllm.v1.hisparse.runtime import HiSparseIndexGroupBuilder
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, SparseCacheRole
 
 from .interfaces import (
@@ -1006,7 +1009,7 @@ class DeepseekV2MLAAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
-        hisparse_index_group_builder: HiSparseIndexGroupBuilder | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
         input_size: int | None = None,
         reduce_results: bool = True,
         non_causal_multi_token_decode: bool = False,
@@ -1194,7 +1197,7 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
-            hisparse_index_group_builder=hisparse_index_group_builder,
+            index_group_builder=index_group_builder,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
@@ -1238,7 +1241,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
-        hisparse_index_group_builder: HiSparseIndexGroupBuilder | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
     ) -> None:
         super().__init__()
 
@@ -1288,7 +1291,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and is_moe_layer
         )
         attn_kwargs = (
-            {"hisparse_index_group_builder": hisparse_index_group_builder}
+            {"index_group_builder": index_group_builder}
             if attn_cls is DeepseekV2MLAAttention
             else {}
         )
@@ -1432,9 +1435,12 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             topk_indices_buffer = None
-        hisparse_index_group_builder = (
-            HiSparseIndexGroupBuilder()
-            if self.is_v32 and vllm_config.attention_config.hisparse_config is not None
+        index_group_builder = (
+            SparseMLAIndexGroupBuilder(
+                topk_indices_buffer,
+                get_sparse_mla_index_group_max_rows(vllm_config),
+            )
+            if topk_indices_buffer is not None
             else None
         )
 
@@ -1453,7 +1459,7 @@ class DeepseekV2Model(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
-                hisparse_index_group_builder=hisparse_index_group_builder,
+                index_group_builder=index_group_builder,
             ),
             prefix=f"{prefix}.layers",
         )

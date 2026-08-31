@@ -627,7 +627,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         attn_metadata: FlashMLASparseMetadata,
         actual_num_heads: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self._hisparse_decode_batch or self._can_use_hisparse_resident_cache:
+        if self._hisparse_decode_batch:
             kv_c_and_k_pe_cache, topk_indices, topk_length = (
                 self._hisparse_decode_cache(
                     kv_c_and_k_pe_cache,
@@ -678,15 +678,23 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
         )
-        topk_indices, topk_length = triton_convert_req_index_to_global_index(
-            req_id_per_token,
-            block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            return_valid_counts=True,
-        )
+        if self.hisparse_cache is None:
+            topk_indices, topk_length = self._convert_decode_logical_topk(
+                topk_indices,
+                attn_metadata,
+                block_stride_rows=block_stride_rows,
+                return_valid_counts=True,
+            )
+        else:
+            topk_indices, topk_length = triton_convert_req_index_to_global_index(
+                req_id_per_token,
+                block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+            )
 
         attn_out, lse = self._bf16_flash_mla_kernel(
             q,
@@ -737,7 +745,14 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # prefill_workspace_starts has been adjusted in-place per chunk so
         # prefill indices automatically come out chunk-local
         topk_length = None
-        if num_prefill_tokens > 0 or not use_hisparse:
+        if num_prefill_tokens == 0 and not use_hisparse:
+            topk_indices, topk_length = self._convert_decode_logical_topk(
+                topk_indices,
+                attn_metadata,
+                block_stride_rows=None,
+                return_valid_counts=True,
+            )
+        elif num_prefill_tokens > 0:
             topk_indices, topk_length = triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token[: topk_indices.shape[0]],
                 attn_metadata.block_table,
@@ -894,6 +909,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             ),
         )
         fp8_metadata = attn_metadata.fp8_extra_metadata
+        use_hisparse = self.hisparse_cache is not None
         indices_converted = False
 
         block_table = attn_metadata.block_table
@@ -969,13 +985,21 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         elif not indices_converted:
             # Convert per-request indices to global slots (decode) or workspace
             # offsets (prefill).
-            topk_indices = triton_convert_req_index_to_global_index(
-                req_id_per_token,
-                block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-            )
+            if not use_hisparse:
+                topk_indices = self._convert_decode_logical_topk(
+                    topk_indices,
+                    attn_metadata,
+                    block_stride_rows=None,
+                    return_valid_counts=False,
+                )
+            else:
+                topk_indices = triton_convert_req_index_to_global_index(
+                    req_id_per_token,
+                    block_table,
+                    topk_indices,
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+                )
 
         _attn_out, _lse = self._fp8_flash_mla_kernel(
             q=q.unsqueeze(0),  # unsqueeze to add batch_dim: (T, H, D) -> (1, T, H, D)
@@ -1052,28 +1076,6 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         *,
         flatten_requests: bool = False,
     ) -> torch.Tensor:
-        if self._can_use_hisparse_resident_cache:
-            num_decodes = attn_metadata.num_decodes
-            num_decode_tokens = attn_metadata.num_decode_tokens
-            resident_cache, physical_indices = self._hisparse_resident_decode_cache(
-                topk_indices[:num_decode_tokens],
-                attn_metadata,
-                return_valid_counts=False,
-            )
-            if flatten_requests:
-                q = q[:num_decode_tokens].unsqueeze(0)
-                physical_indices = physical_indices.unsqueeze(0)
-            else:
-                q = reshape_query_for_spec_decode(q[:num_decode_tokens], num_decodes)
-                physical_indices = physical_indices.view(num_decodes, q.shape[1], -1)
-            output, _ = self._fp8_flash_mla_kernel(
-                q=q,
-                kv_c_and_k_pe_cache=resident_cache,
-                topk_indices=physical_indices,
-                kernel_metadata=kernel_metadata,
-            )
-            return reshape_attn_output_for_spec_decode(output)
-
         sequence_dim = 0 if flatten_requests else 1
 
         def run_fp8_step(

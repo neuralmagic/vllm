@@ -28,7 +28,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
-    triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -383,13 +382,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 return_valid_counts=True,
             )
         else:
-            topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
+            topk_indices_physical, seq_lens = self._convert_decode_logical_topk(
                 topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                attn_metadata,
+                block_stride_rows=block_stride_rows,
                 return_valid_counts=True,
             )
 

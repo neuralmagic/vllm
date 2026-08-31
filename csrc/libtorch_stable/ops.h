@@ -625,7 +625,7 @@ void concat_and_cache_mla_grouped(torch::stable::Tensor& kv_c,
 
 #ifndef USE_ROCM
 // HiSparse kernels use raw PTX in the row copy; CUDA-only.
-void hisparse_swap_in(
+void hisparse_resolve_residency(
     torch::stable::Tensor const& host_cache, torch::stable::Tensor& hot_cache,
     torch::stable::Tensor const& hot_block_table,
     torch::stable::Tensor const& global_indices,
@@ -643,9 +643,9 @@ void hisparse_swap_in(
     int64_t source_block_size,
     std::optional<torch::stable::Tensor> const& resolved_global_indices,
     std::optional<torch::stable::Tensor> const& valid_counts,
-    std::optional<torch::stable::Tensor> const& compact_miss_globals,
-    std::optional<torch::stable::Tensor> const& compact_miss_hots,
-    std::optional<torch::stable::Tensor> const& compact_miss_counts,
+    std::optional<torch::stable::Tensor> const& swap_host_physical_rows,
+    std::optional<torch::stable::Tensor> const& swap_device_physical_rows,
+    std::optional<torch::stable::Tensor> const& swap_counts,
     std::optional<torch::stable::Tensor> const& resident_block_table,
     int64_t resident_block_size, int64_t resident_null_block);
 

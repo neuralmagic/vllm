@@ -34,12 +34,17 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.torch_utils import (
+    current_stream,
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
     np_to_pinned_tensor,
 )
 from vllm.v1.attention.backend import AttentionMetadataBuilder
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+from vllm.v1.attention.backends.mla.index_group import (
+    SparseMLAIndexGroup,
+    SparseMLAIndexGroupBuilder,
+)
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
@@ -50,7 +55,6 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.hisparse.runtime import (
     FP8_DS_MLA_ROW_BYTES,
     HiSparseCacheHandle,
-    HiSparseIndexGroupBuilder,
     HiSparsePrefillStagingPlan,
     build_hisparse_prefill_staging_plan,
     create_hisparse_cache_handle,
@@ -619,7 +623,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         kv_b_proj: "ColumnParallelLinear",
         indexer: object | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
-        hisparse_index_group_builder: HiSparseIndexGroupBuilder | None = None,
+        index_group_builder: SparseMLAIndexGroupBuilder | None = None,
         q_pad_num_heads: int | None = None,
     ) -> None:
         super().__init__(
@@ -644,6 +648,12 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             if indexer is not None
             else topk_indices_buffer
         )
+        self.index_group: SparseMLAIndexGroup | None = None
+        self.index_group_index = 0
+        if index_group_builder is not None:
+            self.index_group, self.index_group_index = (
+                index_group_builder.register_layer(indexer is not None)
+            )
 
         self.hisparse_cache: HiSparseCacheHandle | None = None
         vllm_config = get_current_vllm_config()
@@ -664,10 +674,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             self.hisparse_cache = create_hisparse_cache_handle(
                 vllm_config,
                 model_top_k,
-                is_index_group_leader=indexer is not None,
+                is_index_group_leader=self.index_group_index == 0,
                 row_width=row_width,
                 kv_dtype=kv_dtype,
-                index_group_builder=hisparse_index_group_builder,
+                index_group=self.index_group,
             )
             assert self.hisparse_cache is not None
         self._hisparse_dummy_batch = False
@@ -695,6 +705,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
     def prepare_for_batch(self, attn_metadata: Any | None) -> None:
         self._hisparse_dummy_batch = attn_metadata is None
         if self.hisparse_cache is not None:
+            self.hisparse_cache.runtime.begin_forward()
             self.hisparse_cache.num_actual_tokens = (
                 attn_metadata.num_actual_tokens if attn_metadata is not None else 0
             )
@@ -715,32 +726,113 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 or self.hisparse_cache.runtime.eager_host_mirror
             )
 
+    def record_logical_topk_ready(self) -> None:
+        group = self.index_group
+        if group is not None and group.has_indexer:
+            group.logical_topk_ready.record(current_stream())
+
     def _hisparse_swap_in(
         self,
-        topk_indices: torch.Tensor,
+        logical_topk_indices: torch.Tensor,
         attn_metadata: Any,
         num_decode_tokens: int | None = None,
         return_valid_counts: bool = False,
         req_id_per_token: torch.Tensor | None = None,
-        plan_row_offset: int = 0,
-        prefetch_followers: bool = True,
     ):
         assert self.hisparse_cache is not None
-        n = topk_indices.shape[0] if num_decode_tokens is None else num_decode_tokens
+        n = (
+            logical_topk_indices.shape[0]
+            if num_decode_tokens is None
+            else num_decode_tokens
+        )
         if req_id_per_token is None:
             assert num_decode_tokens is None or n == attn_metadata.num_decodes, (
                 "Multi-token HiSparse decode must resolve one step at a time."
             )
             req_id_per_token = attn_metadata.req_id_per_token[:n]
-        return self.hisparse_cache.resolve_topk(
+        return self.hisparse_cache.swap_in(
             req_id_per_token,
             block_table=attn_metadata.block_table,
-            topk_indices=topk_indices[:n],
+            logical_topk_indices=logical_topk_indices[:n],
             block_size=attn_metadata.block_size,
             return_valid_counts=return_valid_counts,
-            plan_row_offset=plan_row_offset,
-            prefetch_followers=prefetch_followers,
         )
+
+    def _convert_decode_logical_topk(
+        self,
+        logical_topk_indices: torch.Tensor,
+        attn_metadata: Any,
+        *,
+        block_stride_rows: int | None,
+        return_valid_counts: bool,
+        block_table: torch.Tensor | None = None,
+        block_size: int | None = None,
+        req_id_per_token: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        group = self.index_group
+        num_tokens = logical_topk_indices.shape[0]
+        if block_table is None:
+            block_table = attn_metadata.block_table
+        if block_size is None:
+            block_size = attn_metadata.block_size
+        if req_id_per_token is None:
+            req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
+        layout_key = (
+            block_table.data_ptr(),
+            block_size,
+            block_stride_rows or block_size,
+        )
+        if group is not None and self.index_group_index == 0:
+            group.physical_layout_key = layout_key
+        can_share = (
+            group is not None
+            and self.hisparse_cache is None
+            and self.dcp_world_size == 1
+            and attn_metadata.num_decode_tokens == num_tokens
+            and attn_metadata.num_actual_tokens == num_tokens
+            and num_tokens <= group.physical_topk_indices.shape[0]
+            and logical_topk_indices.data_ptr() == group.logical_topk_indices.data_ptr()
+            and group.physical_layout_key == layout_key
+        )
+        if not can_share:
+            return triton_convert_req_index_to_global_index(
+                req_id_per_token,
+                block_table,
+                logical_topk_indices,
+                BLOCK_SIZE=block_size,
+                BLOCK_STRIDE_ROWS=block_stride_rows,
+                NUM_TOPK_TOKENS=logical_topk_indices.shape[1],
+                return_valid_counts=return_valid_counts,
+            )
+
+        assert group is not None
+        physical_topk_indices = group.physical_topk_indices[:num_tokens]
+        valid_topk_counts = group.valid_topk_counts[:num_tokens]
+        compute = current_stream()
+        if self.index_group_index == 0:
+            if group.has_indexer:
+                group.side_stream.wait_event(group.logical_topk_ready)
+            else:
+                group.side_stream.wait_stream(compute)
+            with group.side_stream:
+                triton_convert_req_index_to_global_index(
+                    req_id_per_token,
+                    block_table,
+                    logical_topk_indices,
+                    BLOCK_SIZE=block_size,
+                    BLOCK_STRIDE_ROWS=block_stride_rows,
+                    NUM_TOPK_TOKENS=logical_topk_indices.shape[1],
+                    return_valid_counts=return_valid_counts,
+                    out=physical_topk_indices,
+                    valid_counts_out=(
+                        valid_topk_counts if return_valid_counts else None
+                    ),
+                )
+                group.physical_topk_ready.record(group.side_stream)
+        compute.wait_event(group.physical_topk_ready)
+        if return_valid_counts:
+            return physical_topk_indices, valid_topk_counts
+        return physical_topk_indices
 
     def _run_hisparse_decode(
         self,
@@ -804,27 +896,16 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 )
                 step_req_ids = request_ids
 
-            if self._can_use_hisparse_resident_cache:
-                hot_cache, physical_indices, seq_lens = (
-                    self._hisparse_resident_decode_cache(
-                        step_topk,
-                        attn_metadata,
-                        return_valid_counts=True,
-                        req_id_per_token=step_req_ids,
-                    )
-                )
-            else:
-                hot_cache, physical_indices, seq_lens = self._hisparse_swap_in(
-                    step_topk,
-                    attn_metadata,
-                    return_valid_counts=True,
-                    req_id_per_token=step_req_ids,
-                    plan_row_offset=step * num_decodes,
-                    prefetch_followers=max_query_len == 1,
-                )
+            physical_indices, seq_lens = self._hisparse_swap_in(
+                step_topk,
+                attn_metadata,
+                return_valid_counts=True,
+                req_id_per_token=step_req_ids,
+            )
+            assert self.hisparse_cache is not None
             step_out, step_lse = run_step(
                 step_q,
-                hot_cache,
+                self.hisparse_cache.runtime.hot.attention_cache,
                 physical_indices,
                 seq_lens,
             )
@@ -918,13 +999,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
     ):
         if self.hisparse_cache is None:
             return None
-        if self._can_use_hisparse_resident_cache:
-            return self._hisparse_resident_decode_cache(
-                topk_indices,
-                attn_metadata,
-                return_valid_counts=return_valid_counts,
-            )
         if attn_metadata.num_decode_tokens == 0:
+            if self._can_use_hisparse_resident_cache:
+                return self._hisparse_resident_decode_cache(
+                    topk_indices,
+                    attn_metadata,
+                    return_valid_counts=return_valid_counts,
+                )
             kv_cache, block_table, req_ids = self._hisparse_stage_prefill_rows(
                 kv_cache, attn_metadata
             )
@@ -957,7 +1038,11 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             ),
             return_valid_counts=return_valid_counts,
         )
-        return (resolved[0].view(kv_cache.dtype), *resolved[1:])
+        hot_cache = self.hisparse_cache.runtime.hot.attention_cache.view(kv_cache.dtype)
+        if return_valid_counts:
+            physical_indices, valid_counts = resolved
+            return hot_cache, physical_indices, valid_counts
+        return hot_cache, resolved
 
     @property
     def _can_use_hisparse_resident_cache(self) -> bool:

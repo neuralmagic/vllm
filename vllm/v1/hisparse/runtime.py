@@ -7,6 +7,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeAlias
 
 import psutil
 import torch
@@ -15,6 +16,11 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import current_stream
+from vllm.v1.attention.backends.mla.index_group import (
+    SparseMLAIndexGroup,
+    get_sparse_mla_index_group_max_rows,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     HOST_REGISTER_CHUNK_BYTES,
@@ -25,9 +31,7 @@ logger = init_logger(__name__)
 
 # fp8_ds_mla KV row: 512 B quantized NoPE + 16 B scales + 128 B RoPE.
 FP8_DS_MLA_ROW_BYTES = 656
-HiSparseTopKResult = (
-    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-)
+HiSparseTopKResult: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -440,42 +444,37 @@ def _has_hisparse_ops() -> bool:
     if not hasattr(torch.ops, "_C_cache_ops"):
         return False
     return (
-        hasattr(torch.ops._C_cache_ops, "hisparse_swap_in")
+        hasattr(torch.ops._C_cache_ops, "hisparse_resolve_residency")
         and hasattr(torch.ops._C_cache_ops, "hisparse_invalidate_written_slots")
         and hasattr(torch.ops._C_cache_ops, "hisparse_gather_plan")
         and hasattr(torch.ops._C_cache_ops, "hisparse_gather_compact")
     )
 
 
-class _GroupPlan:
-    """CUDA-graph-safe swap plan replayed by index-sharing runtimes."""
+class _SharedTopKState:
+    """CUDA-graph-safe residency result shared by index-sharing layers."""
 
     def __init__(self, device: torch.device, max_rows: int, top_k: int) -> None:
-        self.hot_indices = torch.full(
+        self.device_topk_rows = torch.full(
             (max_rows, top_k), -1, dtype=torch.int32, device=device
         )
-        self.attention_indices = torch.empty_like(self.hot_indices)
-        self.miss_global_indices = torch.empty(
+        self.physical_topk_indices = torch.empty_like(self.device_topk_rows)
+        self.swap_host_physical_rows = torch.empty(
             (max_rows, top_k), dtype=torch.int32, device=device
         )
-        self.miss_hot_indices = torch.empty_like(self.miss_global_indices)
-        self.miss_counts = torch.empty(max_rows, dtype=torch.int32, device=device)
-        self.valid_counts = torch.empty(max_rows, dtype=torch.int32, device=device)
+        self.swap_device_physical_rows = torch.empty_like(self.swap_host_physical_rows)
+        self.swap_counts = torch.empty(max_rows, dtype=torch.int32, device=device)
+        self.valid_topk_counts = torch.empty(max_rows, dtype=torch.int32, device=device)
 
 
-def _create_group_plan(device: torch.device, max_rows: int, top_k: int) -> _GroupPlan:
-    return _GroupPlan(device, max_rows, top_k)
+def _create_shared_topk_state(
+    device: torch.device, max_rows: int, top_k: int
+) -> _SharedTopKState:
+    return _SharedTopKState(device, max_rows, top_k)
 
 
 def _create_copy_stream(device: torch.device) -> torch.Stream:
     return torch.Stream(device=device)
-
-
-@dataclass
-class HiSparseIndexGroupBuilder:
-    """Carry the latest index-producing runtime through model construction."""
-
-    current_group: HiSparseIndexGroup | None = None
 
 
 class HiSparseIndexGroup:
@@ -490,6 +489,7 @@ class HiSparseIndexGroup:
         region_stride: int,
         max_swap_rows: int,
         top_k: int,
+        copy_stream: torch.Stream | None = None,
     ) -> None:
         self.device_global_indices = torch.full(
             (max_num_reqs, region_stride),
@@ -499,8 +499,10 @@ class HiSparseIndexGroup:
         )
         self.lru_init = torch.arange(region_stride, dtype=torch.int16, device=device)
         self.lru_slots = self.lru_init.repeat(max_num_reqs, 1).contiguous()
-        self.plan = _create_group_plan(device, max_swap_rows, top_k)
-        self.copy_stream = _create_copy_stream(device)
+        self.shared_topk = _create_shared_topk_state(device, max_swap_rows, top_k)
+        self.copy_stream = (
+            copy_stream if copy_stream is not None else _create_copy_stream(device)
+        )
         self.followers: list[HiSparseRuntime] = []
         self.swap_stats = torch.zeros(2, dtype=torch.uint64, device=device)
         self.swap_stats_host = torch.empty(
@@ -527,6 +529,7 @@ class HiSparseRuntime:
         device: torch.device | str,
         max_swap_rows: int | None = None,
         index_group: HiSparseIndexGroup | None = None,
+        copy_stream: torch.Stream | None = None,
     ) -> None:
         if not _has_hisparse_ops():
             raise RuntimeError(
@@ -549,7 +552,9 @@ class HiSparseRuntime:
                 f"HiSparse requires 16-byte aligned KV rows, got {row_bytes}B."
             )
 
-        self._prefetch_event: torch.Event | None = None
+        self._layer_ready_event: torch.Event | None = None
+        self._swap_staged = False
+        self._swap_step = 0
         self.is_group_leader = index_group is None
         if index_group is None:
             index_group = HiSparseIndexGroup(
@@ -558,6 +563,7 @@ class HiSparseRuntime:
                 self.region_stride,
                 max_swap_rows or max_num_reqs,
                 config.top_k,
+                copy_stream,
             )
             index_group.leader = self
         else:
@@ -720,7 +726,22 @@ class HiSparseRuntime:
             written_slots[:num_tokens],
         )
 
-    def swap_in(
+    def begin_forward(self) -> None:
+        self._swap_step = 0
+
+    def _step_rows(self, num_tokens: int) -> slice:
+        start = self._swap_step * num_tokens
+        stop = start + num_tokens
+        if stop > self.index_group.shared_topk.physical_topk_indices.shape[0]:
+            raise ValueError(
+                "HiSparse swap rows exceed the configured speculative decode "
+                f"capacity: stop={stop}, capacity="
+                f"{self.index_group.shared_topk.physical_topk_indices.shape[0]}."
+            )
+        self._swap_step += 1
+        return slice(start, stop)
+
+    def _resolve_residency(
         self,
         *,
         resident: HiSparseCacheHandle | None = None,
@@ -729,11 +750,9 @@ class HiSparseRuntime:
         topk_indices: torch.Tensor,
         block_size: int,
         return_valid_counts: bool = False,
-        produce_plan: bool = False,
-        plan_row_offset: int = 0,
-        prefetch_followers: bool = True,
-    ) -> HiSparseTopKResult:
-        """Resolve top-k positions against resident, hot, then host storage."""
+        shared_rows: slice,
+    ) -> None:
+        """Resolve logical top-k positions and compact rows requiring swaps."""
         num_tokens = topk_indices.shape[0]
         hot = self.hot
         host_cache = self.host_cache
@@ -741,48 +760,42 @@ class HiSparseRuntime:
         request_state_indices = self.request_state_indices
         assert request_state_indices is not None
         group = self.index_group
-        plan = group.plan
+        shared = group.shared_topk
 
         relative_indices = topk_indices[:num_tokens].contiguous()
-
-        plan_rows = slice(plan_row_offset, plan_row_offset + num_tokens)
-        hot_indices = plan.hot_indices[plan_rows]
-        valid_counts = plan.valid_counts[plan_rows] if return_valid_counts else None
-        if produce_plan:
-            compact_miss_globals = plan.miss_global_indices[plan_rows]
-            compact_miss_hots = plan.miss_hot_indices[plan_rows]
-            compact_miss_counts = plan.miss_counts[plan_rows]
-        else:
-            compact_miss_globals = None
-            compact_miss_hots = None
-            compact_miss_counts = None
-
-        attention_indices = plan.attention_indices[plan_rows]
+        device_topk_rows = shared.device_topk_rows[shared_rows]
+        valid_topk_counts = (
+            shared.valid_topk_counts[shared_rows] if return_valid_counts else None
+        )
+        physical_topk_indices = shared.physical_topk_indices[shared_rows]
+        swap_host_physical_rows = shared.swap_host_physical_rows[shared_rows]
+        swap_device_physical_rows = shared.swap_device_physical_rows[shared_rows]
+        swap_counts = shared.swap_counts[shared_rows]
 
         # Padded rows are skipped by the kernel (request_state_indices) and must
         # come out as -1 so the attention kernel masks them.
-        torch.ops._C_cache_ops.hisparse_swap_in(
+        torch.ops._C_cache_ops.hisparse_resolve_residency(
             host_cache,
             hot.cache,
             self.hot_block_table,
             relative_indices,
-            hot_indices,
+            device_topk_rows,
             group.device_global_indices,
             group.lru_slots,
             request_state_indices,
             self.region_stride,
             None,
             group.swap_stats,
-            attention_indices,
+            physical_topk_indices,
             hot.attention_block_stride,
             req_id_per_token[:num_tokens].contiguous(),
             block_table,
             block_size,
             None,
-            valid_counts,
-            compact_miss_globals,
-            compact_miss_hots,
-            compact_miss_counts,
+            valid_topk_counts,
+            swap_host_physical_rows,
+            swap_device_physical_rows,
+            swap_counts,
             resident.block_table if resident is not None else None,
             resident.view.block_size
             if resident is not None and resident.view is not None
@@ -790,69 +803,79 @@ class HiSparseRuntime:
             0,
         )
 
-        if produce_plan and group.followers and prefetch_followers:
-            self._prefetch_group(num_tokens, plan_row_offset)
-
-        if not return_valid_counts:
-            return hot.attention_cache, attention_indices
-        assert valid_counts is not None
-        return hot.attention_cache, attention_indices, valid_counts
-
-    def _gather_plan_into(self, num_tokens: int, plan_row_offset: int = 0) -> None:
+    def _swap_rows(self, shared_rows: slice) -> None:
         hot = self.hot
-        plan = self.index_group.plan
-        plan_rows = slice(plan_row_offset, plan_row_offset + num_tokens)
+        shared = self.index_group.shared_topk
         torch.ops._C_cache_ops.hisparse_gather_compact(
             self.host_cache,
             hot.cache,
-            plan.miss_global_indices[plan_rows],
-            plan.miss_hot_indices[plan_rows],
-            plan.miss_counts[plan_rows],
+            shared.swap_host_physical_rows[shared_rows],
+            shared.swap_device_physical_rows[shared_rows],
+            shared.swap_counts[shared_rows],
         )
 
-    def _prefetch_group(self, num_tokens: int, plan_row_offset: int = 0) -> None:
+    def _stage_group_swaps(self, shared_rows: slice, stage_followers: bool) -> None:
         group = self.index_group
-        compute = torch.accelerator.current_stream(self.device)
+        compute = current_stream()
         group.copy_stream.wait_stream(compute)
         with group.copy_stream:
-            for follower in group.followers:
-                follower._gather_plan_into(num_tokens, plan_row_offset)
-                if follower._prefetch_event is None:
-                    follower._prefetch_event = torch.Event()
-                follower._prefetch_event.record(group.copy_stream)
+            runtimes = [self]
+            if stage_followers:
+                runtimes.extend(group.followers)
+            for runtime in runtimes:
+                runtime._swap_rows(shared_rows)
+                if runtime._layer_ready_event is None:
+                    runtime._layer_ready_event = torch.Event()
+                runtime._layer_ready_event.record(group.copy_stream)
+                runtime._swap_staged = True
 
-    def apply_plan(
+    def swap_in(
         self,
         *,
+        resident: HiSparseCacheHandle,
+        req_id_per_token: torch.Tensor,
+        block_table: torch.Tensor,
+        logical_topk_indices: torch.Tensor,
         block_size: int,
-        num_tokens: int,
         return_valid_counts: bool = False,
-        plan_row_offset: int = 0,
+        all_context_pages_resident: bool = False,
     ) -> HiSparseTopKResult:
-        """Replay the leader's swap plan for an index-sharing follower."""
-        n = num_tokens
+        """Resolve once per group and ensure this layer's rows are available."""
+        num_tokens = logical_topk_indices.shape[0]
+        shared_rows = self._step_rows(num_tokens)
         group = self.index_group
-        leader = group.leader
-        plan = group.plan
         hot = self.hot
         assert hot.block_size == block_size
-        assert hot.attention_block_stride == leader.hot.attention_block_stride
-        plan_rows = slice(plan_row_offset, plan_row_offset + n)
-        attention_indices = plan.attention_indices[plan_rows]
-        if self._prefetch_event is not None:
-            torch.accelerator.current_stream(self.device).wait_event(
-                self._prefetch_event
+        assert hot.attention_block_stride == group.leader.hot.attention_block_stride
+
+        if self.is_group_leader:
+            self._resolve_residency(
+                resident=resident,
+                req_id_per_token=req_id_per_token,
+                block_table=block_table,
+                topk_indices=logical_topk_indices,
+                block_size=block_size,
+                return_valid_counts=return_valid_counts,
+                shared_rows=shared_rows,
             )
-            self._prefetch_event = None
-        else:
-            self._gather_plan_into(num_tokens, plan_row_offset)
+            if not all_context_pages_resident:
+                self._stage_group_swaps(shared_rows, resident.decode_batch)
+
+        if not all_context_pages_resident:
+            if self._swap_staged:
+                assert self._layer_ready_event is not None
+                current_stream().wait_event(self._layer_ready_event)
+                self._swap_staged = False
+            else:
+                self._swap_rows(shared_rows)
+
+        physical_topk_indices = group.shared_topk.physical_topk_indices[shared_rows]
         if return_valid_counts:
             return (
-                hot.attention_cache,
-                attention_indices,
-                plan.valid_counts[plan_rows],
+                physical_topk_indices,
+                group.shared_topk.valid_topk_counts[shared_rows],
             )
-        return hot.attention_cache, attention_indices
+        return physical_topk_indices
 
 
 class HiSparseCacheHandle:
@@ -897,35 +920,23 @@ class HiSparseCacheHandle:
         self.block_table = block_table
         self.slot_mapping = slot_mapping
 
-    def resolve_topk(
+    def swap_in(
         self,
         req_id_per_token: torch.Tensor,
         block_table: torch.Tensor,
-        topk_indices: torch.Tensor,
+        logical_topk_indices: torch.Tensor,
         *,
         block_size: int,
         return_valid_counts: bool = False,
-        plan_row_offset: int = 0,
-        prefetch_followers: bool = True,
     ) -> HiSparseTopKResult:
-        num_tokens = topk_indices.shape[0]
-        if not self.runtime.is_group_leader:
-            return self.runtime.apply_plan(
-                block_size=block_size,
-                num_tokens=num_tokens,
-                return_valid_counts=return_valid_counts,
-                plan_row_offset=plan_row_offset,
-            )
         return self.runtime.swap_in(
             resident=self,
-            req_id_per_token=req_id_per_token[:num_tokens],
+            req_id_per_token=req_id_per_token[: logical_topk_indices.shape[0]],
             block_table=block_table,
-            topk_indices=topk_indices,
+            logical_topk_indices=logical_topk_indices,
             block_size=block_size,
             return_valid_counts=return_valid_counts,
-            produce_plan=bool(self.runtime.index_group.followers),
-            plan_row_offset=plan_row_offset,
-            prefetch_followers=prefetch_followers,
+            all_context_pages_resident=self.all_context_pages_resident,
         )
 
 
@@ -936,7 +947,7 @@ def create_hisparse_cache_handle(
     is_index_group_leader: bool,
     row_width: int,
     kv_dtype: torch.dtype,
-    index_group_builder: HiSparseIndexGroupBuilder | None = None,
+    index_group: SparseMLAIndexGroup | None = None,
     device: torch.device | str | None = None,
 ) -> HiSparseCacheHandle | None:
     config = ResolvedHiSparseConfig.from_vllm_config(vllm_config, model_top_k)
@@ -944,30 +955,16 @@ def create_hisparse_cache_handle(
         return None
 
     max_num_reqs = vllm_config.scheduler_config.max_num_seqs
-    # Each speculative step needs its own replayable plan rows even though the
-    # per-request hot state is reused between steps.
-    max_decode_query_len = 1
-    speculative_config = vllm_config.speculative_config
-    if (
-        speculative_config is not None
-        and speculative_config.num_speculative_tokens is not None
-    ):
-        max_decode_query_len += speculative_config.num_speculative_tokens * (
-            2 if speculative_config.parallel_drafting else 1
-        )
-    max_swap_rows = min(
-        vllm_config.scheduler_config.max_num_batched_tokens,
-        max_num_reqs * max_decode_query_len,
-    )
+    max_swap_rows = get_sparse_mla_index_group_max_rows(vllm_config)
     if device is None:
         device = torch.device(
             current_platform.device_type, torch.accelerator.current_device_index()
         )
 
-    index_group = (
+    hisparse_group = (
         None
-        if is_index_group_leader or index_group_builder is None
-        else index_group_builder.current_group
+        if is_index_group_leader or index_group is None
+        else index_group.hisparse_group
     )
     runtime = HiSparseRuntime(
         config=config,
@@ -976,10 +973,11 @@ def create_hisparse_cache_handle(
         row_width=row_width,
         kv_dtype=kv_dtype,
         device=device,
-        index_group=index_group,
+        index_group=hisparse_group,
+        copy_stream=index_group.side_stream if index_group is not None else None,
     )
-    if is_index_group_leader and index_group_builder is not None:
-        index_group_builder.current_group = runtime.index_group
+    if is_index_group_leader and index_group is not None:
+        index_group.hisparse_group = runtime.index_group
     logger.info_once(
         "Enabled experimental HiSparse HMA hot cache: top_k=%d, "
         "device_buffer_size=%d (%d LRU rows), host_pool_gib=%s, "
