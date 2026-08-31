@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pcp_group,
@@ -97,6 +98,7 @@ class PCPManager:
         self._global_batch: InputBatch | None = None
         self._replicated_verification = False
         self._replicated_verification_num_tokens_padded: int | None = None
+        self._num_local_tokens_padded: int = 0
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
@@ -189,7 +191,16 @@ class PCPManager:
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         if speculative_config is not None:
             if speculative_config.use_dspark():
-                if not envs.VLLM_USE_PCP_DIRECT_KV:
+                # With TP1 and DCP spanning the complete PCP group, each PCP
+                # rank already owns the matching DCP KV shard.  Publishing
+                # every shard to every PCP peer is unnecessary (and would
+                # overwrite peer-local DCP slots).  Other PCP layouts still
+                # need the direct-KV replication path for DSpark.
+                dcp_spans_pcp = (
+                    parallel_config.tensor_parallel_size == 1
+                    and parallel_config.decode_context_parallel_size == pcp_size
+                )
+                if not envs.VLLM_USE_PCP_DIRECT_KV and not dcp_spans_pcp:
                     raise NotImplementedError(
                         "DSpark with PCP requires VLLM_USE_PCP_DIRECT_KV=1 so "
                         "sharded prefill context KV can be published to every "
@@ -471,9 +482,7 @@ class PCPManager:
         self._replicated_verification_num_tokens_padded = None
 
         if input_batch.num_draft_tokens > 0 and not input_batch.has_prefill:
-            return self._prepare_replicated_verification(
-                input_batch, padded_num_tokens
-            )
+            return self._prepare_replicated_verification(input_batch, padded_num_tokens)
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
@@ -560,6 +569,7 @@ class PCPManager:
                 "PCP local token count exceeds the MRV2 input buffer size: "
                 f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
             )
+        self._num_local_tokens_padded = num_local_tokens_padded
         rank_token_start = self.pcp_rank * num_local_tokens_padded
         assert self._padded_gather_idx is not None
         local_gather_idx = self._padded_gather_idx[
@@ -819,6 +829,104 @@ class PCPManager:
         )
         return gathered_kv_slot_mappings
 
+    def add_token_sharded_indexer_metadata(
+        self,
+        model_state: Any,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        attn_groups: list[list[Any]],
+        kv_cache_config: Any,
+        dummy_run: bool,
+    ) -> dict[str, Any]:
+        """DCP spanning the PCP group: rebuild the sparse indexer's metadata from
+        the *global* PCP batch so every rank scores identical rows against its K
+        shard (the DCP top-k merge all-gathers per row), and attach the index
+        maps the indexer op needs to gather queries and keep its own rows."""
+        if (
+            self.dcp_world_size <= 1
+            or self.dcp_world_size != self.pcp_world_size
+            or self._global_batch is None
+            or self._padded_gather_idx is None
+            or self._hidden_restore_idx is None
+        ):
+            return attn_metadata
+        if dummy_run:
+            # Dummy batches are built directly (not partitioned), so there is no
+            # global batch to describe. The sparse paths then run a local-only
+            # simulation with the same shapes/memory and no cross-rank gathers.
+            return attn_metadata
+        indexer_groups = [
+            [g for g in groups if g.backend.get_name() == "DEEPSEEK_V32_INDEXER"]
+            for groups in attn_groups
+        ]
+        sparse_mla_groups = [
+            [g for g in groups if g.backend.get_name() == "FLASHMLA_SPARSE"]
+            for groups in attn_groups
+        ]
+        if not any(indexer_groups) and not any(sparse_mla_groups):
+            return attn_metadata
+        assert self._block_tables is not None
+        global_batch = self._global_batch
+        block_tables = self._block_tables.gather_block_tables(
+            global_batch.idx_mapping,
+            global_batch.num_reqs_after_padding,
+        )
+        num_global_tokens = self._hidden_restore_idx.shape[0]
+        if dummy_run or self._global_batch_slot_mappings is None:
+            slot_mappings = torch.full(
+                (self._block_tables.num_kv_cache_groups, num_global_tokens),
+                PAD_SLOT_ID,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            slot_mappings = self._global_batch_slot_mappings[:, :num_global_tokens]
+
+        global_metadata = model_state.prepare_attn(
+            global_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            slot_mappings,
+            indexer_groups,
+            kv_cache_config,
+        )
+        num_padded = self._num_local_tokens_padded
+        # Global request id per gathered (rank-major, padded) row for the sparse
+        # MLA token-sharded attention; padding rows map to request 0 and carry
+        # top-k -1, so they never touch the cache.
+        global_req_id = torch.repeat_interleave(
+            torch.arange(global_batch.num_reqs, device=self.device, dtype=torch.int32),
+            torch.from_numpy(
+                global_batch.num_scheduled_tokens[: global_batch.num_reqs].astype(
+                    np.int64
+                )
+            ).to(self.device, non_blocking=True),
+        )
+        if global_req_id.shape[0] < num_global_tokens:
+            global_req_id = torch.nn.functional.pad(
+                global_req_id, (0, num_global_tokens - global_req_id.shape[0])
+            )
+        gathered_req_id = global_req_id[self._padded_gather_idx]
+        for i, groups in enumerate(sparse_mla_groups):
+            for g in groups:
+                for layer_name in g.layer_names:
+                    meta = attn_metadata.get(layer_name)
+                    if meta is None:
+                        continue
+                    meta.pcp_gathered_req_id = gathered_req_id
+                    meta.pcp_global_block_table = block_tables[i]
+        if not any(indexer_groups):
+            return attn_metadata
+        start = self.pcp_rank * num_padded
+        local_rows = self._padded_gather_idx[start : start + input_batch.num_tokens]
+        for layer_name, meta in global_metadata.items():
+            meta.pcp_num_padded = num_padded
+            meta.pcp_restore_idx = self._hidden_restore_idx
+            meta.pcp_local_rows = local_rows
+            meta.pcp_gathered_slot_mapping = attn_metadata[layer_name].slot_mapping
+            attn_metadata[layer_name] = meta
+        return attn_metadata
+
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self._global_batch is not None
         if self._replicated_verification:
@@ -955,8 +1063,13 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "Direct PCP KV requires the specialized NVIDIA deepseek_v32 attention path."
         )
-    if parallel_config.decode_context_parallel_size != 1:
-        raise NotImplementedError("Direct PCP KV currently requires DCP=1.")
+    dcp_size = parallel_config.decode_context_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    if dcp_size != 1 and not (tp_size == 1 and dcp_size == pcp_size):
+        raise NotImplementedError(
+            "Direct PCP KV with DCP requires TP1 and DCP spanning the full PCP group."
+        )
     if parallel_config.data_parallel_size != 1:
         raise NotImplementedError("Direct PCP KV currently requires DP=1.")
     if parallel_config.use_ubatching:
@@ -976,15 +1089,18 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
             "Set --no-enable-prefix-caching."
         )
     kv_transfer_config = vllm_config.kv_transfer_config
-    if kv_transfer_config is not None and kv_transfer_config.kv_connector is not None:
-        if not (
+    if (
+        kv_transfer_config is not None
+        and kv_transfer_config.kv_connector is not None
+        and not (
             kv_transfer_config.kv_connector == "NixlConnector"
             and kv_transfer_config.kv_role == "kv_producer"
-        ):
-            raise NotImplementedError(
-                "Direct PCP KV supports only the NixlConnector kv_producer "
-                "path; consumers, other connectors, and offloading are unsupported."
-            )
+        )
+    ):
+        raise NotImplementedError(
+            "Direct PCP KV supports only the NixlConnector kv_producer "
+            "path; consumers, other connectors, and offloading are unsupported."
+        )
     if getattr(model_config, "enable_sleep_mode", False):
         raise NotImplementedError("Direct PCP KV does not support sleep mode.")
 

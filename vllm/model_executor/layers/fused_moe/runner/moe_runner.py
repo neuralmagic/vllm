@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+    is_breakable_cudagraph_enabled,
+)
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -224,6 +229,37 @@ def _unpack(
         return (None, result)
 
 
+@eager_break_during_capture
+def _moe_forward_with_output(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    fused_output: torch.Tensor,
+    shared_output: torch.Tensor | None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    result = layer._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+    )
+    actual_shared_output, actual_fused_output = _unpack(result)
+    if isinstance(actual_fused_output, UnfinalizedMoEOutput):
+        raise RuntimeError("Breakable CUDA graphs require finalized MoE output")
+
+    fused_output.copy_(actual_fused_output)
+    if shared_output is None:
+        assert actual_shared_output is None
+        return fused_output
+
+    assert isinstance(actual_shared_output, torch.Tensor)
+    shared_output.copy_(actual_shared_output)
+    return shared_output, fused_output
+
+
 class MoERunner(MoERunnerInterface):
     """
     Standard MoE runner implementation for executing Mixture of Experts layers.
@@ -296,7 +332,13 @@ class MoERunner(MoERunnerInterface):
         self._forward_entry = self._select_forward()
 
         # For smuggling this layer into the fused moe custom op
-        register_layer_for_moe_forward_op(get_current_vllm_config(), self)
+        vllm_config = get_current_vllm_config()
+        self._break_moe_for_cudagraph = (
+            is_breakable_cudagraph_enabled()
+            and vllm_config.parallel_config.all2all_backend
+            in ("deepep_high_throughput", "deepep_v2")
+        )
+        register_layer_for_moe_forward_op(vllm_config, self)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -720,16 +762,50 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-            self._encode_layer_name(),
+        layer_name = self._encode_layer_name()
+        hidden_dim_unpadded = (
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
-            else 0,
+            else 0
         )
+        if self._break_moe_for_cudagraph and BreakableCUDAGraphCapture.is_active():
+            if self._shared_experts is None:
+                fused_output = _moe_forward_fake(
+                    hidden_states,
+                    router_logits,
+                    shared_experts_input,
+                    input_ids,
+                    layer_name,
+                    hidden_dim_unpadded,
+                )
+                shared_output = None
+            else:
+                shared_output, fused_output = _moe_forward_shared_fake(
+                    hidden_states,
+                    router_logits,
+                    shared_experts_input,
+                    input_ids,
+                    layer_name,
+                    hidden_dim_unpadded,
+                )
+            result = _moe_forward_with_output(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                layer_name,
+                fused_output,
+                shared_output,
+            )
+        else:
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                layer_name,
+                hidden_dim_unpadded,
+            )
 
         #
         # Note: there are two all-reduce points below. They are mutually

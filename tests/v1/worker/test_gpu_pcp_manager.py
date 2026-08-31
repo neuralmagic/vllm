@@ -158,6 +158,54 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         )
 
 
+def _make_dspark_pcp_config(*, pcp_size: int, dcp_size: int, tp_size: int = 1):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size,
+            prefill_context_parallel_size=pcp_size,
+            decode_context_parallel_size=dcp_size,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        ),
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            use_dspark=lambda: True,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+
+def test_dspark_pcp_accepts_matching_dcp_shards_without_direct_kv(monkeypatch):
+    monkeypatch.setattr(pcp_manager_module.envs, "VLLM_USE_PCP_DIRECT_KV", False)
+
+    PCPManager.validate_config(
+        _make_dspark_pcp_config(pcp_size=8, dcp_size=8),
+        supports_mm_inputs=False,
+    )
+
+
+@pytest.mark.parametrize(("dcp_size", "tp_size"), [(1, 1), (8, 2)])
+def test_dspark_pcp_other_topologies_still_require_direct_kv(
+    monkeypatch, dcp_size, tp_size
+):
+    monkeypatch.setattr(pcp_manager_module.envs, "VLLM_USE_PCP_DIRECT_KV", False)
+
+    with pytest.raises(NotImplementedError, match="VLLM_USE_PCP_DIRECT_KV=1"):
+        PCPManager.validate_config(
+            _make_dspark_pcp_config(
+                pcp_size=8,
+                dcp_size=dcp_size,
+                tp_size=tp_size,
+            ),
+            supports_mm_inputs=False,
+        )
+
+
 @pytest.mark.parametrize(
     ("connector", "role", "allowed"),
     [
@@ -166,13 +214,13 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         ("LMCacheConnectorV1", "kv_producer", False),
     ],
 )
-def test_direct_pcp_kv_allows_nixl_producer_only(
-    monkeypatch, connector, role, allowed
-):
+def test_direct_pcp_kv_allows_nixl_producer_only(monkeypatch, connector, role, allowed):
     monkeypatch.setattr(pcp_manager_module.current_platform, "is_cuda", lambda: True)
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=8,
+            decode_context_parallel_size=8,
             data_parallel_size=1,
             use_ubatching=False,
         ),
@@ -182,9 +230,7 @@ def test_direct_pcp_kv_allows_nixl_producer_only(
         ),
         compilation_config=SimpleNamespace(static_forward_context={}),
         scheduler_config=SimpleNamespace(async_scheduling=False),
-        cache_config=SimpleNamespace(
-            cache_dtype="fp8", enable_prefix_caching=False
-        ),
+        cache_config=SimpleNamespace(cache_dtype="fp8", enable_prefix_caching=False),
         kv_transfer_config=SimpleNamespace(kv_connector=connector, kv_role=role),
     )
 

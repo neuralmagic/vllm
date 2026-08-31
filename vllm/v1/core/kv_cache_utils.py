@@ -654,10 +654,10 @@ def resolve_kv_cache_block_sizes(
     """Resolve (scheduler_block_size, hash_block_size).
 
     - ``scheduler_block_size`` is the token-alignment invariant used by the
-      scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
-      ``cache_config.block_size * dcp``. Multiple groups: LCM of every
-      group's effective block size. Attention groups are scaled by DCP;
-      Mamba groups keep their full per-rank state and are not scaled.
+      scheduler (e.g. for ``num_computed_tokens`` rounding). It is the single
+      group's effective block size, or the LCM of every group's effective block
+      size. Attention groups are scaled by DCP; Mamba groups keep their full
+      per-rank state and are not scaled.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.prefix_match_unit`` override if set, else the GCD of
@@ -669,7 +669,15 @@ def resolve_kv_cache_block_sizes(
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
 
-    if len(groups) <= 1:
+    if len(groups) == 1:
+        spec = groups[0].kv_cache_spec
+        bs = (
+            spec.block_size * dcp
+            if isinstance(spec, AttentionSpec)
+            else spec.block_size
+        )
+        return bs, bs
+    if not groups:
         bs = cache_config.block_size * dcp
         return bs, bs
 

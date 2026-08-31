@@ -6,6 +6,7 @@ import deep_ep
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -76,6 +77,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_topk = num_topk
         self.use_fp8_dispatch = use_fp8_dispatch
         self.use_cudagraph = use_cudagraph
+        self._breakable_capture_seen = False
 
         # DBO microbatching: one handle slot per micro-batch.
         self.handles: list[deep_ep.EPHandle | None] = [None, None]
@@ -83,6 +85,14 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # arange(num_local_experts) + rank_expert_offset. Rank-constant, so it
         # is built once per device instead of once per layer per step.
         self._global_expert_ids_cache: torch.Tensor | None = None
+
+    def _track_breakable_capture(self) -> None:
+        self._breakable_capture_seen |= BreakableCUDAGraphCapture.is_active()
+
+    def _breakable_previous_event(self) -> deep_ep.EventHandle | None:
+        if self._breakable_capture_seen and not BreakableCUDAGraphCapture.is_active():
+            return self.buffer.capture()
+        return None
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -121,6 +131,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> Callable:
+        self._track_breakable_capture()
         has_scales = token_scales is not None
 
         token_data = tokens
@@ -131,6 +142,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # Prefill: do_expand=True + do_cpu_sync=True (memory-efficient)
         do_expand = not self.use_cudagraph
         do_cpu_sync = not self.use_cudagraph
+        previous_event = self._breakable_previous_event()
 
         # In do_expand=False mode, the recv buffer is the worst case
         # R * num_max_tokens_per_rank. Defaulting to the buffer's init value
@@ -169,6 +181,8 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             do_expand=do_expand,
             do_cpu_sync=do_cpu_sync,
             async_with_compute_stream=False,
+            previous_event=previous_event,
+            allocate_on_comm_stream=previous_event is not None,
         )
 
         a2a_idx = dbo_current_ubatch_id()
@@ -404,11 +418,14 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 f"got {fused_expert_output.dtype}"
             )
 
+        previous_event = self._breakable_previous_event()
         combined_x, _, event = self.buffer.combine(
             x=fused_expert_output,
             handle=handle,
             topk_weights=None,
             async_with_compute_stream=False,
+            previous_event=previous_event,
+            allocate_on_comm_stream=previous_event is not None,
         )
 
         output.copy_(combined_x, non_blocking=True)

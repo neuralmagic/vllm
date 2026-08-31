@@ -20,6 +20,13 @@ def get_local_sizes() -> list[int] | None:
     return dp_metadata.get_chunk_sizes_across_dp_rank()
 
 
+def _runtime_max_tokens_per_rank(
+    local_num_tokens: int, local_sizes: list[int] | None
+) -> int:
+    """Return a dispatch bound that also covers rank-local PCP padding."""
+    return max(local_num_tokens, max(local_sizes or [], default=0))
+
+
 class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """FlashInfer implementation using the Moe AlltoAll kernel."""
 
@@ -91,12 +98,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             a1.mul_(topk_weights.to(a1.dtype))
 
         global_num_tokens_cpu = get_local_sizes()
-        self.runtime_max_tokens_per_rank = (
-            max(global_num_tokens_cpu)
-            if global_num_tokens_cpu is not None
-            else a1.shape[0]
+        self.runtime_max_tokens_per_rank = _runtime_max_tokens_per_rank(
+            a1.shape[0], global_num_tokens_cpu
         )
-
         if defer_input_quant:
             dispatch_x, dispatch_x_sf = a1, None
         else:

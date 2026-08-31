@@ -70,10 +70,10 @@ def _make_vllm_config(
     return cast(VllmConfig, config)
 
 
-def _make_kv_cache_config() -> KVCacheConfig:
+def _make_kv_cache_config(block_size: int = 16) -> KVCacheConfig:
     num_blocks = 16
     spec = FullAttentionSpec(
-        block_size=16,
+        block_size=block_size,
         num_kv_heads=1,
         head_size=1,
         dtype=torch.float32,
@@ -356,6 +356,21 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
             mamba_group.is_eagle_group,
         )
     ] == [1, 3]
+
+
+def test_dcp_uses_resolved_single_group_block_size():
+    config = _make_vllm_config(
+        prefill_context_parallel_size=8,
+        decode_context_parallel_size=8,
+    )
+    config.cache_config.block_size = 64
+
+    offloading_config = build_offloading_config(
+        config, _make_kv_cache_config(block_size=8)
+    )
+
+    assert tuple(group.tokens_per_block for group in offloading_config.groups) == (64,)
+    assert offloading_config.cache.tokens_per_hash == 64
 
 
 def test_preserves_data_parallel_config():

@@ -1567,6 +1567,7 @@ def _build_sparse_dcp_vllm_config(
     local_heads: int,
     dcp_world_size: int,
     comm_backend: str = "ag_rs",
+    pcp_world_size: int = 1,
 ):
     """Minimal sparse-MLA VllmConfig for the FlashMLASparse DCP head-envelope
     guard. TP is simulated by mocking ``get_num_attention_heads`` to return the
@@ -1610,6 +1611,7 @@ def _build_sparse_dcp_vllm_config(
 
     vllm_config.cache_config.cache_dtype = "fp8_ds_mla"
     vllm_config.parallel_config.decode_context_parallel_size = dcp_world_size
+    vllm_config.parallel_config.prefill_context_parallel_size = pcp_world_size
     vllm_config.parallel_config.dcp_comm_backend = comm_backend
     # The base builder clones the layer's dense-MHA prefill backend from
     # static_forward_context; the guard tests never run prefill.
@@ -1652,6 +1654,28 @@ def test_fp8_dcp_head_envelope_guard(local_heads, dcp_world_size, should_raise):
         gathered_pad = 64 if gathered_heads <= 64 else 128
         assert builder.fp8_decode_padded_heads == local_pad
         assert local_pad == gathered_pad
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() < (9, 0),
+    reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
+)
+def test_fp8_pcp_spanning_dcp_uses_mixed_batch_without_head_gather():
+    """PCP-spanning DCP combines partial outputs without gathering query heads."""
+    local_heads = 64
+    world_size = 8
+    device = torch.device(DEVICE_TYPE)
+    vllm_config = _build_sparse_dcp_vllm_config(
+        local_heads, world_size, pcp_world_size=world_size
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder_cls = FlashMLASparseBackend.get_builder_cls()
+
+    builder = builder_cls(kv_cache_spec, ["placeholder"], vllm_config, device)
+
+    assert builder.fp8_use_mixed_batch
+    assert builder.fp8_decode_padded_heads == local_heads
+    assert FlashMLASparseImpl.supports_mtp_with_cp_non_trivial_interleave_size
 
 
 def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):

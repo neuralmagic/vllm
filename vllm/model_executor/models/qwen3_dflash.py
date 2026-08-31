@@ -644,10 +644,24 @@ class DFlashQwen3Model(nn.Module):
         if context_slot_mapping is None:
             return
 
+        replicate_to_pcp = False
+        if publish_to_pcp:
+            from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                pcp_direct_kv_active,
+                pcp_sharded_peer_kv_active,
+            )
+
+            replicate_to_pcp = pcp_direct_kv_active()
+            if not replicate_to_pcp and not pcp_sharded_peer_kv_active():
+                raise RuntimeError(
+                    "DFlash PCP publication requested without an active PCP peer "
+                    "KV cache"
+                )
+
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        published_rows = False
+        stored_rows = False
         for i in range(L):
             slot_mapping = (
                 context_slot_mapping[i] if per_layer else context_slot_mapping
@@ -663,7 +677,8 @@ class DFlashQwen3Model(nn.Module):
                 kv_cache,
                 slot_mapping,
             )
-            if publish_to_pcp:
+            stored_rows = True
+            if replicate_to_pcp:
                 from vllm.model_executor.layers.attention.pcp_direct_kv import (
                     publish_pcp_cache_rows,
                 )
@@ -674,15 +689,21 @@ class DFlashQwen3Model(nn.Module):
                     slot_mapping,
                     kv_cache.shape[1],
                 )
-                published_rows = True
         if publish_to_pcp:
-            if not published_rows:
-                raise RuntimeError("DFlash PCP precompute published no cache rows")
-            from vllm.model_executor.layers.attention.pcp_direct_kv import (
-                publish_pcp_direct_kv,
-            )
+            if not stored_rows:
+                raise RuntimeError("DFlash PCP precompute stored no cache rows")
+            if replicate_to_pcp:
+                from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                    publish_pcp_direct_kv,
+                )
 
-            publish_pcp_direct_kv()
+                publish_pcp_direct_kv()
+            else:
+                from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                    publish_pcp_sharded_peer_kv,
+                )
+
+                publish_pcp_sharded_peer_kv()
 
     def forward(
         self,

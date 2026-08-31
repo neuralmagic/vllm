@@ -7,6 +7,7 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from copy import deepcopy
 from datetime import timedelta
 from types import NoneType
 from typing import TYPE_CHECKING, Any
@@ -43,6 +44,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     checkpoint_prepare_distributed_state,
     checkpoint_restore_distributed_state,
+    get_pcp_group,
     get_pp_group,
     get_tp_group,
 )
@@ -100,6 +102,21 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
         if use_v2_model_runner and spec_config is not None and spec_config.use_dspark()
         else 1
     )
+
+
+def _project_kv_cache_config_for_transfer(
+    kv_cache_config: KVCacheConfig, draft_layer_names: set[str]
+) -> KVCacheConfig:
+    """Exclude decoder-local draft KV from the connector's cache view."""
+    if not draft_layer_names:
+        return kv_cache_config
+
+    projected_config = deepcopy(kv_cache_config)
+    for group in projected_config.kv_cache_groups:
+        group.layer_names = [
+            name for name in group.layer_names if name not in draft_layer_names
+        ]
+    return projected_config
 
 
 if TYPE_CHECKING:
@@ -651,6 +668,14 @@ class Worker(WorkerBase):
 
         pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.decode_context_parallel_size > 1
+        ):
+            tp_rank += (
+                get_pcp_group().rank_in_group * parallel_config.tensor_parallel_size
+            )
         return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -686,7 +711,20 @@ class Worker(WorkerBase):
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
-        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        draft_layer_names = getattr(
+            getattr(self.model_runner, "speculator", None),
+            "draft_attn_layer_names",
+            set(),
+        )
+        # Draft-model attention KV is built locally by the decoder and has no
+        # counterpart on a remote prefiller. Give the connector a projected
+        # copy while preserving the full config for scheduling and model
+        # execution. A group may contain both target and draft layers when
+        # their cache specs are uniform.
+        kv_transfer_config = _project_kv_cache_config_for_transfer(
+            kv_cache_config, draft_layer_names
+        )
+        ensure_kv_transfer_initialized(self.vllm_config, kv_transfer_config)
 
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -817,9 +855,20 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
-        if self.use_v2_model_runner:
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        skip_v2_warmup = (
+            self.parallel_config.prefill_context_parallel_size > 1
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        )
+        if self.use_v2_model_runner and not skip_v2_warmup:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+        elif skip_v2_warmup:
+            # A disaggregated PCP prefiller never executes decode or sampling.
+            # The scheduler-realistic V2 warmup includes both and can deadlock
+            # PCP/DCP collectives before the producer starts serving.
+            logger.info("Skipping V2 decode/sampler warmup on PCP KV producer")
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
