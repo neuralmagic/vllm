@@ -1278,6 +1278,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
 
+@eager_break_during_capture
 def unified_mla_kv_cache_update(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
@@ -1286,8 +1287,9 @@ def unified_mla_kv_cache_update(
     k_scale: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Returns a dummy that is passed to unified_attention to signal a side effect and
-    the data dependency between them to ensure torch.compile preserves ordering.
+    Returns an empty dummy that is passed to unified_attention to signal a side
+    effect and preserve ordering. The empty tensor has no storage, so replay can
+    discard the eager call's return value safely.
     """
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(

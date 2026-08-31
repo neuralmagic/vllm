@@ -4,6 +4,7 @@ import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
 import vllm._custom_ops as ops
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
@@ -23,6 +24,7 @@ from .matcher_utils import MatcherDeepseekScalingRotaryEmbedding, MatcherRotaryE
 logger = init_logger(__name__)
 
 
+@eager_break_during_capture
 def fused_rope_unified_mla_kv_cache_update_impl(
     positions: torch.Tensor,
     q_pe: torch.Tensor,

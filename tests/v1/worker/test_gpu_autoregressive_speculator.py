@@ -260,7 +260,7 @@ def test_mtp_graph_capture_stages_current_hisparse_rows():
     assert handle.use_current_staging
 
 
-def test_hisparse_draft_prefill_uses_eager_execution(monkeypatch):
+def test_hisparse_draft_prefill_preserves_configured_cudagraph_mode(monkeypatch):
     modes = []
 
     def make_manager(config, device, mode, decode_query_len):
@@ -277,7 +277,10 @@ def test_hisparse_draft_prefill_uses_eager_execution(monkeypatch):
 
     speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
 
-    assert modes == [CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY]
+    assert modes == [
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+    ]
 
 
 @pytest.mark.parametrize(
