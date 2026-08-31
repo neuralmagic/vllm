@@ -309,6 +309,10 @@ class KVConnectorBase_V1(ABC):
         """Reset worker state mutated while capturing CUDA graphs."""
         return
 
+    def supports_cudagraph(self, metadata: KVConnectorMetadata) -> bool:
+        """Return whether this batch can safely use a captured CUDA graph."""
+        return True
+
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         """
         Handle preempted requests or evicted blocks BEFORE they are overwritten.

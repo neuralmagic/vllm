@@ -2444,7 +2444,10 @@ def test_hisparse_fp8_decode_resolves_each_speculative_step():
         kernel_shapes.append(q.shape)
         return q[..., :1], None
 
-    impl = SimpleNamespace(kv_lora_rank=1)
+    impl = SimpleNamespace(
+        kv_lora_rank=1,
+        _can_use_hisparse_resident_cache=False,
+    )
     impl._run_hisparse_decode = MethodType(
         SparseMLACommonImpl._run_hisparse_decode, impl
     )
@@ -2470,6 +2473,101 @@ def test_hisparse_fp8_decode_resolves_each_speculative_step():
     assert steps == [0, 1, 2]
     assert kernel_shapes == [(1, num_decodes, 2, 4)] * query_len
     assert output.shape == (num_tokens, 2, 1)
+
+
+def test_hisparse_decode_reads_resident_cache_when_context_is_resident(monkeypatch):
+    raw_cache = torch.empty(32, dtype=torch.float32)
+    resident_cache = torch.as_strided(
+        raw_cache,
+        size=(2, 2, 4),
+        stride=(12, 4, 1),
+    )
+    block_table = torch.tensor([[1, 0]], dtype=torch.int32)
+    cache_handle = SimpleNamespace(
+        decode_batch=True,
+        all_context_pages_resident=True,
+        view=SimpleNamespace(cache=resident_cache, block_size=2),
+        block_table=block_table,
+        resolve_topk=MagicMock(),
+    )
+    impl = object.__new__(FlashMLASparseImpl)
+    impl.hisparse_cache = cache_handle
+    impl.dcp_world_size = 1
+    topk = torch.tensor([[0, 1]], dtype=torch.int32)
+    expected_indices = torch.tensor([[6, 7]], dtype=torch.int32)
+    expected_counts = torch.tensor([2], dtype=torch.int32)
+    convert = MagicMock(return_value=(expected_indices, expected_counts))
+    monkeypatch.setattr(
+        sparse_mla_attention_module,
+        "triton_convert_req_index_to_global_index",
+        convert,
+    )
+    metadata = SimpleNamespace(
+        num_decode_tokens=1,
+        req_id_per_token=torch.tensor([0], dtype=torch.int32),
+    )
+
+    cache, indices, counts = impl._hisparse_decode_cache(
+        torch.empty(1), topk, metadata, return_valid_counts=True
+    )
+
+    assert cache is resident_cache
+    assert indices is expected_indices
+    assert counts is expected_counts
+    assert convert.call_args.kwargs["BLOCK_STRIDE_ROWS"] == 3
+    cache_handle.resolve_topk.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "cudagraph_mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+)
+def test_hisparse_cudagraph_captures_resident_decode(monkeypatch, cudagraph_mode):
+    impl = object.__new__(FlashMLASparseImpl)
+    impl.hisparse_cache = SimpleNamespace(
+        decode_batch=False,
+        all_context_pages_resident=False,
+    )
+    impl._hisparse_dummy_batch = True
+    impl.dcp_world_size = 1
+    monkeypatch.setattr(
+        sparse_mla_attention_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=cudagraph_mode),
+    )
+
+    assert impl._can_use_hisparse_resident_cache
+
+
+def test_flashmla_fp8_decode_uses_hisparse_cache_selector():
+    impl = object.__new__(FlashMLASparseImpl)
+    impl.hisparse_cache = SimpleNamespace(decode_batch=True)
+    selected_cache = torch.empty(2, 2, 4, device=DEVICE_TYPE)
+    selected_indices = torch.zeros(2, 4, dtype=torch.int32, device=DEVICE_TYPE)
+    impl._hisparse_decode_cache = MagicMock(
+        return_value=(selected_cache, selected_indices)
+    )
+    q = torch.empty(2, 2, 3, device=DEVICE_TYPE)
+    impl._fp8_flash_mla_kernel = MagicMock(return_value=(q.unsqueeze(0), None))
+    metadata = SimpleNamespace(
+        fp8_extra_metadata=FlashMLASparseMetadata.FP8KernelMetadata(
+            scheduler_metadata=object(),  # type: ignore[arg-type]
+            dummy_block_table=torch.empty(1, 1, dtype=torch.int32),
+            cache_lens=torch.empty(1, dtype=torch.int32),
+        )
+    )
+
+    output, lse = impl._forward_fp8_kv_mixed_batch(
+        q, torch.empty(0, device=DEVICE_TYPE), selected_indices, metadata
+    )
+
+    assert output.shape == q.shape
+    assert lse is None
+    assert impl._fp8_flash_mla_kernel.call_args.kwargs["kv_c_and_k_pe_cache"] is (
+        selected_cache
+    )
+    assert impl._fp8_flash_mla_kernel.call_args.kwargs["topk_indices"].data_ptr() == (
+        selected_indices.data_ptr()
+    )
 
 
 def test_hisparse_shared_sparse_builder_routes_multi_token_chunks_to_prefill():

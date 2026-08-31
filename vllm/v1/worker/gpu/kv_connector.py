@@ -58,6 +58,9 @@ class KVConnector:
     def reset_capture_state(self) -> None:
         pass
 
+    def supports_cudagraph(self, scheduler_output: "SchedulerOutput") -> bool:
+        return True
+
 
 class ActiveKVConnector(KVConnector):
     def __init__(
@@ -109,6 +112,13 @@ class ActiveKVConnector(KVConnector):
 
     def reset_capture_state(self) -> None:
         self.kv_connector.reset_capture_state()
+
+    def supports_cudagraph(self, scheduler_output: "SchedulerOutput") -> bool:
+        if self._disabled:
+            return True
+        metadata = scheduler_output.kv_connector_metadata
+        assert metadata is not None
+        return self.kv_connector.supports_cudagraph(metadata)
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True

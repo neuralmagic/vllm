@@ -854,6 +854,7 @@ class HiSparseCacheHandle:
         self.slot_mapping: torch.Tensor | None = None
         self.runtime = runtime
         self.decode_batch = False
+        self.all_context_pages_resident = True
         self.num_actual_tokens = 0
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None

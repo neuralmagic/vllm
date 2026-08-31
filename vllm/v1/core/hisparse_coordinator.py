@@ -691,6 +691,24 @@ class HiSparseCoordinator:
                 token_position += num_rows
         return tuple(mirrors)
 
+    def all_context_pages_resident(
+        self,
+        requests: Iterable[tuple[str, int, int]],
+    ) -> bool:
+        """Return whether every scheduled request can read only resident KV."""
+        if not self.resident_managers:
+            return False
+        block_size = self.resident_managers[0].block_size
+        for request_id, num_computed_tokens, num_scheduled_tokens in requests:
+            num_pages = cdiv(num_computed_tokens + num_scheduled_tokens, block_size)
+            for page_idx in range(num_pages):
+                if any(
+                    manager.get_resident_page(request_id, page_idx) is None
+                    for manager in self.resident_managers
+                ):
+                    return False
+        return True
+
     def take_block_table_updates(self) -> dict[str, tuple[list[int], ...]]:
         updates = {
             request_id: tuple(

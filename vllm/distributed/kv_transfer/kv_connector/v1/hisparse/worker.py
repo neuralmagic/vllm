@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 
 _METRICS_INTERVAL = 2000
+_MIRROR_LAYER_CHUNK_SIZE = 4
 
 
 class _DMADescriptors(NamedTuple):
@@ -259,6 +260,7 @@ class HiSparseConnectorWorker:
         )
         self._dma_submitted = False
         self._per_layer_mirrored: set[int] = set()
+        self._submitted_mirror_layers = 0
         self._layer_ready_events = tuple(torch.Event() for _ in cache_handles)
         self._forward_ready_event = torch.Event()
         self._slot_mapping_host = torch.empty(
@@ -268,6 +270,7 @@ class HiSparseConnectorWorker:
         )
         self._slot_mapping_ready_event = torch.Event()
         self._slot_mapping_pending = False
+        self._slot_mapping_materialized = True
         self._set_row_mirrors(())
         self.host_write_events = _create_hisparse_host_events(
             shared_host_region, is_host_writer, device
@@ -382,11 +385,15 @@ class HiSparseConnectorWorker:
                 for mirror in row_mirrors.get(request_id, ())
             )
         self._set_row_mirrors(mirrors)
-        self._enqueue_slot_mapping_copy()
+        self._slot_mapping_materialized = not bool(mirrors)
         self._dma_submitted = False
         self._per_layer_mirrored.clear()
+        self._submitted_mirror_layers = 0
         for handle in self.cache_handles:
             handle.decode_batch = False
+            handle.all_context_pages_resident = getattr(
+                metadata, "all_context_pages_resident", False
+            )
             handle.host_mirror_required = False
             handle.num_actual_tokens = 0
             handle.num_decode_tokens = 0
@@ -595,6 +602,7 @@ class HiSparseConnectorWorker:
             _replace_row_mirror_destinations(self._row_mirrors, destination_slots)
         )
         self._slot_mapping_pending = False
+        self._slot_mapping_materialized = True
 
     def _require_row_mirrors(self, num_rows: int) -> tuple[SparseKVRowMirror, ...]:
         if self._row_mirror_num_rows != num_rows:
@@ -607,10 +615,13 @@ class HiSparseConnectorWorker:
     def _enqueue_row_dma(
         self, layer_indices: range, ready_event: torch.Event | None = None
     ) -> None:
-        self._materialize_row_mirror_destinations()
         mirrors = self._row_mirrors
         if not mirrors or not self.is_host_writer:
             return
+        if not getattr(self, "_slot_mapping_materialized", True):
+            self._enqueue_slot_mapping_copy()
+            self._materialize_row_mirror_destinations()
+            mirrors = self._row_mirrors
         num_layers = len(layer_indices)
         descriptor_count = len(mirrors) * num_layers
         descriptors = self._acquire_dma_descriptors(descriptor_count)
@@ -682,12 +693,16 @@ class HiSparseConnectorWorker:
         if layer_index in self._per_layer_mirrored:
             raise RuntimeError(f"HiSparse layer {layer_index} mirrored twice.")
         self._require_row_mirrors(handle.num_actual_tokens)
+        self._per_layer_mirrored.add(layer_index)
+        if layer_index + 1 - self._submitted_mirror_layers < _MIRROR_LAYER_CHUNK_SIZE:
+            return
         ready_event = self._layer_ready_events[layer_index]
         ready_event.record()
         self._enqueue_row_dma(
-            range(layer_index, layer_index + 1), ready_event=ready_event
+            range(self._submitted_mirror_layers, layer_index + 1),
+            ready_event=ready_event,
         )
-        self._per_layer_mirrored.add(layer_index)
+        self._submitted_mirror_layers = layer_index + 1
 
     def _enqueue_transfers(
         self,
@@ -849,6 +864,15 @@ class HiSparseConnectorWorker:
                 if force:
                     self._enqueue_row_dma(
                         range(num_active_layers), ready_event=ready_event
+                    )
+                elif (
+                    submitted_layers := getattr(
+                        self, "_submitted_mirror_layers", num_active_layers
+                    )
+                ) < num_active_layers:
+                    self._enqueue_row_dma(
+                        range(submitted_layers, num_active_layers),
+                        ready_event=ready_event,
                     )
             else:
                 self._enqueue_row_dma(range(num_active_layers), ready_event=ready_event)

@@ -563,6 +563,46 @@ def test_hisparse_finish_forward_does_not_repeat_per_layer_mirrors():
     worker._enqueue_row_dma.assert_not_called()
 
 
+def test_hisparse_prefill_mirrors_layers_in_chunks_and_flushes_tail():
+    slots = torch.tensor([7, 8], dtype=torch.int64)
+    runtime = SimpleNamespace(
+        eager_host_mirror=False,
+        is_group_leader=False,
+    )
+    handles = [
+        SimpleNamespace(
+            runtime=runtime,
+            decode_batch=False,
+            host_mirror_required=True,
+            num_actual_tokens=2,
+            num_decode_tokens=0,
+            req_id_per_token=torch.empty(0, dtype=torch.int32),
+            mirror_slot_mapping=slots,
+        )
+        for _ in range(6)
+    ]
+    worker = object.__new__(HiSparseConnectorWorker)
+    worker.is_host_writer = True
+    worker.cache_handles = handles
+    worker._set_row_mirrors((SparseKVRowMirror((0,), 7, 2),))
+    worker._per_layer_mirrored = set()
+    worker._submitted_mirror_layers = 0
+    worker._layer_ready_events = tuple(MagicMock() for _ in handles)
+    worker._enqueue_row_dma = MagicMock()
+
+    for layer_index in range(6):
+        worker._enqueue_layer_mirror(layer_index)
+
+    worker._enqueue_row_dma.assert_called_once_with(
+        range(4), ready_event=worker._layer_ready_events[3]
+    )
+    worker._enqueue_host_mirror(ready_event=worker._layer_ready_events[5])
+    assert worker._enqueue_row_dma.call_args_list[1].args == (range(4, 6),)
+    assert worker._enqueue_row_dma.call_args_list[1].kwargs == {
+        "ready_event": worker._layer_ready_events[5]
+    }
+
+
 def test_hisparse_finish_forward_rejects_partial_per_layer_mirror():
     slots = torch.tensor([7, 8], dtype=torch.int64)
     runtime = SimpleNamespace(

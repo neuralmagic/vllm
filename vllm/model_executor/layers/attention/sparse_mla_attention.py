@@ -41,6 +41,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionMetadataBuilder
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
@@ -803,14 +804,24 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 )
                 step_req_ids = request_ids
 
-            hot_cache, physical_indices, seq_lens = self._hisparse_swap_in(
-                step_topk,
-                attn_metadata,
-                return_valid_counts=True,
-                req_id_per_token=step_req_ids,
-                plan_row_offset=step * num_decodes,
-                prefetch_followers=max_query_len == 1,
-            )
+            if self._can_use_hisparse_resident_cache:
+                hot_cache, physical_indices, seq_lens = (
+                    self._hisparse_resident_decode_cache(
+                        step_topk,
+                        attn_metadata,
+                        return_valid_counts=True,
+                        req_id_per_token=step_req_ids,
+                    )
+                )
+            else:
+                hot_cache, physical_indices, seq_lens = self._hisparse_swap_in(
+                    step_topk,
+                    attn_metadata,
+                    return_valid_counts=True,
+                    req_id_per_token=step_req_ids,
+                    plan_row_offset=step * num_decodes,
+                    prefetch_followers=max_query_len == 1,
+                )
             step_out, step_lse = run_step(
                 step_q,
                 hot_cache,
@@ -907,6 +918,15 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
     ):
         if self.hisparse_cache is None:
             return None
+        if (
+            attn_metadata.num_decode_tokens > 0
+            and self._can_use_hisparse_resident_cache
+        ):
+            return self._hisparse_resident_decode_cache(
+                topk_indices,
+                attn_metadata,
+                return_valid_counts=return_valid_counts,
+            )
         if attn_metadata.num_decode_tokens == 0:
             kv_cache, block_table, req_ids = self._hisparse_stage_prefill_rows(
                 kv_cache, attn_metadata
@@ -941,6 +961,52 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             return_valid_counts=return_valid_counts,
         )
         return (resolved[0].view(kv_cache.dtype), *resolved[1:])
+
+    @property
+    def _can_use_hisparse_resident_cache(self) -> bool:
+        capture_resident_decode = torch.cuda.is_current_stream_capturing() or (
+            getattr(self, "_hisparse_dummy_batch", False)
+            and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE
+        )
+        return (
+            (self._hisparse_decode_batch or capture_resident_decode)
+            and self.hisparse_cache is not None
+            and (
+                capture_resident_decode
+                or getattr(self.hisparse_cache, "all_context_pages_resident", False)
+            )
+            and getattr(self, "dcp_world_size", 1) == 1
+        )
+
+    def _hisparse_resident_decode_cache(
+        self,
+        topk_indices: torch.Tensor,
+        attn_metadata: Any,
+        *,
+        return_valid_counts: bool,
+        req_id_per_token: torch.Tensor | None = None,
+    ):
+        resident = self.hisparse_cache
+        assert resident is not None
+        assert resident.view is not None and resident.block_table is not None
+        if req_id_per_token is None:
+            req_id_per_token = attn_metadata.req_id_per_token[: topk_indices.shape[0]]
+        _, block_stride_rows = flat_kv_row_view(
+            resident.view.cache, resident.view.block_size
+        )
+        converted = triton_convert_req_index_to_global_index(
+            req_id_per_token,
+            resident.block_table,
+            topk_indices,
+            BLOCK_SIZE=resident.view.block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=return_valid_counts,
+        )
+        if return_valid_counts:
+            indices, valid_counts = converted
+            return resident.view.cache, indices, valid_counts
+        return resident.view.cache, converted
 
     def _hisparse_stage_prefill_rows(
         self, kv_cache: torch.Tensor, attn_metadata: Any

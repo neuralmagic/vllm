@@ -47,6 +47,7 @@ class HiSparseConnectorMetadata(KVConnectorMetadata):
     host_block_copies: tuple[KVCacheBlockCopy, ...]
     source_block_ids: tuple[int, ...]
     row_mirrors: dict[str, tuple[SparseKVRowMirror, ...]]
+    all_context_pages_resident: bool
 
 
 @dataclass
@@ -109,6 +110,16 @@ class HiSparseConnectorScheduler:
                 scheduler_output.scheduled_cached_reqs.num_computed_tokens,
             )
         )
+        scheduled_requests = tuple(
+            (
+                request_id,
+                num_computed_tokens[request_id],
+                scheduled_count,
+            )
+            for request_id, scheduled_count in (
+                scheduler_output.num_scheduled_tokens.items()
+            )
+        )
         row_mirrors = {
             request_id: self.coordinator.build_row_mirrors(
                 ((request_id, num_computed_tokens[request_id], scheduled_count),)
@@ -122,6 +133,7 @@ class HiSparseConnectorScheduler:
             host_block_copies,
             tuple(source_block_ids),
             row_mirrors,
+            self.coordinator.all_context_pages_resident(scheduled_requests),
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -184,6 +196,10 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
     def reset_capture_state(self) -> None:
         assert self.connector_worker is not None
         self.connector_worker.reset_hot_state()
+
+    def supports_cudagraph(self, metadata: KVConnectorMetadata) -> bool:
+        assert isinstance(metadata, HiSparseConnectorMetadata)
+        return metadata.all_context_pages_resident
 
     def finish_step(self) -> HiSparseStats | None:
         assert self.connector_worker is not None

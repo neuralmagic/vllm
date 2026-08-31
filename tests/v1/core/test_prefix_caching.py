@@ -250,6 +250,23 @@ def test_hisparse_builds_dma_row_mirrors_across_pages():
     assert [mirror.num_rows for mirror in mirrors] == [2, 2]
 
 
+def test_hisparse_reports_when_context_is_fully_resident():
+    manager = make_hisparse_kv_cache_manager(32, 16)
+    request = make_request(
+        "request",
+        list(range(2 * HISPARSE_BLOCK_SIZE)),
+        HISPARSE_BLOCK_SIZE,
+        sha256,
+    )
+    assert manager.allocate_slots(request, num_new_tokens=32) is not None
+    coordinator = manager.hisparse_coordinator
+    scheduled = ((request.request_id, 31, 1),)
+
+    assert coordinator.all_context_pages_resident(scheduled)
+    assert coordinator.resident_managers[0].release_resident_page(request.request_id, 0)
+    assert not coordinator.all_context_pages_resident(scheduled)
+
+
 def test_hisparse_host_prefix_can_be_completed_by_indexer_offload():
     manager = make_hisparse_kv_cache_manager(
         32,
@@ -562,6 +579,9 @@ def test_hisparse_prefix_hit_adopts_gpu_shadow_pages():
         original_resident_ids[:3]
     )
     assert not any(block.is_null for block in resident_blocks[:3])
+    assert manager.hisparse_coordinator.all_context_pages_resident(
+        ((resumed.request_id, num_computed, len(tokens) - num_computed),)
+    )
 
 
 def test_hisparse_shadow_pages_free_under_pool_pressure():

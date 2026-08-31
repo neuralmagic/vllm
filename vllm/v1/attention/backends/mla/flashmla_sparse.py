@@ -628,10 +628,13 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         actual_num_heads: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self._hisparse_decode_batch:
-            kv_c_and_k_pe_cache, topk_indices, topk_length = self._hisparse_swap_in(
-                topk_indices,
-                attn_metadata,
-                return_valid_counts=True,
+            kv_c_and_k_pe_cache, topk_indices, topk_length = (
+                self._hisparse_decode_cache(
+                    kv_c_and_k_pe_cache,
+                    topk_indices,
+                    attn_metadata,
+                    return_valid_counts=True,
+                )
             )
             return self._bf16_flash_mla_kernel(
                 q,
@@ -855,7 +858,8 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         The lse is only returned when DCP needs it, otherwise None.
         """
         if self._hisparse_decode_batch:
-            kv_c_and_k_pe_cache, topk_indices = self._hisparse_swap_in(
+            kv_c_and_k_pe_cache, topk_indices = self._hisparse_decode_cache(
+                kv_c_and_k_pe_cache,
                 topk_indices,
                 attn_metadata,
             )

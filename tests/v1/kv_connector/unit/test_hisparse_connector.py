@@ -19,3 +19,15 @@ def test_no_forward_enqueues_deferred_hisparse_transfers():
 
     connector.pre_forward.assert_called_once_with(scheduler_output)
     connector.finish_forward.assert_called_once_with()
+
+
+def test_active_connector_forwards_cudagraph_support():
+    connector = object.__new__(ActiveKVConnector)
+    connector._disabled = False
+    connector.kv_connector = MagicMock()
+    connector.kv_connector.supports_cudagraph.return_value = False
+    metadata = object()
+    scheduler_output = SimpleNamespace(kv_connector_metadata=metadata)
+
+    assert not connector.supports_cudagraph(scheduler_output)
+    connector.kv_connector.supports_cudagraph.assert_called_once_with(metadata)
