@@ -1278,16 +1278,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
 
-def _update_mla_kv_cache(
+def unified_mla_kv_cache_update(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
-    attn_metadata: "MLACommonMetadata | None",
-    attn_layer: MLAAttention,
-    kv_cache: torch.Tensor,
-    layer_slot_mapping: torch.Tensor | None,
+    layer_name: LayerNameType,
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
+    """Update the MLA cache ahead of the attention custom op."""
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+    attn_layer.impl.prepare_for_batch(attn_metadata)
     if layer_slot_mapping is not None:
         kv_c_normed, k_pe, layer_slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,
@@ -1304,31 +1307,6 @@ def _update_mla_kv_cache(
             kv_cache_dtype,
             k_scale,
         )
-
-
-def unified_mla_kv_cache_update(
-    kv_c_normed: torch.Tensor,
-    k_pe: torch.Tensor,
-    layer_name: LayerNameType,
-    kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-) -> torch.Tensor:
-    """Update ordinary MLA caches ahead of the attention custom op."""
-    layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
-        layer_name
-    )
-    attn_layer.impl.prepare_for_batch(attn_metadata)
-    _update_mla_kv_cache(
-        kv_c_normed,
-        k_pe,
-        attn_metadata,
-        attn_layer,
-        kv_cache,
-        layer_slot_mapping,
-        kv_cache_dtype,
-        k_scale,
-    )
 
     return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
