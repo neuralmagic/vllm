@@ -53,7 +53,12 @@ def _packed_a2a_reference(
         .contiguous()
         .float()
     )
-    lses = cp_attn_lse.view(B, world_size, h_per_rank).permute(1, 0, 2).contiguous()
+    lses = (
+        cp_attn_lse.view(B, world_size, h_per_rank)
+        .permute(1, 0, 2)
+        .contiguous()
+        .float()
+    )
     return _lse_weighted_combine(
         outputs,
         lses,
@@ -352,6 +357,54 @@ class TestLSEWeightedCombine:
         assert _dcp_a2a_lse_pack_dim(torch.float32) == 1
 
 
+class TestTokenShardedA2A:
+    def test_transposes_tokens_into_scattered_axis(self, monkeypatch):
+        import vllm.v1.attention.ops.dcp as dcp
+
+        class FakeGroup:
+            world_size = 4
+
+        output = torch.arange(8 * 3 * 5, dtype=torch.float32).view(8, 3, 5)
+        lse = torch.arange(8 * 3, dtype=torch.float32).view(8, 3)
+
+        def fake_a2a(transposed_output, transposed_lse, group, **kwargs):
+            assert transposed_output.shape == (3, 8, 5)
+            assert transposed_lse.shape == (3, 8)
+            assert group is FakeGroup
+            assert kwargs == {"is_lse_base_on_e": False}
+            # Model rank 2 receiving its two contiguous token rows.
+            return transposed_output[:, 4:6]
+
+        monkeypatch.setattr(dcp, "dcp_a2a_lse_reduce", fake_a2a)
+        actual = dcp.dcp_a2a_lse_reduce_token_sharded(
+            output, lse, FakeGroup, is_lse_base_on_e=False
+        )
+
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual, output[4:6])
+
+    @pytest.mark.parametrize(
+        ("output_shape", "lse_shape", "message"),
+        [
+            ((8, 3), (8, 3), "expects output"),
+            ((8, 3, 5), (8, 2), "dimensions must match"),
+            ((7, 3, 5), (7, 3), "must be divisible"),
+        ],
+    )
+    def test_validates_geometry(self, output_shape, lse_shape, message):
+        from vllm.v1.attention.ops.dcp import (
+            dcp_a2a_lse_reduce_token_sharded,
+        )
+
+        class FakeGroup:
+            world_size = 4
+
+        with pytest.raises(ValueError, match=message):
+            dcp_a2a_lse_reduce_token_sharded(
+                torch.empty(output_shape), torch.empty(lse_shape), FakeGroup
+            )
+
+
 class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."
@@ -545,7 +598,7 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
         lses = torch.stack(
             [t[:, rank * h_per_rank : (rank + 1) * h_per_rank] for t in gathered_lse],
             dim=0,
-        )
+        ).float()
         from vllm.v1.attention.ops.dcp import _lse_weighted_combine
 
         expected_out, expected_lse = _lse_weighted_combine(
@@ -569,6 +622,74 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
         dist.destroy_process_group()
 
 
+def _distributed_token_sharded_a2a_worker(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    world_size = int(env["WORLD_SIZE"])
+    torch.accelerator.set_device_index(local_rank)
+    if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+        dist.init_process_group(
+            backend="cpu:gloo,cuda:nccl",
+            device_id=torch.device(f"cuda:{local_rank}"),
+            init_method=env["DISTRIBUTED_INIT_METHOD"],
+            rank=local_rank,
+            world_size=world_size,
+        )
+    else:
+        dist.init_process_group(
+            backend="nccl",
+            init_method=env["DISTRIBUTED_INIT_METHOD"],
+            rank=local_rank,
+            world_size=world_size,
+        )
+    try:
+        from vllm.v1.attention.ops.dcp import (
+            _lse_weighted_combine,
+            dcp_a2a_lse_reduce_token_sharded,
+        )
+
+        rank = dist.get_rank()
+        local_tokens, num_heads, head_dim = 3, 5, 32
+        total_tokens = world_size * local_tokens
+        generator = torch.Generator(device=f"cuda:{local_rank}")
+        generator.manual_seed(4321 + rank)
+        output = torch.randn(
+            total_tokens,
+            num_heads,
+            head_dim,
+            device=f"cuda:{local_rank}",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        lse = torch.randn(
+            total_tokens,
+            num_heads,
+            device=f"cuda:{local_rank}",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        actual = dcp_a2a_lse_reduce_token_sharded(
+            output,
+            lse,
+            _FakeCPGroup(world_size, dist.group.WORLD),
+        )
+
+        gathered_output = [torch.empty_like(output) for _ in range(world_size)]
+        gathered_lse = [torch.empty_like(lse) for _ in range(world_size)]
+        dist.all_gather(gathered_output, output)
+        dist.all_gather(gathered_lse, lse)
+        token_slice = slice(rank * local_tokens, (rank + 1) * local_tokens)
+        expected = _lse_weighted_combine(
+            torch.stack([value[token_slice] for value in gathered_output]).float(),
+            torch.stack([value[token_slice] for value in gathered_lse]),
+        )
+
+        assert actual.shape == (local_tokens, num_heads, head_dim)
+        _assert_packed_a2a_close(actual, expected, torch.bfloat16)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
 )
@@ -582,6 +703,17 @@ def test_distributed_packed_a2a_matches_reference(dtype_name: str):
             "RETURN_LSE": "1",
             "LSE_BASE_E": "1",
         },
+    )
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
+)
+def test_distributed_token_sharded_a2a_matches_reference():
+    _distributed_run(
+        _distributed_token_sharded_a2a_worker,
+        world_size=4,
+        extra_env={},
     )
 
 

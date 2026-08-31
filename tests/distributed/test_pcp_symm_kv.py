@@ -268,6 +268,120 @@ def _worker_fused_direct_matches_gather_insert(env: dict[str, str]) -> None:
     dist.destroy_process_group()
 
 
+def _worker_gather_sharded_peer_cache(env: dict[str, str]) -> None:
+    """Check DCP-local cache rows can be reconstructed through PCP peer loads."""
+    update_environment_variables(env)
+    rank = int(env["RANK"])
+    world_size = int(env["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    from vllm.distributed.device_communicators.symm_mem import allocate_symm_mem_peer
+    from vllm.model_executor.layers.attention.pcp_direct_kv import (
+        PCPPeerCacheFence,
+        gather_pcp_sharded_peer_cache,
+        get_pcp_direct_kv_state,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    block_size, row_nbytes, num_blocks, num_layers = 64, 656, 12, 3
+    prefix_nbytes = 128
+    allocation = allocate_symm_mem_peer(
+        (prefix_nbytes + num_blocks * num_layers * block_size * row_nbytes,),
+        torch.uint8,
+        device,
+        dist.group.WORLD,
+    )
+    allocation.storage.zero_()
+    # Mirror the unified LBNHC allocation: selecting one layer leaves a
+    # non-contiguous block stride in the per-layer cache view.
+    cache = allocation.storage[prefix_nbytes:].view(
+        num_blocks, num_layers, block_size, row_nbytes
+    )[:, 1]
+    assert not cache.is_contiguous()
+    peer_ptrs = allocation.peer_ptrs_for_view(cache)
+
+    # Use non-identity physical block IDs and slices that start/end inside pages.
+    block_table = torch.tensor(
+        [[7, 2, 10, 4], [9, 1, 6, 11]], dtype=torch.int32, device=device
+    )
+    starts = [3, 61]
+    lengths = [141, 135]
+
+    expected_parts: list[torch.Tensor] = []
+    for req_idx, (start, length) in enumerate(zip(starts, lengths)):
+        expected = torch.empty((length, 576), dtype=torch.bfloat16, device=device)
+        for offset in range(length):
+            global_pos = start + offset
+            owner = global_pos % world_size
+            local_pos = global_pos // world_size
+            block_number = int(block_table[req_idx, local_pos // block_size].item())
+            block_offset = local_pos % block_size
+
+            nope = (
+                (torch.arange(512, device=device) + global_pos + 3 * req_idx) % 7 - 3
+            ).to(torch.float8_e4m3fn)
+            scales = torch.tensor(
+                [0.5, 1.0, 1.5, 2.0], dtype=torch.float32, device=device
+            )
+            rope = (
+                (torch.arange(64, device=device) + 2 * global_pos + req_idx) % 11 - 5
+            ).to(torch.bfloat16)
+            expected[offset, :512] = (nope.float() * scales.repeat_interleave(128)).to(
+                torch.bfloat16
+            )
+            expected[offset, 512:] = rope
+
+            if owner == rank:
+                entry = cache[block_number, block_offset]
+                entry[:512].copy_(nope.view(torch.uint8))
+                entry[512:528].view(torch.float32).copy_(scales)
+                entry[528:].view(torch.bfloat16).copy_(rope)
+        expected_parts.append(expected)
+
+    fence = PCPPeerCacheFence(dist.group.WORLD, device)
+    fence()
+
+    lengths_tensor = torch.tensor(lengths, dtype=torch.int32, device=device)
+    cu_seq_lens = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), lengths_tensor.cumsum(0)]
+    )
+    token_to_seq = torch.repeat_interleave(
+        torch.arange(len(lengths), dtype=torch.int32, device=device), lengths_tensor
+    )
+    seq_starts = torch.tensor(starts, dtype=torch.int32, device=device)
+    dst = torch.empty((sum(lengths), 576), dtype=torch.bfloat16, device=device)
+
+    state = get_pcp_direct_kv_state()
+    state.enabled = True
+    state.sharded = True
+    state.interleave_size = 1
+    state.world_size = world_size
+    state.rank = rank
+    state.tensor_peer_ptrs[cache.data_ptr()] = peer_ptrs
+    gather_pcp_sharded_peer_cache(
+        cache=cache,
+        dst=dst,
+        block_table=block_table,
+        cu_seq_lens=cu_seq_lens,
+        token_to_seq=token_to_seq,
+        seq_starts=seq_starts,
+        num_tokens=sum(lengths),
+        scale=torch.ones(1, dtype=torch.float32, device=device),
+        cache_block_size=block_size,
+        packed_ds_mla=True,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst, torch.cat(expected_parts), rtol=0, atol=0)
+
+    state.tensor_peer_ptrs.clear()
+    state.enabled = False
+    state.sharded = False
+    fence.close()
+    allocation.close()
+    dist.destroy_process_group()
+
+
 def _worker_peer_fence_cudagraph(env: dict[str, str]) -> None:
     update_environment_variables(env)
     rank = int(env["RANK"])
@@ -355,6 +469,60 @@ def test_fused_direct_fp8_ds_mla_indexer_pcp2():
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
 def test_fused_direct_fp8_ds_mla_indexer_pcp4():
     _distributed_run(_worker_fused_direct_matches_gather_insert, world_size=4)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs")
+def test_fused_direct_fp8_ds_mla_indexer_pcp8():
+    _distributed_run(_worker_fused_direct_matches_gather_insert, world_size=8)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
+def test_gather_sharded_fp8_ds_mla_peer_cache_pcp2_dcp2():
+    _distributed_run(_worker_gather_sharded_peer_cache, world_size=2)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
+def test_gather_sharded_fp8_ds_mla_peer_cache_pcp4_dcp4():
+    _distributed_run(_worker_gather_sharded_peer_cache, world_size=4)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="needs 8 GPUs")
+def test_gather_sharded_fp8_ds_mla_peer_cache_pcp8_dcp8():
+    _distributed_run(_worker_gather_sharded_peer_cache, world_size=8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fp8_ds_mla_insert_into_noncontiguous_layer_view():
+    """The generic DCP insert must honor unified-cache layer strides."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_blocks, num_layers, block_size, entry = 12, 3, 64, 656
+    num_tokens = 157
+    kv_c = torch.randn(num_tokens, 512, device=device, dtype=torch.bfloat16)
+    k_pe = torch.randn(num_tokens, 64, device=device, dtype=torch.bfloat16)
+    slots = torch.randperm(num_blocks * block_size, device=device)[:num_tokens]
+    scale = torch.ones(1, device=device, dtype=torch.float32)
+
+    reference = torch.full(
+        (num_blocks, block_size, entry), 0xA5, device=device, dtype=torch.uint8
+    )
+    backing = torch.full(
+        (num_blocks, num_layers, block_size, entry),
+        0xA5,
+        device=device,
+        dtype=torch.uint8,
+    )
+    layer_view = backing[:, 1]
+    assert not layer_view.is_contiguous()
+    ops.concat_and_cache_mla(kv_c, k_pe, reference, slots, "fp8_ds_mla", scale)
+    ops.concat_and_cache_mla(kv_c, k_pe, layer_view, slots, "fp8_ds_mla", scale)
+    torch.cuda.synchronize()
+
+    assert torch.equal(layer_view, reference)
+    assert torch.all(backing[:, 0] == 0xA5)
+    assert torch.all(backing[:, 2] == 0xA5)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")

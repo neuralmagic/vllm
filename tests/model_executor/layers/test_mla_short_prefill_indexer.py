@@ -8,6 +8,10 @@ import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.config import CUDAGraphMode
+from vllm.model_executor.layers.attention.mla_attention import MLACommonBaseImpl
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonImpl,
+)
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
@@ -44,6 +48,38 @@ def make_mla_metadata(*, use_dense_mha: bool = True, num_decode_tokens: int = 0)
     )
 
 
+def test_dense_mha_metadata_routes_long_prefill_to_generic_backend(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class ConcreteSparseMLA(SparseMLACommonImpl):
+        def forward_mqa(self, *args, **kwargs):
+            raise NotImplementedError
+
+    impl = object.__new__(ConcreteSparseMLA)
+    marker = object()
+
+    def generic_forward_mha(*args, **kwargs):
+        return marker
+
+    monkeypatch.setattr(MLACommonBaseImpl, "forward_mha", generic_forward_mha)
+    metadata = SimpleNamespace(
+        prefill_max_seq_len=16384,
+        topk_tokens=2048,
+        prefill=SimpleNamespace(use_dense_mha=True),
+    )
+    empty = torch.empty(0)
+    result = impl.forward_mha(
+        empty,
+        empty,
+        empty,
+        empty,
+        metadata,
+        empty,
+        empty,
+    )
+    assert result is marker
+
+
 @pytest.mark.parametrize(
     "batch_kind",
     [
@@ -52,6 +88,7 @@ def make_mla_metadata(*, use_dense_mha: bool = True, num_decode_tokens: int = 0)
         "mqa_only_layer",
         "force_mqa",
         "mla_decode",
+        "mixed_dense",
         "capture",
         "full",
     ],
@@ -61,15 +98,21 @@ def test_short_prefill_updates_k_cache_before_scoring_decision(
     batch_kind: str,
 ):
     slot_mapping = torch.tensor([63, 64, 127, 128, -1])
-    mla_num_decode_tokens = 1 if batch_kind == "mla_decode" else 0
+    mla_num_decode_tokens = 1 if batch_kind in ("mla_decode", "mixed_dense") else 0
     runtime_mode = (
         CUDAGraphMode.FULL if batch_kind == "full" else CUDAGraphMode.PIECEWISE
     )
     should_skip = batch_kind in ("short", "threshold_mismatch")
-    num_decodes = int(batch_kind == "threshold_mismatch")
-    num_decode_tokens = 3 if batch_kind == "threshold_mismatch" else 0
+    num_decodes = int(batch_kind in ("threshold_mismatch", "mixed_dense"))
+    num_decode_tokens = (
+        3 if batch_kind == "threshold_mismatch" else int(batch_kind == "mixed_dense")
+    )
     num_prefills = 0 if batch_kind == "threshold_mismatch" else 2
-    num_prefill_tokens = 0 if batch_kind == "threshold_mismatch" else 5
+    num_prefill_tokens = (
+        4
+        if batch_kind == "mixed_dense"
+        else (0 if batch_kind == "threshold_mismatch" else 5)
+    )
     if batch_kind == "threshold_mismatch":
         # With MTP=3 the indexer threshold is four. A main MLA backend whose
         # threshold is one (for example FlashMLA under DCP) still routes this
@@ -122,7 +165,7 @@ def test_short_prefill_updates_k_cache_before_scoring_decision(
         pass
 
     def scoring_trigger():
-        if should_skip:
+        if should_skip or batch_kind == "mixed_dense":
             pytest.fail("short dense-MHA prefill must not enter indexer scoring")
         raise ScoringReached
 

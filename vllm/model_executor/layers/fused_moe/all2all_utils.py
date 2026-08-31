@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
@@ -266,7 +267,12 @@ def maybe_make_prepare_finalize(
         )
         handle = all2all_manager.get_handle(all_to_all_args)
         vllm_config = get_current_vllm_config()
-        use_cudagraph = not vllm_config.model_config.enforce_eager
+        # Breakable graphs execute the whole MoE as an eager segment. Use the
+        # memory-efficient prefill layout instead of capturing ElasticBuffer.
+        use_cudagraph = (
+            not vllm_config.model_config.enforce_eager
+            and not is_breakable_cudagraph_enabled()
+        )
 
         prepare_finalize = DeepEPV2PrepareAndFinalize(
             buffer=handle,

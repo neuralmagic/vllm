@@ -27,3 +27,10 @@ def test_get_local_sizes_with_dp_metadata():
         return_value=context,
     ):
         assert flashinfer_nvlink_one_sided.get_local_sizes() == [3, 5]
+
+
+def test_runtime_max_tokens_covers_pcp_padding():
+    get_max = flashinfer_nvlink_one_sided._runtime_max_tokens_per_rank
+    assert get_max(7, [3, 5]) == 7
+    assert get_max(3, [3, 5]) == 5
+    assert get_max(7, None) == 7

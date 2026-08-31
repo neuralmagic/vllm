@@ -33,7 +33,7 @@ class _AttentionLayer:
         return _NoPCPBackend
 
 
-def _pcp_config():
+def _pcp_config(kv_role: str | None = None):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=4,
@@ -41,6 +41,14 @@ def _pcp_config():
             cp_kv_cache_interleave_size=1,
         ),
         speculative_config=SimpleNamespace(method="dspark"),
+        kv_transfer_config=(
+            SimpleNamespace(
+                is_kv_producer=kv_role in ("kv_producer", "kv_both"),
+                is_kv_consumer=kv_role in ("kv_consumer", "kv_both"),
+            )
+            if kv_role is not None
+            else None
+        ),
     )
 
 
@@ -59,9 +67,7 @@ def test_cp_compatibility_excludes_replicated_draft_layer_names(monkeypatch):
         "get_layers_from_vllm_config",
         lambda *_args, **_kwargs: {"draft": _AttentionLayer(use_pcp=True)},
     )
-    check_attention_cp_compatibility(
-        _pcp_config(), exclude_layer_names={"draft"}
-    )
+    check_attention_cp_compatibility(_pcp_config(), exclude_layer_names={"draft"})
 
 
 def test_cp_compatibility_still_validates_pcp_attention(monkeypatch):
@@ -72,6 +78,47 @@ def test_cp_compatibility_still_validates_pcp_attention(monkeypatch):
     )
     with pytest.raises(AssertionError, match="NO_PCP"):
         check_attention_cp_compatibility(_pcp_config())
+
+
+class _UnsupportedSpecCPImpl:
+    supports_mtp_with_cp_non_trivial_interleave_size = False
+    need_to_return_lse_for_decode = True
+
+
+class _PCPAttentionLayer:
+    use_pcp = True
+    impl = _UnsupportedSpecCPImpl()
+
+    @staticmethod
+    def get_attn_backend():
+        return SimpleNamespace(supports_pcp=lambda: True)
+
+
+@pytest.mark.parametrize("kv_role", ["kv_producer"])
+def test_cp_compatibility_skips_spec_runtime_check_for_producer_only(
+    monkeypatch, kv_role
+):
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"target": _PCPAttentionLayer()},
+    )
+    config = _pcp_config(kv_role)
+    config.parallel_config.cp_kv_cache_interleave_size = 16
+    check_attention_cp_compatibility(config)
+
+
+@pytest.mark.parametrize("kv_role", [None, "kv_consumer", "kv_both"])
+def test_cp_compatibility_keeps_spec_runtime_check_elsewhere(monkeypatch, kv_role):
+    monkeypatch.setattr(
+        cp_utils,
+        "get_layers_from_vllm_config",
+        lambda *_args, **_kwargs: {"target": _PCPAttentionLayer()},
+    )
+    config = _pcp_config(kv_role)
+    config.parallel_config.cp_kv_cache_interleave_size = 16
+    with pytest.raises(AssertionError, match="MTP with cp_kv_cache_interleave_size"):
+        check_attention_cp_compatibility(config)
 
 
 def test_skip_gate_only_for_zero_context():

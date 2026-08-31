@@ -381,8 +381,21 @@ def sparse_attn_indexer(
     # out-of-bounds reads in the kernel.
     # Keep PCP padding so every rank contributes the same all-gather shape.
     num_tokens = slot_mapping.shape[0]
-    if use_pcp:
+    # DCP spanning the PCP group: the metadata describes the global PCP batch
+    # (see DeepseekV32IndexerMetadata.pcp_*). Queries are gathered to global
+    # order below so every rank scores the same rows against its K shard and the
+    # DCP top-k merge lines up; each rank keeps only its own rows at the end.
+    pcp_token_sharded = use_pcp and attn_metadata_narrowed.pcp_num_padded is not None
+    pcp_local_num_actual = hidden_states.shape[0]
+    if pcp_token_sharded:
+        num_tokens = attn_metadata_narrowed.pcp_num_padded
+        slot_mapping_for_gather = attn_metadata_narrowed.pcp_gathered_slot_mapping
+        assert slot_mapping_for_gather is not None
+    elif use_pcp:
         num_tokens //= get_pcp_group().world_size
+        slot_mapping_for_gather = slot_mapping
+    else:
+        slot_mapping_for_gather = slot_mapping
     if k is not None:
         k = k[:num_tokens]
 
@@ -390,7 +403,7 @@ def sparse_attn_indexer(
         assert k is not None
         k, slot_mapping_for_cache = maybe_gather_indexer_k(
             k,
-            slot_mapping,
+            slot_mapping_for_gather,
             num_decode_tokens,
             use_pcp,
         )
@@ -408,20 +421,28 @@ def sparse_attn_indexer(
     # The indexer and main MLA may classify the same short extend differently
     # because they use independent decode thresholds. Only the main MLA route
     # can determine whether the top-k indices will be consumed.
+    dense_prefill = False
     if forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
         dense_mha_layer = _resolve_layer_name(dense_mha_metadata_layer_name)
         if dense_mha_layer:
             mla_metadata = attn_metadata.get(dense_mha_layer)
             prefill_metadata = getattr(mla_metadata, "prefill", None)
-            if (
+            dense_mha_selected = bool(
                 getattr(prefill_metadata, "use_dense_mha", False)
-                and getattr(mla_metadata, "num_decode_tokens", -1) == 0
                 and not torch.cuda.is_current_stream_capturing()
-            ):
+            )
+            mla_num_decode_tokens = getattr(mla_metadata, "num_decode_tokens", -1)
+            if dense_mha_selected and mla_num_decode_tokens == 0:
                 # Deliberately leave the buffer untouched. Dense MHA does not
                 # consume top-k indices for this batch; clearing it would be
                 # unnecessary work.
                 return topk_indices_buffer
+            # Independent decode thresholds can classify the same short
+            # extension differently. Only skip the indexer's prefill rows when
+            # both metadata builders agree on the decode/prefill boundary.
+            dense_prefill = bool(
+                dense_mha_selected and mla_num_decode_tokens == num_decode_tokens
+            )
 
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
@@ -430,7 +451,45 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
-    if has_prefill:
+    local_topk_indices_buffer = topk_indices_buffer
+    if pcp_token_sharded:
+        # Decode rows are replicated on every PCP rank and ordered first in both
+        # the local and the global batch, so the global-order gather below keeps
+        # them consistent with the existing DCP decode path.
+        pcp_group = get_pcp_group()
+        restore_idx = attn_metadata_narrowed.pcp_restore_idx
+        assert restore_idx is not None
+        # Gather this rank's (padded) rows from every rank, then reorder the
+        # rank-major result into global batch order.
+        # One packed all-gather for q (fp8 bytes) and the fp32 weights.
+        q_shape = q_quant.shape[1:]
+        q_bytes = q_quant[:num_tokens].reshape(num_tokens, -1).view(torch.uint8)
+        w_bytes = weights[:num_tokens].contiguous().view(torch.uint8)
+        packed = pcp_group.all_gather(torch.cat((q_bytes, w_bytes), dim=1), dim=0)
+        q_quant = (
+            packed[:, : q_bytes.shape[1]]
+            .contiguous()
+            .view(q_quant.dtype)
+            .view(-1, *q_shape)[restore_idx]
+        )
+        weights = (
+            packed[:, q_bytes.shape[1] :]
+            .contiguous()
+            .view(weights.dtype)
+            .view(-1, weights.shape[1])[restore_idx]
+        )
+        if q_scale is not None:
+            q_scale = pcp_group.all_gather(q_scale[:num_tokens].contiguous(), dim=0)[
+                restore_idx
+            ]
+        topk_indices_buffer = torch.full(
+            (restore_idx.shape[0], topk_indices_buffer.shape[1]),
+            -1,
+            dtype=topk_indices_buffer.dtype,
+            device=topk_indices_buffer.device,
+        )
+
+    if has_prefill and not dense_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
 
@@ -526,6 +585,14 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
+    if pcp_token_sharded:
+        local_rows = attn_metadata_narrowed.pcp_local_rows
+        assert local_rows is not None
+        local_topk_indices_buffer[: local_rows.shape[0], :topk_tokens] = (
+            topk_indices_buffer[local_rows, :topk_tokens]
+        )
+        local_topk_indices_buffer[local_rows.shape[0] : pcp_local_num_actual] = -1
+        return local_topk_indices_buffer
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

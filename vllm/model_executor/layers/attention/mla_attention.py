@@ -714,6 +714,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                publish_pcp_sharded_peer_kv,
+            )
+
+            publish_pcp_sharded_peer_kv()
             output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
             self.forward_impl(
                 q,
@@ -1293,6 +1298,14 @@ def unified_mla_kv_cache_update(
             kv_cache_dtype,
             k_scale,
         )
+    # The peer-cache fence is group-wide even when this rank has no local rows.
+    # PCP can assign zero tokens to a rank, so placing this inside the
+    # layer_slot_mapping branch gives different fence epochs across peers.
+    from vllm.model_executor.layers.attention.pcp_direct_kv import (
+        publish_pcp_sharded_peer_kv,
+    )
+
+    publish_pcp_sharded_peer_kv()
 
     return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
@@ -1493,6 +1506,7 @@ class MLACommonPrefillMetadata:
         max_query_len: int
         cu_seq_lens: torch.Tensor
         starts: torch.Tensor
+        global_starts: torch.Tensor
         max_seq_len: int
         seq_lens: torch.Tensor
         token_to_seq: torch.Tensor
@@ -1985,6 +1999,7 @@ def build_mla_chunked_context_metadata(
             max_query_len=max(query_lens),
             cu_seq_lens=cu_seq_lens[boundary_slice],
             starts=starts[request_slice],
+            global_starts=_flat_int32(plan.starts).to(device, non_blocking=True),
             max_seq_len=max(plan.seq_lens),
             seq_lens=seq_lens_cpu[request_slice],
             token_to_seq=token_to_seq[token_slice],
@@ -2683,6 +2698,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             self.kv_b_proj, use_fp8_prefill
         )
         workspace = chunked_context.workspace
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            gather_pcp_sharded_peer_cache,
+            pcp_sharded_peer_kv_active,
+        )
+
+        use_sharded_peer_cache = pcp_sharded_peer_kv_active()
 
         if use_fp8_prefill:
             q = q.to(prefill_metadata.q_data_type)
@@ -2692,7 +2713,25 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         for chunk in chunked_context.chunks:
             toks = chunk.num_context_tokens
             block_table = prefill_metadata.block_table[chunk.request_slice]
-            if self.kv_cache_dtype == "fp8_ds_mla":
+            if use_sharded_peer_cache:
+                if self.kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+                    raise NotImplementedError(
+                        "PCP+DCP peer context gather currently supports standard "
+                        f"FP8 KV cache only, got {self.kv_cache_dtype}"
+                    )
+                gather_pcp_sharded_peer_cache(
+                    cache=kv_c_and_k_pe_cache,
+                    dst=workspace[:toks],
+                    block_table=block_table,
+                    cu_seq_lens=chunk.cu_seq_lens,
+                    token_to_seq=chunk.token_to_seq,
+                    seq_starts=chunk.global_starts,
+                    num_tokens=toks,
+                    scale=k_scale,
+                    cache_block_size=kv_c_and_k_pe_cache.shape[1],
+                    packed_ds_mla=self.kv_cache_dtype == "fp8_ds_mla",
+                )
+            elif self.kv_cache_dtype == "fp8_ds_mla":
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace[:toks],
@@ -2954,7 +2993,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         if has_context:
             assert prefill_metadata.chunked_context is not None
             suffix_output, suffix_lse = output_prefill
-            if self.dcp_world_size > 1:
+            from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                pcp_sharded_peer_kv_active,
+            )
+
+            if self.dcp_world_size > 1 and not pcp_sharded_peer_kv_active():
                 context_output, context_lse = (
                     self._context_parallel_compute_prefill_context(
                         q,

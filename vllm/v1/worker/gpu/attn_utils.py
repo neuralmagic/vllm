@@ -253,7 +253,7 @@ def init_kv_cache(
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
     from vllm.model_executor.layers.attention.pcp_direct_kv import (
         bind_pcp_direct_layer_views,
-        pcp_direct_kv_active,
+        pcp_peer_kv_active,
         should_allocate_pcp_direct_kv,
     )
 
@@ -264,7 +264,7 @@ def init_kv_cache(
         except Exception:
             close_pcp_direct_kv()
             raise
-        if not pcp_direct_kv_active():
+        if not pcp_peer_kv_active():
             close_pcp_direct_kv()
             raise RuntimeError("VLLM_USE_PCP_DIRECT_KV=1 failed to enable after bind")
     return kv_caches
