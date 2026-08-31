@@ -473,19 +473,24 @@ def test_hisparse_shared_host_reader_stages_without_host_mirror(monkeypatch):
     runtime.backup_rows.assert_not_called()
 
 
-def test_hisparse_trailing_draft_stages_current_rows(monkeypatch):
+def test_hisparse_trailing_draft_replays_padded_current_rows(monkeypatch):
     runtime = SimpleNamespace(
         device=torch.device("cpu"),
         eager_host_mirror=True,
         max_num_reqs=4,
         backup_rows=MagicMock(),
-        is_group_leader=False,
+        is_group_leader=True,
+        invalidate_written_slots=MagicMock(),
         all_resident=False,
     )
     cache = hisparse_runtime_module.HiSparseCacheHandle(runtime)
     cache.view = SimpleNamespace(cache=torch.empty((2, 2, 4)), block_size=2)
     cache.slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
-    cache.num_actual_tokens = 2
+    # Captured Python state can differ from the active rows at replay. Padded
+    # slot and request-ID buffers bound the replayable trailing-draft writes.
+    cache.num_actual_tokens = 1
+    cache.num_decode_tokens = 0
+    cache.req_id_per_token = torch.tensor([0, -1], dtype=torch.int32)
     cache.decode_batch = True
     cache.defer_host_mirror = False
     cache.use_current_staging = True
@@ -509,6 +514,15 @@ def test_hisparse_trailing_draft_stages_current_rows(monkeypatch):
     assert concat_and_cache.call_count == 2
     assert concat_and_cache.call_args_list[1].args[2] is cache.mirror_staging_cache
     runtime.backup_rows.assert_called_once()
+    runtime.invalidate_written_slots.assert_called_once()
+    torch.testing.assert_close(
+        runtime.invalidate_written_slots.call_args.args[0],
+        torch.tensor([4, 5], dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        runtime.invalidate_written_slots.call_args.args[1],
+        torch.tensor([0, -1], dtype=torch.int32),
+    )
 
 
 @pytest.mark.parametrize(

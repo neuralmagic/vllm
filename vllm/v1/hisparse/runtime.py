@@ -1084,8 +1084,15 @@ class HiSparseCacheHandle:
     ) -> None:
         assert self.view is not None and self.slot_mapping is not None
         host_slots = slot_mapping.flatten()
-        num_rows = min(kv_c_normed.shape[0], host_slots.numel(), self.num_actual_tokens)
-        if not mirror_to_host:
+        if self.use_current_staging:
+            # MTP captures this path. Padded replay buffers, not Python batch
+            # counts frozen at capture time, determine which rows are active.
+            num_rows = min(kv_c_normed.shape[0], host_slots.numel())
+        else:
+            num_rows = min(
+                kv_c_normed.shape[0], host_slots.numel(), self.num_actual_tokens
+            )
+        if not mirror_to_host and not self.use_current_staging:
             num_rows = min(num_rows, self.runtime.max_num_reqs)
         if num_rows == 0:
             return
@@ -1137,7 +1144,13 @@ class HiSparseCacheHandle:
                     mirror_src_slots,
                     mirrored_slots,
                 )
-            if self.runtime.is_group_leader and self.num_decode_tokens:
+            if self.runtime.is_group_leader and self.use_current_staging:
+                assert self.req_id_per_token is not None
+                self.runtime.invalidate_written_slots(
+                    mirrored_slots[:num_rows],
+                    self.req_id_per_token[:num_rows],
+                )
+            elif self.runtime.is_group_leader and self.num_decode_tokens:
                 assert self.req_id_per_token is not None
                 num_decode_tokens = min(self.num_decode_tokens, num_rows)
                 self.runtime.invalidate_written_slots(

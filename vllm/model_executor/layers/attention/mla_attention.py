@@ -1318,20 +1318,17 @@ def unified_mla_kv_cache_update(
     attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
         layer_name
     )
-    # HiSparse writes depend on live residency state and run at the existing
-    # attention boundary below instead of baking capture-time state into the graph.
-    if not attn_layer.impl.requires_kv_cache_update_at_attention_boundary:
-        attn_layer.impl.prepare_for_batch(attn_metadata)
-        _update_mla_kv_cache(
-            kv_c_normed,
-            k_pe,
-            attn_metadata,
-            attn_layer,
-            kv_cache,
-            layer_slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-        )
+    attn_layer.impl.prepare_for_batch(attn_metadata)
+    _update_mla_kv_cache(
+        kv_c_normed,
+        k_pe,
+        attn_metadata,
+        attn_layer,
+        kv_cache,
+        layer_slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+    )
 
     return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
@@ -1375,21 +1372,8 @@ def unified_mla_attention_with_output(
     # attention forward.
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, layer, kv_cache, layer_slot_mapping = get_attention_context(
-        layer_name
-    )
+    attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
     layer.impl.prepare_for_batch(attn_metadata)
-    if layer.impl.requires_kv_cache_update_at_attention_boundary:
-        _update_mla_kv_cache(
-            kv_c_normed,
-            k_pe,
-            attn_metadata,
-            layer,
-            kv_cache,
-            layer_slot_mapping,
-            layer.kv_cache_dtype,
-            layer._k_scale,
-        )
     layer.forward_impl(
         q,
         kv_c_normed,

@@ -18,10 +18,10 @@ INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
 
 
-def test_unified_mla_attention_updates_hisparse_cache_before_forward(
+def test_unified_mla_attention_refreshes_batch_state_before_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A replayed attention boundary must write the current HiSparse batch."""
+    """A replayed attention boundary must publish its current batch state."""
     metadata = SimpleNamespace(num_decode_tokens=0)
     kv_cache = torch.empty(1)
     slot_mapping = torch.empty(1, dtype=torch.int64)
@@ -32,23 +32,13 @@ def test_unified_mla_attention_updates_hisparse_cache_before_forward(
         assert attn_metadata is metadata
         calls.append("prepare")
 
-    def do_kv_cache_update(kv_c, k_pe, cache, slots, dtype, scale):
-        assert calls == ["prepare"]
-        assert cache is kv_cache
-        assert slots is slot_mapping
-        assert dtype == "auto"
-        assert scale is k_scale
-        calls.append("update")
-
     def forward_impl(*args, **kwargs):
-        assert calls == ["prepare", "update"]
+        assert calls == ["prepare"]
         calls.append("forward")
 
     layer = SimpleNamespace(
         impl=SimpleNamespace(
-            requires_kv_cache_update_at_attention_boundary=True,
             prepare_for_batch=prepare_for_batch,
-            do_kv_cache_update=do_kv_cache_update,
         ),
         forward_impl=forward_impl,
         kv_cache_dtype="auto",
@@ -69,7 +59,7 @@ def test_unified_mla_attention_updates_hisparse_cache_before_forward(
         MLA_LAYER,
     )
 
-    assert calls == ["prepare", "update", "forward"]
+    assert calls == ["prepare", "forward"]
 
 
 def test_sparse_attention_refreshes_batch_state_inside_eager_segment(

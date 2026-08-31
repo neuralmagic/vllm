@@ -904,10 +904,6 @@ class AttentionImplBase(ABC, Generic[T]):
     def prepare_for_batch(self, attn_metadata: T | None) -> None:
         """Prepare implementation-specific state for the current batch."""
 
-    @property
-    def requires_kv_cache_update_at_attention_boundary(self) -> bool:
-        return False
-
 
 class AttentionImpl(AttentionImplBase[T], Generic[T]):
     """Standard attention implementation with forward method."""
