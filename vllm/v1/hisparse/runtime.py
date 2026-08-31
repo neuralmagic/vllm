@@ -5,12 +5,12 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import psutil
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -442,8 +442,6 @@ def _has_hisparse_ops() -> bool:
         and hasattr(torch.ops._C_cache_ops, "hisparse_invalidate_written_slots")
         and hasattr(torch.ops._C_cache_ops, "hisparse_gather_plan")
         and hasattr(torch.ops._C_cache_ops, "hisparse_gather_compact")
-        and hasattr(torch.ops._C_cache_ops, "hisparse_backup")
-        and hasattr(torch.ops._C_cache_ops, "hisparse_backup_layers")
     )
 
 
@@ -712,25 +710,6 @@ class HiSparseRuntime:
             written_slots[:num_tokens],
         )
 
-    def backup_rows(
-        self,
-        src_cache: torch.Tensor,
-        src_indices: torch.Tensor,
-        dst_slots: torch.Tensor,
-    ) -> None:
-        torch.ops._C_cache_ops.hisparse_backup(
-            src_cache,
-            src_indices,
-            self.host_cache,
-            dst_slots,
-        )
-
-    def backup_caches(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the static tensors needed by the all-layer backup plan."""
-        return self.hot.cache, self.host_cache
-
     def swap_in(
         self,
         *,
@@ -878,10 +857,11 @@ class HiSparseCacheHandle:
         self.num_actual_tokens = 0
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None
-        self.defer_host_mirror = False
+        self.host_mirror_required = False
         self.mirror_slot_mapping: torch.Tensor | None = None
         self.mirror_staging_cache: torch.Tensor | None = None
         self.mirror_staging_slots: torch.Tensor | None = None
+        self.submit_layer_mirror: Callable[[], None] | None = None
 
     def bind_cache(
         self,
@@ -905,76 +885,6 @@ class HiSparseCacheHandle:
         )
         self.block_table = block_table
         self.slot_mapping = slot_mapping
-
-    def write_rows(
-        self,
-        kv_c_normed: torch.Tensor,
-        k_pe: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: torch.Tensor,
-        *,
-        mirror_to_host: bool,
-    ) -> None:
-        assert self.view is not None and self.slot_mapping is not None
-        host_slots = slot_mapping.flatten()
-        num_rows = min(kv_c_normed.shape[0], host_slots.numel(), self.num_actual_tokens)
-        if not mirror_to_host:
-            num_rows = min(num_rows, self.runtime.max_num_reqs)
-        if num_rows == 0:
-            return
-        resident_slots = self.slot_mapping[:num_rows]
-        ops.concat_and_cache_mla(
-            kv_c_normed[:num_rows],
-            k_pe[:num_rows].squeeze(1),
-            self.view.cache,
-            resident_slots,
-            kv_cache_dtype=kv_cache_dtype,
-            scale=k_scale,
-        )
-        if mirror_to_host or self.runtime.eager_host_mirror:
-            mirrored_slots = host_slots[:num_rows].to(
-                device=self.runtime.device, dtype=torch.int64
-            )
-            if self.defer_host_mirror and not mirror_to_host:
-                if self.mirror_slot_mapping is None:
-                    self.mirror_slot_mapping = mirrored_slots
-                return
-            mirrored_slots = mirrored_slots.contiguous()
-            mirror_src_cache = self.view.cache
-            mirror_src_slots = resident_slots
-            if mirror_to_host:
-                staging_cache = self.mirror_staging_cache
-                staging_slots = self.mirror_staging_slots
-                if staging_cache is None or staging_slots is None:
-                    raise RuntimeError("HiSparse prefill mirror staging is not bound.")
-                if num_rows > staging_slots.numel():
-                    raise RuntimeError(
-                        "HiSparse prefill mirror exceeds staging capacity: "
-                        f"{num_rows} > {staging_slots.numel()}."
-                    )
-                mirror_src_slots = staging_slots[:num_rows]
-                ops.concat_and_cache_mla(
-                    kv_c_normed[:num_rows],
-                    k_pe[:num_rows].squeeze(1),
-                    staging_cache,
-                    mirror_src_slots,
-                    kv_cache_dtype=kv_cache_dtype,
-                    scale=k_scale,
-                )
-                mirror_src_cache = staging_cache
-            self.runtime.backup_rows(
-                mirror_src_cache,
-                mirror_src_slots,
-                mirrored_slots,
-            )
-            if self.runtime.is_group_leader and self.num_decode_tokens:
-                assert self.req_id_per_token is not None
-                num_decode_tokens = min(self.num_decode_tokens, num_rows)
-                self.runtime.invalidate_written_slots(
-                    mirrored_slots[:num_decode_tokens],
-                    self.req_id_per_token[:num_decode_tokens],
-                )
 
     def resolve_topk(
         self,

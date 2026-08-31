@@ -142,11 +142,7 @@ def test_profiling_cleanup_releases_tp_shared_region_once(monkeypatch):
     )
     forward_context = {
         "layer": SimpleNamespace(
-            hisparse_cache=SimpleNamespace(
-                runtime=runtime,
-                mirror_staging_cache=object(),
-                mirror_staging_slots=object(),
-            ),
+            hisparse_cache=SimpleNamespace(runtime=runtime),
         )
     }
     released = []
@@ -163,9 +159,6 @@ def test_profiling_cleanup_releases_tp_shared_region_once(monkeypatch):
     attn_utils_module.release_hisparse_profiling_cache(forward_context)
 
     assert released == [([runtime], [], region)]
-    cache = forward_context["layer"].hisparse_cache
-    assert cache.mirror_staging_cache is None
-    assert cache.mirror_staging_slots is None
 
 
 def test_allocate_hisparse_kv_cache_rolls_back_on_device_failure(monkeypatch):

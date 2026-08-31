@@ -224,6 +224,32 @@ def make_hisparse_kv_cache_manager(
     )
 
 
+def test_hisparse_builds_dma_row_mirrors_across_pages():
+    manager = make_hisparse_kv_cache_manager(32, 16)
+    request = make_request(
+        "request",
+        list(range(2 * HISPARSE_BLOCK_SIZE)),
+        HISPARSE_BLOCK_SIZE,
+        sha256,
+    )
+    assert manager.allocate_slots(request, num_new_tokens=32) is not None
+    coordinator = manager.hisparse_coordinator
+    resident_blocks = coordinator.resident_managers[0].req_to_blocks[request.request_id]
+    host_blocks = coordinator.host_manager.req_to_blocks[request.request_id]
+
+    mirrors = coordinator.build_row_mirrors([(request.request_id, 14, 4)])
+
+    assert [mirror.source_starts for mirror in mirrors] == [
+        (resident_blocks[0].block_id * HISPARSE_BLOCK_SIZE + 14,),
+        (resident_blocks[1].block_id * HISPARSE_BLOCK_SIZE,),
+    ]
+    assert [mirror.destination_start for mirror in mirrors] == [
+        host_blocks[0].block_id * HISPARSE_BLOCK_SIZE + 14,
+        host_blocks[1].block_id * HISPARSE_BLOCK_SIZE,
+    ]
+    assert [mirror.num_rows for mirror in mirrors] == [2, 2]
+
+
 def test_hisparse_host_prefix_can_be_completed_by_indexer_offload():
     manager = make_hisparse_kv_cache_manager(
         32,

@@ -12,11 +12,12 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import (
     get_dcp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBaseImpl,
@@ -708,6 +709,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 and attn_metadata.max_query_len == 1
                 and attn_metadata.num_reqs == attn_metadata.num_actual_tokens
             )
+            self.hisparse_cache.host_mirror_required = attn_metadata is not None and (
+                not self.hisparse_cache.decode_batch
+                or self.hisparse_cache.runtime.eager_host_mirror
+            )
 
     def _hisparse_swap_in(
         self,
@@ -946,8 +951,18 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         prefill = attn_metadata.prefill
         staging_plan = prefill.hisparse_staging_plan if prefill is not None else None
         assert staging_plan is not None
-        staged_cache = self.hisparse_cache.runtime.gather_prefill_cache(
-            kv_cache, staging_plan
+        handle = self.hisparse_cache
+        resident_cache = None
+        if handle.view is not None and handle.block_table is not None:
+            staging_plan.ensure_gpu_sources(
+                handle.block_table[attn_metadata.num_decodes :],
+                handle.view.block_size,
+            )
+            resident_cache = handle.view.cache
+        staged_cache = handle.runtime.gather_prefill_cache(
+            kv_cache,
+            staging_plan,
+            resident_cache=resident_cache,
         )
         staged_bt = staging_plan.block_table
         prefill_req_ids = attn_metadata.req_id_per_token[num_decode_tokens:]
@@ -976,14 +991,50 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             )
         if self._hisparse_dummy_batch:
             return
-        hisparse_cache.write_rows(
-            kv_c_normed,
-            k_pe,
-            slot_mapping,
+        assert hisparse_cache.view is not None
+        assert hisparse_cache.slot_mapping is not None
+        num_rows = min(
+            kv_c_normed.shape[0],
+            slot_mapping.numel(),
+            hisparse_cache.num_actual_tokens,
+        )
+        if hisparse_cache.decode_batch:
+            num_rows = min(num_rows, hisparse_cache.runtime.max_num_reqs)
+        if num_rows == 0:
+            return
+        super().do_kv_cache_update(
+            kv_c_normed[:num_rows],
+            k_pe[:num_rows],
+            hisparse_cache.view.cache,
+            hisparse_cache.slot_mapping[:num_rows],
             kv_cache_dtype,
             k_scale,
-            mirror_to_host=not hisparse_cache.decode_batch,
         )
+        if not hisparse_cache.decode_batch:
+            staging_cache = hisparse_cache.mirror_staging_cache
+            staging_slots = hisparse_cache.mirror_staging_slots
+            if staging_cache is None or staging_slots is None:
+                raise RuntimeError("HiSparse prefill mirror staging is not bound.")
+            if num_rows > staging_slots.numel():
+                raise RuntimeError(
+                    "HiSparse prefill mirror exceeds staging capacity: "
+                    f"{num_rows} > {staging_slots.numel()}."
+                )
+            super().do_kv_cache_update(
+                kv_c_normed[:num_rows],
+                k_pe[:num_rows],
+                staging_cache,
+                staging_slots[:num_rows],
+                kv_cache_dtype,
+                k_scale,
+            )
+        submit_layer_mirror = hisparse_cache.submit_layer_mirror
+        if (
+            submit_layer_mirror is not None
+            and not hisparse_cache.decode_batch
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+        ):
+            submit_layer_mirror()
 
     @staticmethod
     def masked_mha_workspace_fits(prefill: MLACommonPrefillMetadata) -> bool:

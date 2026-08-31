@@ -34,6 +34,7 @@ class KVConnector:
         self,
         scheduler_output: "SchedulerOutput",
         batch_request_indices: torch.Tensor | None = None,
+        batch_request_ids: list[str] | None = None,
     ) -> None:
         pass
 
@@ -76,6 +77,7 @@ class ActiveKVConnector(KVConnector):
         self,
         scheduler_output: "SchedulerOutput",
         batch_request_indices: torch.Tensor | None = None,
+        batch_request_ids: list[str] | None = None,
     ) -> None:
         if self._disabled:
             return
@@ -85,14 +87,20 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
         # TODO: sort out KV Connectors' use of forward_context
+        worker_kwargs = {
+            "request_state_indices": batch_request_indices,
+            "request_ids": batch_request_ids,
+        }
         if is_forward_context_available():
             self.kv_connector.start_load_kv(
-                get_forward_context(), request_state_indices=batch_request_indices
+                get_forward_context(),
+                **worker_kwargs,
             )
         else:
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(
-                    get_forward_context(), request_state_indices=batch_request_indices
+                    get_forward_context(),
+                    **worker_kwargs,
                 )
 
     def finish_forward(self) -> None:

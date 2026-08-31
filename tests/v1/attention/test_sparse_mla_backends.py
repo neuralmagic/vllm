@@ -3,6 +3,7 @@
 """Unit tests for the sparse MLA backends and utilities."""
 
 import math
+from collections import deque
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -21,7 +22,18 @@ from tests.v1.attention.utils import (
     create_vllm_config,
 )
 from vllm import _custom_ops as ops
-from vllm.config import HiSparseConfig, SpeculativeConfig, set_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    HiSparseConfig,
+    SpeculativeConfig,
+    set_current_vllm_config,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
+    HiSparseConnectorWorker,
+)
+from vllm.model_executor.layers.attention import (
+    sparse_mla_attention as sparse_mla_attention_module,
+)
 from vllm.model_executor.layers.attention.mla_attention import _use_masked_mha
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     GLOBAL_TOPK_MASK_MAX_BYTES,
@@ -44,6 +56,7 @@ if not current_platform.is_cuda():
     )
 
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseMetadataBuilder,
     FlashInferMLASparseTRTLLMBackend,
@@ -71,6 +84,7 @@ from vllm.v1.hisparse.runtime import (
     build_hisparse_prefill_staging_plan,
     hisparse_prefill_staging_remap,
 )
+from vllm.v1.hisparse.types import SparseKVRowMirror
 
 SPARSE_BACKEND_BATCH_SPECS = {
     name: BATCH_SPECS[name]
@@ -1679,13 +1693,20 @@ def test_hisparse_apply_multi_step_plan_matches_independent():
 
 
 @requires_hisparse_ops
-def test_hisparse_prefill_writes_resident_and_host_rows():
-    """Resident prefill rows remain available to host-backed attention."""
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "expected_layer_mirrors"),
+    [
+        (CUDAGraphMode.NONE, 1),
+        (CUDAGraphMode.PIECEWISE, 0),
+        (CUDAGraphMode.FULL, 0),
+    ],
+)
+def test_hisparse_kv_update_uses_common_resident_write_path(
+    monkeypatch, cudagraph_mode, expected_layer_mirrors
+):
     device = torch.device(DEVICE_TYPE)
     block_size = 4
     row_width = 8
-    kv_pool = torch.zeros(8, block_size, row_width, dtype=torch.float32).pin_memory()
-    flat_pool = kv_pool.reshape(-1, row_width)
     cache_handle = _make_hisparse_cache_handle(
         max_num_reqs=1,
         row_width=row_width,
@@ -1705,22 +1726,26 @@ def test_hisparse_prefill_writes_resident_and_host_rows():
     slots = torch.tensor([3, 7, -1], dtype=torch.int64, device=device)
     kv_c = torch.randn(8, row_width - 2, device=device)
     k_pe = torch.randn(8, 1, 2, device=device)
-    cache_handle.runtime.bind_source_cache(kv_pool)
     cache_handle.num_actual_tokens = slots.numel()
-    cache_handle.mirror_staging_cache = torch.zeros(
-        1, block_size, row_width, dtype=torch.float32, device=device
+    cache_handle.decode_batch = False
+    cache_handle.submit_layer_mirror = MagicMock()
+    monkeypatch.setattr(
+        sparse_mla_attention_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=cudagraph_mode),
     )
-    cache_handle.mirror_staging_slots = torch.arange(
-        slots.numel(), dtype=torch.int64, device=device
-    )
+    source_cache = torch.zeros_like(cache_handle.view.cache)
+    impl = object.__new__(FlashMLASparseImpl)
+    impl.hisparse_cache = cache_handle
+    impl._hisparse_dummy_batch = False
 
-    cache_handle.write_rows(
+    impl.do_kv_cache_update(
         kv_c,
         k_pe,
+        source_cache,
         slots,
         "auto",
         torch.tensor(1.0, device=device),
-        mirror_to_host=True,
     )
     torch.accelerator.synchronize()
 
@@ -1729,8 +1754,59 @@ def test_hisparse_prefill_writes_resident_and_host_rows():
         cache_handle.view.cache.view(-1, row_width)[resident_slots[:2]],
         expected.to(device),
     )
-    torch.testing.assert_close(flat_pool[torch.tensor([3, 7])], expected)
-    torch.testing.assert_close(flat_pool[8], torch.zeros(row_width))
+    torch.testing.assert_close(source_cache, torch.zeros_like(source_cache))
+    assert cache_handle.submit_layer_mirror.call_count == expected_layer_mirrors
+
+
+@requires_hisparse_ops
+def test_hisparse_row_dma_copies_discontiguous_spans_across_layers():
+    device = torch.device(DEVICE_TYPE)
+    block_size = 4
+    row_width = 8
+    num_rows = 16
+    resident_caches = tuple(
+        (
+            torch.arange(num_rows * row_width, dtype=torch.uint8, device=device)
+            .add_(layer_index * 17)
+            .view(num_rows // block_size, block_size, row_width)
+        )
+        for layer_index in range(2)
+    )
+    host_caches = tuple(
+        torch.zeros((num_rows, row_width), dtype=torch.uint8, pin_memory=True)
+        for _ in resident_caches
+    )
+    worker = object.__new__(HiSparseConnectorWorker)
+    worker.is_host_writer = True
+    worker.kernel_block_size = block_size
+    worker.resident_caches = resident_caches
+    worker.host_caches = host_caches
+    worker.cache_handles = [
+        SimpleNamespace(runtime=SimpleNamespace(resident_source_index=0))
+        for _ in resident_caches
+    ]
+    worker.dma_stream = torch.cuda.Stream(device=device)
+    worker.host_write_event = torch.Event()
+    worker._dma_free_descriptors = []
+    worker._pending_dma_descriptors = deque()
+    worker._pending_transfer_events = deque()
+    worker._enqueued_transfer_ids = []
+    worker._dma_submitted = False
+    worker._set_row_mirrors(
+        (
+            SparseKVRowMirror((1,), 5, 2),
+            SparseKVRowMirror((8,), 10, 4),
+        )
+    )
+
+    worker._enqueue_row_dma(range(2))
+    current_stream().wait_event(worker.host_write_event)
+    torch.accelerator.synchronize()
+
+    for resident, host in zip(resident_caches, host_caches):
+        flat_resident = resident.view(num_rows, row_width).cpu()
+        torch.testing.assert_close(host[5:7], flat_resident[1:3])
+        torch.testing.assert_close(host[10:14], flat_resident[8:12])
 
 
 @requires_hisparse_ops
@@ -1778,79 +1854,6 @@ def test_hisparse_remaps_strided_hma_rows_for_attention():
         + physical_indices % block_size
     )
     torch.testing.assert_close(attention_indices[0], expected)
-
-
-@requires_hisparse_ops
-def test_hisparse_backup_layers_from_packed_hma():
-    device = torch.device(DEVICE_TYPE)
-    num_layers, num_blocks, block_size, row_width = 3, 5, 4, 8
-    row_bytes = row_width * torch.float32.itemsize
-    page_bytes = block_size * row_bytes
-    block_stride = num_layers * page_bytes + 64
-    backing = torch.zeros(num_blocks * block_stride, dtype=torch.uint8, device=device)
-
-    hot_caches = [
-        torch.as_strided(
-            backing.view(torch.float32),
-            (num_blocks, block_size, row_width),
-            (block_stride // torch.float32.itemsize, row_width, 1),
-            storage_offset=layer * page_bytes // torch.float32.itemsize,
-        )
-        for layer in range(num_layers)
-    ]
-    source_indices = [
-        torch.tensor(
-            [layer + 1, block_size + layer, 2 * block_size + layer],
-            dtype=torch.int64,
-            device=device,
-        )
-        for layer in range(num_layers)
-    ]
-    host_caches = [
-        torch.full((num_blocks * block_size, row_width), -1.0).pin_memory()
-        for _ in range(num_layers)
-    ]
-    dst_slots = torch.tensor([2, 17, -1], dtype=torch.int64, device=device)
-
-    for layer, (hot_cache, indices) in enumerate(zip(hot_caches, source_indices)):
-        for item, src_slot in enumerate(indices.tolist()):
-            block, offset = divmod(src_slot, block_size)
-            hot_cache[block, offset].fill_(100 * layer + item + 1)
-
-    torch.ops._C_cache_ops.hisparse_backup_layers(
-        backing,
-        torch.tensor(
-            [cache.data_ptr() - backing.data_ptr() for cache in hot_caches],
-            dtype=torch.int64,
-            device=device,
-        ),
-        torch.tensor(
-            [indices.data_ptr() for indices in source_indices],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        host_caches[0],
-        torch.tensor(
-            [cache.data_ptr() for cache in host_caches],
-            dtype=torch.uint64,
-            device=device,
-        ),
-        dst_slots,
-        dst_slots.numel(),
-        block_stride,
-        block_size,
-        num_blocks * block_size,
-    )
-    torch.accelerator.synchronize()
-
-    for layer, host_cache in enumerate(host_caches):
-        torch.testing.assert_close(
-            host_cache[2], torch.full((row_width,), 100 * layer + 1.0)
-        )
-        torch.testing.assert_close(
-            host_cache[17], torch.full((row_width,), 100 * layer + 2.0)
-        )
-        torch.testing.assert_close(host_cache[0], torch.full((row_width,), -1.0))
 
 
 @requires_hisparse_ops
@@ -1950,16 +1953,17 @@ def test_hisparse_newest_write_and_recycled_slot_invalidation():
     k_pe = torch.randn(3, 1, 2, device=device)
     cache_handle.runtime.bind_source_cache(kv_pool)
     cache_handle.num_actual_tokens = slot_mapping.numel()
-    cache_handle.write_rows(
-        kv_c,
-        k_pe,
-        slot_mapping,
-        "auto",
-        torch.tensor(1.0, device=device),
-        mirror_to_host=False,
+    ops.concat_and_cache_mla(
+        kv_c[:1],
+        k_pe[:1, 0],
+        cache_handle.view.cache,
+        resident_slots[:1],
+        kv_cache_dtype="auto",
+        scale=torch.tensor(1.0, device=device),
     )
     torch.accelerator.synchronize()
     expected_row = torch.cat([kv_c[0], k_pe[0, 0]]).cpu()
+    flat_pool[newest_global].copy_(expected_row)
     torch.testing.assert_close(flat_pool[newest_global], expected_row)
     torch.testing.assert_close(flat_pool[padded_global], padded_row)
     flat_hot = cache_handle.runtime.hot.cache.view(-1, row_width)
@@ -2877,10 +2881,14 @@ def test_hisparse_prefill_reuses_builder_staging_plan():
         return staged
 
     impl = object.__new__(FlashMLASparseImpl)
+    resident_cache = torch.empty((1, 1, 8))
+    resident_block_table = torch.tensor([[1]], dtype=torch.int32)
     impl.hisparse_cache = SimpleNamespace(
         runtime=SimpleNamespace(
             gather_prefill_cache=gather,
         ),
+        view=SimpleNamespace(cache=resident_cache, block_size=1),
+        block_table=resident_block_table,
     )
     source = torch.empty((1, 1, 8))
     metadata = SimpleNamespace(
@@ -2898,5 +2906,8 @@ def test_hisparse_prefill_reuses_builder_staging_plan():
     assert result is staged
     assert block_table is plan.block_table
     torch.testing.assert_close(request_ids, metadata.req_id_per_token)
-    plan.ensure_gpu_sources.assert_not_called()
-    assert calls == [(source, plan, None)]
+    plan.ensure_gpu_sources.assert_called_once()
+    args = plan.ensure_gpu_sources.call_args.args
+    torch.testing.assert_close(args[0], resident_block_table)
+    assert args[1] == 1
+    assert calls == [(source, plan, resident_cache)]

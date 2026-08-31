@@ -1231,6 +1231,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # fp8_ds_mla: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             state_content_bytes=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
+            alignment=656 if self.kv_cache_dtype == "fp8_ds_mla" else None,
         )
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(

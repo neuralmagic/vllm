@@ -475,17 +475,22 @@ def _bind_hisparse_kv_caches(
     staging_blocks = (
         max_num_batched_tokens + resident.block_size - 1
     ) // resident.block_size
-    mirror_staging_cache = torch.empty(
-        (staging_blocks, resident.block_size, resident.cache.shape[-1]),
+    mirror_staging_caches = torch.empty(
+        (
+            len(cache_handles),
+            staging_blocks,
+            resident.block_size,
+            resident.cache.shape[-1],
+        ),
         dtype=resident.cache.dtype,
         device=hot_backing.device,
     )
     mirror_staging_slots = torch.arange(
         max_num_batched_tokens, dtype=torch.int64, device=hot_backing.device
     )
-    for cache_handle in cache_handles:
+    for layer_index, cache_handle in enumerate(cache_handles):
         cache_handle.mirror_slot_mapping = source_slot_mapping
-        cache_handle.mirror_staging_cache = mirror_staging_cache
+        cache_handle.mirror_staging_cache = mirror_staging_caches[layer_index]
         cache_handle.mirror_staging_slots = mirror_staging_slots
 
 
