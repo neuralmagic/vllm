@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_mod
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
@@ -67,6 +68,13 @@ class _TextOnlyDraftModel(torch.nn.Module):
         is_multimodal=None,
     ):
         raise AssertionError("embed_input_ids should not be called during loading")
+
+
+class _HiSparseDraftModel(torch.nn.Module):
+    def __init__(self, handle):
+        super().__init__()
+        self.attention = torch.nn.Module()
+        self.attention.hisparse_cache = handle
 
 
 def _mock_base_model_load(monkeypatch):
@@ -197,9 +205,11 @@ def test_load_model_disables_mm_support_for_text_only_drafter(monkeypatch):
 
     assert not speculator.supports_mm_inputs
     assert warning_messages == [
-        "Draft model _TextOnlyDraftModel does not support external multimodal "
-        "embeddings. Embeddings from the target model will not be passed to the "
-        "drafter; using text-only draft inputs instead."
+        (
+            "Draft model _TextOnlyDraftModel does not support external multimodal "
+            "embeddings. Embeddings from the target model will not be passed to the "
+            "drafter; using text-only draft inputs instead."
+        )
     ]
 
 
@@ -235,6 +245,39 @@ def test_multi_module_mm_support_configured_after_model_load(monkeypatch):
     assert speculator.inputs_embeds.shape == (4, 3)
     assert speculator.cached_draft_input_embeds is not None
     assert speculator.cached_draft_input_embeds.shape == (2, 2, 3)
+
+
+def test_mtp_graph_capture_stages_current_hisparse_rows():
+    """Captured MTP forwards must not omit current-step sparse KV rows."""
+    handle = SimpleNamespace(defer_host_mirror=True, use_current_staging=False)
+    speculator = object.__new__(MTPSpeculator)
+    speculator.model = _HiSparseDraftModel(handle)
+    speculator.share_mtp_topk_indices = False
+
+    speculator.on_prefill_begin(num_reqs=1)
+
+    assert not handle.defer_host_mirror
+    assert handle.use_current_staging
+
+
+def test_hisparse_draft_prefill_uses_eager_execution(monkeypatch):
+    modes = []
+
+    def make_manager(config, device, mode, decode_query_len):
+        modes.append(mode)
+        return Mock()
+
+    monkeypatch.setattr(spec_module, "SpeculatorCudaGraphManager", make_manager)
+    speculator = object.__new__(_TestSpeculator)
+    speculator.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=object())
+    )
+    speculator.device = torch.device("cpu")
+    speculator.num_speculative_steps = 3
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
+
+    assert modes == [CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY]
 
 
 @pytest.mark.parametrize(

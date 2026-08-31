@@ -289,7 +289,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         req_id_per_token = np.repeat(
             np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
         )
-        self.req_id_per_token_buffer.fill_(0)
+        self.req_id_per_token_buffer.fill_(-1)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             np_to_pinned_tensor(req_id_per_token), non_blocking=True
         )

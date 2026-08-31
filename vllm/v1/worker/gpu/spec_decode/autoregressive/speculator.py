@@ -122,11 +122,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        prefill_cudagraph_mode = cudagraph_mode
+        if self.vllm_config.attention_config.hisparse_config is not None:
+            prefill_cudagraph_mode = CUDAGraphMode.NONE
+            logger.info_once(
+                "HiSparse draft prefill uses eager execution; draft decode "
+                "CUDA graphs remain enabled."
+            )
+
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            prefill_cudagraph_mode,
             self.num_speculative_steps + 1,
         )
 

@@ -436,6 +436,13 @@ class HiSparseConnectorWorker:
             runtime.reset_hot_state()
 
     def finish_step(self) -> HiSparseStats | None:
+        transfers = self._post_forward_transfers
+        self._post_forward_transfers = []
+        self._enqueue_transfers(transfers)
+        if self.is_host_writer:
+            self.host_write_event.record(
+                torch.accelerator.current_stream(self.hot_backing.device)
+            )
         delta = None
         if self._metrics_pending and self._metrics_event.query():
             delta = HiSparseStats()
@@ -634,13 +641,7 @@ class HiSparseConnectorWorker:
                 )
 
     def finish_forward(self) -> None:
-        current_stream = torch.accelerator.current_stream(self.hot_backing.device)
         self._enqueue_host_mirror()
-        transfers = self._post_forward_transfers
-        self._post_forward_transfers = []
-        self._enqueue_transfers(transfers)
-        if self.is_host_writer:
-            self.host_write_event.record(current_stream)
 
     def take_transfer_updates(self) -> tuple[list[int], list[int]]:
         enqueued = self._enqueued_transfer_ids

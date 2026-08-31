@@ -26,6 +26,7 @@ from vllm.model_executor.layers.attention.mla_attention import _use_masked_mha
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     GLOBAL_TOPK_MASK_MAX_BYTES,
     SparseMLACommonImpl,
+    SparseMLACommonMetadataBuilder,
     SparseMLAPrefillMetadata,
     _masked_mha_workspace_fits,
     _topk_mask_shape,
@@ -89,6 +90,28 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_prefill"] = BatchSpec(
 SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
     seq_lens=[256] * 2, query_lens=[256] * 2
 )
+
+
+def test_sparse_mla_request_ids_exclude_cuda_graph_padding():
+    """Graph padding must not alias a live request's persistent cache state."""
+    builder = object.__new__(SparseMLACommonMetadataBuilder)
+    builder.req_id_per_token_buffer = torch.empty(
+        8, dtype=torch.int32, device=DEVICE_TYPE
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=8,
+        query_start_loc_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
+    )
+
+    request_ids = builder._build_req_id_per_token(metadata)
+
+    torch.testing.assert_close(
+        request_ids,
+        torch.tensor(
+            [0, 0, 1, 1, 1, -1, -1, -1], dtype=torch.int32, device=DEVICE_TYPE
+        ),
+    )
+
 
 DEVICE_TYPE = current_platform.device_type
 

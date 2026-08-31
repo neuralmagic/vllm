@@ -12,6 +12,19 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
 
+    def _prepare_hisparse_draft_cache(self) -> None:
+        handles = getattr(self, "_hisparse_cache_handles", None)
+        if handles is None:
+            handles = tuple(
+                handle
+                for module in self.model.modules()
+                if (handle := getattr(module, "hisparse_cache", None)) is not None
+            )
+            self._hisparse_cache_handles = handles
+        for handle in handles:
+            handle.defer_host_mirror = False
+            handle.use_current_staging = True
+
     def load_draft_model(
         self,
         target_model: nn.Module,
@@ -35,6 +48,10 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
+        # These branches are captured in the standalone MTP graphs. The target
+        # connector normally enables them after its forward, which is too late
+        # when the graphs are first recorded during engine startup.
+        self._prepare_hisparse_draft_cache()
         # Step 0 computes its own top-k. Unconditional, so a step that died
         # midway cannot leave reuse mode on.
         if self.share_mtp_topk_indices:

@@ -23,6 +23,10 @@ from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 
 def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
     worker = object.__new__(HiSparseConnectorWorker)
+    worker.is_host_writer = False
+    worker._post_forward_transfers = []
+    worker._enqueue_transfers = MagicMock()
+    worker.host_write_event = MagicMock()
     worker._metrics_calls = hisparse_worker_module._METRICS_INTERVAL - 1
     worker._metrics_pending = False
     worker._metrics_event = MagicMock()
@@ -39,6 +43,34 @@ def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
     worker._metrics_event.record.assert_called_once_with()
     assert group.swap_stats.tolist() == [0, 0]
     assert worker.finish_step() == HiSparseStats(12, 4, 64)
+
+
+def test_hisparse_spill_and_publish_wait_for_trailing_mtp_forward(monkeypatch):
+    """A reclaimed page cannot be published before its MTP rows are written."""
+    transfer = SparseKVPageTransfer(1, 2, 0, (3,), True)
+    worker = object.__new__(HiSparseConnectorWorker)
+    worker.is_host_writer = True
+    worker.hot_backing = SimpleNamespace(device=torch.device("cuda:0"))
+    worker.host_write_event = MagicMock()
+    worker._post_forward_transfers = [transfer]
+    worker._enqueue_host_mirror = MagicMock()
+    worker._enqueue_transfers = MagicMock()
+    worker._metrics_calls = 0
+    worker._metrics_pending = False
+    worker.leader_runtimes = []
+    current_stream = MagicMock()
+    calls = MagicMock()
+    calls.attach_mock(worker._enqueue_transfers, "spill")
+    calls.attach_mock(worker.host_write_event.record, "publish")
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda device: current_stream
+    )
+
+    worker.finish_forward()
+
+    assert calls.mock_calls == []
+    worker.finish_step()
+    assert calls.mock_calls == [call.spill([transfer]), call.publish(current_stream)]
 
 
 def _hisparse_parallel_config(**overrides):
@@ -558,7 +590,7 @@ def test_hisparse_finish_forward_mirrors_all_layers_once(
     torch.testing.assert_close(invalidate_layers.call_args.args[3], dst_slots[:2])
     leader.invalidate_written_slots.assert_not_called()
     follower.invalidate_written_slots.assert_not_called()
-    worker.host_write_event.record.assert_called_once_with(current_stream)
+    worker.host_write_event.record.assert_not_called()
 
 
 def test_hisparse_finish_forward_excludes_trailing_mtp_cache(monkeypatch):
@@ -750,7 +782,7 @@ def test_hisparse_empty_step_does_not_replay_stale_host_mirror(monkeypatch):
     worker._enqueue_host_mirror.assert_called_once_with()
     assert handle.num_actual_tokens == 0
     torch.testing.assert_close(handle.mirror_slot_mapping, torch.tensor([4, 5]))
-    worker._enqueue_transfers.assert_called_once_with([])
+    worker._enqueue_transfers.assert_not_called()
 
 
 def test_hisparse_runtime_invalidates_only_scheduled_request_states():
