@@ -46,7 +46,7 @@ def test_unified_mla_attention_updates_hisparse_cache_before_forward(
 
     layer = SimpleNamespace(
         impl=SimpleNamespace(
-            hisparse_cache=object(),
+            requires_kv_cache_update_at_attention_boundary=True,
             prepare_for_batch=prepare_for_batch,
             do_kv_cache_update=do_kv_cache_update,
         ),

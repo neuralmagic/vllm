@@ -1320,7 +1320,7 @@ def unified_mla_kv_cache_update(
     )
     # HiSparse writes depend on live residency state and run at the existing
     # attention boundary below instead of baking capture-time state into the graph.
-    if getattr(attn_layer.impl, "hisparse_cache", None) is None:
+    if not attn_layer.impl.requires_kv_cache_update_at_attention_boundary:
         attn_layer.impl.prepare_for_batch(attn_metadata)
         _update_mla_kv_cache(
             kv_c_normed,
@@ -1379,7 +1379,7 @@ def unified_mla_attention_with_output(
         layer_name
     )
     layer.impl.prepare_for_batch(attn_metadata)
-    if getattr(layer.impl, "hisparse_cache", None) is not None:
+    if layer.impl.requires_kv_cache_update_at_attention_boundary:
         _update_mla_kv_cache(
             kv_c_normed,
             k_pe,
