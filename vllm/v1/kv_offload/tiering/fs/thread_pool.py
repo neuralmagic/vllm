@@ -96,6 +96,8 @@ class DualQueueThreadPool:
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool, float]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
+        self._batched_jobs: set[JobId] = set()  # guarded by _condition
+        self._max_num_batches = self.total_threads // 2
 
         assert self.total_threads > 0, "ThreadPool needs at least one thread"
 
@@ -150,7 +152,6 @@ class DualQueueThreadPool:
         job_id: JobId,
         tasks: Iterable[Task],
         n_tasks: int,
-        n_threads: int,
     ) -> None:
         """Batch `tasks` and append (fn, state, batch_size) entries to `queue`."""
         if n_tasks == 0:
@@ -159,13 +160,10 @@ class DualQueueThreadPool:
         state = JobState(job_id, n_tasks)
         task_lst = list(tasks)  # Materialize tasks out of self._condition
         assert len(task_lst) == n_tasks, "Unaccounted tasks"
-        n_batches = 0
         with self._condition:
             self._inflight_jobs += 1
-            for batch in self._batch_tasks(task_lst, n_threads):
-                queue.append((make_batch_fn(batch), len(batch), state))
-                n_batches += 1
-            self._condition.notify(n_batches)
+            queue.append((state, make_batch_fn, task_lst, False))
+            self._condition.notify(len(task_lst))
 
     def enqueue_load(
         self,
@@ -181,10 +179,7 @@ class DualQueueThreadPool:
             make_batch_fn,
             job_id,
             tasks,
-            n_tasks=n_tasks,
-            n_threads=self._n_read_threads
-            if self._n_read_threads > 0
-            else self.total_threads,
+            n_tasks,
         )
 
     def enqueue_store(
@@ -201,10 +196,7 @@ class DualQueueThreadPool:
             make_batch_fn,
             job_id,
             tasks,
-            n_tasks=n_tasks,
-            n_threads=self._n_write_threads
-            if self._n_write_threads > 0
-            else self.total_threads,
+            n_tasks,
         )
 
     def get_finished(self) -> list[tuple[JobId, bool, float]]:
@@ -241,6 +233,21 @@ class DualQueueThreadPool:
 
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
+
+        def maybe_batch_tasks(q: deque):
+            materialized = q[0][3]
+            if materialized:
+                return q.popleft()
+
+            n_batches = 1 if self._batched_jobs else self._max_num_batches
+            state, make_batch_fn, tasks, _ = q.popleft()
+            batched_tasks = list(self._batch_tasks(tasks, n_batches))
+            for b in reversed(batched_tasks):
+                q.appendleft((make_batch_fn(b), len(b), state, True))
+            if n_batches != 1:
+                self._batched_jobs.add(state.job_id)
+            return q.popleft()
+
         while True:
             with self._condition:
                 self._condition.wait_for(
@@ -248,11 +255,11 @@ class DualQueueThreadPool:
                 )
                 if self._stop:
                     return
+
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
-                fn, batch_size, state = (
-                    primary.popleft() if primary else secondary.popleft()
-                )
+                q = primary if primary else secondary
+                fn, batch_size, state, _ = maybe_batch_tasks(q)
             try:
                 start_time = time.monotonic()
                 fn()
@@ -274,5 +281,6 @@ class DualQueueThreadPool:
             if job_finished:
                 with self._condition:
                     self._finished_q.append((state.job_id, success, total_time))
+                    self._batched_jobs.discard(state.job_id)
                     self._inflight_jobs -= 1
                     self._condition.notify_all()
