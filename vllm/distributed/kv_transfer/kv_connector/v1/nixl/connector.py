@@ -107,10 +107,18 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
                 "Consumers and kv_both require "
                 "prefill_context_parallel_size=1."
             )
-        if pcp_size > 1 and parallel_config.decode_context_parallel_size > 1:
+        dcp_size = parallel_config.decode_context_parallel_size
+        tp_size = parallel_config.tensor_parallel_size
+        if (
+            pcp_size > 1
+            and dcp_size > 1
+            and not (
+                kv_role == "kv_producer" and tp_size == 1 and dcp_size == pcp_size
+            )
+        ):
             raise NotImplementedError(
-                "NixlConnector PCP producers currently require "
-                "decode_context_parallel_size=1."
+                "NixlConnector PCP+DCP currently supports only kv_producer "
+                "with TP1 and DCP spanning the full PCP group."
             )
         # TODO: Support PCP with bidirectional KV transfer by tracking separate
         # send and receive completion counts.
@@ -238,6 +246,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.kv_transfer_config.kv_role == "kv_producer"
             and self.connector_worker.pcp_rank > 0
+            and not self.connector_worker.pcp_dcp_sharded
         ):
             # Replicated-KV PCP: this rank does not transfer, but every worker
             # must report so the aggregator (and MultiConnector's per-request
@@ -323,6 +332,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.kv_transfer_config.kv_role == "kv_producer"
             and self.connector_worker.pcp_rank > 0
+            and not self.connector_worker.pcp_dcp_sharded
         ):
             return None
         return self.connector_worker.xfer_handshake_metadata
