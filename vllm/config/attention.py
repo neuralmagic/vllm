@@ -31,6 +31,12 @@ class HiSparseConfig:
     to the GPU cache block size selected from the active backends.
     """
 
+    eager_host_mirror: bool = True
+    """Mirror decode-written KV rows to the host pool during the forward so
+    page spills complete without moving data. When disabled, decode rows stay
+    resident-only and evicted pages are copied to host at spill time. Prefill
+    rows are always mirrored during the forward."""
+
 
 @config
 class AttentionConfig:

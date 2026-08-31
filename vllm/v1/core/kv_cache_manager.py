@@ -381,7 +381,7 @@ class KVCacheManager:
             per_group_hits[group_id] for group_id in fixed_group_ids
         )
         if completion_boundary <= local_hit:
-            return *self.get_computed_blocks(request), False, None
+            return *self.get_computed_blocks(request), False, 0
 
         blocks = self.truncate_group_completion_blocks(
             self.create_kv_cache_blocks(computed),

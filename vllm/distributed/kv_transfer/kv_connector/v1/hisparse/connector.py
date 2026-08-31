@@ -120,14 +120,14 @@ class HiSparseConnectorScheduler:
                 scheduler_output.num_scheduled_tokens.items()
             )
         )
-        row_mirrors = {
-            request_id: self.coordinator.build_row_mirrors(
-                ((request_id, num_computed_tokens[request_id], scheduled_count),)
+        row_mirrors = {}
+        for (
+            request_id,
+            scheduled_count,
+        ) in scheduler_output.num_scheduled_tokens.items():
+            row_mirrors[request_id] = self.coordinator.build_row_mirrors(
+                ((request_id, num_computed_tokens[request_id], scheduled_count),),
             )
-            for request_id, scheduled_count in (
-                scheduler_output.num_scheduled_tokens.items()
-            )
-        }
         return HiSparseConnectorMetadata(
             command,
             host_block_copies,

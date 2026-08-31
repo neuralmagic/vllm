@@ -918,10 +918,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
     ):
         if self.hisparse_cache is None:
             return None
-        if (
-            attn_metadata.num_decode_tokens > 0
-            and self._can_use_hisparse_resident_cache
-        ):
+        if self._can_use_hisparse_resident_cache:
             return self._hisparse_resident_decode_cache(
                 topk_indices,
                 attn_metadata,
@@ -969,8 +966,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE
         )
         return (
-            (self._hisparse_decode_batch or capture_resident_decode)
-            and self.hisparse_cache is not None
+            self.hisparse_cache is not None
             and (
                 capture_resident_decode
                 or getattr(self.hisparse_cache, "all_context_pages_resident", False)
@@ -991,9 +987,11 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
         assert resident.view is not None and resident.block_table is not None
         if req_id_per_token is None:
             req_id_per_token = attn_metadata.req_id_per_token[: topk_indices.shape[0]]
-        _, block_stride_rows = flat_kv_row_view(
-            resident.view.cache, resident.view.block_size
-        )
+        block_stride_rows = None
+        if self.kv_cache_dtype != "fp8_ds_mla":
+            _, block_stride_rows = flat_kv_row_view(
+                resident.view.cache, resident.view.block_size
+            )
         converted = triton_convert_req_index_to_global_index(
             req_id_per_token,
             resident.block_table,
@@ -1003,10 +1001,15 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             NUM_TOPK_TOKENS=topk_indices.shape[1],
             return_valid_counts=return_valid_counts,
         )
+        resident_cache = (
+            resident.view.cache
+            if self.kv_cache_dtype == "fp8_ds_mla"
+            else resident.view.attention_cache
+        )
         if return_valid_counts:
             indices, valid_counts = converted
-            return resident.view.cache, indices, valid_counts
-        return resident.view.cache, converted
+            return resident_cache, indices, valid_counts
+        return resident_cache, converted
 
     def _hisparse_stage_prefill_rows(
         self, kv_cache: torch.Tensor, attn_metadata: Any
@@ -1094,6 +1097,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
                 kv_cache_dtype,
                 k_scale,
             )
+        self.finish_hisparse_kv_cache_update()
+
+    def finish_hisparse_kv_cache_update(self) -> None:
+        """Submit a prefill mirror after KV has been written to resident cache."""
+        hisparse_cache = self.hisparse_cache
+        if hisparse_cache is None or self._hisparse_dummy_batch:
+            return
         submit_layer_mirror = hisparse_cache.submit_layer_mirror
         if (
             submit_layer_mirror is not None

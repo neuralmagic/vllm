@@ -1541,6 +1541,47 @@ def test_hisparse_resident_rows_bypass_hot_lru():
 
 
 @requires_hisparse_ops
+def test_hisparse_bf16_resident_decode_uses_flat_padded_cache():
+    device = torch.device(DEVICE_TYPE)
+    block_size, row_width = 4, 8
+    page_bytes = block_size * row_width * torch.float32.itemsize
+    cache_handle = _make_hisparse_cache_handle(
+        top_k=128,
+        device_buffer_size=128,
+        max_num_reqs=1,
+        row_width=row_width,
+        block_size=block_size,
+    )
+    raw = torch.zeros(2 * page_bytes, dtype=torch.uint8, device=device)
+    cache_handle.bind_cache(
+        raw,
+        byte_offset=0,
+        block_stride=2 * page_bytes,
+        num_blocks=1,
+        block_size=block_size,
+        block_table=torch.tensor([[0]], dtype=torch.int32, device=device),
+        slot_mapping=torch.tensor([0], dtype=torch.int64, device=device),
+    )
+    impl = SimpleNamespace(hisparse_cache=cache_handle, kv_cache_dtype="auto")
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.tensor([0], dtype=torch.int32, device=device)
+    )
+
+    resident_cache, _ = SparseMLACommonImpl._hisparse_resident_decode_cache(
+        impl,
+        torch.arange(128, dtype=torch.int32, device=device).remainder_(block_size)[
+            None
+        ],
+        metadata,
+        return_valid_counts=False,
+    )
+
+    assert cache_handle.view is not None
+    assert resident_cache is cache_handle.view.attention_cache
+    assert resident_cache.is_contiguous()
+
+
+@requires_hisparse_ops
 def test_hisparse_swap_in_preserves_rows_across_eviction():
     device = torch.device(DEVICE_TYPE)
     block_size = 64
@@ -1721,6 +1762,12 @@ def test_hisparse_kv_update_uses_common_resident_write_path(
         block_size=block_size,
         block_table=torch.tensor([[1]], dtype=torch.int32, device=device),
         slot_mapping=resident_slots,
+    )
+    cache_handle.mirror_staging_cache = torch.empty(
+        (1, block_size, row_width), dtype=torch.float32, device=device
+    )
+    cache_handle.mirror_staging_slots = torch.arange(
+        block_size, dtype=torch.int64, device=device
     )
 
     slots = torch.tensor([3, 7, -1], dtype=torch.int64, device=device)
@@ -2475,7 +2522,50 @@ def test_hisparse_fp8_decode_resolves_each_speculative_step():
     assert output.shape == (num_tokens, 2, 1)
 
 
-def test_hisparse_decode_reads_resident_cache_when_context_is_resident(monkeypatch):
+@pytest.mark.parametrize("flatten_requests", [False, True])
+def test_hisparse_fp8_decode_batches_resident_speculative_tokens(
+    flatten_requests,
+):
+    num_decodes = 2
+    query_len = 3
+    num_tokens = num_decodes * query_len
+    q = torch.randn(num_tokens, 2, 4, device=DEVICE_TYPE)
+    topk = torch.zeros(num_tokens, 4, dtype=torch.int32, device=DEVICE_TYPE)
+    resident_cache = torch.empty(1, device=DEVICE_TYPE)
+    physical_indices = torch.ones_like(topk)
+    kernel = MagicMock(return_value=(q[..., :1].view(2, 3, 2, 1), None))
+    impl = SimpleNamespace(
+        _can_use_hisparse_resident_cache=True,
+        _hisparse_resident_decode_cache=MagicMock(
+            return_value=(resident_cache, physical_indices)
+        ),
+        _fp8_flash_mla_kernel=kernel,
+    )
+    metadata = SimpleNamespace(
+        num_decodes=num_decodes,
+        num_decode_tokens=num_tokens,
+    )
+
+    output = FlashMLASparseImpl._hisparse_fp8_decode(
+        impl,
+        q,
+        topk,
+        metadata,
+        SimpleNamespace(),
+        flatten_requests=flatten_requests,
+    )
+
+    assert output.shape == (num_tokens, 2, 1)
+    assert kernel.call_count == 1
+    expected_shape = (1, 6) if flatten_requests else (2, 3)
+    assert kernel.call_args.kwargs["q"].shape[:2] == expected_shape
+    assert kernel.call_args.kwargs["topk_indices"].shape[:2] == expected_shape
+
+
+@pytest.mark.parametrize("num_decode_tokens", [0, 1])
+def test_hisparse_reads_resident_cache_when_context_is_resident(
+    monkeypatch, num_decode_tokens
+):
     raw_cache = torch.empty(32, dtype=torch.float32)
     resident_cache = torch.as_strided(
         raw_cache,
@@ -2484,15 +2574,20 @@ def test_hisparse_decode_reads_resident_cache_when_context_is_resident(monkeypat
     )
     block_table = torch.tensor([[1, 0]], dtype=torch.int32)
     cache_handle = SimpleNamespace(
-        decode_batch=True,
+        decode_batch=num_decode_tokens > 0,
         all_context_pages_resident=True,
-        view=SimpleNamespace(cache=resident_cache, block_size=2),
+        view=SimpleNamespace(
+            cache=resident_cache,
+            attention_cache=torch.empty_like(resident_cache),
+            block_size=2,
+        ),
         block_table=block_table,
         resolve_topk=MagicMock(),
     )
     impl = object.__new__(FlashMLASparseImpl)
     impl.hisparse_cache = cache_handle
     impl.dcp_world_size = 1
+    impl.kv_cache_dtype = "fp8_ds_mla"
     topk = torch.tensor([[0, 1]], dtype=torch.int32)
     expected_indices = torch.tensor([[6, 7]], dtype=torch.int32)
     expected_counts = torch.tensor([2], dtype=torch.int32)
@@ -2503,7 +2598,7 @@ def test_hisparse_decode_reads_resident_cache_when_context_is_resident(monkeypat
         convert,
     )
     metadata = SimpleNamespace(
-        num_decode_tokens=1,
+        num_decode_tokens=num_decode_tokens,
         req_id_per_token=torch.tensor([0], dtype=torch.int32),
     )
 
@@ -2514,7 +2609,7 @@ def test_hisparse_decode_reads_resident_cache_when_context_is_resident(monkeypat
     assert cache is resident_cache
     assert indices is expected_indices
     assert counts is expected_counts
-    assert convert.call_args.kwargs["BLOCK_STRIDE_ROWS"] == 3
+    assert convert.call_args.kwargs["BLOCK_STRIDE_ROWS"] is None
     cache_handle.resolve_topk.assert_not_called()
 
 
@@ -2538,9 +2633,15 @@ def test_hisparse_cudagraph_captures_resident_decode(monkeypatch, cudagraph_mode
     assert impl._can_use_hisparse_resident_cache
 
 
-def test_flashmla_fp8_decode_uses_hisparse_cache_selector():
+@pytest.mark.parametrize("decode_batch", [False, True])
+def test_flashmla_fp8_resident_batch_uses_hisparse_cache_selector(decode_batch):
     impl = object.__new__(FlashMLASparseImpl)
-    impl.hisparse_cache = SimpleNamespace(decode_batch=True)
+    impl.hisparse_cache = SimpleNamespace(
+        decode_batch=decode_batch,
+        all_context_pages_resident=True,
+    )
+    impl._hisparse_dummy_batch = False
+    impl.dcp_world_size = 1
     selected_cache = torch.empty(2, 2, 4, device=DEVICE_TYPE)
     selected_indices = torch.zeros(2, 4, dtype=torch.int32, device=DEVICE_TYPE)
     impl._hisparse_decode_cache = MagicMock(
@@ -2549,11 +2650,12 @@ def test_flashmla_fp8_decode_uses_hisparse_cache_selector():
     q = torch.empty(2, 2, 3, device=DEVICE_TYPE)
     impl._fp8_flash_mla_kernel = MagicMock(return_value=(q.unsqueeze(0), None))
     metadata = SimpleNamespace(
+        num_decode_tokens=0 if not decode_batch else 2,
         fp8_extra_metadata=FlashMLASparseMetadata.FP8KernelMetadata(
             scheduler_metadata=object(),  # type: ignore[arg-type]
             dummy_block_table=torch.empty(1, 1, dtype=torch.int32),
             cache_lens=torch.empty(1, dtype=torch.int32),
-        )
+        ),
     )
 
     output, lse = impl._forward_fp8_kv_mixed_batch(

@@ -762,9 +762,13 @@ class HiSparseCoordinator:
             int, tuple[str, _HiSparseRequestState, list[_PendingSpill]]
         ] = {}
         for pending in self.pending_spills.values():
-            if pending.expected_worker_completions and (
-                not pending.enqueue_applied
-                or (pending.release_after and not pending.resident_released)
+            if (
+                pending.expected_worker_completions
+                and pending.worker_completions >= pending.expected_worker_completions
+                and (
+                    not pending.enqueue_applied
+                    or (pending.release_after and not pending.resident_released)
+                )
             ):
                 request_id = pending.page[0]
                 entry = ready_by_state.setdefault(

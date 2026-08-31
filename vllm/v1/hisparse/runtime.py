@@ -71,6 +71,7 @@ class ResolvedHiSparseConfig:
     top_k: int
     device_buffer_size: int
     host_pool_gib: float
+    eager_host_mirror: bool = True
 
     @classmethod
     def from_vllm_config(
@@ -122,6 +123,7 @@ class ResolvedHiSparseConfig:
             top_k=model_top_k,
             device_buffer_size=device_buffer_size,
             host_pool_gib=config.host_pool_gib,
+            eager_host_mirror=config.eager_host_mirror,
         )
 
 
@@ -563,7 +565,7 @@ class HiSparseRuntime:
         self.index_group = index_group
         index_group.stats_row_bytes += row_bytes
 
-        self.eager_host_mirror = False
+        self.eager_host_mirror = config.eager_host_mirror
         self.resident_source_index = -1
         self.request_state_indices: torch.Tensor | None = None
         self.shared_host_region: SharedOffloadRegion | None = None
@@ -681,11 +683,19 @@ class HiSparseRuntime:
         request_state_indices: torch.Tensor,
     ) -> None:
         """Drop scheduled requests' hot copies of recycled global slots."""
-        device_global_indices = self.index_group.device_global_indices
         slots = slots.to(device=self.device, dtype=torch.int32)
         state_indices = request_state_indices.to(device=self.device, dtype=torch.long)
-        active_indices = device_global_indices.index_select(0, state_indices)
         sorted_slots = torch.sort(slots).values
+        self.invalidate_sorted_slots(sorted_slots, state_indices)
+
+    def invalidate_sorted_slots(
+        self,
+        sorted_slots: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> None:
+        """Drop hot copies using shared, preprocessed invalidation inputs."""
+        device_global_indices = self.index_group.device_global_indices
+        active_indices = device_global_indices.index_select(0, state_indices)
         positions = torch.searchsorted(sorted_slots, active_indices)
         positions.clamp_(max=sorted_slots.numel() - 1)
         active_indices.masked_fill_(
@@ -970,10 +980,6 @@ def create_hisparse_cache_handle(
     )
     if is_index_group_leader and index_group_builder is not None:
         index_group_builder.current_group = runtime.index_group
-    kv_transfer_config = vllm_config.kv_transfer_config
-    runtime.eager_host_mirror = bool(
-        kv_transfer_config is not None and kv_transfer_config.is_kv_producer
-    )
     logger.info_once(
         "Enabled experimental HiSparse HMA hot cache: top_k=%d, "
         "device_buffer_size=%d (%d LRU rows), host_pool_gib=%s, "

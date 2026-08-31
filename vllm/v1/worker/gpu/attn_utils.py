@@ -448,6 +448,7 @@ def _bind_hisparse_kv_caches(
             if (
                 resident.cache.untyped_storage().data_ptr()
                 != hot.cache.untyped_storage().data_ptr()
+                or resident.cache.data_ptr() != hot.cache.data_ptr()
                 or resident.cache.stride() != hot.cache.stride()
             ):
                 raise RuntimeError("HiSparse resident and hot layouts must match.")
@@ -606,6 +607,8 @@ def build_attn_metadata(
     attn_metadata: dict[str, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
+        if not attn_groups[i]:
+            continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
         # Per-group causal for hybrid drafters (mixed SWA/full attention).

@@ -250,6 +250,28 @@ def test_hisparse_builds_dma_row_mirrors_across_pages():
     assert [mirror.num_rows for mirror in mirrors] == [2, 2]
 
 
+def test_hisparse_row_mirrors_keep_pending_pages_current():
+    manager = make_hisparse_kv_cache_manager(32, 16, enable_caching=True)
+    coordinator = manager.hisparse_coordinator
+    coordinator.max_spill_pages = 1
+    request = make_request(
+        "request",
+        list(range(2 * HISPARSE_BLOCK_SIZE)),
+        HISPARSE_BLOCK_SIZE,
+        sha256,
+    )
+    assert manager.allocate_slots(request, num_new_tokens=32) is not None
+    resident_blocks = coordinator.resident_managers[0].req_to_blocks[request.request_id]
+
+    mirrors = coordinator.build_row_mirrors([(request.request_id, 14, 4)])
+
+    assert [mirror.source_starts for mirror in mirrors] == [
+        (resident_blocks[0].block_id * HISPARSE_BLOCK_SIZE + 14,),
+        (resident_blocks[1].block_id * HISPARSE_BLOCK_SIZE,),
+    ]
+    assert [mirror.num_rows for mirror in mirrors] == [2, 2]
+
+
 def test_hisparse_reports_when_context_is_fully_resident():
     manager = make_hisparse_kv_cache_manager(32, 16)
     request = make_request(
@@ -316,6 +338,33 @@ def test_hisparse_host_prefix_can_be_completed_by_indexer_offload():
     # The local prefix is adopted from shadow pages (GPU-resident), while the
     # externally imported page stays host-backed until its tail allocation.
     assert not any(block.is_null for block in resident[:2])
+
+
+def test_hisparse_indexer_offload_is_capped_by_missing_host_prefix():
+    manager = make_hisparse_kv_cache_manager(
+        32,
+        16,
+        enable_caching=True,
+    )
+    tokens = list(range(4 * HISPARSE_BLOCK_SIZE))
+    original = make_request("original", tokens, HISPARSE_BLOCK_SIZE, sha256)
+    assert manager.allocate_slots(original, num_new_tokens=len(tokens)) is not None
+    spills = manager.hisparse_coordinator.build_offload_command().page_transfers
+    spill_counts = {spill.transfer_id: 1 for spill in spills}
+    manager.hisparse_coordinator.update_spills(spill_counts, spill_counts)
+    host_blocks, _, _, _ = manager.get_blocks(original.request_id).blocks
+    evicted_host_id = host_blocks[0].block_id
+    manager.free(original)
+    assert manager.hisparse_coordinator.evict_host_blocks({evicted_host_id})
+
+    resumed = make_request("resumed", tokens, HISPARSE_BLOCK_SIZE, sha256)
+    _, num_local, _, diverged, max_completion = (
+        manager.get_computed_blocks_for_group_completion(resumed, frozenset({1}))
+    )
+
+    assert not diverged
+    assert num_local == 0
+    assert max_completion == 0
 
 
 def allocate_external_prefix(
@@ -402,6 +451,8 @@ def test_hisparse_materializes_prefix_without_allocating_hot_blocks():
     spills = manager.hisparse_coordinator.build_offload_command().page_transfers
     assert len(spills) == 2
     assert all(spill.after_forward for spill in spills)
+    resident_blocks = manager.get_blocks(request.request_id).blocks[2]
+    assert [block.ref_cnt for block in resident_blocks] == [2, 2]
     spill_counts = {spill.transfer_id: 1 for spill in spills}
     duplicate = make_request(
         "duplicate",
@@ -413,10 +464,12 @@ def test_hisparse_materializes_prefix_without_allocating_hot_blocks():
     assert num_computed == 0
 
     manager.hisparse_coordinator.update_spills(spill_counts, {})
+    assert [block.ref_cnt for block in resident_blocks] == [2, 2]
     _, num_computed, _ = manager.get_computed_blocks(duplicate)
     assert num_computed == 0
 
     manager.hisparse_coordinator.update_spills({}, {spills[1].transfer_id: 1})
+    assert [block.ref_cnt for block in resident_blocks] == [2, 1]
     _, num_computed, _ = manager.get_computed_blocks(duplicate)
     assert num_computed == 0
 
