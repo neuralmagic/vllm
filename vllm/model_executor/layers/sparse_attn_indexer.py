@@ -550,14 +550,22 @@ def sparse_attn_indexer(
             # can't produce NaN/Inf in the logits kernel.
             if q_scale is not None:
                 padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens, pad_value=0
+                    q_quant[:num_decode_tokens],
+                    decode_lens,
+                    pad_value=0,
+                    max_length=decode_metadata.max_decode_len,
                 )
                 padded_q_scale = pack_seq_triton(
-                    q_scale[:num_decode_tokens], decode_lens, pad_value=0
+                    q_scale[:num_decode_tokens],
+                    decode_lens,
+                    pad_value=0,
+                    max_length=decode_metadata.max_decode_len,
                 )
             else:
                 padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens
+                    q_quant[:num_decode_tokens],
+                    decode_lens,
+                    max_length=decode_metadata.max_decode_len,
                 )
                 padded_q_scale = None
         else:
@@ -680,6 +688,7 @@ def sparse_attn_indexer(
             topk_indices = unpack_seq_triton(
                 topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
                 decode_lens,
+                total_length=decode_metadata.num_decode_tokens,
             )
             topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
                 topk_indices

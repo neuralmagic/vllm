@@ -434,6 +434,8 @@ class DeepSeekV32IndexerDecodeMetadata:
     # Both fp8_fp4_paged_mqa_logits and the topk kernels accept both shapes.
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
+    max_decode_len: int
+    num_decode_tokens: int
     requires_padding: bool
     schedule_metadata: torch.Tensor
     global_seq_lens: torch.Tensor | None = None
@@ -1051,6 +1053,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 block_table=block_table,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
+                max_decode_len=max_decode_len,
+                num_decode_tokens=num_decode_tokens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
                 indices=decode_indices,

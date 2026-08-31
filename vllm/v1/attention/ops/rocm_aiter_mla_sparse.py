@@ -999,7 +999,9 @@ def rocm_aiter_sparse_attn_indexer(
             # prefill and decode by decode_threshold
             # (currently set to 1 + speculative tokens)
             padded_q_fp8_decode_tokens = pack_seq_triton(
-                q_fp8[:num_decode_tokens], decode_lens
+                q_fp8[:num_decode_tokens],
+                decode_lens,
+                max_length=decode_metadata.max_decode_len,
             )
         else:
             padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
@@ -1062,6 +1064,7 @@ def rocm_aiter_sparse_attn_indexer(
             topk_indices = unpack_seq_triton(
                 topk_indices.reshape(batch_size, next_n, topk_indices.shape[-1]),
                 decode_lens,
+                total_length=decode_metadata.num_decode_tokens,
             )
             topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
                 topk_indices

@@ -66,6 +66,7 @@ def pack_seq_triton(
     pad_value: float | int = -float("inf"),
     block_t: int = 64,
     block_d: int = 64,
+    max_length: int | None = None,
 ) -> torch.Tensor:
     """Pack sequences of different lengths into a batched tensor.
 
@@ -105,7 +106,7 @@ def pack_seq_triton(
         x_reshaped = x
 
     B = lengths.numel()
-    Lmax = int(lengths.max().item())
+    Lmax = max_length if max_length is not None else int(lengths.max().item())
 
     out = torch.empty((B, Lmax, D), device=x.device, dtype=x.dtype)
 
@@ -179,6 +180,7 @@ def unpack_seq_triton(
     lengths: torch.Tensor,
     block_t: int = 64,
     block_d: int = 64,
+    total_length: int | None = None,
 ) -> torch.Tensor:
     """
     Unpack a packed decode query tensor back to the original format.
@@ -205,7 +207,7 @@ def unpack_seq_triton(
         packed_reshaped = packed_tensor
 
     # Calculate total number of elements
-    N = int(lengths.sum().item())
+    N = total_length if total_length is not None else int(lengths.sum().item())
 
     out = torch.empty((N, D), device=packed_tensor.device, dtype=packed_tensor.dtype)
 
