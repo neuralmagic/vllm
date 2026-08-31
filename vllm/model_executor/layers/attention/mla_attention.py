@@ -1278,25 +1278,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
 
 
-@eager_break_during_capture
-def unified_mla_kv_cache_update(
+def _update_mla_kv_cache(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
-    layer_name: LayerNameType,
+    attn_metadata: "MLACommonMetadata | None",
+    attn_layer: MLAAttention,
+    kv_cache: torch.Tensor,
+    layer_slot_mapping: torch.Tensor | None,
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Returns an empty dummy that is passed to unified_attention to signal a side
-    effect and preserve ordering. The empty tensor has no storage, so replay can
-    discard the eager call's return value safely.
-    """
-    layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
-        layer_name
-    )
+) -> None:
     if layer_slot_mapping is not None:
-        attn_layer.impl.prepare_for_batch(attn_metadata)
         kv_c_normed, k_pe, layer_slot_mapping = maybe_gather_mla_latent_cache_inputs(
             kv_c_normed,
             k_pe,
@@ -1307,6 +1299,34 @@ def unified_mla_kv_cache_update(
         attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
             kv_c_normed,
             k_pe,
+            kv_cache,
+            layer_slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+        )
+
+
+def unified_mla_kv_cache_update(
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    layer_name: LayerNameType,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Update ordinary MLA caches ahead of the attention custom op."""
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+    # HiSparse writes depend on live residency state and run at the existing
+    # attention boundary below instead of baking capture-time state into the graph.
+    if getattr(attn_layer.impl, "hisparse_cache", None) is None:
+        attn_layer.impl.prepare_for_batch(attn_metadata)
+        _update_mla_kv_cache(
+            kv_c_normed,
+            k_pe,
+            attn_metadata,
+            attn_layer,
             kv_cache,
             layer_slot_mapping,
             kv_cache_dtype,
@@ -1355,7 +1375,21 @@ def unified_mla_attention_with_output(
     # attention forward.
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
-    attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+    layer.impl.prepare_for_batch(attn_metadata)
+    if getattr(layer.impl, "hisparse_cache", None) is not None:
+        _update_mla_kv_cache(
+            kv_c_normed,
+            k_pe,
+            attn_metadata,
+            layer,
+            kv_cache,
+            layer_slot_mapping,
+            layer.kv_cache_dtype,
+            layer._k_scale,
+        )
     layer.forward_impl(
         q,
         kv_c_normed,

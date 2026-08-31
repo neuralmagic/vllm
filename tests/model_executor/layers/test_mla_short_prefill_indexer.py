@@ -9,12 +9,67 @@ import torch
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 import vllm.models.deepseek_v32.attention as deepseek_attention
 from vllm.config import CUDAGraphMode
+from vllm.model_executor.layers.attention import mla_attention
 from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
+
+
+def test_unified_mla_attention_updates_hisparse_cache_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replayed attention boundary must write the current HiSparse batch."""
+    metadata = SimpleNamespace(num_decode_tokens=0)
+    kv_cache = torch.empty(1)
+    slot_mapping = torch.empty(1, dtype=torch.int64)
+    k_scale = torch.empty(1)
+    calls = []
+
+    def prepare_for_batch(attn_metadata):
+        assert attn_metadata is metadata
+        calls.append("prepare")
+
+    def do_kv_cache_update(kv_c, k_pe, cache, slots, dtype, scale):
+        assert calls == ["prepare"]
+        assert cache is kv_cache
+        assert slots is slot_mapping
+        assert dtype == "auto"
+        assert scale is k_scale
+        calls.append("update")
+
+    def forward_impl(*args, **kwargs):
+        assert calls == ["prepare", "update"]
+        calls.append("forward")
+
+    layer = SimpleNamespace(
+        impl=SimpleNamespace(
+            hisparse_cache=object(),
+            prepare_for_batch=prepare_for_batch,
+            do_kv_cache_update=do_kv_cache_update,
+        ),
+        forward_impl=forward_impl,
+        kv_cache_dtype="auto",
+        _k_scale=k_scale,
+        use_pcp=False,
+    )
+    monkeypatch.setattr(
+        mla_attention,
+        "get_attention_context",
+        lambda _: (metadata, layer, kv_cache, slot_mapping),
+    )
+
+    mla_attention.unified_mla_attention_with_output(
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1),
+        MLA_LAYER,
+    )
+
+    assert calls == ["prepare", "update", "forward"]
 
 
 def test_sparse_attention_refreshes_batch_state_inside_eager_segment(
@@ -286,6 +341,7 @@ def test_deepseek_v32_dispatches_selected_mha(
         skip_topk=False,
         layer_name=MLA_LAYER,
         use_pcp=False,
+        impl=SimpleNamespace(prepare_for_batch=lambda _: None),
         _fp8_query=fp8_query,
         _use_sparse_mha=lambda _: True,
         rotary_emb=lambda _positions, q: (q + 1, None),
