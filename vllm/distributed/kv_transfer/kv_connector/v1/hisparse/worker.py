@@ -377,7 +377,6 @@ class HiSparseConnectorWorker:
             handle.num_actual_tokens = 0
             handle.num_decode_tokens = 0
             handle.req_id_per_token = None
-            handle.use_current_staging = False
         if not self.is_host_writer:
             torch.accelerator.current_stream(self.hot_backing.device).wait_event(
                 self.host_write_event
@@ -555,7 +554,6 @@ class HiSparseConnectorWorker:
             # Draft-model forwards run after the connector's finish_forward hook,
             # so their rows cannot participate in the deferred all-layer mirror.
             handle.defer_host_mirror = False
-            handle.use_current_staging = True
         if any(handle.num_actual_tokens != 0 for handle in inactive_handles):
             raise RuntimeError("HiSparse active cache layers must form a prefix.")
         mismatch = next(

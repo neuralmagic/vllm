@@ -23,7 +23,6 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             self._hisparse_cache_handles = handles
         for handle in handles:
             handle.defer_host_mirror = False
-            handle.use_current_staging = True
 
     def load_draft_model(
         self,

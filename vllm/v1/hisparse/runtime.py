@@ -1043,7 +1043,6 @@ class HiSparseCacheHandle:
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None
         self.defer_host_mirror = False
-        self.use_current_staging = False
         self.host_mirror_writer = True
         self.mirror_slot_mapping: torch.Tensor | None = None
         self.mirror_staging_cache: torch.Tensor | None = None
@@ -1084,7 +1083,8 @@ class HiSparseCacheHandle:
     ) -> None:
         assert self.view is not None and self.slot_mapping is not None
         host_slots = slot_mapping.flatten()
-        if self.use_current_staging:
+        mirror_immediately = not self.defer_host_mirror
+        if mirror_immediately:
             # MTP captures this path. Padded replay buffers, not Python batch
             # counts frozen at capture time, determine which rows are active.
             num_rows = min(kv_c_normed.shape[0], host_slots.numel())
@@ -1092,7 +1092,7 @@ class HiSparseCacheHandle:
             num_rows = min(
                 kv_c_normed.shape[0], host_slots.numel(), self.num_actual_tokens
             )
-        if not mirror_to_host and not self.use_current_staging:
+        if not mirror_to_host and not mirror_immediately:
             num_rows = min(num_rows, self.runtime.max_num_reqs)
         if num_rows == 0:
             return
@@ -1105,7 +1105,7 @@ class HiSparseCacheHandle:
             kv_cache_dtype=kv_cache_dtype,
             scale=k_scale,
         )
-        if mirror_to_host or self.runtime.eager_host_mirror or self.use_current_staging:
+        if mirror_to_host or self.runtime.eager_host_mirror or mirror_immediately:
             mirrored_slots = host_slots[:num_rows].to(
                 device=self.runtime.device, dtype=torch.int64
             )
@@ -1118,7 +1118,7 @@ class HiSparseCacheHandle:
             mirrored_slots = mirrored_slots.contiguous()
             mirror_src_cache = self.view.cache
             mirror_src_slots = resident_slots
-            if mirror_to_host or self.use_current_staging:
+            if mirror_to_host or mirror_immediately:
                 staging_cache = self.mirror_staging_cache
                 staging_slots = self.mirror_staging_slots
                 if staging_cache is None or staging_slots is None:
@@ -1144,7 +1144,7 @@ class HiSparseCacheHandle:
                     mirror_src_slots,
                     mirrored_slots,
                 )
-            if self.runtime.is_group_leader and self.use_current_staging:
+            if self.runtime.is_group_leader and mirror_immediately:
                 assert self.req_id_per_token is not None
                 self.runtime.invalidate_written_slots(
                     mirrored_slots[:num_rows],
@@ -1172,9 +1172,10 @@ class HiSparseCacheHandle:
         seq_lens: torch.Tensor | None = None,
     ) -> HiSparseTopKResult:
         num_tokens = topk_indices.shape[0]
+        mirror_immediately = not self.defer_host_mirror
         current_cache = (
             self.mirror_staging_cache
-            if not self.decode_batch or self.use_current_staging
+            if not self.decode_batch or mirror_immediately
             else None
         )
         if not self.runtime.is_group_leader:

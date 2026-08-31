@@ -493,7 +493,6 @@ def test_hisparse_trailing_draft_replays_padded_current_rows(monkeypatch):
     cache.req_id_per_token = torch.tensor([0, -1], dtype=torch.int32)
     cache.decode_batch = True
     cache.defer_host_mirror = False
-    cache.use_current_staging = True
     cache.host_mirror_writer = True
     cache.mirror_staging_cache = torch.empty((2, 2, 4))
     cache.mirror_staging_slots = torch.tensor([0, 1], dtype=torch.int64)
@@ -627,7 +626,6 @@ def test_hisparse_finish_forward_excludes_trailing_mtp_cache(monkeypatch):
         runtime=runtime,
         decode_batch=False,
         defer_host_mirror=True,
-        use_current_staging=False,
         num_actual_tokens=0,
         num_decode_tokens=0,
         req_id_per_token=None,
@@ -671,7 +669,6 @@ def test_hisparse_finish_forward_excludes_trailing_mtp_cache(monkeypatch):
     assert backup_layers.call_args.args[2].numel() == 1
     assert backup_layers.call_args.args[4].numel() == 1
     assert not mtp.defer_host_mirror
-    assert mtp.use_current_staging
 
 
 def test_hisparse_shared_host_reader_skips_mirror(monkeypatch):

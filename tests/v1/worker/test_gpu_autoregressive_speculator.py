@@ -249,7 +249,7 @@ def test_multi_module_mm_support_configured_after_model_load(monkeypatch):
 
 def test_mtp_graph_capture_stages_current_hisparse_rows():
     """Captured MTP forwards must not omit current-step sparse KV rows."""
-    handle = SimpleNamespace(defer_host_mirror=True, use_current_staging=False)
+    handle = SimpleNamespace(defer_host_mirror=True)
     speculator = object.__new__(MTPSpeculator)
     speculator.model = _HiSparseDraftModel(handle)
     speculator.share_mtp_topk_indices = False
@@ -257,7 +257,6 @@ def test_mtp_graph_capture_stages_current_hisparse_rows():
     speculator.on_prefill_begin(num_reqs=1)
 
     assert not handle.defer_host_mirror
-    assert handle.use_current_staging
 
 
 def test_hisparse_draft_prefill_preserves_configured_cudagraph_mode(monkeypatch):

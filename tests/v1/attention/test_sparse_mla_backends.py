@@ -1631,7 +1631,7 @@ def test_hisparse_swap_in_reads_current_nonresident_rows_from_device():
     ).view(1, block_size, row_width)
     cache_handle.mirror_staging_cache = current
     cache_handle.decode_batch = True
-    cache_handle.use_current_staging = True
+    cache_handle.defer_host_mirror = False
 
     cache, indices = cache_handle.resolve_topk(
         req_id_per_token=torch.tensor([0], dtype=torch.int32, device=device),
