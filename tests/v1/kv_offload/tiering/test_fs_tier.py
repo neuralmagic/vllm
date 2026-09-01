@@ -455,7 +455,12 @@ def test_wait_idle_blocks_until_tasks_complete():
     # dummy task
     task = Task(key=key(0), path="0", offset=0)
 
-    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+    pool = DualQueueThreadPool(
+        n_read_threads=1,
+        n_write_threads=1,
+        n_read_fast_threads=1,
+        n_write_fast_threads=1,
+    )
     pool.enqueue_store(
         job_id=1,
         n_tasks=1,

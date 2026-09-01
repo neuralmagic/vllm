@@ -113,8 +113,10 @@ class FileSystemTierManager(SecondaryTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         root_dir: str,
-        n_read_threads: int = 16,
-        n_write_threads: int = 16,
+        n_read_threads: int = 14,
+        n_write_threads: int = 14,
+        n_read_fast_threads: int = 2,
+        n_write_fast_threads: int = 2,
         enable_kv_events: bool = False,
         locality: str | None = None,
     ):
@@ -196,6 +198,8 @@ class FileSystemTierManager(SecondaryTierManager):
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
+            n_read_fast_threads,
+            n_write_fast_threads,
             thread_name_prefix="vllm_kv_py_fs",
         )
 
