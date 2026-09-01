@@ -102,6 +102,7 @@ class WorkItem:
         assert self.make_batch_fn is not None
         self.fn = self.make_batch_fn(self.tasks)
         self.make_batch_fn = None
+        return self
 
     @property
     def n_tasks(self):
@@ -132,7 +133,8 @@ class DualQueueThreadPool:
         self._n_write_threads = n_write_threads
         self._n_read_fast_threads = n_read_fast_threads
         self._load_q: deque = deque()
-        self._load_fast_q: PriorityQueue = PriorityQueue()
+        self._load_fast_q: deque = deque()
+        self._load_fast_pq: PriorityQueue = PriorityQueue()
         self._store_q: PriorityQueue = PriorityQueue()
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
@@ -242,7 +244,7 @@ class DualQueueThreadPool:
                 self._inflight_load_tasks += n_tasks
                 tasks_per_job = self._inflight_load_tasks / self._inflight_load_jobs
                 if n_tasks < tasks_per_job and self._n_read_fast_threads:
-                    self._load_fast_q.put(
+                    self._load_fast_pq.put(
                         (n_tasks, state.job_id, wi)
                     )  # not materialized
                     num_work += 1
@@ -251,8 +253,9 @@ class DualQueueThreadPool:
                         self._load_q.append(w)  # materialized
                         num_work += 1
             else:
-                wi.materialize()
-                self._store_q.put((n_tasks, state.job_id, wi))  # materialized
+                self._store_q.put(
+                    (n_tasks, state.job_id, wi.materialize())
+                )  # materialized
                 num_work += 1
             self._condition.notify_all()
 
@@ -326,33 +329,46 @@ class DualQueueThreadPool:
     def _worker(self, role: Role) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
 
+        def populate_fast_q(n_threads: int):
+            assert not self._load_fast_q
+            assert not self._load_fast_pq.empty()
+            _, _, wi = self._load_fast_pq.get()
+            assert not wi.is_materialized()
+            # batch only if it is necessary.
+            if wi.n_tasks <= n_threads:
+                self._load_fast_q.append(wi.materialize())
+            else:
+                for w in self._batch_workitem(wi, n_threads):
+                    self._load_fast_q.append(w)
+
         def fetch_work():
             if role == Role.LOAD:
                 if self._load_q:
                     return self._load_q.popleft().as_work()
-                assert not self._load_fast_q.empty()
+                if self._load_fast_q:
+                    return self._load_fast_q.popleft().as_work()
                 print(f"Warning : {role} fetching from fast q")
-                _, _, wi = self._load_fast_q.get()
-                assert not wi.is_materialized()
-                for w in self._batch_workitem(wi, self._n_read_threads):
-                    self._load_q.append(w)
-                return self._load_q.popleft().as_work()
+                populate_fast_q(self._n_read_threads)
+                return self._load_fast_q.popleft().as_work()
+
             if role == Role.STORE:
                 _, _, wi = self._store_q.get()
                 return wi.as_work()
             if role == Role.LOAD_FAST:
-                assert not self._load_fast_q.empty()
-                _, _, wi = self._load_fast_q.get()
-                wi.materialize()
-                return wi.as_work()
+                if self._load_fast_q:
+                    return self._load_fast_q.popleft().as_work()
+                populate_fast_q(self._n_read_fast_threads)
+                return self._load_fast_q.popleft().as_work()
 
         def has_work():
             if role == Role.LOAD:
-                return self._load_q or not self._load_fast_q.empty()
+                return (
+                    self._load_q or self._load_fast_q or not self._load_fast_pq.empty()
+                )
             if role == Role.STORE:
                 return not self._store_q.empty()
             if role == Role.LOAD_FAST:
-                return not self._load_fast_q.empty()
+                return self._load_fast_q or not self._load_fast_pq.empty()
 
         while True:
             with self._condition:
