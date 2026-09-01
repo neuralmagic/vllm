@@ -106,8 +106,7 @@ def _warmup_hisparse_index_conversion(runner: "V2GPUModelRunner") -> None:
 
     attention_strides: dict[int, set[int]] = {}
     for layer in runner.vllm_config.compilation_config.static_forward_context.values():
-        impl = getattr(layer, "impl", None)
-        cache = getattr(impl, "hisparse_cache", None)
+        cache = getattr(layer, "hisparse_cache", None)
         if cache is None:
             continue
         hot = cache.runtime.hot
