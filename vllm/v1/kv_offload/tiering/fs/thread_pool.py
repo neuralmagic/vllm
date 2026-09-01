@@ -84,7 +84,6 @@ class Role(Enum):
     LOAD = 1
     STORE = 2
     LOAD_FAST = 3  # fast lane for quick jobs
-    STORE_FAST = 4  # fast lane for quick jobs
 
 
 @dataclass
@@ -125,19 +124,16 @@ class DualQueueThreadPool:
     def __init__(
         self,
         n_read_threads: int,  # batched. big enough to drive bw
-        n_read_fast_threads: int,  # small; absorb small jobs
         n_write_threads: int,  # not batched. big enough to absorb writes
-        n_write_fast_threads: int,  # smalle; absort small jobs
+        n_read_fast_threads: int,  # small; absorb small jobs
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
         self._n_read_threads = n_read_threads
         self._n_write_threads = n_write_threads
         self._n_read_fast_threads = n_read_fast_threads
-        self._n_write_fast_threads = n_write_fast_threads
         self._load_q: deque = deque()
         self._load_fast_q: PriorityQueue = PriorityQueue()
-        self._store_q: deque = deque()
-        self._store_fast_q: PriorityQueue = PriorityQueue()
+        self._store_q: PriorityQueue = PriorityQueue()
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
@@ -181,24 +177,9 @@ class DualQueueThreadPool:
             t.start()
             self._threads.append(t)
 
-        for i in range(self._n_write_fast_threads):
-            t = threading.Thread(
-                target=self._worker,
-                args=(Role.STORE_FAST,),
-                name=f"{thread_name_prefix}_sf{i}",
-                daemon=True,
-            )
-            t.start()
-            self._threads.append(t)
-
     @property
     def total_threads(self) -> int:
-        return (
-            self._n_read_threads
-            + self._n_write_threads
-            + self._n_read_fast_threads
-            + self._n_write_fast_threads
-        )
+        return self._n_read_threads + self._n_write_threads + self._n_read_fast_threads
 
     def _batch_tasks(
         self,
@@ -238,7 +219,6 @@ class DualQueueThreadPool:
 
     def _enqueue(
         self,
-        queue: deque,
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
         job_id: JobId,
         tasks: Iterable[Task],
@@ -261,7 +241,7 @@ class DualQueueThreadPool:
                 self._inflight_load_jobs += 1
                 self._inflight_load_tasks += n_tasks
                 tasks_per_job = self._inflight_load_tasks / self._inflight_load_jobs
-                if n_tasks < tasks_per_job:
+                if n_tasks < tasks_per_job and self._n_read_fast_threads:
                     self._load_fast_q.put(
                         (n_tasks, state.job_id, wi)
                     )  # not materialized
@@ -271,17 +251,9 @@ class DualQueueThreadPool:
                         self._load_q.append(w)  # materialized
                         num_work += 1
             else:
-                self._inflight_store_jobs += 1
-                self._inflight_store_tasks += n_tasks
-                tasks_per_job = self._inflight_store_tasks / self._inflight_store_jobs
-                if n_tasks < tasks_per_job:
-                    wi.materialize()
-                    self._store_fast_q.put((n_tasks, state.job_id, wi))  # materialized
-                    num_work += 1
-                else:
-                    wi.materialize()
-                    self._store_q.append(wi)  # materialized
-                    num_work += 1
+                wi.materialize()
+                self._store_q.put((n_tasks, state.job_id, wi))  # materialized
+                num_work += 1
             self._condition.notify_all()
 
     def enqueue_load(
@@ -294,7 +266,6 @@ class DualQueueThreadPool:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
 
         self._enqueue(
-            self._load_q,
             make_batch_fn,
             job_id,
             tasks,
@@ -312,7 +283,6 @@ class DualQueueThreadPool:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
 
         self._enqueue(
-            self._store_q,
             make_batch_fn,
             job_id,
             tasks,
@@ -343,7 +313,8 @@ class DualQueueThreadPool:
         with self._condition:
             self._stop = True
             self._load_q.clear()
-            self._store_q.clear()
+            while not self._store_q.empty():
+                self._store_q.get()
             # Cancelled tasks will not decrement _inflight_jobs; reset it so a
             # subsequent wait_idle() returns instead of hanging.
             self._inflight_jobs = 0
@@ -367,31 +338,21 @@ class DualQueueThreadPool:
                     self._load_q.append(w)
                 return self._load_q.popleft().as_work()
             if role == Role.STORE:
-                if self._store_q:
-                    return self._store_q.popleft().as_work()
-                print(f"Warning : {role} fetching from fast q")
-                assert not self._store_fast_q.empty()
-                _, _, wi = self._store_fast_q.get()
+                _, _, wi = self._store_q.get()
                 return wi.as_work()
             if role == Role.LOAD_FAST:
                 assert not self._load_fast_q.empty()
                 _, _, wi = self._load_fast_q.get()
                 wi.materialize()
                 return wi.as_work()
-            if role == Role.STORE_FAST:
-                assert not self._store_fast_q.empty()
-                _, _, wi = self._store_fast_q.get()
-                return wi.as_work()
 
         def has_work():
             if role == Role.LOAD:
                 return self._load_q or not self._load_fast_q.empty()
             if role == Role.STORE:
-                return self._store_q or not self._store_fast_q.empty()
+                return not self._store_q.empty()
             if role == Role.LOAD_FAST:
                 return not self._load_fast_q.empty()
-            if role == Role.STORE_FAST:
-                return not self._store_fast_q.empty()
 
         while True:
             with self._condition:

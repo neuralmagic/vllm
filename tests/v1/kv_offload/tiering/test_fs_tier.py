@@ -360,7 +360,8 @@ def test_shutdown_discards_pending_tasks(fs_tier):
 
     # Verify queues are cleared and threads stopped
     assert len(tier._pool._load_q) == 0
-    assert len(tier._pool._store_q) == 0
+    # assert len(tier._pool._store_q) == 0
+    assert tier._pool._store_q.empty()
     assert all(not t.is_alive() for t in tier._pool._threads)
 
 
@@ -459,7 +460,6 @@ def test_wait_idle_blocks_until_tasks_complete():
         n_read_threads=1,
         n_write_threads=1,
         n_read_fast_threads=1,
-        n_write_fast_threads=1,
     )
     pool.enqueue_store(
         job_id=1,
