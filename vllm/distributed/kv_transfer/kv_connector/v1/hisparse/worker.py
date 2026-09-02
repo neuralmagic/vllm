@@ -18,12 +18,16 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
 )
-from vllm.utils.torch_utils import current_stream
+from vllm.utils.torch_utils import (
+    current_stream,
+    get_accelerator_view_from_cpu_tensor,
+)
 from vllm.v1.core.kv_cache_utils import (
     HISPARSE_HOT_SUFFIX,
     KVCacheBlockCopy,
     get_unique_kv_cache_group_id,
 )
+from vllm.v1.hisparse.mirror_scatter import scatter_mirror_rows
 from vllm.v1.hisparse.runtime import HiSparseCacheHandle, release_pinned_state
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
 from vllm.v1.kv_cache_interface import (
@@ -74,16 +78,139 @@ def _get_hisparse_cache(
     return hisparse_cache
 
 
-def _flatten_row_mirrors(
+def _trim_row_mirrors(
+    mirrors: Sequence[SparseKVRowMirror],
+    head_rows: int,
+    num_rows: int,
+) -> tuple[SparseKVRowMirror, ...]:
+    """Drop ``head_rows`` leading rows, then keep the next ``num_rows`` rows.
+
+    Advancing an entry by ``t`` rows moves ``destination_start`` and every
+    ``source_start`` forward by ``t`` and shrinks ``num_rows`` by ``t``.
+    """
+    window_rows = sum(mirror.num_rows for mirror in mirrors)
+    if head_rows < 0 or num_rows < 0 or head_rows + num_rows > window_rows:
+        raise RuntimeError(
+            "HiSparse row mirror trim is out of range: "
+            f"head {head_rows} + {num_rows} rows for a {window_rows}-row window."
+        )
+    trimmed: list[SparseKVRowMirror] = []
+    remaining = num_rows
+    for mirror in mirrors:
+        if remaining == 0:
+            break
+        if head_rows >= mirror.num_rows:
+            head_rows -= mirror.num_rows
+            continue
+        if head_rows:
+            mirror = SparseKVRowMirror(
+                source_starts=tuple(
+                    start + head_rows for start in mirror.source_starts
+                ),
+                destination_start=mirror.destination_start + head_rows,
+                num_rows=mirror.num_rows - head_rows,
+            )
+            head_rows = 0
+        if mirror.num_rows > remaining:
+            mirror = SparseKVRowMirror(
+                source_starts=mirror.source_starts,
+                destination_start=mirror.destination_start,
+                num_rows=remaining,
+            )
+        remaining -= mirror.num_rows
+        trimmed.append(mirror)
+    return tuple(trimmed)
+
+
+def _align_row_mirrors(
     row_mirrors: Mapping[str, tuple[SparseKVRowMirror, ...]],
     request_ids: Sequence[str] | None,
+    window_starts: Mapping[str, int] | None,
+    request_num_computed: Sequence[int] | np.ndarray | None,
+    request_num_scheduled: Mapping[str, int] | None,
 ) -> tuple[SparseKVRowMirror, ...]:
-    ordered_ids = row_mirrors if request_ids is None else request_ids
-    return tuple(
-        mirror
-        for request_id in ordered_ids
-        for mirror in row_mirrors.get(request_id, ())
+    """Align scheduler row-mirror windows with the rows this forward writes.
+
+    The scheduler mirrors an extended window that starts up to
+    ``row_mirror_extension`` rows before the optimistic token count, so the
+    worker can shift it to the actual start position after draft rejections.
+    Invariant: each request contributes exactly its scheduled token count, so
+    the flattened total matches the forward's ``num_actual_tokens`` and the
+    staging cumsum lines up with the per-token staging writes.
+    """
+    ordered_ids = tuple(row_mirrors) if request_ids is None else request_ids
+    if request_num_computed is not None and (
+        request_ids is None or len(request_num_computed) != len(request_ids)
+    ):
+        request_num_computed = None
+    aligned: list[SparseKVRowMirror] = []
+    for index, request_id in enumerate(ordered_ids):
+        mirrors = row_mirrors.get(request_id, ())
+        if not mirrors:
+            continue
+        window_rows = sum(mirror.num_rows for mirror in mirrors)
+        num_rows = (
+            request_num_scheduled.get(request_id)
+            if request_num_scheduled is not None
+            else None
+        )
+        if request_num_computed is not None:
+            actual_start = int(request_num_computed[index])
+            window_start = (
+                window_starts.get(request_id, actual_start)
+                if window_starts is not None
+                else actual_start
+            )
+            head_rows = actual_start - window_start
+        elif num_rows is not None:
+            # Legacy callers: assume no draft rejection shifted the start, so
+            # only the window extension is dropped.
+            head_rows = window_rows - num_rows
+        else:
+            head_rows = 0
+        if num_rows is None:
+            num_rows = window_rows - head_rows
+        aligned.extend(_trim_row_mirrors(mirrors, head_rows, num_rows))
+    return tuple(aligned)
+
+
+def _build_scatter_maps(
+    row_mirrors: Mapping[str, tuple[SparseKVRowMirror, ...]],
+    window_starts: Mapping[str, int],
+    request_ids: Sequence[str],
+    request_num_scheduled: Mapping[str, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int] | None:
+    """Build position->host-row maps for the GPU mirror scatter.
+
+    Returns (req_of_row, window_starts, window_offsets, dst_rows, num_rows)
+    or None when no request has a mirror window.
+    """
+    scheduled = [request_num_scheduled.get(rid, 0) for rid in request_ids]
+    num_rows = sum(scheduled)
+    if num_rows == 0 or not any(row_mirrors.get(rid) for rid in request_ids):
+        return None
+    req_of_row = np.repeat(
+        np.arange(len(request_ids), dtype=np.int32),
+        np.asarray(scheduled, dtype=np.int64),
     )
+    ws = np.zeros(len(request_ids), dtype=np.int64)
+    window_offsets = np.zeros(len(request_ids) + 1, dtype=np.int64)
+    dst_chunks: list[np.ndarray] = []
+    total = 0
+    for index, request_id in enumerate(request_ids):
+        ws[index] = window_starts.get(request_id, 0)
+        for mirror in row_mirrors.get(request_id, ()):
+            dst_chunks.append(
+                np.arange(
+                    mirror.destination_start,
+                    mirror.destination_start + mirror.num_rows,
+                    dtype=np.int64,
+                )
+            )
+            total += mirror.num_rows
+        window_offsets[index + 1] = total
+    dst_rows = np.concatenate(dst_chunks) if dst_chunks else np.empty(0, dtype=np.int64)
+    return req_of_row, ws, window_offsets, dst_rows, num_rows
 
 
 def _is_hisparse_host_writer(
@@ -126,10 +253,15 @@ class HiSparseConnectorWorker:
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
-        self.row_mirror_enabled = not (
+        self.row_mirror_enabled = True
+        # Under async scheduling the CPU cannot know actual start positions at
+        # enqueue time (draft rejections may not have been sampled yet), so
+        # mirror destinations must be resolved on the GPU from ``positions``.
+        self._scatter_mirrors = vllm_config.speculative_config is not None and bool(
             vllm_config.scheduler_config.async_scheduling
-            and vllm_config.speculative_config is not None
         )
+        self._scatter_state: dict[str, Any] | None = None
+        self._request_positions: torch.Tensor | None = None
         self._initialized = False
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -307,6 +439,12 @@ class HiSparseConnectorWorker:
                 raise RuntimeError("HiSparse prefill mirror staging is not bound.")
             mirror_caches.append(mirror_cache)
         self.mirror_caches = tuple(mirror_caches)
+        self.uva_host_caches: tuple[torch.Tensor, ...] = ()
+        if self._scatter_mirrors and self.is_host_writer:
+            self.uva_host_caches = tuple(
+                get_accelerator_view_from_cpu_tensor(host_cache)
+                for host_cache in host_caches
+            )
 
         for resident_cache, host_cache in zip(resident_caches, host_caches):
             row_bytes = resident_cache.shape[-1] * resident_cache.element_size()
@@ -328,6 +466,9 @@ class HiSparseConnectorWorker:
         metadata: HiSparseConnectorMetadata,
         request_state_indices: torch.Tensor | None,
         request_ids: list[str] | None = None,
+        request_num_computed: Sequence[int] | np.ndarray | None = None,
+        request_num_scheduled: Mapping[str, int] | None = None,
+        request_positions: torch.Tensor | None = None,
     ) -> None:
         previous_host_write_event = self.host_write_event
         host_write_events = getattr(self, "host_write_events", None)
@@ -336,8 +477,47 @@ class HiSparseConnectorWorker:
             self._next_host_write_event ^= 1
         current_stream().wait_event(previous_host_write_event)
         self._release_completed_dma_descriptors()
-        mirrors = _flatten_row_mirrors(metadata.row_mirrors, request_ids)
-        self._set_row_mirrors(mirrors)
+        self._scatter_state = None
+        self._request_positions = request_positions
+        window_starts = getattr(metadata, "row_mirror_window_starts", None)
+        if (
+            getattr(self, "_scatter_mirrors", False)
+            and request_ids is not None
+            and request_positions is not None
+            and window_starts is not None
+            and request_num_scheduled is not None
+        ):
+            # Ship the raw extended windows; the GPU scatter aligns them to
+            # actual positions at execution time.
+            maps = _build_scatter_maps(
+                metadata.row_mirrors,
+                window_starts,
+                request_ids,
+                request_num_scheduled,
+            )
+            if maps is not None:
+                req_of_row, ws, window_offsets, dst_rows, num_rows = maps
+                device = request_positions.device
+                self._scatter_state = {
+                    "req_of_row": torch.from_numpy(req_of_row).to(device),
+                    "window_starts": torch.from_numpy(ws).to(device),
+                    "window_offsets": torch.from_numpy(window_offsets).to(device),
+                    "dst_rows": torch.from_numpy(dst_rows).to(device),
+                    "num_rows": num_rows,
+                }
+        if self._scatter_state is not None:
+            self._set_row_mirrors(())
+            self._scatter_num_rows = self._scatter_state["num_rows"]
+        else:
+            self._scatter_num_rows = 0
+            mirrors = _align_row_mirrors(
+                metadata.row_mirrors,
+                request_ids,
+                window_starts,
+                request_num_computed,
+                request_num_scheduled,
+            )
+            self._set_row_mirrors(mirrors)
         self._dma_submitted = False
         self._per_layer_mirrored.clear()
         self._submitted_mirror_layers.clear()
@@ -365,7 +545,9 @@ class HiSparseConnectorWorker:
             self._enqueue_pre_forward_transfers(pre_forward_transfers)
         else:
             self._post_forward_transfers.clear()
-        if self.is_host_writer and self._row_mirror_num_rows:
+        if self.is_host_writer and (
+            self._row_mirror_num_rows or self._scatter_state is not None
+        ):
             for handle, callback in zip(
                 self.cache_handles, self._layer_mirror_callbacks
             ):
@@ -513,6 +695,13 @@ class HiSparseConnectorWorker:
         self._row_mirror_num_rows = int(self._row_mirror_counts.sum())
 
     def _require_row_mirrors(self, num_rows: int) -> tuple[SparseKVRowMirror, ...]:
+        if getattr(self, "_scatter_state", None) is not None:
+            if self._scatter_num_rows < num_rows:
+                raise RuntimeError(
+                    "HiSparse scatter metadata does not cover the forward: "
+                    f"{self._scatter_num_rows} rows for {num_rows} tokens."
+                )
+            return ()
         if self._row_mirror_num_rows != num_rows:
             raise RuntimeError(
                 "HiSparse DMA metadata does not match the forward: "
@@ -520,14 +709,46 @@ class HiSparseConnectorWorker:
             )
         return self._row_mirrors
 
+    def _enqueue_row_scatter(
+        self, layer_indices: Sequence[int], ready_event: torch.Event | None = None
+    ) -> None:
+        state = self._scatter_state
+        assert state is not None
+        positions = self._request_positions
+        assert positions is not None
+        stream = self.dma_stream
+        assert stream is not None
+        if ready_event is None:
+            stream.wait_stream(current_stream())
+        else:
+            stream.wait_event(ready_event)
+        num_rows = min(state["num_rows"], positions.shape[0])
+        completion_event = torch.Event()
+        with torch.cuda.stream(stream):
+            for layer_index in layer_indices:
+                scatter_mirror_rows(
+                    self.mirror_caches[layer_index],
+                    self.uva_host_caches[layer_index],
+                    positions,
+                    state["req_of_row"],
+                    state["window_starts"],
+                    state["window_offsets"],
+                    state["dst_rows"],
+                    num_rows,
+                )
+            self.host_write_event.record(stream)
+            completion_event.record(stream)
+        self._dma_submitted = True
+
     def _enqueue_row_dma(
         self, layer_indices: Sequence[int], ready_event: torch.Event | None = None
     ) -> None:
-        if (
-            not layer_indices
-            or not self._row_mirror_num_rows
-            or not self.is_host_writer
-        ):
+        if not layer_indices or not self.is_host_writer:
+            return
+        if getattr(self, "_scatter_state", None) is not None:
+            self._enqueue_row_scatter(layer_indices, ready_event=ready_event)
+            return
+        if not self._row_mirror_num_rows:
             return
         mirrors = self._row_mirrors
         num_layers = len(layer_indices)

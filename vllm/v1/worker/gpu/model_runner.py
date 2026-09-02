@@ -1743,6 +1743,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output,
                 input_batch.idx_mapping,
                 input_batch.req_ids,
+                input_batch.num_computed_tokens_np,
+                input_batch.positions,
             )
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
@@ -1770,6 +1772,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     scheduler_output,
                     input_batch.idx_mapping,
                     input_batch.req_ids,
+                    input_batch.num_computed_tokens_np,
+                    input_batch.positions,
                 )
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable

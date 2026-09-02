@@ -17,7 +17,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
     HiSparseConnectorWorker,
-    _flatten_row_mirrors,
+    _align_row_mirrors,
+    _trim_row_mirrors,
 )
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
@@ -30,10 +31,75 @@ def test_hisparse_row_mirrors_follow_runner_request_order():
     second = SparseKVRowMirror((2,), 20, 1)
     row_mirrors = {"first": (first,), "second": (second,)}
 
-    assert _flatten_row_mirrors(row_mirrors, ["second", "first"]) == (
+    assert _align_row_mirrors(row_mirrors, ["second", "first"], None, None, None) == (
         second,
         first,
     )
+
+
+def test_hisparse_row_mirror_alignment_zero_offset_is_identity():
+    mirrors = (
+        SparseKVRowMirror((4, 36), 4, 3),
+        SparseKVRowMirror((32, 64), 32, 2),
+    )
+
+    assert _trim_row_mirrors(mirrors, 0, 5) == mirrors
+    assert (
+        _align_row_mirrors({"req": mirrors}, ["req"], {"req": 4}, [4], {"req": 5})
+        == mirrors
+    )
+
+
+def test_hisparse_row_mirror_alignment_trims_and_splits_entries():
+    mirrors = (
+        SparseKVRowMirror((4, 36), 4, 2),
+        SparseKVRowMirror((32, 64), 32, 4),
+    )
+
+    # Head trim consumes the first entry and splits the second one; the split
+    # advances destination_start and every source_start by the trimmed rows.
+    assert _trim_row_mirrors(mirrors, 3, 3) == (SparseKVRowMirror((33, 65), 33, 3),)
+    # Tail trim shrinks the last entry to the rows this forward computes.
+    assert _trim_row_mirrors(mirrors, 1, 3) == (
+        SparseKVRowMirror((5, 37), 5, 1),
+        SparseKVRowMirror((32, 64), 32, 2),
+    )
+    with pytest.raises(RuntimeError, match="out of range"):
+        _trim_row_mirrors(mirrors, 3, 4)
+
+
+def test_hisparse_row_mirror_alignment_uses_actual_start():
+    mirrors = (
+        SparseKVRowMirror((10,), 10, 2),
+        SparseKVRowMirror((12,), 12, 4),
+    )
+
+    # Window [10, 16): the actual start 12 trims two leading rows and the
+    # three scheduled tokens keep rows [12, 15).
+    assert _align_row_mirrors(
+        {"req": mirrors}, ["req"], {"req": 10}, [12], {"req": 3}
+    ) == (SparseKVRowMirror((12,), 12, 3),)
+
+
+def test_hisparse_row_mirror_alignment_falls_back_to_optimistic_window():
+    mirrors = (
+        SparseKVRowMirror((10,), 10, 2),
+        SparseKVRowMirror((12,), 12, 4),
+    )
+    legacy = (SparseKVRowMirror((13,), 13, 3),)
+
+    # No actual start positions: assume no rejection and drop the extension.
+    assert (
+        _align_row_mirrors({"req": mirrors}, ["req"], {"req": 10}, None, {"req": 3})
+        == legacy
+    )
+    # No window start recorded: treat the actual start as the window start and
+    # keep the scheduled rows.
+    assert (
+        _align_row_mirrors({"req": mirrors}, ["req"], {}, [10], {"req": 6}) == mirrors
+    )
+    # Neither actual starts nor scheduled counts: legacy passthrough.
+    assert _align_row_mirrors({"req": mirrors}, ["req"], None, None, None) == mirrors
 
 
 def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
@@ -1233,3 +1299,47 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
+
+
+def test_hisparse_build_scatter_maps_positions_to_host_rows():
+    """Window maps must index host rows by absolute token position - ws."""
+    mirrors = {
+        "a": (
+            SparseKVRowMirror(source_starts=(0,), destination_start=100, num_rows=3),
+            SparseKVRowMirror(source_starts=(3,), destination_start=200, num_rows=2),
+        ),
+        "b": (
+            SparseKVRowMirror(source_starts=(0,), destination_start=500, num_rows=4),
+        ),
+    }
+    maps = hisparse_worker_module._build_scatter_maps(
+        mirrors,
+        {"a": 10, "b": 20},
+        ["a", "b"],
+        {"a": 4, "b": 4},
+    )
+    assert maps is not None
+    req_of_row, ws, window_offsets, dst_rows, num_rows = maps
+    assert num_rows == 8
+    assert req_of_row.tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert ws.tolist() == [10, 20]
+    assert window_offsets.tolist() == [0, 5, 9]
+    assert dst_rows.tolist() == [100, 101, 102, 200, 201, 500, 501, 502, 503]
+
+
+def test_hisparse_build_scatter_maps_empty_windows():
+    assert hisparse_worker_module._build_scatter_maps({}, {}, ["a"], {"a": 4}) is None
+    maps = hisparse_worker_module._build_scatter_maps(
+        {
+            "b": (
+                SparseKVRowMirror(source_starts=(0,), destination_start=7, num_rows=1),
+            )
+        },
+        {"b": 0},
+        ["a", "b"],
+        {"a": 2, "b": 1},
+    )
+    assert maps is not None
+    req_of_row, ws, window_offsets, dst_rows, num_rows = maps
+    assert window_offsets.tolist() == [0, 0, 1]
+    assert dst_rows.tolist() == [7]

@@ -164,6 +164,9 @@ class HiSparseCoordinator:
             self.max_spill_pages = max_model_len // resident_block_size
 
         self.block_table_updates: set[str] = set()
+        # Tokens within this margin of the optimistic frontier may still be
+        # rewritten by draft rejection; spill/publication waits them out.
+        self.durability_margin = 0
         self.spills_to_send: list[SparseKVPageTransfer] = []
         self.pending_spills: dict[int, _PendingSpill] = {}
         self.request_states: dict[str, _HiSparseRequestState] = {}
@@ -510,7 +513,8 @@ class HiSparseCoordinator:
             return
         assert self.host_manager is not None
         host_block_size = self.host_manager.block_size
-        num_pages = num_computed_tokens // host_block_size * self.pages_per_host_block
+        durable_tokens = max(0, num_computed_tokens - self.durability_margin)
+        num_pages = durable_tokens // host_block_size * self.pages_per_host_block
         state = self._get_request_state(request_id)
         budget = max(self.max_spill_pages - len(self.spills_to_send), 0)
         for page_idx in range(num_pages):
@@ -543,23 +547,24 @@ class HiSparseCoordinator:
         manager = self.host_manager
         if manager is None:
             return
-        num_pages = (
-            num_computed_tokens // manager.block_size * self.pages_per_host_block
-        )
+        # Publish only tokens past the durability margin so hashes never cover
+        # a page tail that a draft rejection could still rewrite.
+        durable_tokens = max(0, num_computed_tokens - self.durability_margin)
+        num_pages = durable_tokens // manager.block_size * self.pages_per_host_block
         request_id = request.request_id
         state = self._get_request_state(request_id)
         if state.ready_prefix_pages >= num_pages:
             manager.cache_blocks(
                 request,
-                num_computed_tokens,
+                durable_tokens,
                 retention_interval=retention_interval,
             )
-            self._record_shadow_pages(request_id, num_computed_tokens)
+            self._record_shadow_pages(request_id, durable_tokens)
             state.publication = None
             return
         state.publication = _PendingPublication(
             request=request,
-            num_computed_tokens=num_computed_tokens,
+            num_computed_tokens=durable_tokens,
             num_pages=num_pages,
             retention_interval=retention_interval,
         )

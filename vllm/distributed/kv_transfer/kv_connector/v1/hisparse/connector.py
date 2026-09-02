@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.hisparse.runtime import _get_max_decode_query_len
 from vllm.v1.hisparse.types import SparseKVOffloadCommand, SparseKVRowMirror
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -47,6 +48,7 @@ class HiSparseConnectorMetadata(KVConnectorMetadata):
     host_block_copies: tuple[KVCacheBlockCopy, ...]
     source_block_ids: tuple[int, ...]
     row_mirrors: dict[str, tuple[SparseKVRowMirror, ...]]
+    row_mirror_window_starts: dict[str, int]
     all_context_pages_resident: bool
 
 
@@ -76,10 +78,18 @@ class HiSparseConnectorWorkerMetadata(KVConnectorWorkerMetadata):
 
 class HiSparseConnectorScheduler:
     def __init__(
-        self, coordinator: HiSparseCoordinator, *, row_mirror_enabled: bool
+        self,
+        coordinator: HiSparseCoordinator,
+        *,
+        row_mirror_enabled: bool,
+        row_mirror_extension: int = 0,
     ) -> None:
         self.coordinator = coordinator
         self.row_mirror_enabled = row_mirror_enabled
+        self.row_mirror_extension = row_mirror_extension
+        # Pages within row_mirror_extension tokens of the optimistic frontier
+        # may still be rewritten by draft rejection; delay spill/publication.
+        coordinator.durability_margin = row_mirror_extension
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -123,20 +133,41 @@ class HiSparseConnectorScheduler:
                 scheduler_output.num_scheduled_tokens.items()
             )
         )
-        row_mirrors = {}
+        row_mirrors: dict[str, tuple[SparseKVRowMirror, ...]] = {}
+        row_mirror_window_starts: dict[str, int] = {}
         if self.row_mirror_enabled:
             for (
                 request_id,
                 scheduled_count,
             ) in scheduler_output.num_scheduled_tokens.items():
-                row_mirrors[request_id] = self.coordinator.build_row_mirrors(
-                    ((request_id, num_computed_tokens[request_id], scheduled_count),),
+                num_computed = num_computed_tokens[request_id]
+                # Extend the window below the optimistic frontier so the worker
+                # can realign it after draft rejections shift the actual start.
+                window_start = max(0, num_computed - self.row_mirror_extension)
+                mirrors = self.coordinator.build_row_mirrors(
+                    (
+                        (
+                            request_id,
+                            window_start,
+                            num_computed - window_start + scheduled_count,
+                        ),
+                    ),
                 )
+                if not mirrors and window_start != num_computed:
+                    # Extension rows may live on pages that are no longer
+                    # resident; fall back to the unextended window.
+                    window_start = num_computed
+                    mirrors = self.coordinator.build_row_mirrors(
+                        ((request_id, num_computed, scheduled_count),),
+                    )
+                row_mirrors[request_id] = mirrors
+                row_mirror_window_starts[request_id] = window_start
         return HiSparseConnectorMetadata(
             command,
             host_block_copies,
             tuple(source_block_ids),
             row_mirrors,
+            row_mirror_window_starts,
             self.coordinator.all_context_pages_resident(scheduled_requests),
         )
 
@@ -177,10 +208,8 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
                 raise ValueError("HiSparse scheduler requires a coordinator.")
             self.connector_scheduler = HiSparseConnectorScheduler(
                 coordinator,
-                row_mirror_enabled=not (
-                    vllm_config.scheduler_config.async_scheduling
-                    and vllm_config.speculative_config is not None
-                ),
+                row_mirror_enabled=True,
+                row_mirror_extension=_get_max_decode_query_len(vllm_config) - 1,
             )
         elif role == KVConnectorRole.WORKER:
             if coordinator is not None:
@@ -225,6 +254,9 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
             metadata,
             request_state_indices,
             request_ids,
+            request_num_computed=kwargs.get("request_num_computed"),
+            request_num_scheduled=kwargs.get("request_num_scheduled"),
+            request_positions=kwargs.get("request_positions"),
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
