@@ -13,12 +13,20 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from enum import Enum
+from queue import PriorityQueue
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.base import JobId
 
 logger = init_logger(__name__)
+
+
+class Phase(Enum):
+    LOAD = 1
+    STORE = 2
+    NONE = 3
 
 
 @dataclass
@@ -42,15 +50,17 @@ class JobState:
     __slots__ = (
         "_job_id",
         "_n_tasks",
+        "_is_load",
         "_completed",
         "_success",
         "_transfer_time",
         "_lock",
     )
 
-    def __init__(self, job_id: JobId, n_tasks: int) -> None:
+    def __init__(self, job_id: JobId, n_tasks: int, is_load: bool) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
+        self._is_load = is_load
         self._completed = 0
         self._success = True
         self._transfer_time = 0.0
@@ -59,6 +69,10 @@ class JobState:
     @property
     def job_id(self) -> JobId:
         return self._job_id
+
+    @property
+    def is_load(self):
+        return self._is_load
 
     def task_done(
         self, batch_size: int, success: bool, transfer_time: float
@@ -70,6 +84,36 @@ class JobState:
             if not success:
                 self._success = False
             return self._completed == self._n_tasks, self._success, self._transfer_time
+
+
+@dataclass
+class WorkItem:
+    state: JobState
+    tasks: list[Task]
+    make_batch_fn: Callable | None = None
+    fn: Callable | None = None
+
+    @property
+    def n_tasks(self):
+        return len(self.tasks)
+
+    @property
+    def is_load(self):
+        return self.state.is_load
+
+    def is_materialized(self):
+        return self.fn is not None
+
+    def materialize(self):
+        if self.is_materialized():
+            return self
+        assert self.make_batch_fn is not None
+        self.fn = self.make_batch_fn(self.tasks)
+        return self
+
+    def as_work(self):
+        assert self.is_materialized()
+        return self.fn, len(self.tasks), self.state
 
 
 class DualQueueThreadPool:
@@ -89,13 +133,16 @@ class DualQueueThreadPool:
     ) -> None:
         self._n_read_threads = n_read_threads
         self._n_write_threads = n_write_threads
-        self._load_q: deque = deque()
-        self._store_q: deque = deque()
+        self._load_q: PriorityQueue = PriorityQueue()
+        self._store_q: PriorityQueue = PriorityQueue()
+        self._wq: deque = deque()
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool, float]] = deque()
         self._inflight_jobs = 0  # guarded by _condition
+
+        self._phase = Phase.NONE
 
         assert self.total_threads > 0, "ThreadPool needs at least one thread"
 
@@ -118,6 +165,24 @@ class DualQueueThreadPool:
             )
             t.start()
             self._threads.append(t)
+
+    def switch_phase(self):
+        assert not self._wq
+        if self._phase == Phase.NONE:
+            if not self._load_q.empty():
+                self._phase = Phase.LOAD
+            elif not self._store_q.empty():
+                self._phase = Phase.STORE
+            return
+        elif self._phase == Phase.LOAD and not self._store_q.empty():
+            self._phase = Phase.STORE
+        elif self._phase == Phase.STORE and not self._load_q.empty():
+            self._phase = Phase.LOAD
+        if self._phase == Phase.LOAD:
+            assert not self._load_q.empty()
+        if self._phase == Phase.STORE:
+            assert not self._store_q.empty()
+        return self._phase
 
     @property
     def total_threads(self) -> int:
@@ -143,29 +208,37 @@ class DualQueueThreadPool:
             yield tasks[start : start + bs]
             start += bs
 
+    def _batch_work_item(self, wi: WorkItem, n_threads: int):
+        assert not wi.is_materialized()
+        for b in self._batch_tasks(wi.tasks, n_threads):
+            yield WorkItem(
+                state=wi.state, tasks=b, make_batch_fn=wi.make_batch_fn, fn=wi.fn
+            )
+
     def _enqueue(
         self,
-        queue: deque,
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
         job_id: JobId,
         tasks: Iterable[Task],
         n_tasks: int,
-        n_threads: int,
+        is_load: bool,
     ) -> None:
         """Batch `tasks` and append (fn, state, batch_size) entries to `queue`."""
         if n_tasks == 0:
             self._finished_q.append((job_id, True, 0.0))
             return
-        state = JobState(job_id, n_tasks)
+        state = JobState(job_id, n_tasks, is_load)
         task_lst = list(tasks)  # Materialize tasks out of self._condition
         assert len(task_lst) == n_tasks, "Unaccounted tasks"
-        n_batches = 0
+
+        wi = WorkItem(state, task_lst, make_batch_fn)
         with self._condition:
             self._inflight_jobs += 1
-            for batch in self._batch_tasks(task_lst, n_threads):
-                queue.append((make_batch_fn(batch), len(batch), state))
-                n_batches += 1
-            self._condition.notify(n_batches)
+            if is_load:
+                self._load_q.put((wi.n_tasks, wi.state.job_id, wi))
+            else:
+                self._store_q.put((wi.n_tasks, wi.state.job_id, wi))
+            self._condition.notify_all()
 
     def enqueue_load(
         self,
@@ -177,14 +250,11 @@ class DualQueueThreadPool:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
 
         self._enqueue(
-            self._load_q,
             make_batch_fn,
             job_id,
             tasks,
             n_tasks=n_tasks,
-            n_threads=self._n_read_threads
-            if self._n_read_threads > 0
-            else self.total_threads,
+            is_load=True,
         )
 
     def enqueue_store(
@@ -197,14 +267,11 @@ class DualQueueThreadPool:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
 
         self._enqueue(
-            self._store_q,
             make_batch_fn,
             job_id,
             tasks,
             n_tasks=n_tasks,
-            n_threads=self._n_write_threads
-            if self._n_write_threads > 0
-            else self.total_threads,
+            is_load=False,
         )
 
     def get_finished(self) -> list[tuple[JobId, bool, float]]:
@@ -229,8 +296,10 @@ class DualQueueThreadPool:
     def shutdown(self, wait: bool = True) -> None:
         with self._condition:
             self._stop = True
-            self._load_q.clear()
-            self._store_q.clear()
+            while not self._load_q.empty():
+                self._load_q.get()
+            while not self._store_q.empty():
+                self._store_q.get()
             # Cancelled tasks will not decrement _inflight_jobs; reset it so a
             # subsequent wait_idle() returns instead of hanging.
             self._inflight_jobs = 0
@@ -241,18 +310,37 @@ class DualQueueThreadPool:
 
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
+
+        def has_work():
+            return not self._load_q.empty() or not self._store_q.empty() or self._wq
+
+        def populate_wq(q: PriorityQueue):
+            while not q.empty():
+                _, _, wi = q.get()
+                for b in self._batch_work_item(wi, self.total_threads):
+                    self._wq.append(b.materialize().as_work())
+
+        def fetch_work():
+            if self._wq:
+                return self._wq.popleft()
+            # run out of work
+            self.switch_phase()
+            assert self._phase != Phase.NONE
+            if self._phase == Phase.LOAD:
+                assert not self._load_q.empty()
+                populate_wq(self._load_q)
+            else:
+                assert self._phase == Phase.STORE
+                assert not self._store_q.empty()
+                populate_wq(self._store_q)
+            return self._wq.popleft()
+
         while True:
             with self._condition:
-                self._condition.wait_for(
-                    lambda: self._stop or self._load_q or self._store_q
-                )
+                self._condition.wait_for(lambda: self._stop or has_work())
                 if self._stop:
                     return
-                primary = self._load_q if load_priority else self._store_q
-                secondary = self._store_q if load_priority else self._load_q
-                fn, batch_size, state = (
-                    primary.popleft() if primary else secondary.popleft()
-                )
+                fn, batch_size, state = fetch_work()
             try:
                 start_time = time.monotonic()
                 fn()
