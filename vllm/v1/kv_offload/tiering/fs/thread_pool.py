@@ -29,6 +29,11 @@ class Phase(Enum):
     NONE = 3
 
 
+class Role(Enum):
+    PHASED = 1
+    FAST = 2
+
+
 @dataclass
 class Task:
     """
@@ -129,10 +134,12 @@ class DualQueueThreadPool:
         self,
         n_read_threads: int,
         n_write_threads: int,
+        n_fast_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
         self._n_read_threads = n_read_threads
         self._n_write_threads = n_write_threads
+        self._n_fast_threads = n_fast_threads
         self._load_q: PriorityQueue = PriorityQueue()
         self._store_q: PriorityQueue = PriorityQueue()
         self._wq: deque = deque()
@@ -150,7 +157,7 @@ class DualQueueThreadPool:
         for i in range(self._n_read_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(True,),
+                args=(Role.PHASED,),
                 name=f"{thread_name_prefix}_l{i}",
                 daemon=True,
             )
@@ -160,8 +167,18 @@ class DualQueueThreadPool:
         for i in range(self._n_write_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(False,),
+                args=(Role.PHASED,),
                 name=f"{thread_name_prefix}_s{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        for i in range(self._n_fast_threads):
+            t = threading.Thread(
+                target=self._worker,
+                args=(Role.FAST,),
+                name=f"{thread_name_prefix}_fast{i}",
                 daemon=True,
             )
             t.start()
@@ -309,10 +326,12 @@ class DualQueueThreadPool:
             for t in self._threads:
                 t.join()
 
-    def _worker(self, load_priority: bool) -> None:
+    def _worker(self, role: Role) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.
 
         def has_work():
+            if role == Role.FAST:
+                return not self._load_q.empty() or not self._store_q.empty()
             if self._wq:
                 return True
             # wait till phase work is complete
@@ -329,6 +348,24 @@ class DualQueueThreadPool:
                 self._phase_jobs.add(wi.state.job_id)
 
         def fetch_work():
+            if role == Role.FAST:
+                # Fast lane: always prefer the globally smallest job
+                if self._load_q.empty():
+                    _, _, wi = self._store_q.get()
+                    return wi.materialize().as_work()
+                elif self._store_q.empty():
+                    _, _, wi = self._load_q.get()
+                    return wi.materialize().as_work()
+                # both have work
+                load_min = self._load_q.queue[0][0]
+                store_min = self._store_q.queue[0][0]
+                if load_min < store_min:
+                    _, _, wi = self._load_q.get()
+                    return wi.materialize().as_work()
+                else:
+                    _, _, wi = self._store_q.get()
+                    return wi.materialize().as_work()
+
             if self._wq:
                 return self._wq.popleft()
             # run out of work
