@@ -935,8 +935,8 @@ class HiSparseConnectorWorker:
         )
         if num_rows == 0:
             return
-        self._require_row_mirrors(num_rows)
         if self.is_host_writer:
+            self._require_row_mirrors(num_rows)
             expected_layers = set(active_layer_indices)
             if self._per_layer_mirrored:
                 if self._per_layer_mirrored != expected_layers:

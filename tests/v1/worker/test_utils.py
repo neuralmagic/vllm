@@ -958,7 +958,7 @@ def test_hisparse_shared_host_reader_skips_mirror(monkeypatch):
     worker = _make_hisparse_worker()
     worker.is_host_writer = False
     worker.cache_handles = [handle]
-    worker._set_row_mirrors((SparseKVRowMirror((0,), 7, 2),))
+    worker._set_row_mirrors((SparseKVRowMirror((0,), 7, 3),))
     worker._per_layer_mirrored = set()
     worker._enqueue_row_dma = MagicMock()
 
