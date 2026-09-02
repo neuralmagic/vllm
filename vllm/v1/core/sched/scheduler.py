@@ -1395,6 +1395,10 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            num_output_placeholders={
+                req_id: self.requests[req_id].num_output_placeholders
+                for req_id in num_scheduled_tokens
+            },
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
