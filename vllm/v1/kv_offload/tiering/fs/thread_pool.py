@@ -143,6 +143,7 @@ class DualQueueThreadPool:
         self._inflight_jobs = 0  # guarded by _condition
 
         self._phase = Phase.NONE
+        self._phase_jobs: set[JobId] = set()
 
         assert self.total_threads > 0, "ThreadPool needs at least one thread"
 
@@ -312,13 +313,20 @@ class DualQueueThreadPool:
         # Wait for tasks, process from primary queue first, fall back to secondary.
 
         def has_work():
-            return not self._load_q.empty() or not self._store_q.empty() or self._wq
+            if self._wq:
+                return True
+            # wait till phase work is complete
+            return len(self._phase_jobs) == 0 and (
+                not self._load_q.empty() or not self._store_q.empty()
+            )
 
         def populate_wq(q: PriorityQueue):
+            assert not self._phase_jobs
             while not q.empty():
                 _, _, wi = q.get()
                 for b in self._batch_work_item(wi, self.total_threads):
                     self._wq.append(b.materialize().as_work())
+                self._phase_jobs.add(wi.state.job_id)
 
         def fetch_work():
             if self._wq:
@@ -362,5 +370,6 @@ class DualQueueThreadPool:
             if job_finished:
                 with self._condition:
                     self._finished_q.append((state.job_id, success, total_time))
+                    self._phase_jobs.discard(state.job_id)
                     self._inflight_jobs -= 1
                     self._condition.notify_all()
