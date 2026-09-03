@@ -85,6 +85,18 @@ def test_hisparse_written_rows_preserve_scheduler_page_boundaries():
     )
 
 
+def test_hisparse_written_rows_use_the_active_resident_group():
+    """Draft slots must resolve through the draft resident allocation."""
+    candidates = (
+        SparseKVRowMirror((100, 700), 1000, 2),
+        SparseKVRowMirror((200, 800), 2000, 2),
+    )
+
+    assert _select_written_row_mirrors(
+        candidates, np.array([801], dtype=np.int64), 1
+    ) == (SparseKVRowMirror((201, 801), 2001, 1),)
+
+
 def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
     """Separate context and query writes must share one mirror phase."""
     worker = _make_hisparse_worker()
