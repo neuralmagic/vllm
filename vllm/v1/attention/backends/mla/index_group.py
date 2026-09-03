@@ -258,11 +258,19 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         attn_metadata: Any,
         *,
         return_valid_counts: bool,
+        num_decodes: int | None = None,
+        max_query_len: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        num_tokens = attn_metadata.num_decode_tokens
-        num_decodes = attn_metadata.num_decodes
-        assert logical_topk_indices.shape[0] == num_tokens
-        max_query_len = attn_metadata.decode_max_query_len
+        # Callers with padded common metadata (FP8 uniform-batch cudagraphs)
+        # must pass the active counts: a padded view repeats a request across
+        # rows of one resolve launch, and concurrent thread blocks then
+        # corrupt its persistent hot-LRU state.
+        num_tokens = logical_topk_indices.shape[0]
+        if num_decodes is None:
+            num_decodes = attn_metadata.num_decodes
+            assert num_tokens == attn_metadata.num_decode_tokens
+        if max_query_len is None:
+            max_query_len = attn_metadata.decode_max_query_len
         if max_query_len == 1:
             return self.convert_logical_to_physical_topk(
                 layer_index,

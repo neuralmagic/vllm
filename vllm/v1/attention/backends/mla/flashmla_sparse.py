@@ -773,6 +773,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     topk_indices,
                     attn_metadata,
                     fp8_metadata.decode.kernel_metadata,
+                    num_decodes=num_decodes,
                 )
             # Reshape q: (num_decode_tokens, num_heads, head_dim)
             #         -> (num_decodes, seq_len, num_heads, head_dim)
@@ -982,16 +983,23 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
+        num_decodes: int,
     ) -> torch.Tensor:
         assert isinstance(self.index_group, HiSparseMLAIndexGroup)
+        # Use the active decode count and query length from the FP8 metadata,
+        # not the padded common metadata: padded counts repeat a request
+        # across rows of one resolve launch and concurrent thread blocks then
+        # corrupt its persistent hot-LRU state.
+        assert topk_indices.shape[0] % num_decodes == 0
         physical_topk = self.index_group.convert_decode_logical_to_physical_topk(
             self.index_group_index,
             topk_indices,
             attn_metadata,
             return_valid_counts=False,
+            num_decodes=num_decodes,
+            max_query_len=topk_indices.shape[0] // num_decodes,
         )
         assert isinstance(physical_topk, torch.Tensor)
-        num_decodes = attn_metadata.num_decodes
         q = reshape_query_for_spec_decode(q, num_decodes)
         physical_topk = physical_topk.view(num_decodes, q.shape[1], -1)
         output, _ = self._fp8_flash_mla_kernel(
