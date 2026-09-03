@@ -82,10 +82,12 @@ class HiSparseConnectorScheduler:
         *,
         async_speculative: bool,
         draft_kv_lookahead: int = 0,
+        refine_row_mirrors: bool = False,
     ) -> None:
         self.coordinator = coordinator
         self.async_speculative = async_speculative
         self.draft_kv_lookahead = draft_kv_lookahead
+        self.refine_row_mirrors = refine_row_mirrors
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -146,18 +148,24 @@ class HiSparseConnectorScheduler:
                     scheduled_start
                     - scheduler_output.num_output_placeholders.get(request_id, 0),
                 )
-            row_mirrors[request_id] = self.coordinator.build_row_mirrors(
+            mirror_request = (
                 (
-                    (
-                        request_id,
-                        mirror_start,
-                        scheduled_count
-                        + scheduled_start
-                        - mirror_start
-                        + self.draft_kv_lookahead,
-                    ),
+                    request_id,
+                    mirror_start,
+                    scheduled_count
+                    + scheduled_start
+                    - mirror_start
+                    + self.draft_kv_lookahead,
                 ),
             )
+            if self.refine_row_mirrors:
+                row_mirrors[request_id] = self.coordinator.build_row_mirrors(
+                    mirror_request, hold_blocks=True
+                )
+            else:
+                row_mirrors[request_id] = self.coordinator.build_row_mirrors(
+                    mirror_request
+                )
         return HiSparseConnectorMetadata(
             command,
             host_block_copies,
@@ -218,6 +226,7 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
                 draft_kv_lookahead=(
                     vllm_config.num_speculative_tokens + 1 if refines_row_mirrors else 0
                 ),
+                refine_row_mirrors=refines_row_mirrors,
             )
         elif role == KVConnectorRole.WORKER:
             if coordinator is not None:

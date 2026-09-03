@@ -38,6 +38,10 @@ def _make_hisparse_worker() -> HiSparseConnectorWorker:
     worker._submitted_mirror_layers = set()
     worker._pending_dma_descriptors = deque()
     worker._dma_free_descriptors = []
+    worker._dma_lock = hisparse_worker_module.threading.Lock()
+    worker._mirror_error = None
+    worker._mirror_thread = None
+    worker._pending_mirror_fence = None
     worker.host_write_events = (MagicMock(), MagicMock())
     worker.host_write_event = worker.host_write_events[1]
     worker._next_host_write_event = 0
@@ -164,6 +168,88 @@ def test_hisparse_stages_target_slot_mapping(monkeypatch, mapping_name):
 
     torch.testing.assert_close(state.slots, torch.tensor([7, 8]))
     assert state.source_index == 2
+
+
+def test_hisparse_defers_unready_slot_mapping_without_synchronizing():
+    """A short forward may finish before its asynchronous D2H slot copy."""
+    worker = _make_hisparse_worker()
+    worker.is_host_writer = True
+    worker.refines_row_mirrors = True
+    worker.cache_handles = [SimpleNamespace(submit_layer_mirror=MagicMock())]
+    state = _SlotMappingStaging(
+        MagicMock(), MagicMock(), torch.empty(2, dtype=torch.int64)
+    )
+    state.event.query.return_value = False
+    state.candidates = (SparseKVRowMirror((10,), 20, 2),)
+    state.num_tokens = 2
+    worker._slot_mapping_staging = state
+    worker._mirror_jobs = hisparse_worker_module.queue.Queue()
+    worker._enqueue_host_mirror = MagicMock(return_value=((0,), 2))
+    worker._clear_forward_mirror_state = MagicMock()
+    ready_event = MagicMock()
+
+    worker._finish_mirror_phase(ready_event)
+
+    job = worker._mirror_jobs.get_nowait()
+    assert job == hisparse_worker_module._PendingMirrorPhase(
+        state, ready_event, (0,), 2
+    )
+    state.event.synchronize.assert_not_called()
+    assert worker._slot_mapping_staging is None
+
+
+def test_hisparse_resolves_deferred_slot_mapping_before_dma(monkeypatch):
+    worker = _make_hisparse_worker()
+    worker.is_host_writer = True
+    worker._mirror_jobs = hisparse_worker_module.queue.Queue()
+    worker._mirror_state_lock = hisparse_worker_module.threading.Lock()
+    worker._slot_mapping_free = deque()
+    worker._enqueue_row_dma = MagicMock()
+    state = _SlotMappingStaging(
+        MagicMock(), MagicMock(), torch.tensor([11, 12], dtype=torch.int64)
+    )
+    state.event.query.side_effect = [False, True]
+    state.candidates = (SparseKVRowMirror((10,), 20, 3),)
+    state.num_tokens = 2
+    state.source_index = 0
+    ready_event = MagicMock()
+    worker._mirror_jobs.put(
+        hisparse_worker_module._PendingMirrorPhase(state, ready_event, (1,), 2)
+    )
+    worker._mirror_jobs.put(None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(hisparse_worker_module.time, "sleep", lambda _: None)
+
+    worker._run_mirror_jobs(torch.device("cuda:0"))
+
+    worker._enqueue_row_dma.assert_called_once_with(
+        (1,),
+        ready_event=ready_event,
+        mirrors=(SparseKVRowMirror((11,), 21, 2),),
+        from_resident=True,
+        synchronize_compute=False,
+    )
+    state.event.synchronize.assert_not_called()
+    assert worker._slot_mapping_free.popleft() is state
+
+
+def test_hisparse_next_step_waits_for_deferred_mirror_dma(monkeypatch):
+    worker = _make_hisparse_worker()
+    completion_event = MagicMock()
+    completion = hisparse_worker_module._MirrorStepCompletion(
+        (), MagicMock(), completion_event
+    )
+    completion.enqueued.set()
+    worker._pending_mirror_fence = completion
+    compute_stream = MagicMock()
+    monkeypatch.setattr(
+        hisparse_worker_module, "current_stream", lambda: compute_stream
+    )
+
+    worker._wait_for_previous_mirror_step()
+
+    compute_stream.wait_event.assert_called_once_with(completion_event)
+    assert worker._pending_mirror_fence is None
 
 
 @pytest.mark.parametrize(

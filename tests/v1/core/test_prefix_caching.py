@@ -254,6 +254,38 @@ def test_hisparse_builds_dma_row_mirrors_across_pages():
     assert [mirror.num_rows for mirror in mirrors] == [2, 2]
 
 
+def test_hisparse_row_mirror_blocks_remain_pinned_until_dma_completion():
+    manager = make_hisparse_kv_cache_manager(32, 16)
+    request = make_request(
+        "request",
+        list(range(2 * HISPARSE_BLOCK_SIZE)),
+        HISPARSE_BLOCK_SIZE,
+        sha256,
+    )
+    assert manager.allocate_slots(request, num_new_tokens=32) is not None
+    coordinator = manager.hisparse_coordinator
+    resident = coordinator.resident_managers[0].req_to_blocks[request.request_id][0]
+    assert coordinator.host_manager is not None
+    host = coordinator.host_manager.req_to_blocks[request.request_id][0]
+    resident_ref_count = resident.ref_cnt
+    host_ref_count = host.ref_cnt
+
+    mirrors = coordinator.build_row_mirrors(
+        [(request.request_id, 1, 2)], hold_blocks=True
+    )
+    transfer_id = mirrors[0].transfer_id
+    assert transfer_id is not None
+    assert resident.ref_cnt == resident_ref_count + 1
+    assert host.ref_cnt == host_ref_count + 1
+
+    coordinator.update_spills({transfer_id: 1}, {})
+    assert resident.ref_cnt == resident_ref_count + 1
+    assert host.ref_cnt == host_ref_count + 1
+    coordinator.update_spills({}, {transfer_id: 1})
+    assert resident.ref_cnt == resident_ref_count
+    assert host.ref_cnt == host_ref_count
+
+
 def test_hisparse_async_speculation_mirrors_uncertain_position_range():
     """Unresolved drafts must not leave gaps in the eager host mirror."""
     coordinator = MagicMock(host_group_id=0)

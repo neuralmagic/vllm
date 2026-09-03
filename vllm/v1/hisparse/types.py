@@ -22,6 +22,7 @@ class SparseKVRowMirror:
     source_starts: tuple[int, ...]
     destination_start: int
     num_rows: int
+    transfer_id: int | None = None
 
 
 @dataclass

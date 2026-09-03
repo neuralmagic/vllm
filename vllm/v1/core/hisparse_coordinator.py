@@ -71,6 +71,14 @@ class _PendingSpill:
     resident_released: bool = False
 
 
+@dataclass
+class _PendingRowMirror:
+    transfer_id: int
+    held_blocks: tuple[tuple[BlockPool, KVCacheBlock], ...]
+    expected_worker_completions: int = 0
+    worker_completions: int = 0
+
+
 class HiSparseCoordinator:
     """Own HiSparse host allocation, prefix state, and GPU residency transitions."""
 
@@ -166,6 +174,7 @@ class HiSparseCoordinator:
         self.block_table_updates: set[str] = set()
         self.spills_to_send: list[SparseKVPageTransfer] = []
         self.pending_spills: dict[int, _PendingSpill] = {}
+        self.pending_row_mirrors: dict[int, _PendingRowMirror] = {}
         self.request_states: dict[str, _HiSparseRequestState] = {}
         self.next_spill_id = 0
         self.external_import_populates_resident_cache = True
@@ -643,12 +652,15 @@ class HiSparseCoordinator:
     def build_row_mirrors(
         self,
         requests: Iterable[tuple[str, int, int]],
+        *,
+        hold_blocks: bool = False,
     ) -> tuple[SparseKVRowMirror, ...]:
         """Map scheduled rows to scheduler-owned resident and host blocks."""
         if not self.resident_managers or self.host_manager is None:
             return ()
         block_size = self.resident_managers[0].block_size
         mirrors: list[SparseKVRowMirror] = []
+        held_blocks: dict[tuple[int, int], tuple[BlockPool, KVCacheBlock]] = {}
         for request_id, num_computed_tokens, num_scheduled_tokens in requests:
             host_blocks = self.host_manager.req_to_blocks.get(request_id)
             resident_blocks = [
@@ -670,6 +682,16 @@ class HiSparseCoordinator:
                     source_starts.append(
                         blocks[page_idx].block_id * block_size + row_offset
                     )
+                if hold_blocks:
+                    for manager, blocks in zip(
+                        self.resident_managers, resident_blocks, strict=True
+                    ):
+                        assert blocks is not None
+                        block = blocks[page_idx]
+                        held_blocks[id(manager.block_pool), id(block)] = (
+                            manager.block_pool,
+                            block,
+                        )
                 host_block_idx, destination_page_offset = divmod(
                     page_idx, self.pages_per_host_block
                 )
@@ -678,6 +700,11 @@ class HiSparseCoordinator:
                 host_block = host_blocks[host_block_idx]
                 if host_block.is_null:
                     return ()
+                if hold_blocks:
+                    held_blocks[id(self.host_manager.block_pool), id(host_block)] = (
+                        self.host_manager.block_pool,
+                        host_block,
+                    )
                 destination_page = (
                     host_block.block_id * self.pages_per_host_block
                     + destination_page_offset
@@ -690,6 +717,24 @@ class HiSparseCoordinator:
                     )
                 )
                 token_position += num_rows
+        if hold_blocks and mirrors:
+            transfer_id = self.next_spill_id
+            self.next_spill_id += 1
+            block_holds = tuple(held_blocks.values())
+            for pool, block in block_holds:
+                pool.touch([block])
+            self.pending_row_mirrors[transfer_id] = _PendingRowMirror(
+                transfer_id, block_holds
+            )
+            mirrors = [
+                SparseKVRowMirror(
+                    mirror.source_starts,
+                    mirror.destination_start,
+                    mirror.num_rows,
+                    transfer_id,
+                )
+                for mirror in mirrors
+            ]
         return tuple(mirrors)
 
     def all_context_pages_resident(
@@ -739,7 +784,9 @@ class HiSparseCoordinator:
         )
 
     def has_pending_work(self) -> bool:
-        return bool(self.spills_to_send or self.pending_spills)
+        return bool(
+            self.spills_to_send or self.pending_spills or self.pending_row_mirrors
+        )
 
     def update_spills(
         self,
@@ -750,13 +797,35 @@ class HiSparseCoordinator:
             pending = self.pending_spills.get(spill_id)
             if pending is not None and pending.expected_worker_completions == 0:
                 pending.expected_worker_completions = count
+            pending_mirror = self.pending_row_mirrors.get(spill_id)
+            if (
+                pending_mirror is not None
+                and pending_mirror.expected_worker_completions == 0
+            ):
+                pending_mirror.expected_worker_completions = count
         for spill_id, count in completed_counts.items():
             pending = self.pending_spills.get(spill_id)
             if pending is not None:
                 pending.worker_completions += count
+            pending_mirror = self.pending_row_mirrors.get(spill_id)
+            if pending_mirror is not None:
+                pending_mirror.worker_completions += count
 
         self._apply_enqueued_spills()
         self._complete_host_writes()
+        self._complete_row_mirrors()
+
+    def _complete_row_mirrors(self) -> None:
+        completed = [
+            pending
+            for pending in self.pending_row_mirrors.values()
+            if pending.expected_worker_completions
+            and pending.worker_completions >= pending.expected_worker_completions
+        ]
+        for pending in completed:
+            self.pending_row_mirrors.pop(pending.transfer_id)
+            for pool, block in pending.held_blocks:
+                pool.free_blocks([block])
 
     def _apply_enqueued_spills(self) -> None:
         ready_by_state: dict[
