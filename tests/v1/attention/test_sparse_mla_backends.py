@@ -1885,7 +1885,7 @@ def test_hisparse_swap_in_preserves_rows_across_eviction():
     )
     torch.accelerator.synchronize()
     expected_stats = torch.tensor(
-        [(topk.shape[1] - 1) * num_reqs, 0],
+        [(topk.shape[1] - 1) * num_reqs, 0, 0],
         dtype=torch.uint64,
         device=device,
     )

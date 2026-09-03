@@ -19,6 +19,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
 )
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.core.kv_cache_utils import (
     HISPARSE_HOT_SUFFIX,
@@ -42,6 +43,8 @@ if TYPE_CHECKING:
     )
     from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
+
+logger = init_logger(__name__)
 
 _METRICS_INTERVAL = 2000
 
@@ -102,11 +105,15 @@ def _select_written_row_mirrors(
     candidates: tuple[SparseKVRowMirror, ...],
     source_slots: np.ndarray,
     source_index: int,
-) -> tuple[SparseKVRowMirror, ...]:
-    """Select and coalesce GPU-written rows from a scheduler-owned envelope."""
+) -> tuple[tuple[SparseKVRowMirror, ...], int]:
+    """Select and coalesce GPU-written rows from a scheduler-owned envelope.
+
+    Returns the mirrors plus the number of written rows dropped because the
+    envelope could not map them (their host copy stays stale).
+    """
     source_slots = source_slots[source_slots >= 0]
     if source_slots.size == 0:
-        return ()
+        return (), 0
     if not candidates:
         raise RuntimeError("HiSparse GPU slots have no scheduler mapping envelope.")
     starts = np.asarray([mirror.source_starts for mirror in candidates], dtype=np.int64)
@@ -122,14 +129,16 @@ def _select_written_row_mirrors(
     candidate_ids = order[np.maximum(matches, 0)]
     offsets = source_slots - source_starts[candidate_ids]
     valid = (matches >= 0) & (offsets < counts[candidate_ids])
+    dropped = 0
     if not np.all(valid):
         # A page the scheduler could not map has no host destination, so its
         # rows are simply not mirrorable this step.
+        dropped = int(source_slots.size - np.count_nonzero(valid))
         source_slots = source_slots[valid]
         candidate_ids = candidate_ids[valid]
         offsets = offsets[valid]
         if source_slots.size == 0:
-            return ()
+            return (), dropped
     sources = starts[candidate_ids] + offsets[:, None]
     destinations = destinations[candidate_ids] + offsets
     boundaries = (
@@ -149,7 +158,7 @@ def _select_written_row_mirrors(
             num_rows=int(end - start),
         )
         for start, end in zip(run_starts, run_ends, strict=True)
-    )
+    ), dropped
 
 
 def _is_hisparse_host_writer(
@@ -193,6 +202,8 @@ class HiSparseConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self._initialized = False
+        self._mirror_dropped_rows = 0
+        self._topk_dropped_total = 0
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         forward_context = self.vllm_config.compilation_config.static_forward_context
@@ -488,13 +499,13 @@ class HiSparseConnectorWorker:
 
     def _resolve_row_mirrors(self, state: _SlotMappingStaging) -> None:
         """Compute the final row mirrors from the staged GPU slot mapping."""
-        self._set_row_mirrors(
-            _select_written_row_mirrors(
-                state.candidates,
-                state.slots[: state.num_tokens].numpy(),
-                state.source_index,
-            )
+        mirrors, dropped = _select_written_row_mirrors(
+            state.candidates,
+            state.slots[: state.num_tokens].numpy(),
+            state.source_index,
         )
+        self._mirror_dropped_rows += dropped
+        self._set_row_mirrors(mirrors)
         state.num_tokens = 0
 
     def _copy_host_blocks(
@@ -551,13 +562,26 @@ class HiSparseConnectorWorker:
         delta = None
         if self._metrics_pending and self._metrics_event.query():
             delta = HiSparseStats()
+            topk_dropped = 0
             for runtime in self.leader_runtimes:
                 group = runtime.index_group
-                hits, misses = group.swap_stats_host.tolist()
+                hits, misses, dropped = group.swap_stats_host.tolist()
                 delta.cache_hits += hits
                 delta.cache_misses += misses
+                topk_dropped += dropped
                 delta.host_to_device_bytes += misses * group.stats_row_bytes
             self._metrics_pending = False
+            if topk_dropped or self._mirror_dropped_rows:
+                self._topk_dropped_total += topk_dropped
+                logger.warning(
+                    "HiSparse lossy interval: topk_dropped=%d (total %d) "
+                    "mirror_dropped_rows=%d (cumulative) hits=%d misses=%d",
+                    topk_dropped,
+                    self._topk_dropped_total,
+                    self._mirror_dropped_rows,
+                    delta.cache_hits,
+                    delta.cache_misses,
+                )
             if delta.cache_hits == 0 and delta.cache_misses == 0:
                 delta = None
 

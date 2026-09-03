@@ -203,7 +203,7 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
     int32_t* __restrict__ miss_mask,  // [num_rows, top_k] or nullptr
     int32_t* __restrict__ device_global_indices,  // [max_rows, region_stride]
     int16_t* __restrict__ lru_slots,              // [max_rows, hot_size]
-    unsigned long long* __restrict__ stats,       // [2] hits,misses or nullptr
+    unsigned long long* __restrict__ stats,  // [3] hits,misses,dropped or null
     const int32_t* __restrict__ request_state_indices,  // [num_requests] or
                                                         // nullptr
     const int32_t request_state_count, const int64_t host_rows,
@@ -339,6 +339,11 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
                       attention_block_stride);
       s_topk[i] = kTokenDone;
       atomicAdd(&s_counters[1], 1);
+      // A selected token (not top-k padding) with neither a resident row nor
+      // a host mapping is silently masked from attention; count it.
+      if (token_index >= 0 && stats != nullptr) {
+        atomicAdd(&stats[2], 1ULL);
+      }
     } else {
       s_topk[i] = g;
     }
@@ -520,6 +525,9 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
         // s_lru_out value, so its copy is skipped consistently.
         store_hot_index(row_out, row_attention, i, -1, hot_block_size,
                         attention_block_stride);
+        if (stats != nullptr) {
+          atomicAdd(&stats[2], 1ULL);
+        }
         if (swap_host_physical_rows != nullptr) {
           const int64_t compact_index =
               static_cast<int64_t>(batch_row) * top_k + m;
@@ -1010,8 +1018,8 @@ void hisparse_resolve_residency(
     STD_TORCH_CHECK(
         st.is_cuda() && st.is_contiguous() && st.dim() == 1 &&
             st.scalar_type() == torch::headeronly::ScalarType::UInt64 &&
-            st.numel() == 2,
-        "stats must be a contiguous two-element uint64 CUDA tensor");
+            st.numel() == 3,
+        "stats must be a contiguous three-element uint64 CUDA tensor");
     stats_ptr = static_cast<unsigned long long*>(st.mutable_data_ptr());
   }
 

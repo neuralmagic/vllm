@@ -720,6 +720,40 @@ class HiSparseCoordinator:
                     return False
         return True
 
+    def debug_unmapped_pages(self) -> list[tuple[str, int, str]]:
+        """Pages of live requests with neither a resident row nor a host block.
+
+        The resolve kernel masks selected tokens on such pages out of
+        attention, so any entry here is silent context loss. Returns
+        (request_id, page_idx, state-tag) samples.
+        """
+        if not self.resident_managers or self.host_manager is None:
+            return []
+        resident = self.resident_managers[0]
+        holes: list[tuple[str, int, str]] = []
+        for request_id, state in self.request_states.items():
+            host_blocks = self.host_manager.req_to_blocks.get(request_id, [])
+            num_pages = len(host_blocks) * self.pages_per_host_block
+            resident_blocks = resident.req_to_blocks.get(request_id, [])
+            num_pages = max(num_pages, len(resident_blocks))
+            for page_idx in range(num_pages):
+                if resident.get_resident_page(request_id, page_idx) is not None:
+                    continue
+                host_idx = page_idx // self.pages_per_host_block
+                if host_idx < len(host_blocks):
+                    block = host_blocks[host_idx]
+                    if block.block_id >= 0 and not block.is_null:
+                        continue
+                tag = (
+                    "pending"
+                    if page_idx in state.pending_pages
+                    else "valid"
+                    if page_idx in state.valid_pages
+                    else "untracked"
+                )
+                holes.append((request_id, page_idx, tag))
+        return holes
+
     def take_block_table_updates(self) -> dict[str, tuple[list[int], ...]]:
         updates = {
             request_id: tuple(

@@ -30,7 +30,11 @@ from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 
 def _make_hisparse_worker() -> HiSparseConnectorWorker:
     worker = object.__new__(HiSparseConnectorWorker)
-    worker.refines_row_mirrors = False
+    worker.cache_handles = []
+    worker._mirror_dropped_rows = 0
+    worker._topk_dropped_total = 0
+    worker._post_forward_transfers = []
+    worker._dma_submitted = False
     worker._slot_mapping_staging = None
     worker._row_mirror_num_rows = 0
     worker._row_mirrors_from_resident = False
@@ -66,8 +70,11 @@ def test_hisparse_gpu_slots_select_written_rows_from_async_envelope():
     source_slots = np.array([102, 103, -1, 21, 22, 23], dtype=np.int64)
 
     assert _select_written_row_mirrors(candidates, source_slots, 0) == (
-        SparseKVRowMirror((102, 502), 1002, 2),
-        SparseKVRowMirror((21, 301), 2001, 3),
+        (
+            SparseKVRowMirror((102, 502), 1002, 2),
+            SparseKVRowMirror((21, 301), 2001, 3),
+        ),
+        0,
     )
 
 
@@ -80,8 +87,11 @@ def test_hisparse_written_rows_preserve_scheduler_page_boundaries():
     assert _select_written_row_mirrors(
         candidates, np.array([2, 3, 4, 5], dtype=np.int64), 0
     ) == (
-        SparseKVRowMirror((2,), 102, 2),
-        SparseKVRowMirror((4,), 104, 2),
+        (
+            SparseKVRowMirror((2,), 102, 2),
+            SparseKVRowMirror((4,), 104, 2),
+        ),
+        0,
     )
 
 
@@ -149,8 +159,8 @@ def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
     worker._metrics_event = MagicMock()
     worker._metrics_event.query.return_value = True
     group = SimpleNamespace(
-        swap_stats=torch.tensor([12, 4], dtype=torch.uint64),
-        swap_stats_host=torch.empty(2, dtype=torch.uint64),
+        swap_stats=torch.tensor([12, 4, 0], dtype=torch.uint64),
+        swap_stats_host=torch.empty(3, dtype=torch.uint64),
         stats_row_bytes=16,
     )
     worker.leader_runtimes = [SimpleNamespace(index_group=group)]
@@ -158,7 +168,7 @@ def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
 
     assert worker.finish_step() is None
     worker._metrics_event.record.assert_called_once_with()
-    assert group.swap_stats.tolist() == [0, 0]
+    assert group.swap_stats.tolist() == [0, 0, 0]
     assert worker.finish_step() == HiSparseStats(12, 4, 64)
 
 

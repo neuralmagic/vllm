@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
 )
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.metrics.stats import HiSparseStats
     from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -85,10 +89,32 @@ class HiSparseConnectorScheduler:
         self.coordinator = coordinator
         self.async_speculative = async_speculative
         self.draft_kv_lookahead = draft_kv_lookahead
+        self._debug_coverage = bool(
+            int(os.environ.get("VLLM_HISPARSE_DEBUG_COVERAGE", "0"))
+        )
+        self._debug_coverage_calls = 0
+
+    def _audit_page_coverage(self) -> None:
+        self._debug_coverage_calls += 1
+        if self._debug_coverage_calls % 100 != 0:
+            return
+        holes = self.coordinator.debug_unmapped_pages()
+        if holes:
+            by_tag: dict[str, int] = {}
+            for _, _, tag in holes:
+                by_tag[tag] = by_tag.get(tag, 0) + 1
+            logger.warning(
+                "HiSparse coverage audit: %d unmapped pages %s sample=%s",
+                len(holes),
+                by_tag,
+                holes[:5],
+            )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> HiSparseConnectorMetadata:
+        if self._debug_coverage:
+            self._audit_page_coverage()
         scheduler_output.block_table_updates = (
             self.coordinator.take_block_table_updates() or None
         )
