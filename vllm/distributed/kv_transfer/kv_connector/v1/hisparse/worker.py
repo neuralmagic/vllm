@@ -604,7 +604,7 @@ class HiSparseConnectorWorker:
                     misses,
                     dropped,
                     source_oob,
-                    negative_entry,
+                    null_or_neg_entry,
                     beyond_pool,
                     lru_tripwire,
                     max_masked,
@@ -613,7 +613,7 @@ class HiSparseConnectorWorker:
                 delta.cache_misses += misses
                 topk_dropped += dropped
                 drop_causes[0] += source_oob
-                drop_causes[1] += negative_entry
+                drop_causes[1] += null_or_neg_entry
                 drop_causes[2] += beyond_pool
                 drop_causes[3] += lru_tripwire
                 max_masked_index = max(max_masked_index, max_masked)
@@ -623,7 +623,7 @@ class HiSparseConnectorWorker:
                 self._topk_dropped_total += topk_dropped
                 logger.warning(
                     "HiSparse lossy interval: topk_dropped=%d (total %d) "
-                    "causes[source_oob=%d negative_entry=%d beyond_pool=%d "
+                    "causes[source_oob=%d null_or_neg_entry=%d beyond_pool=%d "
                     "lru_tripwire=%d] max_masked_index=%d "
                     "mirror_dropped_rows=%d (cumulative) hits=%d misses=%d",
                     topk_dropped,

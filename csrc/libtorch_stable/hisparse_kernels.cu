@@ -293,8 +293,8 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
     const int32_t token_index = row_topk[i];
     int32_t g = token_index;
     // Which stats slot a failed host lookup should count into (0 = none):
-    // 3 = request/source-block out of table bounds, 4 = negative table
-    // entry, 5 = mapped row beyond the host pool.
+    // 3 = request/source-block out of table bounds, 4 = null (block 0) or
+    // negative table entry, 5 = mapped row beyond the host pool.
     int32_t drop_cause = 0;
     int32_t resident_row = -1;
     if (source_block_table != nullptr) {
@@ -307,7 +307,11 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
             source_block_table[static_cast<int64_t>(request_id) *
                                    source_bt_stride +
                                source_block];
-        if (physical_block >= 0) {
+        // Block 0 is the host pool's null block: a null or unwritten table
+        // entry must resolve as unavailable, not as rows of block 0 (which
+        // also creates duplicate resolved ids that break the hot LRU's
+        // hit/miss accounting). Matches the prefill staging plan's sentinel.
+        if (physical_block > 0) {
           g = physical_block * source_block_size +
               token_index % source_block_size;
         } else {
