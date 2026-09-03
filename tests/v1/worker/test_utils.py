@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
     HiSparseConnectorWorker,
     _flatten_row_mirrors,
+    _resolve_staged_row_mirrors,
     _select_written_row_mirrors,
     _SlotMappingStaging,
 )
@@ -155,6 +156,21 @@ def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
     assert state.source_index == 1
 
 
+def test_hisparse_mirror_staging_reuses_buffer_after_resolution():
+    """A later draft write must not reuse an earlier resolved slot mapping."""
+    state = _SlotMappingStaging(
+        MagicMock(), MagicMock(), torch.tensor([7, 8], dtype=torch.int64)
+    )
+    state.candidates = (SparseKVRowMirror((7,), 70, 4),)
+    state.num_tokens = 2
+
+    assert _resolve_staged_row_mirrors(state) == (SparseKVRowMirror((7,), 70, 2),)
+    state.slots.copy_(torch.tensor([9, 10]))
+    state.num_tokens = 2
+
+    assert _resolve_staged_row_mirrors(state) == (SparseKVRowMirror((9,), 72, 2),)
+
+
 @pytest.mark.parametrize("mapping_name", ["target", "target.hisparse_resident"])
 def test_hisparse_stages_target_slot_mapping(monkeypatch, mapping_name):
     worker = _make_hisparse_worker()
@@ -196,16 +212,14 @@ def test_hisparse_defers_unready_slot_mapping_without_synchronizing():
     state.num_tokens = 2
     worker._slot_mapping_staging = state
     worker._mirror_jobs = hisparse_worker_module.queue.Queue()
-    worker._enqueue_host_mirror = MagicMock(return_value=((0,), 2))
+    worker._enqueue_host_mirror = MagicMock(return_value=(0,))
     worker._clear_forward_mirror_state = MagicMock()
     ready_event = MagicMock()
 
     worker._finish_mirror_phase(ready_event)
 
     job = worker._mirror_jobs.get_nowait()
-    assert job == hisparse_worker_module._PendingMirrorPhase(
-        state, ready_event, (0,), 2
-    )
+    assert job == hisparse_worker_module._PendingMirrorPhase(state, ready_event, (0,))
     state.event.synchronize.assert_not_called()
     assert worker._slot_mapping_staging is None
 
@@ -214,8 +228,7 @@ def test_hisparse_resolves_deferred_slot_mapping_before_dma(monkeypatch):
     worker = _make_hisparse_worker()
     worker.is_host_writer = True
     worker._mirror_jobs = hisparse_worker_module.queue.Queue()
-    worker._mirror_state_lock = hisparse_worker_module.threading.Lock()
-    worker._slot_mapping_free = deque()
+    worker._slot_mapping_free = hisparse_worker_module.queue.SimpleQueue()
     worker._enqueue_row_dma = MagicMock()
     state = _SlotMappingStaging(
         MagicMock(), MagicMock(), torch.tensor([11, 12], dtype=torch.int64)
@@ -226,7 +239,7 @@ def test_hisparse_resolves_deferred_slot_mapping_before_dma(monkeypatch):
     state.source_index = 0
     ready_event = MagicMock()
     worker._mirror_jobs.put(
-        hisparse_worker_module._PendingMirrorPhase(state, ready_event, (1,), 2)
+        hisparse_worker_module._PendingMirrorPhase(state, ready_event, (1,))
     )
     worker._mirror_jobs.put(None)
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
@@ -242,7 +255,7 @@ def test_hisparse_resolves_deferred_slot_mapping_before_dma(monkeypatch):
         synchronize_compute=False,
     )
     state.event.synchronize.assert_not_called()
-    assert worker._slot_mapping_free.popleft() is state
+    assert worker._slot_mapping_free.get_nowait() is state
 
 
 def test_hisparse_deferred_mapping_allows_gpu_only_rows(monkeypatch):
@@ -250,8 +263,7 @@ def test_hisparse_deferred_mapping_allows_gpu_only_rows(monkeypatch):
     worker = _make_hisparse_worker()
     worker.is_host_writer = True
     worker._mirror_jobs = hisparse_worker_module.queue.Queue()
-    worker._mirror_state_lock = hisparse_worker_module.threading.Lock()
-    worker._slot_mapping_free = deque()
+    worker._slot_mapping_free = hisparse_worker_module.queue.SimpleQueue()
     worker._enqueue_row_dma = MagicMock()
     state = _SlotMappingStaging(
         MagicMock(), MagicMock(), torch.tensor([11, 12], dtype=torch.int64)
@@ -260,7 +272,7 @@ def test_hisparse_deferred_mapping_allows_gpu_only_rows(monkeypatch):
     state.num_tokens = 2
     ready_event = MagicMock()
     worker._mirror_jobs.put(
-        hisparse_worker_module._PendingMirrorPhase(state, ready_event, (1,), 2)
+        hisparse_worker_module._PendingMirrorPhase(state, ready_event, (1,))
     )
     worker._mirror_jobs.put(None)
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())

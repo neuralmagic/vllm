@@ -66,7 +66,6 @@ class _SlotMappingStaging:
     candidates: tuple[SparseKVRowMirror, ...] = ()
     num_tokens: int = 0
     source_index: int = 0
-    resolved_mirrors: tuple[SparseKVRowMirror, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -74,7 +73,6 @@ class _PendingMirrorPhase:
     staging: _SlotMappingStaging
     ready_event: torch.Event
     active_layer_indices: tuple[int, ...]
-    num_rows: int
 
 
 @dataclass(frozen=True)
@@ -176,6 +174,18 @@ def _select_written_row_mirrors(
         )
         for start, end in zip(run_starts, run_ends, strict=True)
     )
+
+
+def _resolve_staged_row_mirrors(
+    staging: _SlotMappingStaging,
+) -> tuple[SparseKVRowMirror, ...]:
+    mirrors = _select_written_row_mirrors(
+        staging.candidates,
+        staging.slots[: staging.num_tokens].numpy(),
+        staging.source_index,
+    )
+    staging.num_tokens = 0
+    return mirrors
 
 
 def _is_hisparse_host_writer(
@@ -323,7 +333,7 @@ class HiSparseConnectorWorker:
             torch.cuda.Stream(device=device) if self.is_host_writer else None
         )
         self._slot_mapping_staging: _SlotMappingStaging | None = None
-        self._slot_mapping_free: deque[_SlotMappingStaging] = deque()
+        self._slot_mapping_free = queue.SimpleQueue[_SlotMappingStaging]()
         if self.is_host_writer and self.refines_row_mirrors:
             speculative_config = self.vllm_config.speculative_config
             assert speculative_config is not None
@@ -333,18 +343,18 @@ class HiSparseConnectorWorker:
             )
             copy_stream = torch.Stream(device=device)
             num_staging_buffers = 2 * (speculative_config.num_speculative_tokens + 2)
-            self._slot_mapping_free.extend(
-                _SlotMappingStaging(
-                    stream=copy_stream,
-                    event=torch.Event(),
-                    slots=torch.empty(
-                        max_mirror_rows,
-                        dtype=torch.int64,
-                        pin_memory=True,
-                    ),
+            for _ in range(num_staging_buffers):
+                self._slot_mapping_free.put(
+                    _SlotMappingStaging(
+                        stream=copy_stream,
+                        event=torch.Event(),
+                        slots=torch.empty(
+                            max_mirror_rows,
+                            dtype=torch.int64,
+                            pin_memory=True,
+                        ),
+                    )
                 )
-                for _ in range(num_staging_buffers)
-            )
         self._step_row_mirrors: tuple[SparseKVRowMirror, ...] = ()
         self._step_mirror_transfer_ids: tuple[int, ...] = ()
         self._mirror_jobs: queue.Queue[
@@ -353,7 +363,6 @@ class HiSparseConnectorWorker:
         self._mirror_thread: threading.Thread | None = None
         self._mirror_error: BaseException | None = None
         self._pending_mirror_fence: _MirrorStepCompletion | None = None
-        self._mirror_state_lock = threading.Lock()
         self._dma_lock = threading.Lock()
         self._dma_free_descriptors: list[_DMADescriptors] = []
         self._pending_dma_descriptors: deque[tuple[torch.Event, _DMADescriptors]] = (
@@ -543,14 +552,15 @@ class HiSparseConnectorWorker:
             return False
         state = self._slot_mapping_staging
         if state is None:
-            with self._mirror_state_lock:
-                if not self._slot_mapping_free:
-                    raise RuntimeError("HiSparse mirror staging queue is exhausted.")
-                state = self._slot_mapping_free.popleft()
+            try:
+                state = self._slot_mapping_free.get_nowait()
+            except queue.Empty as error:
+                raise RuntimeError(
+                    "HiSparse mirror staging queue is exhausted."
+                ) from error
             state.candidates = self._step_row_mirrors
             state.num_tokens = 0
             state.source_index = 0
-            state.resolved_mirrors = None
             self._slot_mapping_staging = state
         eligible = [
             (layer_name, handle)
@@ -598,18 +608,9 @@ class HiSparseConnectorWorker:
         state = self._slot_mapping_staging
         if state is None or not state.num_tokens:
             return True
-        if state.resolved_mirrors is not None:
-            self._set_row_mirrors(state.resolved_mirrors)
-            self._row_mirrors_from_resident = True
-            return True
         if not state.event.query():
             return False
-        state.resolved_mirrors = _select_written_row_mirrors(
-            state.candidates,
-            state.slots[: state.num_tokens].numpy(),
-            state.source_index,
-        )
-        self._set_row_mirrors(state.resolved_mirrors)
+        self._set_row_mirrors(_resolve_staged_row_mirrors(state))
         self._row_mirrors_from_resident = True
         return True
 
@@ -621,20 +622,14 @@ class HiSparseConnectorWorker:
                     if isinstance(job, _PendingMirrorPhase):
                         while not job.staging.event.query():
                             time.sleep(0.0001)
-                        mirrors = _select_written_row_mirrors(
-                            job.staging.candidates,
-                            job.staging.slots[: job.staging.num_tokens].numpy(),
-                            job.staging.source_index,
-                        )
                         self._enqueue_row_dma(
                             job.active_layer_indices,
                             ready_event=job.ready_event,
-                            mirrors=mirrors,
+                            mirrors=_resolve_staged_row_mirrors(job.staging),
                             from_resident=True,
                             synchronize_compute=False,
                         )
-                        with self._mirror_state_lock:
-                            self._slot_mapping_free.append(job.staging)
+                        self._slot_mapping_free.put(job.staging)
                     else:
                         self._record_mirror_step_completion(job)
         except BaseException as error:
@@ -1077,14 +1072,14 @@ class HiSparseConnectorWorker:
         ready_event: torch.Event | None = None,
         *,
         defer_dma: bool = False,
-    ) -> tuple[tuple[int, ...], int]:
+    ) -> tuple[int, ...]:
         active_layer_indices = tuple(
             index
             for index, handle in enumerate(self.cache_handles)
             if handle.num_actual_tokens != 0
         )
         if not active_layer_indices:
-            return (), 0
+            return ()
         cache = self.cache_handles[active_layer_indices[0]]
         dst_slots = cache.mirror_slot_mapping
         active_handles = [self.cache_handles[index] for index in active_layer_indices]
@@ -1130,7 +1125,7 @@ class HiSparseConnectorWorker:
                 f"cache 0={expected}, cache {index}={actual}."
             )
         if not cache.host_mirror_required:
-            return (), 0
+            return ()
         if dst_slots is None:
             raise RuntimeError("HiSparse host mirror has no source slot mapping.")
         num_rows = min(
@@ -1138,7 +1133,7 @@ class HiSparseConnectorWorker:
             dst_slots.numel(),
         )
         if num_rows == 0:
-            return (), 0
+            return ()
         if self.is_host_writer and not defer_dma:
             if not self.refines_row_mirrors:
                 self._require_row_mirrors(num_rows)
@@ -1171,7 +1166,7 @@ class HiSparseConnectorWorker:
                         dst_slots[:num_written_tokens],
                         cache.req_id_per_token[:num_written_tokens],
                     )
-        return active_layer_indices, num_rows
+        return active_layer_indices
 
     def _finish_mirror_phase(self, ready_event: torch.Event | None = None) -> None:
         for handle in self.cache_handles:
@@ -1187,16 +1182,13 @@ class HiSparseConnectorWorker:
             ready_event = torch.Event()
             ready_event.record()
         refined = self._try_refine_row_mirrors()
-        active_layers, num_rows = self._enqueue_host_mirror(
-            ready_event, defer_dma=not refined
-        )
+        active_layers = self._enqueue_host_mirror(ready_event, defer_dma=not refined)
         self._slot_mapping_staging = None
         if refined:
-            with self._mirror_state_lock:
-                self._slot_mapping_free.append(state)
+            self._slot_mapping_free.put(state)
         else:
             self._mirror_jobs.put(
-                _PendingMirrorPhase(state, ready_event, active_layers, num_rows)
+                _PendingMirrorPhase(state, ready_event, active_layers)
             )
         self._clear_forward_mirror_state()
 
