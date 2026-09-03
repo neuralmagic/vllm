@@ -443,11 +443,19 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
         h = (h + 1) % hash_size;
       }
     }
-    const bool is_hit = found_topk_idx >= 0;
+    // Claim the token atomically. Duplicate cached ids (two slots holding
+    // the same host row, however seeded) would otherwise both ballot as
+    // hits while marking one token done: misses then exceed evictable
+    // slots, the miss compaction reads past the evictable suffix of
+    // s_lru_out, and phase 4 writes inconsistent state back into the LRU —
+    // a self-sustaining corruption storm. Losing claimants degrade to
+    // evictable so duplicates recycle instead of snowballing.
+    const bool is_hit =
+        found_topk_idx >= 0 &&
+        atomicCAS(&s_topk[found_topk_idx], cached_g, kTokenDone) == cached_g;
     const bool is_evictable = has_valid_pos && !is_hit;
 
     if (is_hit) {
-      s_topk[found_topk_idx] = kTokenDone;
       store_hot_index(row_out, row_attention, found_topk_idx,
                       static_cast<int32_t>(get_physical_hot_row(
                           hot_block_table, request_row, hot_table_stride,
