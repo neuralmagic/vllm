@@ -1187,6 +1187,37 @@ def test_hisparse_step_waits_for_previous_host_write(monkeypatch, is_host_writer
     assert worker.host_write_event is host_write_events[1]
 
 
+def test_hisparse_step_binds_prestaged_slots_to_current_mirrors(monkeypatch):
+    worker = _make_hisparse_worker()
+    worker.is_host_writer = True
+    worker.hot_backing = SimpleNamespace(device=torch.device("cuda:1"))
+    worker.host_caches = ()
+    worker.host_num_blocks = 1
+    worker._post_forward_transfers = []
+    worker._pending_invalid_block_ids = []
+    worker.cache_handles = []
+    worker._layer_mirror_callbacks = ()
+    state = _SlotMappingStaging(MagicMock(), MagicMock(), torch.empty(1))
+    state.candidates = (SparseKVRowMirror((1,), 2, 1),)
+    worker._slot_mapping_staging = state
+    monkeypatch.setattr(hisparse_worker_module, "current_stream", MagicMock())
+    mirrors = (SparseKVRowMirror((10,), 20, 1),)
+
+    worker.start_step(
+        SimpleNamespace(
+            host_block_copies=[],
+            command=None,
+            source_block_ids=[],
+            row_mirrors={"request": mirrors},
+            all_context_pages_resident=True,
+            row_mirrors_from_resident=False,
+        ),
+        None,
+    )
+
+    assert state.candidates == mirrors
+
+
 @pytest.mark.parametrize("tp_rank, expected_copies", [(0, 1), (1, 0)])
 def test_hisparse_shared_host_block_copy_has_one_writer(
     monkeypatch, tp_rank, expected_copies

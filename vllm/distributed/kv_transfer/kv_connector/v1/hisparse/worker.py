@@ -469,14 +469,14 @@ class HiSparseConnectorWorker:
     ) -> None:
         self._wait_for_previous_mirror_step()
         self._raise_mirror_error()
-        if self._slot_mapping_staging is not None:
-            raise RuntimeError("HiSparse mirror phase crossed a scheduler step.")
         previous_host_write_event = self.host_write_event
         self.host_write_event = self.host_write_events[self._next_host_write_event]
         self._next_host_write_event ^= 1
         current_stream().wait_event(previous_host_write_event)
         self._release_completed_dma_descriptors()
         mirrors = _flatten_row_mirrors(metadata.row_mirrors, request_ids)
+        if self._slot_mapping_staging is not None:
+            self._slot_mapping_staging.candidates = mirrors
         self._step_row_mirrors = mirrors
         self._step_mirror_transfer_ids = tuple(
             dict.fromkeys(
