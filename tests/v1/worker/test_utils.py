@@ -101,6 +101,18 @@ def test_hisparse_written_rows_use_the_active_resident_group():
     ) == (SparseKVRowMirror((201, 801), 2001, 1),)
 
 
+def test_hisparse_written_rows_without_host_destinations_are_skipped():
+    """GPU writes outside the host-backed envelope must remain GPU-only."""
+    candidates = (SparseKVRowMirror((100,), 1000, 2),)
+
+    assert _select_written_row_mirrors(
+        candidates, np.array([99, 100, 101, 102], dtype=np.int64), 0
+    ) == (SparseKVRowMirror((100,), 1000, 2),)
+    assert (
+        _select_written_row_mirrors((), np.array([100, 101], dtype=np.int64), 0) == ()
+    )
+
+
 def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
     """Separate context and query writes must share one mirror phase."""
     worker = _make_hisparse_worker()
@@ -231,6 +243,38 @@ def test_hisparse_resolves_deferred_slot_mapping_before_dma(monkeypatch):
     )
     state.event.synchronize.assert_not_called()
     assert worker._slot_mapping_free.popleft() is state
+
+
+def test_hisparse_deferred_mapping_allows_gpu_only_rows(monkeypatch):
+    """A forward with no host destinations must not fail in the DMA thread."""
+    worker = _make_hisparse_worker()
+    worker.is_host_writer = True
+    worker._mirror_jobs = hisparse_worker_module.queue.Queue()
+    worker._mirror_state_lock = hisparse_worker_module.threading.Lock()
+    worker._slot_mapping_free = deque()
+    worker._enqueue_row_dma = MagicMock()
+    state = _SlotMappingStaging(
+        MagicMock(), MagicMock(), torch.tensor([11, 12], dtype=torch.int64)
+    )
+    state.event.query.return_value = True
+    state.num_tokens = 2
+    ready_event = MagicMock()
+    worker._mirror_jobs.put(
+        hisparse_worker_module._PendingMirrorPhase(state, ready_event, (1,), 2)
+    )
+    worker._mirror_jobs.put(None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+
+    worker._run_mirror_jobs(torch.device("cuda:0"))
+
+    worker._enqueue_row_dma.assert_called_once_with(
+        (1,),
+        ready_event=ready_event,
+        mirrors=(),
+        from_resident=True,
+        synchronize_compute=False,
+    )
+    assert worker._mirror_error is None
 
 
 def test_hisparse_next_step_waits_for_deferred_mirror_dma(monkeypatch):

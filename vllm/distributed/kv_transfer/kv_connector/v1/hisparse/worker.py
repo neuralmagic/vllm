@@ -128,7 +128,7 @@ def _select_written_row_mirrors(
     if source_slots.size == 0:
         return ()
     if not candidates:
-        raise RuntimeError("HiSparse GPU slots have no scheduler mapping envelope.")
+        return ()
     starts = np.asarray([mirror.source_starts for mirror in candidates], dtype=np.int64)
     counts = np.fromiter((mirror.num_rows for mirror in candidates), dtype=np.int64)
     destinations = np.fromiter(
@@ -141,12 +141,12 @@ def _select_written_row_mirrors(
     matches = np.searchsorted(source_starts[order], source_slots, side="right") - 1
     candidate_ids = order[np.maximum(matches, 0)]
     offsets = source_slots - source_starts[candidate_ids]
-    invalid = (matches < 0) | (offsets >= counts[candidate_ids])
-    if np.any(invalid):
-        raise RuntimeError(
-            "HiSparse GPU slot mapping falls outside the scheduler envelope: "
-            f"{source_slots[invalid][:8].tolist()}."
-        )
+    valid = (matches >= 0) & (offsets < counts[candidate_ids])
+    source_slots = source_slots[valid]
+    candidate_ids = candidate_ids[valid]
+    offsets = offsets[valid]
+    if source_slots.size == 0:
+        return ()
     sources = starts[candidate_ids] + offsets[:, None]
     destinations = destinations[candidate_ids] + offsets
     transfer_ids = np.asarray(
@@ -626,12 +626,6 @@ class HiSparseConnectorWorker:
                             job.staging.slots[: job.staging.num_tokens].numpy(),
                             job.staging.source_index,
                         )
-                        if sum(mirror.num_rows for mirror in mirrors) < job.num_rows:
-                            raise RuntimeError(
-                                "HiSparse DMA metadata does not match the forward: "
-                                f"{sum(mirror.num_rows for mirror in mirrors)} rows "
-                                f"for {job.num_rows} tokens."
-                            )
                         self._enqueue_row_dma(
                             job.active_layer_indices,
                             ready_event=job.ready_event,
@@ -955,7 +949,8 @@ class HiSparseConnectorWorker:
             for cache in self.cache_handles:
                 cache.submit_layer_mirror = None
             return
-        self._require_row_mirrors(handle.num_actual_tokens)
+        if not self.refines_row_mirrors:
+            self._require_row_mirrors(handle.num_actual_tokens)
         self._per_layer_mirrored.add(layer_index)
         next_layer = layer_index + 1
         if (
@@ -1145,7 +1140,8 @@ class HiSparseConnectorWorker:
         if num_rows == 0:
             return (), 0
         if self.is_host_writer and not defer_dma:
-            self._require_row_mirrors(num_rows)
+            if not self.refines_row_mirrors:
+                self._require_row_mirrors(num_rows)
             expected_layers = set(active_layer_indices)
             if self._per_layer_mirrored:
                 if self._per_layer_mirrored != expected_layers:

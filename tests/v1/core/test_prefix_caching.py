@@ -254,6 +254,24 @@ def test_hisparse_builds_dma_row_mirrors_across_pages():
     assert [mirror.num_rows for mirror in mirrors] == [2, 2]
 
 
+def test_hisparse_row_mirrors_keep_mapped_rows_at_allocation_boundary():
+    """An unmapped lookahead page must not discard earlier host-backed rows."""
+    manager = make_hisparse_kv_cache_manager(32, 16)
+    request = make_request(
+        "request",
+        list(range(2 * HISPARSE_BLOCK_SIZE)),
+        HISPARSE_BLOCK_SIZE,
+        sha256,
+    )
+    assert manager.allocate_slots(request, num_new_tokens=32) is not None
+    coordinator = manager.hisparse_coordinator
+
+    mirrors = coordinator.build_row_mirrors([(request.request_id, 30, 4)])
+
+    assert len(mirrors) == 1
+    assert mirrors[0].num_rows == 2
+
+
 def test_hisparse_row_mirror_blocks_remain_pinned_until_dma_completion():
     manager = make_hisparse_kv_cache_manager(32, 16)
     request = make_request(

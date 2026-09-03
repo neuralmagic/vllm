@@ -678,10 +678,13 @@ class HiSparseCoordinator:
                 for blocks in resident_blocks:
                     assert blocks is not None
                     if page_idx >= len(blocks) or blocks[page_idx].is_null:
-                        return ()
+                        break
                     source_starts.append(
                         blocks[page_idx].block_id * block_size + row_offset
                     )
+                if len(source_starts) != len(resident_blocks):
+                    token_position += num_rows
+                    continue
                 if hold_blocks:
                     for manager, blocks in zip(
                         self.resident_managers, resident_blocks, strict=True
@@ -696,10 +699,12 @@ class HiSparseCoordinator:
                     page_idx, self.pages_per_host_block
                 )
                 if host_block_idx >= len(host_blocks):
-                    return ()
+                    token_position += num_rows
+                    continue
                 host_block = host_blocks[host_block_idx]
                 if host_block.is_null:
-                    return ()
+                    token_position += num_rows
+                    continue
                 if hold_blocks:
                     held_blocks[id(self.host_manager.block_pool), id(host_block)] = (
                         self.host_manager.block_pool,
