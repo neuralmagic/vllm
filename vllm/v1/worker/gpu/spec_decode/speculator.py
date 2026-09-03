@@ -147,7 +147,7 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.supports_mm_inputs = False
         self.slot_mapping_observer: (
-            Callable[[dict[str, torch.Tensor], int], None] | None
+            Callable[[dict[str, torch.Tensor], int, set[str] | None], bool] | None
         ) = None
         self.host_mirror_forward_observer: Callable[[], None] | None = None
 
@@ -159,15 +159,9 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> bool:
         if dummy_run or self.slot_mapping_observer is None or slot_mappings is None:
             return False
-        draft_slot_mappings = {
-            layer_name: slot_mappings[layer_name]
-            for layer_name in self.draft_attn_layer_names
-            if layer_name in slot_mappings
-        }
-        if not draft_slot_mappings:
-            return False
-        self.slot_mapping_observer(draft_slot_mappings, num_tokens)
-        return True
+        return self.slot_mapping_observer(
+            slot_mappings, num_tokens, self.draft_attn_layer_names
+        )
 
     def finish_draft_host_mirror(self, staged: bool) -> None:
         if staged:

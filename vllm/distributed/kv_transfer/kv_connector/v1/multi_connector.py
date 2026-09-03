@@ -330,10 +330,17 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             c.finish_forward()
 
     def stage_host_mirror_mapping(
-        self, slot_mappings: dict[str, torch.Tensor], num_tokens: int
-    ) -> None:
+        self,
+        slot_mappings: dict[str, torch.Tensor],
+        num_tokens: int,
+        layer_names: set[str] | None = None,
+    ) -> bool:
+        staged = False
         for c in self._connectors:
-            c.stage_host_mirror_mapping(slot_mappings, num_tokens)
+            staged |= c.stage_host_mirror_mapping(
+                slot_mappings, num_tokens, layer_names
+            )
+        return staged
 
     def finish_host_mirror_forward(self) -> None:
         for c in self._connectors:

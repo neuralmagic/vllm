@@ -237,10 +237,15 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.finish_forward()
 
     def stage_host_mirror_mapping(
-        self, slot_mappings: dict[str, torch.Tensor], num_tokens: int
-    ) -> None:
+        self,
+        slot_mappings: dict[str, torch.Tensor],
+        num_tokens: int,
+        layer_names: set[str] | None = None,
+    ) -> bool:
         assert self.connector_worker is not None
-        self.connector_worker.stage_row_mirror_mapping(slot_mappings, num_tokens)
+        return self.connector_worker.stage_row_mirror_mapping(
+            slot_mappings, num_tokens, layer_names
+        )
 
     def finish_host_mirror_forward(self) -> None:
         assert self.connector_worker is not None

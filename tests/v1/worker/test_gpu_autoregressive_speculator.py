@@ -365,7 +365,9 @@ def test_autoregressive_mtp_finishes_each_draft_mirror_phase(monkeypatch, cg_mod
     monkeypatch.setattr(
         spec_module,
         "build_slot_mappings_by_layer",
-        lambda slot_mappings, kv_cache_config: {"draft": slot_mappings[0]},
+        lambda slot_mappings, kv_cache_config: {
+            "draft.hisparse_resident": slot_mappings[0]
+        },
     )
     batch_desc = BatchExecutionDescriptor(
         cg_mode=cg_mode,
@@ -383,6 +385,10 @@ def test_autoregressive_mtp_finishes_each_draft_mirror_phase(monkeypatch, cg_mod
     )
 
     assert speculator.slot_mapping_observer.call_count == 3
+    assert all(
+        set(args[0]) == {"draft.hisparse_resident"} and args[2] == {"draft"}
+        for args, _ in speculator.slot_mapping_observer.call_args_list
+    )
     assert speculator.host_mirror_forward_observer.call_count == 3
 
 

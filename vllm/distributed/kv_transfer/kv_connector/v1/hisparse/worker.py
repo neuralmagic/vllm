@@ -22,6 +22,7 @@ from vllm.distributed.parallel_state import (
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.core.kv_cache_utils import (
     HISPARSE_HOT_SUFFIX,
+    HISPARSE_RESIDENT_SUFFIX,
     KVCacheBlockCopy,
     get_unique_kv_cache_group_id,
 )
@@ -470,25 +471,32 @@ class HiSparseConnectorWorker:
             handle.submit_layer_mirror = callback
 
     def stage_row_mirror_mapping(
-        self, slot_mappings: Mapping[str, torch.Tensor], num_tokens: int
-    ) -> None:
+        self,
+        slot_mappings: Mapping[str, torch.Tensor],
+        num_tokens: int,
+        layer_names: set[str] | None = None,
+    ) -> bool:
         if not self.is_host_writer or not self.refines_row_mirrors:
-            return
+            return False
         state = self._slot_mapping_staging
         assert state is not None
-        mapping = next(
-            (
-                (slot_mappings[layer_name], handle.runtime.resident_source_index)
-                for layer_name, handle in zip(
-                    self.cache_layer_names, self.cache_handles, strict=True
-                )
-                if layer_name in slot_mappings
-            ),
-            None,
-        )
-        if mapping is None:
-            return
-        slots, source_index = mapping
+        eligible = [
+            (layer_name, handle)
+            for layer_name, handle in zip(
+                self.cache_layer_names, self.cache_handles, strict=True
+            )
+            if layer_names is None or layer_name in layer_names
+        ]
+        if not eligible:
+            return False
+        layer_name, handle = eligible[0]
+        resident_name = f"{layer_name}{HISPARSE_RESIDENT_SUFFIX}"
+        if resident_name not in slot_mappings:
+            raise RuntimeError(
+                f"HiSparse resident slot mapping is missing for {layer_name}."
+            )
+        slots = slot_mappings[resident_name]
+        source_index = handle.runtime.resident_source_index
         if slots.ndim != 1:
             raise ValueError("HiSparse requires per-layer slot mappings.")
         start = state.num_tokens
@@ -511,6 +519,7 @@ class HiSparseConnectorWorker:
         state.num_tokens = end
         state.source_index = source_index
         self._arm_layer_mirrors()
+        return True
 
     def _try_refine_row_mirrors(self) -> bool:
         state = self._slot_mapping_staging

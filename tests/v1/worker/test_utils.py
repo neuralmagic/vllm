@@ -94,21 +94,30 @@ def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
         MagicMock(), MagicMock(), torch.empty(4, dtype=torch.int64)
     )
     worker._slot_mapping_staging = state
-    handle = SimpleNamespace(runtime=SimpleNamespace(resident_source_index=1))
-    worker.cache_layer_names = ["layer"]
-    worker.cache_handles = [handle]
-    worker._layer_mirror_callbacks = (MagicMock(),)
+    worker.cache_layer_names = ["target", "draft"]
+    worker.cache_handles = [
+        SimpleNamespace(runtime=SimpleNamespace(resident_source_index=0)),
+        SimpleNamespace(runtime=SimpleNamespace(resident_source_index=1)),
+    ]
+    worker._layer_mirror_callbacks = (MagicMock(), MagicMock())
     worker._row_mirror_num_rows = 1
     worker._submitted_mirror_layers = set()
     main_stream = MagicMock()
     monkeypatch.setattr(hisparse_worker_module, "current_stream", lambda: main_stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
-    worker.stage_row_mirror_mapping(
-        {"layer": torch.tensor([7, 8], dtype=torch.int64)}, 2
+    assert worker.stage_row_mirror_mapping(
+        {
+            "target.hisparse_resident": torch.tensor([1, 2], dtype=torch.int64),
+            "draft.hisparse_resident": torch.tensor([7, 8], dtype=torch.int64),
+        },
+        2,
+        {"draft"},
     )
-    worker.stage_row_mirror_mapping(
-        {"layer": torch.tensor([9, 10], dtype=torch.int64)}, 2
+    assert worker.stage_row_mirror_mapping(
+        {"draft.hisparse_resident": torch.tensor([9, 10], dtype=torch.int64)},
+        2,
+        {"draft"},
     )
 
     torch.testing.assert_close(state.slots, torch.tensor([7, 8, 9, 10]))
@@ -116,6 +125,32 @@ def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
     assert state.event.record.call_args_list == [call(state.stream)] * 2
     assert state.num_tokens == 4
     assert state.source_index == 1
+
+
+def test_hisparse_stages_target_resident_slot_mapping(monkeypatch):
+    worker = _make_hisparse_worker()
+    worker.is_host_writer = True
+    worker.refines_row_mirrors = True
+    state = _SlotMappingStaging(
+        MagicMock(), MagicMock(), torch.empty(2, dtype=torch.int64)
+    )
+    worker._slot_mapping_staging = state
+    worker.cache_layer_names = ["target"]
+    worker.cache_handles = [
+        SimpleNamespace(runtime=SimpleNamespace(resident_source_index=2))
+    ]
+    worker._layer_mirror_callbacks = (MagicMock(),)
+    worker._row_mirror_num_rows = 1
+    worker._submitted_mirror_layers = set()
+    monkeypatch.setattr(hisparse_worker_module, "current_stream", MagicMock())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    assert worker.stage_row_mirror_mapping(
+        {"target.hisparse_resident": torch.tensor([7, 8], dtype=torch.int64)}, 2
+    )
+
+    torch.testing.assert_close(state.slots, torch.tensor([7, 8]))
+    assert state.source_index == 2
 
 
 @pytest.mark.parametrize(
