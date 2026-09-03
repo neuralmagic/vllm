@@ -351,6 +351,7 @@ class HiSparseConnectorWorker:
                 "HiSparse request-state mapping does not match max_num_seqs."
             )
         self.hot_backing = hot_backing
+        self._row_owner: dict[int, str] = {}
         self._pending_invalid_block_ids: list[int] = []
         self._post_forward_transfers: list[SparseKVPageTransfer] = []
         self._enqueued_transfer_ids: list[int] = []
@@ -413,6 +414,7 @@ class HiSparseConnectorWorker:
         metadata: HiSparseConnectorMetadata,
         request_state_indices: torch.Tensor | None,
         request_ids: list[str] | None = None,
+        request_state_indices_np: np.ndarray | None = None,
     ) -> None:
         previous_host_write_event = self.host_write_event
         self.host_write_event = self.host_write_events[self._next_host_write_event]
@@ -441,6 +443,36 @@ class HiSparseConnectorWorker:
         self._pending_invalid_block_ids.extend(metadata.source_block_ids)
         if request_state_indices is not None:
             self.set_request_state_indices(request_state_indices)
+        self._reset_reused_state_rows(request_state_indices_np, request_ids)
+
+    def _reset_reused_state_rows(
+        self,
+        state_rows_np: np.ndarray | None,
+        request_ids: list[str] | None,
+    ) -> None:
+        """Reset per-row hot state when a request-state row changes occupant.
+
+        Rows keep LRU order and cached host-row indices across requests; a
+        new occupant sharing prefix-cached host rows with its predecessor
+        would otherwise take false hot hits on hot blocks it never filled.
+        """
+        if (
+            state_rows_np is None
+            or request_ids is None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        reused = []
+        for row, request_id in zip(state_rows_np.tolist(), request_ids):
+            if self._row_owner.get(row) != request_id:
+                self._row_owner[row] = request_id
+                reused.append(row)
+        if not reused:
+            return
+        staging = torch.tensor(reused, dtype=torch.int64, pin_memory=True)
+        rows = staging.to(self.cache_handles[0].runtime.device, non_blocking=True)
+        for runtime in self.leader_runtimes:
+            runtime.reset_hot_state_rows(rows)
 
     def _clear_forward_mirror_state(self) -> None:
         self._per_layer_mirrored.clear()
@@ -563,21 +595,44 @@ class HiSparseConnectorWorker:
         if self._metrics_pending and self._metrics_event.query():
             delta = HiSparseStats()
             topk_dropped = 0
+            drop_causes = [0, 0, 0, 0]
+            max_masked_index = 0
             for runtime in self.leader_runtimes:
                 group = runtime.index_group
-                hits, misses, dropped = group.swap_stats_host.tolist()
+                (
+                    hits,
+                    misses,
+                    dropped,
+                    source_oob,
+                    negative_entry,
+                    beyond_pool,
+                    lru_tripwire,
+                    max_masked,
+                ) = group.swap_stats_host.tolist()
                 delta.cache_hits += hits
                 delta.cache_misses += misses
                 topk_dropped += dropped
+                drop_causes[0] += source_oob
+                drop_causes[1] += negative_entry
+                drop_causes[2] += beyond_pool
+                drop_causes[3] += lru_tripwire
+                max_masked_index = max(max_masked_index, max_masked)
                 delta.host_to_device_bytes += misses * group.stats_row_bytes
             self._metrics_pending = False
             if topk_dropped or self._mirror_dropped_rows:
                 self._topk_dropped_total += topk_dropped
                 logger.warning(
                     "HiSparse lossy interval: topk_dropped=%d (total %d) "
+                    "causes[source_oob=%d negative_entry=%d beyond_pool=%d "
+                    "lru_tripwire=%d] max_masked_index=%d "
                     "mirror_dropped_rows=%d (cumulative) hits=%d misses=%d",
                     topk_dropped,
                     self._topk_dropped_total,
+                    drop_causes[0],
+                    drop_causes[1],
+                    drop_causes[2],
+                    drop_causes[3],
+                    max_masked_index,
                     self._mirror_dropped_rows,
                     delta.cache_hits,
                     delta.cache_misses,

@@ -31,6 +31,7 @@ from vllm.v1.worker.utils import bind_kv_cache, copy_kv_cache_blocks_inplace
 def _make_hisparse_worker() -> HiSparseConnectorWorker:
     worker = object.__new__(HiSparseConnectorWorker)
     worker.cache_handles = []
+    worker._row_owner = {}
     worker._mirror_dropped_rows = 0
     worker._topk_dropped_total = 0
     worker._post_forward_transfers = []
@@ -159,8 +160,8 @@ def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
     worker._metrics_event = MagicMock()
     worker._metrics_event.query.return_value = True
     group = SimpleNamespace(
-        swap_stats=torch.tensor([12, 4, 0], dtype=torch.uint64),
-        swap_stats_host=torch.empty(3, dtype=torch.uint64),
+        swap_stats=torch.tensor([12, 4, 0, 0, 0, 0, 0, 0], dtype=torch.uint64),
+        swap_stats_host=torch.empty(8, dtype=torch.uint64),
         stats_row_bytes=16,
     )
     worker.leader_runtimes = [SimpleNamespace(index_group=group)]
@@ -168,7 +169,7 @@ def test_hisparse_worker_finish_step_reads_completed_snapshot(monkeypatch):
 
     assert worker.finish_step() is None
     worker._metrics_event.record.assert_called_once_with()
-    assert group.swap_stats.tolist() == [0, 0, 0]
+    assert group.swap_stats.tolist() == [0] * 8
     assert worker.finish_step() == HiSparseStats(12, 4, 64)
 
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -35,6 +36,7 @@ class KVConnector:
         scheduler_output: "SchedulerOutput",
         batch_request_indices: torch.Tensor | None = None,
         batch_request_ids: list[str] | None = None,
+        batch_request_indices_np: "np.ndarray | None" = None,
     ) -> None:
         pass
 
@@ -83,6 +85,7 @@ class ActiveKVConnector(KVConnector):
         scheduler_output: "SchedulerOutput",
         batch_request_indices: torch.Tensor | None = None,
         batch_request_ids: list[str] | None = None,
+        batch_request_indices_np: "np.ndarray | None" = None,
     ) -> None:
         if self._disabled:
             return
@@ -95,6 +98,7 @@ class ActiveKVConnector(KVConnector):
         worker_kwargs = {
             "request_state_indices": batch_request_indices,
             "request_ids": batch_request_ids,
+            "request_state_indices_np": batch_request_indices_np,
         }
         if is_forward_context_available():
             self.kv_connector.start_load_kv(

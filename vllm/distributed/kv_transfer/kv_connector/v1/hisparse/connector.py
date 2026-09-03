@@ -277,10 +277,12 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
         )
         request_ids = kwargs.get("request_ids")
         assert request_ids is None or isinstance(request_ids, list)
+        request_state_indices_np = kwargs.get("request_state_indices_np")
         self.connector_worker.start_step(
             metadata,
             request_state_indices,
             request_ids,
+            request_state_indices_np,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:

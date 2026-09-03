@@ -203,7 +203,11 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
     int32_t* __restrict__ miss_mask,  // [num_rows, top_k] or nullptr
     int32_t* __restrict__ device_global_indices,  // [max_rows, region_stride]
     int16_t* __restrict__ lru_slots,              // [max_rows, hot_size]
-    unsigned long long* __restrict__ stats,  // [3] hits,misses,dropped or null
+    unsigned long long* __restrict__ stats,       // [8] hits, misses, dropped,
+                                             // drop-cause 3..6 (source oob,
+                                             // negative entry, beyond host
+                                             // pool, lru tripwire), max
+                                             // masked token index; or null
     const int32_t* __restrict__ request_state_indices,  // [num_requests] or
                                                         // nullptr
     const int32_t request_state_count, const int64_t host_rows,
@@ -288,6 +292,10 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
   for (int i = tid; i < top_k; i += blockDim.x) {
     const int32_t token_index = row_topk[i];
     int32_t g = token_index;
+    // Which stats slot a failed host lookup should count into (0 = none):
+    // 3 = request/source-block out of table bounds, 4 = negative table
+    // entry, 5 = mapped row beyond the host pool.
+    int32_t drop_cause = 0;
     int32_t resident_row = -1;
     if (source_block_table != nullptr) {
       const int32_t request_id = request_ids[batch_row];
@@ -299,11 +307,16 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
             source_block_table[static_cast<int64_t>(request_id) *
                                    source_bt_stride +
                                source_block];
-        g = physical_block >= 0 ? physical_block * source_block_size +
-                                      token_index % source_block_size
-                                : -1;
+        if (physical_block >= 0) {
+          g = physical_block * source_block_size +
+              token_index % source_block_size;
+        } else {
+          g = -1;
+          drop_cause = 4;
+        }
       } else {
         g = -1;
+        drop_cause = 3;
       }
       if (resident_block_table != nullptr) {
         const int32_t resident_block =
@@ -323,6 +336,7 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
     }
     if (g >= host_rows) {
       g = -1;
+      drop_cause = 5;
     }
     if (resolved_global_indices != nullptr) {
       resolved_global_indices[static_cast<int64_t>(batch_row) * top_k + i] = g;
@@ -340,9 +354,14 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
       s_topk[i] = kTokenDone;
       atomicAdd(&s_counters[1], 1);
       // A selected token (not top-k padding) with neither a resident row nor
-      // a host mapping is silently masked from attention; count it.
+      // a host mapping is silently masked from attention; count it, and
+      // attribute the failed host lookup to its cause.
       if (token_index >= 0 && stats != nullptr) {
         atomicAdd(&stats[2], 1ULL);
+        if (drop_cause != 0) {
+          atomicAdd(&stats[drop_cause], 1ULL);
+        }
+        atomicMax(&stats[7], static_cast<unsigned long long>(token_index));
       }
     } else {
       s_topk[i] = g;
@@ -527,6 +546,7 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
                         attention_block_stride);
         if (stats != nullptr) {
           atomicAdd(&stats[2], 1ULL);
+          atomicAdd(&stats[6], 1ULL);
         }
         if (swap_host_physical_rows != nullptr) {
           const int64_t compact_index =
@@ -1018,8 +1038,8 @@ void hisparse_resolve_residency(
     STD_TORCH_CHECK(
         st.is_cuda() && st.is_contiguous() && st.dim() == 1 &&
             st.scalar_type() == torch::headeronly::ScalarType::UInt64 &&
-            st.numel() == 3,
-        "stats must be a contiguous three-element uint64 CUDA tensor");
+            st.numel() == 8,
+        "stats must be a contiguous eight-element uint64 CUDA tensor");
     stats_ptr = static_cast<unsigned long long*>(st.mutable_data_ptr());
   }
 

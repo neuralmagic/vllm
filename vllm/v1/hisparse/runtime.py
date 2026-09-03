@@ -601,9 +601,9 @@ class HiSparseIndexGroup:
         )
         self.logical_topk_ready = logical_topk_ready
         self.followers: list[HiSparseRuntime] = []
-        self.swap_stats = torch.zeros(3, dtype=torch.uint64, device=device)
+        self.swap_stats = torch.zeros(8, dtype=torch.uint64, device=device)
         self.swap_stats_host = torch.empty(
-            3, dtype=torch.uint64, device="cpu", pin_memory=True
+            8, dtype=torch.uint64, device="cpu", pin_memory=True
         )
         self.stats_row_bytes = 0
 
@@ -781,6 +781,22 @@ class HiSparseRuntime:
         group = self.index_group
         group.device_global_indices.fill_(-1)
         group.lru_slots.copy_(group.lru_init.expand_as(group.lru_slots))
+
+    def reset_hot_state_rows(self, state_rows: torch.Tensor) -> None:
+        """Drop hot-buffer bookkeeping for reassigned request-state rows.
+
+        A state row keeps its LRU order and cached host-row indices across
+        requests; a new occupant would otherwise inherit its predecessor's
+        entries and take false hot hits on shared (prefix-cached) host rows
+        whose bytes were never loaded into its own hot blocks.
+        """
+        group = self.index_group
+        group.device_global_indices.index_fill_(0, state_rows, -1)
+        group.lru_slots.index_copy_(
+            0,
+            state_rows,
+            group.lru_init.expand(state_rows.numel(), -1),
+        )
 
     def invalidate_slots(
         self,
