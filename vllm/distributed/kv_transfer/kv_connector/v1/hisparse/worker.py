@@ -491,11 +491,12 @@ class HiSparseConnectorWorker:
             return False
         layer_name, handle = eligible[0]
         resident_name = f"{layer_name}{HISPARSE_RESIDENT_SUFFIX}"
-        if resident_name not in slot_mappings:
+        mapping_name = resident_name if resident_name in slot_mappings else layer_name
+        if mapping_name not in slot_mappings:
             raise RuntimeError(
                 f"HiSparse resident slot mapping is missing for {layer_name}."
             )
-        slots = slot_mappings[resident_name]
+        slots = slot_mappings[mapping_name]
         source_index = handle.runtime.resident_source_index
         if slots.ndim != 1:
             raise ValueError("HiSparse requires per-layer slot mappings.")

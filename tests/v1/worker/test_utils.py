@@ -127,7 +127,8 @@ def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
     assert state.source_index == 1
 
 
-def test_hisparse_stages_target_resident_slot_mapping(monkeypatch):
+@pytest.mark.parametrize("mapping_name", ["target", "target.hisparse_resident"])
+def test_hisparse_stages_target_slot_mapping(monkeypatch, mapping_name):
     worker = _make_hisparse_worker()
     worker.is_host_writer = True
     worker.refines_row_mirrors = True
@@ -146,7 +147,7 @@ def test_hisparse_stages_target_resident_slot_mapping(monkeypatch):
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
     assert worker.stage_row_mirror_mapping(
-        {"target.hisparse_resident": torch.tensor([7, 8], dtype=torch.int64)}, 2
+        {mapping_name: torch.tensor([7, 8], dtype=torch.int64)}, 2
     )
 
     torch.testing.assert_close(state.slots, torch.tensor([7, 8]))
