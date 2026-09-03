@@ -46,9 +46,6 @@ class KVConnector:
     ) -> None:
         pass
 
-    def finish_host_mirror_forward(self) -> None:
-        pass
-
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
     ) -> KVConnectorOutput | None:
@@ -120,10 +117,6 @@ class ActiveKVConnector(KVConnector):
     ) -> None:
         if not self._disabled:
             self.kv_connector.stage_host_mirror_mapping(slot_mappings, num_tokens)
-
-    def finish_host_mirror_forward(self) -> None:
-        if not self._disabled:
-            self.kv_connector.finish_host_mirror_forward()
 
     def reset_capture_state(self) -> None:
         self.kv_connector.reset_capture_state()
