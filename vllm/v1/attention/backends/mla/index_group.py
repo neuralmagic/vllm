@@ -62,6 +62,9 @@ class SparseMLAIndexGroup:
     def prepare_for_batch(self, layer_index: int, attn_metadata: Any | None) -> None:
         pass
 
+    def finish_attention(self, layer_index: int) -> None:
+        pass
+
     def gather_fp8_prefill(
         self,
         layer_index: int,
@@ -211,6 +214,10 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
     def prepare_for_batch(self, layer_index: int, attn_metadata: Any | None) -> None:
         if layer_index == 0:
             self.cache(0).prepare_group_for_batch(attn_metadata)
+
+    def finish_attention(self, layer_index: int) -> None:
+        if layer_index == 0 and self.cache(0).decode_batch:
+            current_stream().wait_stream(self.side_stream)
 
     def convert_logical_to_physical_topk(
         self,

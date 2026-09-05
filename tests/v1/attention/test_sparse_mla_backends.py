@@ -1500,6 +1500,25 @@ def test_sparse_mla_index_group_converts_decode_indices_once(monkeypatch):
     torch.testing.assert_close(follower_counts, leader_counts)
 
 
+def test_hisparse_index_group_drains_decode_prefetch_after_leader(monkeypatch):
+    group = object.__new__(HiSparseMLAIndexGroup)
+    group.caches = [SimpleNamespace(decode_batch=True)]
+    group.side_stream = MagicMock()
+    compute_stream = MagicMock()
+    monkeypatch.setattr(index_group_module, "current_stream", lambda: compute_stream)
+
+    group.finish_attention(0)
+
+    compute_stream.wait_stream.assert_called_once_with(group.side_stream)
+    compute_stream.reset_mock()
+
+    group.finish_attention(1)
+    group.caches[0].decode_batch = False
+    group.finish_attention(0)
+
+    compute_stream.wait_stream.assert_not_called()
+
+
 def test_sparse_mla_index_group_falls_back_for_prefill_sized_batch(monkeypatch):
     device = torch.device(DEVICE_TYPE)
     logical = torch.full((4, 128), -1, dtype=torch.int32, device=device)
