@@ -42,6 +42,7 @@ from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool, Task
 
 STRESS_TIMEOUT = 15.0  # seconds; generous for CI; deadlock => timeout
 _DUMMY_KEY = b"\x00" * 16
+_BLOCK_SIZE = 1  # 1 byte per block; keeps bucket math identical to num_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +90,9 @@ def _ssd_pool(
     """Create a DualQueueThreadPool backed by SSDTPScheduler."""
     with patch("vllm.v1.kv_offload.tiering.fs.thread_pool.envs") as mock_envs:
         mock_envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS = "SSDTPScheduler"
-        return DualQueueThreadPool(n_read, n_write, thread_name_prefix=prefix)
+        return DualQueueThreadPool(
+            n_read, n_write, _BLOCK_SIZE, thread_name_prefix=prefix
+        )
 
 
 def _drain_finished(pool: DualQueueThreadPool, timeout: float = STRESS_TIMEOUT) -> list:
@@ -111,32 +114,32 @@ Role = SSDTPScheduler.Role
 
 class TestSJFQueue:
     def test_add_single_has_work(self):
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=4)
         assert q.has_work()
 
     def test_has_short_job_single_item_is_false(self):
         # One job => one bucket => not multimodal.
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=8)
         assert not q.has_short_job()
 
     def test_has_short_job_same_bucket_is_false(self):
         # 4 and 5 both land in bucket 2 (floor(log2(4))==2, floor(log2(5))==2).
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=4)
         q.add(job_id=2, num_tasks=5)
         assert not q.has_short_job()
 
     def test_has_short_job_different_buckets_is_true(self):
         # 1 (bucket 0) and 1024 (bucket 10) → multimodal.
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=1)
         q.add(job_id=2, num_tasks=1024)
         assert q.has_short_job()
 
     def test_returns_smallest_first(self):
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         for job_id, size in enumerate([8, 2, 16, 1], start=1):
             q.add(job_id=job_id, num_tasks=size)
         results = [q.next()[1] for _ in range(4)]
@@ -144,7 +147,7 @@ class TestSJFQueue:
 
     def test_bucket_assignment_boundaries(self):
         # Explicit spot-checks: num_tasks → expected bucket (floor(log2(n))).
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         cases = [1, 2, 3, 4, 7, 8, 15, 16]
         for i, n in enumerate(cases, start=1):
             q.add(job_id=i, num_tasks=n)
@@ -156,13 +159,13 @@ class TestSJFQueue:
         assert sizes == sorted(sizes)
 
     def test_meta_bitmap_cleared_after_last_removal(self):
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=4)  # bucket 2
         q.next()  # remove it
         assert q.sjf_meta.value == 0
 
     def test_meta_bitmap_partial_after_partial_removal(self):
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=4)  # bucket 2
         q.add(job_id=2, num_tasks=8)  # bucket 3
         q.next()  # removes bucket-2 entry
@@ -171,7 +174,7 @@ class TestSJFQueue:
         assert q.has_work()
 
     def test_clear(self):
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=4)
         q.add(job_id=2, num_tasks=1024)
         q.clear()
@@ -180,7 +183,7 @@ class TestSJFQueue:
 
     def test_remove_consistency_error_on_wrong_order(self):
         # _remove asserts that the front of the bucket matches job_id.
-        q = SJFQueue()
+        q = SJFQueue(_BLOCK_SIZE)
         q.add(job_id=1, num_tasks=4)
         q.add(job_id=2, num_tasks=5)  # same bucket
         # job_id=2 is behind job_id=1 in bucket 2 → _remove(2, 4) must fail.
@@ -228,20 +231,20 @@ class TestFCFSQueue:
 class TestLoadQueue:
     def test_read_role_returns_n_read_threads_as_n_batch(self):
         n_read = 4
-        q = LoadQueue(n_read_threads=n_read)
+        q = LoadQueue(n_read_threads=n_read, block_size=_BLOCK_SIZE)
         q.add(item="job_a", job_id=1, num_tasks=64)
         item, n_batch = q.fetch_work(Role.READ)
         assert item == "job_a"
         assert n_batch == n_read
 
     def test_read_role_removes_from_both_queues(self):
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         q.add(item="job_a", job_id=1, num_tasks=64)
         q.fetch_work(Role.READ)
         assert not q.has_work()
 
     def test_fast_role_returns_batch_size_1(self):
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         q.add(item="small", job_id=1, num_tasks=1)
         q.add(item="large", job_id=2, num_tasks=1024)
         assert q.has_short_job()
@@ -252,7 +255,7 @@ class TestLoadQueue:
     def test_fast_role_leaves_stale_fcfs_entry(self):
         # After FAST steals a job via SJF, the job is gone from .jobs
         # but fcfs_q still has a stale reference.
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         q.add(item="small", job_id=1, num_tasks=1)
         q.add(item="large", job_id=2, num_tasks=1024)
         q.fetch_work(Role.FAST)  # steals job 1 via SJF
@@ -264,7 +267,7 @@ class TestLoadQueue:
 
     def test_read_skips_stale_fcfs_entries(self):
         # READ must skip job_id=1 (stolen by fast) and return job_id=2.
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         q.add(item="small", job_id=1, num_tasks=1)
         q.add(item="large", job_id=2, num_tasks=1024)
         q.fetch_work(Role.FAST)  # steals job 1
@@ -274,28 +277,28 @@ class TestLoadQueue:
         assert not q.has_work()
 
     def test_has_short_job_uniform_sizes(self):
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         q.add(item="a", job_id=1, num_tasks=100)
-        q.add(item="b", job_id=2, num_tasks=200)
+        q.add(item="b", job_id=2, num_tasks=10)
         # floor(log2(100))=6, floor(log2(200))=7 → different buckets.
         # has_short_job only False when same bucket.
         # 100→bucket6, 200→bucket7: multimodal, so True here.
         assert q.has_short_job()
 
     def test_has_short_job_same_bucket(self):
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         q.add(item="a", job_id=1, num_tasks=4)
         q.add(item="b", job_id=2, num_tasks=5)  # same bucket 2
         assert not q.has_short_job()
 
     def test_has_work_empty_and_populated(self):
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         assert not q.has_work()
         q.add(item="x", job_id=1, num_tasks=10)
         assert q.has_work()
 
     def test_clear(self):
-        q = LoadQueue(n_read_threads=4)
+        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
         q.add(item="x", job_id=1, num_tasks=10)
         q.clear()
         assert not q.has_work()
@@ -308,13 +311,13 @@ class TestLoadQueue:
 
 class TestStoreQueue:
     def test_fetch_always_returns_batch_size_1(self):
-        q = StoreQueue()
+        q = StoreQueue(_BLOCK_SIZE)
         q.add(item="job_a", job_id=1, num_tasks=100)
         _, n_batch = q.fetch_work(Role.WRITE)
         assert n_batch == 1
 
     def test_sjf_ordering(self):
-        q = StoreQueue()
+        q = StoreQueue(_BLOCK_SIZE)
         q.add(item="large", job_id=1, num_tasks=100)
         q.add(item="small", job_id=2, num_tasks=1)
         q.add(item="medium", job_id=3, num_tasks=50)
@@ -324,7 +327,7 @@ class TestStoreQueue:
             sizes.append(n_batch)
         # All n_batch == 1; we verify ordering via the job removal order.
         # Re-run to check ordering by item:
-        q2 = StoreQueue()
+        q2 = StoreQueue(_BLOCK_SIZE)
         q2.add(item="large", job_id=1, num_tasks=100)
         q2.add(item="small", job_id=2, num_tasks=1)
         q2.add(item="medium", job_id=3, num_tasks=50)
@@ -335,14 +338,14 @@ class TestStoreQueue:
         assert items == ["small", "medium", "large"]
 
     def test_fetch_removes_from_jobs(self):
-        q = StoreQueue()
+        q = StoreQueue(_BLOCK_SIZE)
         q.add(item="x", job_id=1, num_tasks=8)
         q.fetch_work(Role.WRITE)
         assert 1 not in q.jobs
         assert not q.has_work()
 
     def test_has_work(self):
-        q = StoreQueue()
+        q = StoreQueue(_BLOCK_SIZE)
         assert not q.has_work()
         q.add(item="x", job_id=1, num_tasks=8)
         assert q.has_work()
@@ -350,7 +353,7 @@ class TestStoreQueue:
         assert not q.has_work()
 
     def test_clear(self):
-        q = StoreQueue()
+        q = StoreQueue(_BLOCK_SIZE)
         q.add(item="x", job_id=1, num_tasks=8)
         q.clear()
         assert not q.has_work()
@@ -371,8 +374,8 @@ class TestSSDTPSchedulerHasWork:
         sched._n_read_threads = n_read - (n_read // 4)
         sched._n_write_threads = n_write
         sched._n_fast_threads = n_read // 4
-        sched._load_q = LoadQueue(sched._n_read_threads)
-        sched._store_q = StoreQueue()
+        sched._load_q = LoadQueue(sched._n_read_threads, block_size=_BLOCK_SIZE)
+        sched._store_q = StoreQueue(_BLOCK_SIZE)
         from collections import deque
 
         sched._load_deque = deque()
@@ -439,7 +442,9 @@ def _make_recording_pool(
     """Pool backed by SSDTPScheduler; make_batch_fn records (thread, batch_size)."""
     with patch("vllm.v1.kv_offload.tiering.fs.thread_pool.envs") as mock_envs:
         mock_envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS = "SSDTPScheduler"
-        return DualQueueThreadPool(n_read, n_write, thread_name_prefix=prefix)
+        return DualQueueThreadPool(
+            n_read, n_write, _BLOCK_SIZE, thread_name_prefix=prefix
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +477,9 @@ class TestThreadingPolicies:
 
         with patch("vllm.v1.kv_offload.tiering.fs.thread_pool.envs") as mock_envs:
             mock_envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS = "SSDTPScheduler"
-            pool = DualQueueThreadPool(n_read, n_write, thread_name_prefix=prefix)
+            pool = DualQueueThreadPool(
+                n_read, n_write, _BLOCK_SIZE, thread_name_prefix=prefix
+            )
 
         for job_id, n_tasks, is_load in jobs:
             task_list = _tasks(n_tasks)
@@ -605,7 +612,9 @@ class TestThreadingPolicies:
 
         with patch("vllm.v1.kv_offload.tiering.fs.thread_pool.envs") as mock_envs:
             mock_envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS = "SSDTPScheduler"
-            pool = DualQueueThreadPool(n_read, n_write, thread_name_prefix="prio")
+            pool = DualQueueThreadPool(
+                n_read, n_write, _BLOCK_SIZE, thread_name_prefix="prio"
+            )
 
         pool.enqueue_load(1, 64, iter(_tasks(64)), make_fn_with_time(True))
         pool.enqueue_store(2, 8, iter(_tasks(8)), make_fn_with_time(False))
@@ -635,7 +644,9 @@ class TestStressNoDeadlock:
     def _pool(self, n_read: int = 8, n_write: int = 4, prefix: str = "stress"):
         with patch("vllm.v1.kv_offload.tiering.fs.thread_pool.envs") as mock_envs:
             mock_envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS = "SSDTPScheduler"
-            return DualQueueThreadPool(n_read, n_write, thread_name_prefix=prefix)
+            return DualQueueThreadPool(
+                n_read, n_write, _BLOCK_SIZE, thread_name_prefix=prefix
+            )
 
     def _submit_and_wait(
         self,
@@ -775,7 +786,9 @@ class TestStressNoDeadlock:
 
         with patch("vllm.v1.kv_offload.tiering.fs.thread_pool.envs") as mock_envs:
             mock_envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS = "SSDTPScheduler"
-            pool = DualQueueThreadPool(8, 4, thread_name_prefix="integrity")
+            pool = DualQueueThreadPool(
+                8, 4, _BLOCK_SIZE, thread_name_prefix="integrity"
+            )
 
         total_tasks = 0
         for i in range(100):
@@ -842,7 +855,7 @@ class TestStressNoDeadlock:
         # touching any worker thread.
         with patch("vllm.v1.kv_offload.tiering.fs.thread_pool.envs") as mock_envs:
             mock_envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS = "SSDTPScheduler"
-            pool = DualQueueThreadPool(8, 4, thread_name_prefix="zero")
+            pool = DualQueueThreadPool(8, 4, _BLOCK_SIZE, thread_name_prefix="zero")
 
         pool.enqueue_load(99, 0, iter([]), _noop_make_batch_fn)
         # No wait_idle needed; 0-task jobs bypass the queue entirely.
