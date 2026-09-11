@@ -197,6 +197,7 @@ class FileSystemTierManager(SecondaryTierManager):
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
+            self._block_size,
             thread_name_prefix="vllm_kv_py_fs",
         )
 

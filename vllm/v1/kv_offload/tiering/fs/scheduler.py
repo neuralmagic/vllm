@@ -14,9 +14,10 @@ from vllm.v1.kv_offload.tiering.base import JobId
 
 
 class TPScheduler(ABC):
-    def __init__(self, n_read_threads: int, n_write_threads: int):
+    def __init__(self, n_read_threads: int, n_write_threads: int, block_size: int):
         self._n_read_threads = n_read_threads
         self._n_write_threads = n_write_threads
+        self._block_size = block_size
 
     @abstractmethod
     def make_threads(
@@ -44,8 +45,8 @@ class TPScheduler(ABC):
 
 
 class NoBatchTPScheduler(TPScheduler):
-    def __init__(self, n_read_threads: int, n_write_threads: int):
-        super().__init__(n_read_threads, n_write_threads)
+    def __init__(self, n_read_threads: int, n_write_threads: int, block_size: int):
+        super().__init__(n_read_threads, n_write_threads, block_size)
         self._load_q: deque = deque()
         self._store_q: deque = deque()
 
@@ -95,8 +96,8 @@ class NoBatchTPScheduler(TPScheduler):
 
 
 class BatchTPScheduler(NoBatchTPScheduler):
-    def __init__(self, n_read_threads: int, n_write_threads: int):
-        super().__init__(n_read_threads, n_write_threads)
+    def __init__(self, n_read_threads: int, n_write_threads: int, block_size: int):
+        super().__init__(n_read_threads, n_write_threads, block_size)
 
     @property
     def _total_threads(self):
@@ -166,22 +167,26 @@ class SSDTPScheduler(TPScheduler):
     class SJFQueue:
         MAX_BUCKETS = 32
 
-        def __init__(self):
+        def __init__(self, block_size: int):
+            self._block_size = block_size
             self.sjf_q: list[deque[tuple[JobId, int]]] = [
                 deque() for _ in range(SSDTPScheduler.SJFQueue.MAX_BUCKETS)
             ]
             self.sjf_meta = ctypes.c_uint32(0x00000000)
 
-        def _add(self, job_id: JobId, num_tasks: int):
+        def _get_bucket_id(self, job_id: JobId, num_tasks: int):
             assert num_tasks != 0
-            bucket_id = int(math.floor(math.log2(num_tasks)))
+            mbytes = max(1, num_tasks * self._block_size)
+            return int(math.floor(math.log2(mbytes)))
+
+        def _add(self, job_id: JobId, num_tasks: int):
+            bucket_id = self._get_bucket_id(job_id, num_tasks)
             assert bucket_id < SSDTPScheduler.SJFQueue.MAX_BUCKETS
             self.sjf_q[bucket_id].append((job_id, num_tasks))
             self.sjf_meta.value |= 1 << bucket_id
 
         def _remove(self, job_id: JobId, num_tasks: int):
-            assert num_tasks != 0
-            bucket_id = int(math.floor(math.log2(num_tasks)))
+            bucket_id = self._get_bucket_id(job_id, num_tasks)
             assert bucket_id < SSDTPScheduler.SJFQueue.MAX_BUCKETS
 
             q = self.sjf_q[bucket_id]
@@ -206,7 +211,17 @@ class SSDTPScheduler(TPScheduler):
             x = self.sjf_meta.value
             if x == 0:
                 return False
-            return bool(x & (x - 1))
+
+            b = self._get_sjf_bucket()
+            # Shift the mask so the minimum bucket aligns to the 0th bit
+            m = x >> b
+
+            # 3. Apply the bitwise rules
+            # Condition A:
+            #  Is this a wide distribution
+            # Condition B:
+            #  Is there a valley in distribution
+            return ((m & 7) == 7) or (((m + 1) & m) != 0)
 
         def add(self, job_id: JobId, num_tasks: int):
             self._add(job_id, num_tasks)
@@ -227,11 +242,11 @@ class SSDTPScheduler(TPScheduler):
             return self.sjf_meta.value != 0
 
     class LoadQueue:
-        def __init__(self, n_read_threads: int):
+        def __init__(self, n_read_threads: int, block_size: int):
             self.n_read_threads = n_read_threads
             self.jobs: dict[JobId, Any] = {}
             self.fcfs_q = SSDTPScheduler.FCFSQueue()
-            self.sjf_q = SSDTPScheduler.SJFQueue()
+            self.sjf_q = SSDTPScheduler.SJFQueue(block_size)
 
         def add(self, item: Any, job_id: JobId, num_tasks: int):
             self.jobs[job_id] = item
@@ -279,9 +294,9 @@ class SSDTPScheduler(TPScheduler):
                 return self._get_sjf_job()
 
     class StoreQueue:
-        def __init__(self):
+        def __init__(self, block_size: int):
             self.jobs: dict[JobId, Any] = {}
-            self.sjf_q = SSDTPScheduler.SJFQueue()
+            self.sjf_q = SSDTPScheduler.SJFQueue(block_size)
 
         def add(self, item: Any, job_id: JobId, num_tasks: int):
             self.sjf_q.add(job_id, num_tasks)
@@ -311,14 +326,18 @@ class SSDTPScheduler(TPScheduler):
     #    jobs.
     #  * fast threads and store threads, if they dont have work,
     #    they simply wait for incoming work.
-    def __init__(self, n_read_threads: int, n_write_threads: int):
+    def __init__(self, n_read_threads: int, n_write_threads: int, block_size: int):
         # allocate 25% of the threads for the load fast queue
         self._n_fast_threads = n_read_threads // 4
-        super().__init__(n_read_threads - self._n_fast_threads, n_write_threads)
-        self._load_q: SSDTPScheduler.LoadQueue = SSDTPScheduler.LoadQueue(
-            self._n_read_threads
+        super().__init__(
+            n_read_threads - self._n_fast_threads, n_write_threads, block_size
         )
-        self._store_q: SSDTPScheduler.StoreQueue = SSDTPScheduler.StoreQueue()
+        self._load_q: SSDTPScheduler.LoadQueue = SSDTPScheduler.LoadQueue(
+            self._n_read_threads, self._block_size
+        )
+        self._store_q: SSDTPScheduler.StoreQueue = SSDTPScheduler.StoreQueue(
+            self._block_size
+        )
         print(
             f"SSDTPScheduler : \n"
             f"  - {self._n_read_threads=} \n"

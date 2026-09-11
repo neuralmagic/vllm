@@ -88,6 +88,7 @@ class DualQueueThreadPool:
         self,
         n_read_threads: int,
         n_write_threads: int,
+        block_size: int,
         thread_name_prefix: str = "fs_secondary_tier",
     ) -> None:
         self._n_read_threads = n_read_threads
@@ -101,7 +102,9 @@ class DualQueueThreadPool:
         assert self.total_threads > 0, "ThreadPool needs at least one thread"
 
         scheduler_cls = SCHEDULER_CLASS_MAPPING[envs.VLLM_FS_THREAD_POOL_SCHEDULER_CLS]
-        self._scheduler: TPScheduler = scheduler_cls(n_read_threads, n_write_threads)
+        self._scheduler: TPScheduler = scheduler_cls(
+            n_read_threads, n_write_threads, block_size
+        )
         self._threads = self._scheduler.make_threads(self._worker, thread_name_prefix)
 
     @property
