@@ -3,6 +3,7 @@
 
 import ctypes
 import math
+import queue
 import threading
 from abc import ABC, abstractmethod
 from collections import deque
@@ -13,6 +14,39 @@ from typing import Any
 from vllm.v1.kv_offload.tiering.base import JobId
 
 
+class ThreadWaker:
+    """
+    Role-scoped wakeup primitive backed by a POSIX semaphore (SimpleQueue).
+
+    wait() parks the calling thread at the C level (GIL fully released) until
+    notify() or stop() is called by another thread.  Each notify() wakes
+    exactly one waiting thread — no thundering herd.  Tokens accumulate in the
+    semaphore counter when all threads are busy, so no wakeup is ever lost.
+
+    The sentinel objects (_WORK / _STOP) are private implementation details;
+    callers only see the three named operations.
+    """
+
+    _WORK = object()
+    _STOP = object()
+
+    def __init__(self) -> None:
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+
+    def notify(self, n: int = 1) -> None:
+        """Wake up to n threads that are blocked in wait()."""
+        for _ in range(n):
+            self._q.put(ThreadWaker._WORK)
+
+    def wait(self) -> bool:
+        """Block until notified. Returns True → do work, False → stop."""
+        return self._q.get() is ThreadWaker._WORK
+
+    def stop(self) -> None:
+        """Unblock exactly one wait() call and signal it to exit."""
+        self._q.put(ThreadWaker._STOP)
+
+
 class TPScheduler(ABC):
     def __init__(self, n_read_threads: int, n_write_threads: int, block_size: int):
         self._n_read_threads = n_read_threads
@@ -20,15 +54,44 @@ class TPScheduler(ABC):
         self._block_size = block_size
 
     @abstractmethod
+    def make_wakers(self) -> dict[Any, ThreadWaker]:
+        """
+        Return a mapping of {thread-args → ThreadWaker} for each thread role.
+
+        Each worker thread receives its role-specific ThreadWaker and blocks on
+        waker.wait() exclusively, so notify() calls from submit() can only wake
+        threads eligible to process the incoming job.
+
+        The scheduler stores the returned wakers internally so that submit()
+        can call notify() directly — the thread pool does not route tokens.
+        """
+        pass
+
+    @abstractmethod
     def make_threads(
-        self, worker_fn: Callable, thread_name_prefix: str
-    ) -> list[threading.Thread]:
+        self,
+        worker_fn: Callable,
+        thread_name_prefix: str,
+        wakers: dict[Any, ThreadWaker],
+    ) -> list[tuple[threading.Thread, ThreadWaker]]:
+        """
+        Spawn and start worker threads, returning a list of (thread, waker) pairs.
+
+        Each thread is started with worker_fn(args, role_waker) so it knows both
+        its scheduler role (for has_work / fetch_work) and its dedicated waker
+        (for blocking).  The companion waker is returned alongside the thread so
+        the pool can call waker.stop() for each thread during shutdown.
+        """
         pass
 
     @abstractmethod
     def submit(
         self, state: Any, make_batch_fn: Callable, tasks: list[Any], is_load: bool
-    ) -> int:
+    ) -> None:
+        """
+        Accept a job and call notify() on the appropriate role wakers.
+        All wakeup routing logic lives here; the thread pool sees no return value.
+        """
         pass
 
     @abstractmethod
@@ -49,38 +112,53 @@ class NoBatchTPScheduler(TPScheduler):
         super().__init__(n_read_threads, n_write_threads, block_size)
         self._load_q: deque = deque()
         self._store_q: deque = deque()
+        # Populated by make_wakers(); used in submit() to notify threads.
+        self._waker: ThreadWaker | None = None
+
+    def make_wakers(self) -> dict[Any, ThreadWaker]:
+        # Both roles share one waker: priority is enforced by fetch_work(), not
+        # by which thread is woken.  has_work(True) == has_work(False) so any
+        # thread can handle any job; the shared waker is therefore correct.
+        waker = ThreadWaker()
+        self._waker = waker
+        return {True: waker, False: waker}
 
     def make_threads(
-        self, worker_fn: Callable, thread_name_prefix: str
-    ) -> list[threading.Thread]:
-        threads: list[threading.Thread] = []
+        self,
+        worker_fn: Callable,
+        thread_name_prefix: str,
+        wakers: dict[Any, ThreadWaker],
+    ) -> list[tuple[threading.Thread, ThreadWaker]]:
+        result: list[tuple[threading.Thread, ThreadWaker]] = []
         for i in range(self._n_read_threads):
+            waker = wakers[True]
             t = threading.Thread(
                 target=worker_fn,
-                args=(True,),
+                args=(True, waker),
                 name=f"{thread_name_prefix}_l{i}",
                 daemon=True,
             )
             t.start()
-            threads.append(t)
-
+            result.append((t, waker))
         for i in range(self._n_write_threads):
+            waker = wakers[False]
             t = threading.Thread(
                 target=worker_fn,
-                args=(False,),
+                args=(False, waker),
                 name=f"{thread_name_prefix}_s{i}",
                 daemon=True,
             )
             t.start()
-            threads.append(t)
-        return threads
+            result.append((t, waker))
+        return result
 
     def submit(
         self, state: Any, make_batch_fn: Callable, tasks: list[Any], is_load: bool
-    ) -> int:
+    ) -> None:
         q = self._load_q if is_load else self._store_q
         q.append((make_batch_fn(tasks), len(tasks), state))
-        return 1
+        assert self._waker is not None
+        self._waker.notify()
 
     def has_work(self, load_priority: bool) -> bool:
         return bool(self._load_q) or bool(self._store_q)
@@ -88,7 +166,11 @@ class NoBatchTPScheduler(TPScheduler):
     def fetch_work(self, load_priority: bool):
         primary = self._load_q if load_priority else self._store_q
         secondary = self._store_q if load_priority else self._load_q
-        return primary.popleft() if primary else secondary.popleft()
+        if primary:
+            return primary.popleft()
+        if secondary:
+            return secondary.popleft()
+        return None
 
     def clear(self):
         self._load_q.clear()
@@ -125,7 +207,7 @@ class BatchTPScheduler(NoBatchTPScheduler):
 
     def submit(
         self, state: Any, make_batch_fn: Callable, tasks: list[Any], is_load: bool
-    ) -> int:
+    ) -> None:
         q = self._load_q if is_load else self._store_q
         if is_load:
             n_threads = (
@@ -135,11 +217,10 @@ class BatchTPScheduler(NoBatchTPScheduler):
             n_threads = (
                 self._n_write_threads if self._n_write_threads else self._total_threads
             )
-        n_batches = 0
+        assert self._waker is not None
         for b in self._batch_tasks(tasks, n_threads):
             q.append((make_batch_fn(b), len(b), state))
-            n_batches += 1
-        return n_batches
+            self._waker.notify()
 
 
 class SSDTPScheduler(TPScheduler):
@@ -346,46 +427,66 @@ class SSDTPScheduler(TPScheduler):
         )
 
         self._load_deque: deque[Any] = deque()
+        # Role wakers: populated by make_wakers(), used directly in submit().
+        self._role_wakers: dict[SSDTPScheduler.Role, ThreadWaker] = {}
 
     @property
     def total_threads(self) -> int:
         return self._n_read_threads + self._n_write_threads + self._n_fast_threads
 
+    def make_wakers(self) -> dict[Any, ThreadWaker]:
+        # One dedicated ThreadWaker per role.  notify() on Role.READ can only
+        # wake READ threads, etc.  This eliminates spurious wakeups and the
+        # starvation risk of a single shared waker.
+        # Stored on self so submit() can call notify() directly.
+        self._role_wakers = {
+            SSDTPScheduler.Role.READ: ThreadWaker(),
+            SSDTPScheduler.Role.FAST: ThreadWaker(),
+            SSDTPScheduler.Role.WRITE: ThreadWaker(),
+        }
+        return self._role_wakers
+
     def make_threads(
-        self, worker_fn: Callable, thread_name_prefix: str
-    ) -> list[threading.Thread]:
-        threads: list[threading.Thread] = []
+        self,
+        worker_fn: Callable,
+        thread_name_prefix: str,
+        wakers: dict[Any, ThreadWaker],
+    ) -> list[tuple[threading.Thread, ThreadWaker]]:
+        result: list[tuple[threading.Thread, ThreadWaker]] = []
         for i in range(self._n_read_threads):
+            waker = wakers[SSDTPScheduler.Role.READ]
             t = threading.Thread(
                 target=worker_fn,
-                args=(SSDTPScheduler.Role.READ,),
+                args=(SSDTPScheduler.Role.READ, waker),
                 name=f"{thread_name_prefix}_l{i}",
                 daemon=True,
             )
             t.start()
-            threads.append(t)
+            result.append((t, waker))
 
         for i in range(self._n_write_threads):
+            waker = wakers[SSDTPScheduler.Role.WRITE]
             t = threading.Thread(
                 target=worker_fn,
-                args=(SSDTPScheduler.Role.WRITE,),
+                args=(SSDTPScheduler.Role.WRITE, waker),
                 name=f"{thread_name_prefix}_s{i}",
                 daemon=True,
             )
             t.start()
-            threads.append(t)
+            result.append((t, waker))
 
         for i in range(self._n_fast_threads):
+            waker = wakers[SSDTPScheduler.Role.FAST]
             t = threading.Thread(
                 target=worker_fn,
-                args=(SSDTPScheduler.Role.FAST,),
+                args=(SSDTPScheduler.Role.FAST, waker),
                 name=f"{thread_name_prefix}_f{i}",
                 daemon=True,
             )
             t.start()
-            threads.append(t)
+            result.append((t, waker))
 
-        return threads
+        return result
 
     def _batch_tasks(
         self,
@@ -409,13 +510,26 @@ class SSDTPScheduler(TPScheduler):
 
     def submit(
         self, state: Any, make_batch_fn: Callable, tasks: list[Any], is_load: bool
-    ) -> int:
+    ) -> None:
+        rw = self._role_wakers
         if is_load:
             self._load_q.add((make_batch_fn, tasks, state), state.job_id, len(tasks))
-            return self.total_threads
+            # Always wake read threads — they batch and execute the job.
+            rw[SSDTPScheduler.Role.READ].notify(self._n_read_threads)
+            # If this submission created a multimodal size distribution, also
+            # wake fast and write threads so they can drain the short job.
+            if self._load_q.has_short_job():
+                rw[SSDTPScheduler.Role.FAST].notify(self._n_fast_threads)
+                rw[SSDTPScheduler.Role.WRITE].notify(self._n_write_threads)
         else:
             self._store_q.add((make_batch_fn, tasks, state), state.job_id, len(tasks))
-            return 1
+            # One store job is processed one-at-a-time (batch_size=1 policy).
+            # Wake one write thread.  Also wake one fast thread because
+            # has_work(FAST) includes store_q.has_work(), so fast threads can
+            # drain stores when no short load job exists.
+            rw[SSDTPScheduler.Role.WRITE].notify()
+            if self._n_fast_threads > 0:
+                rw[SSDTPScheduler.Role.FAST].notify()
 
     def has_work(self, role: "SSDTPScheduler.Role") -> bool:
         if role == SSDTPScheduler.Role.READ:

@@ -6,6 +6,26 @@ Thread pool:
       - Load-priority threads: drain the load queue first, then the store queue.
       - Store-priority threads: drain the store queue first, then the load queue.
     Load jobs are enqueued to the load queue; store jobs to the store queue.
+
+Design notes — per-role ThreadWakers:
+    Each thread role (READ / FAST / WRITE for SSDTPScheduler; load-priority /
+    store-priority for NoBatch/Batch) gets its own ThreadWaker.  Workers block
+    exclusively on their role's waker.wait(), so waker.notify() calls from
+    submit() can ONLY wake threads eligible to process the incoming job.
+
+    The scheduler owns the wakers: make_wakers() creates them, and submit()
+    calls notify() directly.  The thread pool only stores per-thread waker refs
+    for shutdown (waker.stop() delivery).  No token routing lives in the pool.
+
+    ThreadWaker wraps a SimpleQueue backed by a POSIX semaphore: wait() parks
+    the thread at the C level (GIL fully released).  notify() wakes exactly one
+    waiting thread; if all threads are busy the semaphore counter increments so
+    no wakeup is ever lost.
+
+    Idle detection uses a dedicated threading.Condition (_idle_cond) that is
+    only acquired by the main thread (wait_idle) and workers when a job
+    finishes.  This separates the hot-path scheduler lock from the rarely
+    used idle-wait path.
 """
 
 import threading
@@ -19,7 +39,11 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.base import JobId
-from vllm.v1.kv_offload.tiering.fs.scheduler import SCHEDULER_CLASS_MAPPING, TPScheduler
+from vllm.v1.kv_offload.tiering.fs.scheduler import (
+    SCHEDULER_CLASS_MAPPING,
+    ThreadWaker,
+    TPScheduler,
+)
 
 logger = init_logger(__name__)
 
@@ -80,8 +104,15 @@ class DualQueueThreadPool:
     Thread pool with two task queues (load and store) and two thread groups.
 
     Load-priority threads drain the load queue first, then fall back to the
-    store queue.  Store-priority threads do the reverse.  Both queues share
-    a single condition variable.
+    store queue.  Store-priority threads do the reverse.
+
+    Workers block on their role-specific SimpleQueue[_WORK | _STOP]:
+      - submit() returns {role → n_tokens}; the pool puts tokens into the
+        matching role queue — only eligible threads are woken.
+      - Each get() wakes exactly one thread via a POSIX semaphore; no GIL
+        storm, no spurious cross-role wakeups.
+      - Idle detection is a separate Condition so wait_idle() never wakes
+        worker threads.
     """
 
     def __init__(
@@ -93,11 +124,18 @@ class DualQueueThreadPool:
     ) -> None:
         self._n_read_threads = n_read_threads
         self._n_write_threads = n_write_threads
-        self._condition = threading.Condition(threading.Lock())
+
+        # Guards scheduler internal state (submit / has_work / fetch_work).
+        # Not held during the actual I/O fn() call.
+        self._sched_lock = threading.Lock()
+
+        # Idle detection — only used by wait_idle() and job-completion paths.
+        self._idle_lock = threading.Lock()
+        self._idle_cond = threading.Condition(self._idle_lock)
+        self._inflight_jobs = 0  # guarded by _idle_cond
+
         self._stop = False
-        self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool, float]] = deque()
-        self._inflight_jobs = 0  # guarded by _condition
 
         assert self.total_threads > 0, "ThreadPool needs at least one thread"
 
@@ -105,7 +143,18 @@ class DualQueueThreadPool:
         self._scheduler: TPScheduler = scheduler_cls(
             n_read_threads, n_write_threads, block_size
         )
-        self._threads = self._scheduler.make_threads(self._worker, thread_name_prefix)
+
+        # make_wakers() initialises the scheduler's internal role→waker mapping
+        # and returns it so make_threads() can hand each thread its own waker.
+        wakers = self._scheduler.make_wakers()
+
+        # (thread, its_waker) pairs — used during shutdown to call waker.stop()
+        # for the exact waker each thread is blocking on.
+        thread_waker_pairs = self._scheduler.make_threads(
+            self._worker, thread_name_prefix, wakers
+        )
+        self._threads: list[threading.Thread] = [t for t, _ in thread_waker_pairs]
+        self._thread_wakers: list[ThreadWaker] = [w for _, w in thread_waker_pairs]
 
     @property
     def total_threads(self) -> int:
@@ -144,12 +193,16 @@ class DualQueueThreadPool:
             self._finished_q.append((job_id, True, 0.0))
             return
         state = JobState(job_id, n_tasks)
-        task_lst = list(tasks)  # Materialize tasks out of self._condition
+        task_lst = list(tasks)  # Materialize tasks outside locks
         assert len(task_lst) == n_tasks, "Unaccounted tasks"
-        with self._condition:
+
+        # Increment inflight before submit so wait_idle() can't return early.
+        with self._idle_cond:
             self._inflight_jobs += 1
-            n_notify = self._scheduler.submit(state, make_batch_fn, task_lst, is_load)
-            self._condition.notify(n_notify)
+
+        # submit() routes _WORK tokens into the right role queues internally.
+        with self._sched_lock:
+            self._scheduler.submit(state, make_batch_fn, task_lst, is_load)
 
     def enqueue_load(
         self,
@@ -159,7 +212,6 @@ class DualQueueThreadPool:
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
-
         self._enqueue(
             make_batch_fn,
             job_id,
@@ -176,7 +228,6 @@ class DualQueueThreadPool:
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
-
         self._enqueue(
             make_batch_fn,
             job_id,
@@ -201,31 +252,51 @@ class DualQueueThreadPool:
         completed jobs may still be sitting in ``_finished_q`` waiting
         for ``get_finished()`` to drain them.
         """
-        with self._condition:
-            self._condition.wait_for(lambda: self._inflight_jobs == 0)
+        with self._idle_cond:
+            self._idle_cond.wait_for(lambda: self._inflight_jobs == 0)
 
     def shutdown(self, wait: bool = True) -> None:
-        with self._condition:
+        with self._sched_lock:
             self._stop = True
             self._scheduler.clear()
-            # Cancelled tasks will not decrement _inflight_jobs; reset it so a
-            # subsequent wait_idle() returns instead of hanging.
+
+        # Reset inflight so wait_idle() returns if called after shutdown.
+        with self._idle_cond:
             self._inflight_jobs = 0
-            self._condition.notify_all()
+            self._idle_cond.notify_all()
+
+        # Call stop() on each thread's own waker so only that thread receives
+        # the signal.  This guarantees each thread exits exactly once regardless
+        # of whether role wakers are shared or distinct.
+        for waker in self._thread_wakers:
+            waker.stop()
+
         if wait:
             for t in self._threads:
                 t.join()
 
-    def _worker(self, args: Any) -> None:
-        # Wait for tasks, process from primary queue first, fall back to secondary.
+    def _worker(self, args: Any, my_waker: ThreadWaker) -> None:
+        """Worker loop: block on this thread's role waker, fetch work, execute I/O."""
         while True:
-            with self._condition:
-                self._condition.wait_for(
-                    lambda: self._stop or self._scheduler.has_work(args)
-                )
-                if self._stop:
-                    return
-                fn, batch_size, state = self._scheduler.fetch_work(args)
+            # Blocks at C level (POSIX sem_wait); GIL fully released.
+            # Only notify()/stop() on this role's waker can wake this thread.
+            if not my_waker.wait():
+                return  # stop() was called — exit cleanly
+
+            # Verify there is work for our role.  With per-role wakers this
+            # check should almost always pass; it guards the rare race where
+            # another thread of the same role consumed the work between the
+            # notify() and this wait().
+            with self._sched_lock:
+                if not self._scheduler.has_work(args):
+                    continue
+                result = self._scheduler.fetch_work(args)
+
+            if result is None:
+                # Defensive: fetch_work returned nothing despite has_work=True.
+                continue
+
+            fn, batch_size, state = result
             try:
                 start_time = time.monotonic()
                 fn()
@@ -245,7 +316,10 @@ class DualQueueThreadPool:
                 )
 
             if job_finished:
-                with self._condition:
-                    self._finished_q.append((state.job_id, success, total_time))
+                # Append before decrementing inflight so get_finished() sees
+                # the result as soon as wait_idle() returns.
+                self._finished_q.append((state.job_id, success, total_time))
+                with self._idle_cond:
                     self._inflight_jobs -= 1
-                    self._condition.notify_all()
+                    if self._inflight_jobs == 0:
+                        self._idle_cond.notify_all()
