@@ -12,11 +12,11 @@ Data-structure tests (no threading):
 
 Policy tests (real threads, no disk I/O):
   - Read threads always batch
-  - Fast threads drain small load jobs with batch_size=1
+  - Fast threads drain small load jobs split across n_fast_threads batches
   - Store threads always execute with batch_size=1
-  - Store threads (and fast threads) drain small load jobs
-  - Read threads drain store jobs with batch_size=1 when load is empty
-  - Fast/store threads wait when no short jobs exist
+  - Fast threads drain short load jobs (store threads no longer do)
+  - Read threads drain store jobs when load is empty
+  - Fast threads wait when no short jobs or store jobs exist
 
 Stress / deadlock tests (DualQueueThreadPool with fake I/O):
   - All submitted jobs complete without deadlock
@@ -231,31 +231,33 @@ class TestFCFSQueue:
 class TestLoadQueue:
     def test_read_role_returns_n_read_threads_as_n_batch(self):
         n_read = 4
-        q = LoadQueue(n_read_threads=n_read, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=n_read, n_fast_threads=1, block_size=_BLOCK_SIZE)
         q.add(item="job_a", job_id=1, num_tasks=64)
         item, n_batch = q.fetch_work(Role.READ)
         assert item == "job_a"
         assert n_batch == n_read
 
     def test_read_role_removes_from_both_queues(self):
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=4, n_fast_threads=1, block_size=_BLOCK_SIZE)
         q.add(item="job_a", job_id=1, num_tasks=64)
         q.fetch_work(Role.READ)
         assert not q.has_work()
 
-    def test_fast_role_returns_batch_size_1(self):
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+    def test_fast_role_returns_n_fast_threads_as_n_batch(self):
+        # FAST splits the short job across n_fast_threads batches.
+        n_fast = 2
+        q = LoadQueue(n_read_threads=4, n_fast_threads=n_fast, block_size=_BLOCK_SIZE)
         q.add(item="small", job_id=1, num_tasks=1)
         q.add(item="large", job_id=2, num_tasks=1024)
         assert q.has_short_job()
         item, n_batch = q.fetch_work(Role.FAST)
-        assert n_batch == 1
+        assert n_batch == n_fast
         assert item == "small"
 
     def test_fast_role_leaves_stale_fcfs_entry(self):
         # After FAST steals a job via SJF, the job is gone from .jobs
         # but fcfs_q still has a stale reference.
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=4, n_fast_threads=1, block_size=_BLOCK_SIZE)
         q.add(item="small", job_id=1, num_tasks=1)
         q.add(item="large", job_id=2, num_tasks=1024)
         q.fetch_work(Role.FAST)  # steals job 1 via SJF
@@ -267,7 +269,7 @@ class TestLoadQueue:
 
     def test_read_skips_stale_fcfs_entries(self):
         # READ must skip job_id=1 (stolen by fast) and return job_id=2.
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=4, n_fast_threads=1, block_size=_BLOCK_SIZE)
         q.add(item="small", job_id=1, num_tasks=1)
         q.add(item="large", job_id=2, num_tasks=1024)
         q.fetch_work(Role.FAST)  # steals job 1
@@ -277,7 +279,7 @@ class TestLoadQueue:
         assert not q.has_work()
 
     def test_has_short_job_uniform_sizes(self):
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=4, n_fast_threads=1, block_size=_BLOCK_SIZE)
         q.add(item="a", job_id=1, num_tasks=100)
         q.add(item="b", job_id=2, num_tasks=10)
         # floor(log2(100))=6, floor(log2(200))=7 → different buckets.
@@ -286,19 +288,19 @@ class TestLoadQueue:
         assert q.has_short_job()
 
     def test_has_short_job_same_bucket(self):
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=4, n_fast_threads=1, block_size=_BLOCK_SIZE)
         q.add(item="a", job_id=1, num_tasks=4)
         q.add(item="b", job_id=2, num_tasks=5)  # same bucket 2
         assert not q.has_short_job()
 
     def test_has_work_empty_and_populated(self):
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=4, n_fast_threads=1, block_size=_BLOCK_SIZE)
         assert not q.has_work()
         q.add(item="x", job_id=1, num_tasks=10)
         assert q.has_work()
 
     def test_clear(self):
-        q = LoadQueue(n_read_threads=4, block_size=_BLOCK_SIZE)
+        q = LoadQueue(n_read_threads=4, n_fast_threads=1, block_size=_BLOCK_SIZE)
         q.add(item="x", job_id=1, num_tasks=10)
         q.clear()
         assert not q.has_work()
@@ -374,11 +376,14 @@ class TestSSDTPSchedulerHasWork:
         sched._n_read_threads = n_read - (n_read // 4)
         sched._n_write_threads = n_write
         sched._n_fast_threads = n_read // 4
-        sched._load_q = LoadQueue(sched._n_read_threads, block_size=_BLOCK_SIZE)
+        sched._load_q = LoadQueue(
+            sched._n_read_threads, sched._n_fast_threads, block_size=_BLOCK_SIZE
+        )
         sched._store_q = StoreQueue(_BLOCK_SIZE)
         from collections import deque
 
         sched._load_deque = deque()
+        sched._fast_load_deque = deque()
         return sched
 
     def _fake_state(self, job_id=1):
@@ -414,7 +419,7 @@ class TestSSDTPSchedulerHasWork:
         )
         assert sched.has_work(Role.READ)
         assert sched.has_work(Role.FAST)  # multimodal → has_short_job
-        assert sched.has_work(Role.WRITE)  # no store_q work
+        assert not sched.has_work(Role.WRITE)  # no store_q work
 
     def test_write_does_not_see_uniform_load(self):
         sched = self._make_sched()
@@ -511,24 +516,23 @@ class TestThreadingPolicies:
         for _, batch_size in read_records:
             assert batch_size > 1, "Read thread got batch_size=1 for uniform large job"
 
-    def test_fast_threads_drain_small_load_jobs_batch_size_1(self):
+    def test_fast_threads_drain_small_load_jobs(self):
         # Submit many small (1-task) load jobs alongside one large (500-task) job.
         # When multimodal distribution exists, fast threads (Role.FAST) pick up
-        # the small jobs via SJF and execute them with batch_size==1 (1 task each).
-        # Because thread scheduling is concurrent we cannot guarantee WHICH thread
-        # wins, but IF a fast thread executes a load job its batch_size must be 1.
+        # the small jobs via SJF and split them across n_fast_threads batches.
+        # For 1-task jobs, each batch is still 1 task (min(n_tasks, n_fast) == 1).
+        # n_read=8 → n_fast=2, effective_read=6.
         n_read, n_write = 8, 2
         jobs = [(i, 1, True) for i in range(50)] + [(50, 500, True)]
         records, finished = self._run(n_read, n_write, jobs, prefix="fast")
         assert sorted(finished) == list(range(51))
         total = sum(s for _, s in records)
         assert total == 50 + 500, f"Task count wrong: {total}"
-        # Fast threads may or may not win the race vs read threads,
-        # but any load execution by a fast thread must use batch_size=1.
+        # For 1-task short jobs, each fast-thread batch contains exactly 1 task.
         fast_records = [(t, s) for t, s in records if "_f" in t]
         for _, bs in fast_records:
             assert bs == 1, (
-                f"Fast thread executed batch_size={bs} for load job; expected 1"
+                f"Fast thread executed batch_size={bs} for 1-task load job; expected 1"
             )
 
     def test_store_threads_one_job_per_dequeue(self):
@@ -552,9 +556,10 @@ class TestThreadingPolicies:
         # Each execution unit covers a whole job (batch_size == one of the job sizes).
         assert sorted(s for _, s in records) == sorted(job_sizes)
 
-    def test_store_threads_drain_small_load_jobs(self):
+    def test_fast_threads_drain_multimodal_load_jobs(self):
         # Two load jobs of different sizes (multimodal) → has_short_job True.
-        # Store threads (WRITE role) check load_q.has_short_job() and can pick it up.
+        # Fast threads (FAST role) are notified and pick up the short job.
+        # Store/WRITE threads are NOT notified for short load jobs.
         n_read, n_write = 8, 4
         records, finished = self._run(
             n_read,
@@ -563,12 +568,13 @@ class TestThreadingPolicies:
             prefix="stdrn",
         )
         assert sorted(finished) == [1, 2]
-        # Store threads have names ending in _s; they should have executed something.
+        # All tasks must complete.
+        assert sum(s for _, s in records) == 1 + 1024
+        # Store/WRITE threads must not have touched load jobs.
         store_records = [(t, s) for t, s in records if "_s" in t]
-        # Store threads may or may not win the race vs fast threads;
-        # what matters is all tasks complete and any store execution uses batch_size=1.
-        for _, bs in store_records:
-            assert bs == 1
+        assert not store_records, (
+            f"Store threads should not process load jobs, got: {store_records}"
+        )
 
     def test_read_threads_drain_store_jobs_when_load_empty(self):
         # With no load work, read threads (and fast threads) fall back to the

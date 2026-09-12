@@ -323,8 +323,9 @@ class SSDTPScheduler(TPScheduler):
             return self.sjf_meta.value != 0
 
     class LoadQueue:
-        def __init__(self, n_read_threads: int, block_size: int):
+        def __init__(self, n_read_threads: int, n_fast_threads: int, block_size: int):
             self.n_read_threads = n_read_threads
+            self.n_fast_threads = n_fast_threads
             self.jobs: dict[JobId, Any] = {}
             self.fcfs_q = SSDTPScheduler.FCFSQueue()
             self.sjf_q = SSDTPScheduler.SJFQueue(block_size)
@@ -351,11 +352,12 @@ class SSDTPScheduler(TPScheduler):
             else:
                 return self.jobs.pop(job_id), self.n_read_threads
 
-        def _get_sjf_job(self) -> tuple[Any, int | None]:
+        def _get_sjf_job(self, role: "SSDTPScheduler.Role") -> tuple[Any, int | None]:
             # jobs fetched here has leftover fcfs
             assert self.sjf_q.has_short_job()
             job_id, _ = self.sjf_q.next()
-            return self.jobs.pop(job_id), 1
+            n_threads = 1 if role == SSDTPScheduler.Role.WRITE else self.n_fast_threads
+            return self.jobs.pop(job_id), n_threads
 
         def clear(self):
             self.fcfs_q.clear()
@@ -372,7 +374,7 @@ class SSDTPScheduler(TPScheduler):
             if role == SSDTPScheduler.Role.READ:
                 return self._get_job()
             else:
-                return self._get_sjf_job()
+                return self._get_sjf_job(role)
 
     class StoreQueue:
         def __init__(self, block_size: int):
@@ -414,7 +416,7 @@ class SSDTPScheduler(TPScheduler):
             n_read_threads - self._n_fast_threads, n_write_threads, block_size
         )
         self._load_q: SSDTPScheduler.LoadQueue = SSDTPScheduler.LoadQueue(
-            self._n_read_threads, self._block_size
+            self._n_read_threads, self._n_fast_threads, self._block_size
         )
         self._store_q: SSDTPScheduler.StoreQueue = SSDTPScheduler.StoreQueue(
             self._block_size
@@ -427,6 +429,7 @@ class SSDTPScheduler(TPScheduler):
         )
 
         self._load_deque: deque[Any] = deque()
+        self._fast_load_deque: deque[Any] = deque()
         # Role wakers: populated by make_wakers(), used directly in submit().
         self._role_wakers: dict[SSDTPScheduler.Role, ThreadWaker] = {}
 
@@ -520,7 +523,6 @@ class SSDTPScheduler(TPScheduler):
             # wake fast and write threads so they can drain the short job.
             if self._load_q.has_short_job():
                 rw[SSDTPScheduler.Role.FAST].notify(self._n_fast_threads)
-                rw[SSDTPScheduler.Role.WRITE].notify(self._n_write_threads)
         else:
             self._store_q.add((make_batch_fn, tasks, state), state.job_id, len(tasks))
             # One store job is processed one-at-a-time (batch_size=1 policy).
@@ -528,8 +530,7 @@ class SSDTPScheduler(TPScheduler):
             # has_work(FAST) includes store_q.has_work(), so fast threads can
             # drain stores when no short load job exists.
             rw[SSDTPScheduler.Role.WRITE].notify()
-            if self._n_fast_threads > 0:
-                rw[SSDTPScheduler.Role.FAST].notify()
+            rw[SSDTPScheduler.Role.FAST].notify()
 
     def has_work(self, role: "SSDTPScheduler.Role") -> bool:
         if role == SSDTPScheduler.Role.READ:
@@ -539,9 +540,13 @@ class SSDTPScheduler(TPScheduler):
                 or self._store_q.has_work()
             )
         elif role == SSDTPScheduler.Role.FAST:
-            return self._load_q.has_short_job() or self._store_q.has_work()
+            return (
+                bool(self._fast_load_deque)
+                or self._load_q.has_short_job()
+                or self._store_q.has_work()
+            )
         else:
-            return self._store_q.has_work() or self._load_q.has_short_job()
+            return self._store_q.has_work()
 
     def fetch_work(self, role: "SSDTPScheduler.Role"):
         if role == SSDTPScheduler.Role.READ:
@@ -562,22 +567,39 @@ class SSDTPScheduler(TPScheduler):
                 self._load_deque.append((make_batch_fn(b), len(b), state))
             return self._load_deque.popleft()
         elif role == SSDTPScheduler.Role.FAST:
-            q = self._load_q if self._load_q.has_short_job() else self._store_q
-        else:
-            q = self._store_q if self._store_q.has_work() else self._load_q
+            if self._fast_load_deque:
+                return self._fast_load_deque.popleft()
 
-        assert role in [SSDTPScheduler.Role.FAST, SSDTPScheduler.Role.WRITE]
-        work, n_batch = q.fetch_work(role)
-        if work is None:
-            return None
-        make_batch_fn, tasks, state = work
-        assert n_batch == 1
-        return (make_batch_fn(tasks), len(tasks), state)
+            q = self._load_q if self._load_q.has_short_job() else self._store_q
+            work, n_batch = q.fetch_work(role)
+            if work is None:
+                return None
+            assert n_batch is not None
+            make_batch_fn, tasks, state = work
+            if n_batch == 1:
+                return (make_batch_fn(tasks), len(tasks), state)
+
+            for b in self._batch_tasks(tasks, n_batch):
+                self._fast_load_deque.append((make_batch_fn(b), len(b), state))
+            return self._fast_load_deque.popleft()
+        else:
+            q = self._store_q
+            if not q.has_work():
+                return None
+
+            assert role in [SSDTPScheduler.Role.WRITE]
+            work, n_batch = q.fetch_work(role)
+            if work is None:
+                return None
+            make_batch_fn, tasks, state = work
+            assert n_batch == 1
+            return (make_batch_fn(tasks), len(tasks), state)
 
     def clear(self):
         self._load_q.clear()
         self._store_q.clear()
         self._load_deque.clear()
+        self._fast_load_deque.clear()
 
 
 SCHEDULER_CLASS_MAPPING = {
