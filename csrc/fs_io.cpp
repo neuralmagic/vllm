@@ -17,6 +17,18 @@ constexpr int kODirectFlag = O_DIRECT;
 constexpr int kODirectFlag = 0;
 #endif
 
+#if defined(__linux__)
+  #include <linux/falloc.h>
+// Pre-allocate disk space for fd. Non-fatal: if the filesystem does not
+// support fallocate (EOPNOTSUPP/ENOSYS), we skip silently and let the
+// subsequent write() proceed normally.
+inline void try_fallocate(int fd, size_t size) {
+  fallocate(fd, 0, 0, static_cast<off_t>(size));
+}
+#else
+inline void try_fallocate(int /*fd*/, size_t /*size*/) {}
+#endif
+
 extern "C" {
 
 namespace {
@@ -53,6 +65,11 @@ inline int _store_block(const char* tmp_path, const char* dest_path,
   if (fd < 0) {
     return errno;
   }
+
+  // Pre-allocate contiguous disk space before the write. Under concurrent
+  // stores (thread pool), this prevents interleaved block allocation from
+  // fragmenting individual files. Non-fatal: unsupported filesystems skip it.
+  try_fallocate(fd, size);
 
   const ssize_t written = write(fd, src, size);
   if (written < 0 || static_cast<size_t>(written) != size) {
