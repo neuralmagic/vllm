@@ -102,6 +102,11 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+_TP_REPLICATED_SPEC_TYPES: tuple[type[AttentionSpec], ...] = (
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # For cryptographic hash algorithms it is derived deterministically from a fixed
@@ -2361,47 +2366,15 @@ def get_kv_cache_groups(
     return groups
 
 
-def _all_kv_groups_tp_replicated(
-    groups: list[KVCacheGroupSpec],
-    vllm_config: VllmConfig,
-) -> bool:
-    """Returns True iff every layer in every group is an MLA spec with
-    ``num_kv_heads == 1`` (so all TP ranks hold identical KV data).
-
-    Conservative by design: PP and CP combinations are excluded.  DP is
-    allowed since it does not affect per-TP-rank KV data.  As support for
-    other parallelisms is validated, this check can be relaxed.
-    """
-    pc = vllm_config.parallel_config
-    if (
-        pc.tensor_parallel_size == 1
-        or pc.pipeline_parallel_size != 1
-        or pc.prefill_context_parallel_size != 1
-        or pc.decode_context_parallel_size != 1
-        or pc.world_size != pc.tensor_parallel_size
-    ):
-        return False
-
-    _mla_types: frozenset[type] = frozenset({MLAAttentionSpec, SlidingWindowMLASpec})
-    if not groups:
-        return False
-    for group in groups:
-        spec = group.kv_cache_spec
-        inner: list[KVCacheSpec] = (
-            list(spec.kv_cache_specs.values())
-            if isinstance(spec, UniformTypeKVCacheSpecs)
-            else [spec]
-        )
-        if not inner:
-            return False
-        if not all(
-            type(s) in _mla_types
-            and isinstance(s, AttentionSpec)
-            and s.num_kv_heads == 1
-            for s in inner
-        ):
-            return False
-    return True
+def kv_cache_groups_tp_replicated(groups: list[KVCacheGroupSpec]) -> bool:
+    """Whether every layer is MLA with a single KV head, i.e. TP-replicated."""
+    return bool(groups) and all(
+        isinstance(spec, AttentionSpec)
+        and type(spec) in _TP_REPLICATED_SPEC_TYPES
+        and spec.num_kv_heads == 1
+        for group in groups
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    )
 
 
 def generate_scheduler_kv_cache_config(
@@ -2819,8 +2792,8 @@ def get_kv_cache_configs(
         )
 
     for kv_cache_config in kv_cache_configs:
-        kv_cache_config.all_groups_are_tp_replicated = _all_kv_groups_tp_replicated(
-            kv_cache_config.kv_cache_groups, vllm_config
+        kv_cache_config.kv_layers_tp_replicated = kv_cache_groups_tp_replicated(
+            kv_cache_config.kv_cache_groups
         )
 
     return kv_cache_configs

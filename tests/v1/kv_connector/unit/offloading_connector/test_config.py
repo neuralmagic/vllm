@@ -18,8 +18,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.core.kv_cache_utils import (
-    _all_kv_groups_tp_replicated,
     generate_scheduler_kv_cache_config,
+    kv_cache_groups_tp_replicated,
 )
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -324,8 +324,8 @@ def _replicated_layout(
     config.parallel_config.nnodes = nnodes
     if world_size is not None:
         config.parallel_config.world_size = world_size
-    kv_cache_config.all_groups_are_tp_replicated = _all_kv_groups_tp_replicated(
-        kv_cache_config.kv_cache_groups, config
+    kv_cache_config.kv_layers_tp_replicated = kv_cache_groups_tp_replicated(
+        kv_cache_config.kv_cache_groups
     )
 
     # Scheduler and Worker offload config
@@ -1201,8 +1201,8 @@ def test_uncertifiable_canonical_layout_resets_replication(spec: KVCacheSpec):
             ],
         )
 
-        kv_config.all_groups_are_tp_replicated = _all_kv_groups_tp_replicated(
-            kv_config.kv_cache_groups, config
+        kv_config.kv_layers_tp_replicated = kv_cache_groups_tp_replicated(
+            kv_config.kv_cache_groups
         )
 
         return build_offloading_config(config, kv_config)
