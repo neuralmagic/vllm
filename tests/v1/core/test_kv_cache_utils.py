@@ -52,6 +52,7 @@ from vllm.v1.core.kv_cache_utils import (
     hash_block_tokens,
     init_none_hash,
     is_kv_cache_spec_uniform,
+    kv_cache_groups_tp_replicas,
     make_block_hash_with_group_id,
     tensor_data,
 )
@@ -4558,7 +4559,7 @@ _GQA_SWA_SPEC = SlidingWindowSpec(
 @pytest.mark.parametrize(
     "specs,expected",
     [
-        pytest.param({"l.0": new_mla_spec(), "l.1": new_mla_spec()}, True, id="mla"),
+        pytest.param({"l.0": new_mla_spec(), "l.1": new_mla_spec()}, 4, id="mla"),
         pytest.param(
             {
                 "l.0": new_mla_spec(),
@@ -4566,13 +4567,13 @@ _GQA_SWA_SPEC = SlidingWindowSpec(
                 "s.0": new_swa_mla_spec(),
                 "s.1": new_swa_mla_spec(),
             },
-            True,
+            4,
             id="mla-and-swa-mla",
         ),
-        pytest.param({"l.0": _GQA_SPEC, "l.1": _GQA_SPEC}, False, id="gqa"),
+        pytest.param({"l.0": _GQA_SPEC, "l.1": _GQA_SPEC}, 1, id="gqa"),
         pytest.param(
             {"l.0": new_mla_spec(), "l.1": _GQA_SPEC},
-            False,
+            1,
             id="mla-and-gqa-uniform-group",
         ),
         pytest.param(
@@ -4582,17 +4583,55 @@ _GQA_SWA_SPEC = SlidingWindowSpec(
                 "s.0": _GQA_SWA_SPEC,
                 "s.1": _GQA_SWA_SPEC,
             },
-            False,
+            1,
             id="mla-and-gqa-swa",
         ),
     ],
 )
-def test_kv_layers_tp_replicated(specs, expected):
+def test_kv_tp_replicas(specs, expected):
     """Resolved per layer before scheduler flattening hides mixed groups."""
-    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    from vllm.config import ParallelConfig
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        parallel_config=ParallelConfig(tensor_parallel_size=4),
+    )
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     mem = sum(s.page_size_bytes for s in specs.values()) * 10
     configs = get_kv_cache_configs(vllm_config, [specs], [mem])
-    assert configs[0].kv_layers_tp_replicated is expected
+    assert configs[0].kv_tp_replicas == expected
     scheduler = generate_scheduler_kv_cache_config(configs)
-    assert scheduler.kv_layers_tp_replicated is expected
+    assert scheduler.kv_tp_replicas == expected
+
+
+@pytest.mark.parametrize(
+    "specs,tp_size,dcp_size,expected",
+    [
+        pytest.param([new_mla_spec()], 8, 1, 8, id="mla"),
+        pytest.param([new_mla_spec()], 8, 2, 1, id="mla-dcp"),
+        pytest.param([replace(_GQA_SPEC, max_tp_shards=2)], 8, 1, 4, id="gqa-partial"),
+        pytest.param([replace(_GQA_SPEC, max_tp_shards=8)], 4, 1, 1, id="gqa-sharded"),
+        pytest.param(
+            [new_mla_spec(), replace(_GQA_SWA_SPEC, max_tp_shards=4)],
+            8,
+            1,
+            2,
+            id="mla-and-gqa-partial",
+        ),
+        pytest.param(
+            [
+                HiddenStateCacheSpec(
+                    block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float32
+                )
+            ],
+            8,
+            1,
+            1,
+            id="hidden-state",
+        ),
+    ],
+)
+def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
+    """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
+    groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
+    assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected

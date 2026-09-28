@@ -484,6 +484,9 @@ class HiSparseResidentSpec(KVCacheSpec):
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
     dcp_sharded: bool = True
+    max_tp_shards: int | None = None
+    """Distinct shards this cache splits into across TP; TP ranks beyond this
+    hold replicas. None: shards across any TP size."""
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
@@ -618,6 +621,7 @@ class FullAttentionSpec(AttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             dcp_sharded=specs[0].dcp_sharded,
+            max_tp_shards=specs[0].max_tp_shards,
             page_size_padded=specs[0].page_size_padded,
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
@@ -668,6 +672,7 @@ class MLAAttentionSpec(FullAttentionSpec):
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
+    max_tp_shards: int | None = 1
 
     def __post_init__(self):
         super().__post_init__()
@@ -705,6 +710,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             dcp_sharded=specs[0].dcp_sharded,
+            max_tp_shards=specs[0].max_tp_shards,
             page_size_padded=specs[0].page_size_padded,
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
@@ -732,7 +738,7 @@ class MLAAttentionSpec(FullAttentionSpec):
 class HiddenStateCacheSpec(MLAAttentionSpec):
     """Marker for hidden-state cache layers used by extract_hidden_states."""
 
-    pass
+    max_tp_shards: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -768,6 +774,7 @@ class RSWASpec(FullAttentionSpec):
             dtype=base.dtype,
             kv_quant_mode=base.kv_quant_mode,
             dcp_sharded=base.dcp_sharded,
+            max_tp_shards=base.max_tp_shards,
             page_size_padded=base.page_size_padded,
             num_head_slots=base.num_head_slots,
             state_content_bytes=base.state_content_bytes,
@@ -930,6 +937,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
+    max_tp_shards: int | None = 1
 
     def __post_init__(self):
         assert self.model_version in (None, "deepseek_v4"), (
@@ -960,6 +968,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         bounded_replay_set = set(spec.bounded_replay for spec in specs)
         block_stride_alignment_set = {spec.block_stride_alignment for spec in specs}
         assert len({spec.dcp_sharded for spec in specs}) == 1
+        assert len({spec.max_tp_shards for spec in specs}) == 1
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
@@ -980,6 +989,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
             dcp_sharded=specs[0].dcp_sharded,
+            max_tp_shards=specs[0].max_tp_shards,
             page_size_padded=specs[0].page_size_padded,
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
@@ -1197,6 +1207,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             kv_quant_mode=specs[0].kv_quant_mode,
             dcp_sharded=specs[0].dcp_sharded,
+            max_tp_shards=specs[0].max_tp_shards,
             page_size_padded=specs[0].page_size_padded,
             num_head_slots=specs[0].num_head_slots,
             state_content_bytes=specs[0].state_content_bytes,
@@ -1483,8 +1494,8 @@ class KVCacheConfig:
     hisparse_shared_host_pool: bool = False
     """Whether local TP ranks share one physical HiSparse host pool."""
 
-    kv_layers_tp_replicated: bool = False
-    """Whether all layers hold identical KV on all TP ranks (MLA-only, one KV head)."""
+    kv_tp_replicas: int = 1
+    """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:

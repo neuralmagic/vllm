@@ -157,10 +157,10 @@ def build_offloading_config(
     )
     replicated_layout = (
         vllm_config.model_config.use_mla
-        and kv_cache_config.kv_layers_tp_replicated
+        and parallel_config.tensor_parallel_size > 1
+        and kv_cache_config.kv_tp_replicas == parallel_config.tensor_parallel_size
         and worker_kv_bytes_per_block > 0
         # Safe MVP boundary: TP-only, no other parallel axes.
-        and parallel_config.tensor_parallel_size > 1
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.prefill_context_parallel_size == 1
         and parallel_config.decode_context_parallel_size == 1

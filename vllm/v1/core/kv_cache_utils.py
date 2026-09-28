@@ -9,7 +9,7 @@ import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from functools import partial
+from functools import partial, reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
@@ -101,11 +101,6 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 
 logger = init_logger(__name__)
-
-_TP_REPLICATED_SPEC_TYPES: tuple[type[AttentionSpec], ...] = (
-    MLAAttentionSpec,
-    SlidingWindowMLASpec,
-)
 
 # The hash seed for the first block of any prefix block sequence.
 #
@@ -2366,14 +2361,23 @@ def get_kv_cache_groups(
     return groups
 
 
-def kv_cache_groups_tp_replicated(groups: list[KVCacheGroupSpec]) -> bool:
-    """Whether every layer is MLA with a single KV head, i.e. TP-replicated."""
-    return bool(groups) and all(
-        isinstance(spec, AttentionSpec)
-        and type(spec) in _TP_REPLICATED_SPEC_TYPES
-        and spec.num_kv_heads == 1
-        for group in groups
-        for spec in iter_layer_specs(group.kv_cache_spec)
+def _layer_tp_replicas(spec: KVCacheSpec, tp_size: int, dcp_size: int) -> int:
+    if not isinstance(spec, AttentionSpec) or spec.max_tp_shards is None:
+        return 1
+    if spec.dcp_sharded and dcp_size > 1:
+        return 1
+    return max(1, tp_size // spec.max_tp_shards)
+
+
+def kv_cache_groups_tp_replicas(
+    groups: list[KVCacheGroupSpec], tp_size: int, dcp_size: int = 1
+) -> int:
+    """Consecutive TP ranks holding identical KV for every layer."""
+    specs = [spec for g in groups for spec in iter_layer_specs(g.kv_cache_spec)]
+    if not specs:
+        return 1
+    return reduce(
+        math.gcd, (_layer_tp_replicas(s, tp_size, dcp_size) for s in specs), tp_size
     )
 
 
@@ -2792,8 +2796,10 @@ def get_kv_cache_configs(
         )
 
     for kv_cache_config in kv_cache_configs:
-        kv_cache_config.kv_layers_tp_replicated = kv_cache_groups_tp_replicated(
-            kv_cache_config.kv_cache_groups
+        kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
+            kv_cache_config.kv_cache_groups,
+            vllm_config.parallel_config.tensor_parallel_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
         )
 
     return kv_cache_configs
