@@ -1484,9 +1484,7 @@ class KVCacheConfig:
     """Whether local TP ranks share one physical HiSparse host pool."""
 
     kv_layers_tp_replicated: bool = False
-    """Whether every layer holds identical KV on all TP ranks (MLA-only, one
-    KV head). Resolved before scheduler configs flatten
-    ``UniformTypeKVCacheSpecs``, which hides the per-layer specs."""
+    """Whether all layers hold identical KV on all TP ranks (MLA-only, one KV head)."""
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
