@@ -167,6 +167,7 @@ def _mla_spec(
     return MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
+        max_tp_shards=1,
         head_size=head_size,
         dtype=dtype,
         tokens_per_state=tokens_per_state,
@@ -352,6 +353,7 @@ def _replicated_layout(
 _SWA_MLA_PAGE = SlidingWindowMLASpec(
     block_size=16,
     num_kv_heads=1,
+    max_tp_shards=1,
     head_size=512,
     dtype=torch.float32,
     sliding_window=128,
@@ -365,6 +367,7 @@ def _make_swa_mla_kv_cache_config(
     spec = SlidingWindowMLASpec(
         block_size=16,
         num_kv_heads=1,
+        max_tp_shards=1,
         head_size=512,
         dtype=torch.float32,
         sliding_window=128,
@@ -405,6 +408,7 @@ def _make_dsv4_flash_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
         spec = SlidingWindowMLASpec(
             block_size=block_size,
             num_kv_heads=1,
+            max_tp_shards=1,
             head_size=head_size,
             dtype=dtype,
             sliding_window=sw,
@@ -422,6 +426,7 @@ def _make_dsv4_flash_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
         spec = MLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
+            max_tp_shards=1,
             head_size=head_size,
             dtype=dtype,
         )
@@ -475,6 +480,7 @@ def _make_dsv3_2_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
     spec = MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
+        max_tp_shards=1,
         head_size=512,
         dtype=torch.float32,
     )
@@ -930,6 +936,7 @@ def test_replicated_layout_excludes_unproven_cache_shapes(
                         SlidingWindowMLASpec(
                             block_size=16,
                             num_kv_heads=1,
+                            max_tp_shards=1,
                             head_size=512,
                             dtype=torch.float32,
                             sliding_window=128,
@@ -1111,6 +1118,7 @@ _SWA_SPEC = SlidingWindowSpec(
 _SWA_MLA_SPEC = SlidingWindowMLASpec(
     block_size=16,
     num_kv_heads=1,
+    max_tp_shards=1,
     head_size=576,
     dtype=torch.float32,
     sliding_window=128,

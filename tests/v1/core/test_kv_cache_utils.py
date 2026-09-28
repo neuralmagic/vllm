@@ -3183,6 +3183,7 @@ def new_mla_spec(cache_dtype_str=None, block_size: int = 16):
     return MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
+        max_tp_shards=1,
         head_size=576,
         dtype=torch.float32,
         cache_dtype_str=cache_dtype_str,
@@ -3193,6 +3194,7 @@ def new_swa_mla_spec(head_size=576, sliding_window=128, model_version=None):
     return SlidingWindowMLASpec(
         block_size=16,
         num_kv_heads=1,
+        max_tp_shards=1,
         head_size=head_size,
         dtype=torch.float32,
         sliding_window=sliding_window,
@@ -4588,13 +4590,15 @@ _GQA_SWA_SPEC = SlidingWindowSpec(
         ),
     ],
 )
-def test_kv_tp_replicas(specs, expected):
+def test_kv_tp_replicas(monkeypatch, specs, expected):
     """Resolved per layer before scheduler flattening hides mixed groups."""
     from vllm.config import ParallelConfig
+    from vllm.platforms import current_platform
 
+    monkeypatch.setattr(current_platform, "device_count", lambda: 4)
+    parallel_config = ParallelConfig(tensor_parallel_size=4)
     vllm_config = VllmConfig(
-        model_config=ModelConfig(max_model_len=16),
-        parallel_config=ParallelConfig(tensor_parallel_size=4),
+        model_config=ModelConfig(max_model_len=16), parallel_config=parallel_config
     )
     vllm_config.cache_config.kv_cache_layout = "LBNHC"
     mem = sum(s.page_size_bytes for s in specs.values()) * 10
@@ -4609,6 +4613,9 @@ def test_kv_tp_replicas(specs, expected):
     [
         pytest.param([new_mla_spec()], 8, 1, 8, id="mla"),
         pytest.param([new_mla_spec()], 8, 2, 1, id="mla-dcp"),
+        pytest.param(
+            [replace(new_mla_spec(), max_tp_shards=None)], 8, 1, 1, id="mla-unset"
+        ),
         pytest.param([replace(_GQA_SPEC, max_tp_shards=2)], 8, 1, 4, id="gqa-partial"),
         pytest.param([replace(_GQA_SPEC, max_tp_shards=8)], 4, 1, 1, id="gqa-sharded"),
         pytest.param(

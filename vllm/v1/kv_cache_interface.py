@@ -486,7 +486,7 @@ class AttentionSpec(KVCacheSpec):
     dcp_sharded: bool = True
     max_tp_shards: int | None = None
     """Distinct shards this cache splits into across TP; TP ranks beyond this
-    hold replicas. None: shards across any TP size."""
+    hold replicas. None: unknown, treated as not replicated."""
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
@@ -672,7 +672,6 @@ class MLAAttentionSpec(FullAttentionSpec):
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
-    max_tp_shards: int | None = 1
 
     def __post_init__(self):
         super().__post_init__()
@@ -738,7 +737,7 @@ class MLAAttentionSpec(FullAttentionSpec):
 class HiddenStateCacheSpec(MLAAttentionSpec):
     """Marker for hidden-state cache layers used by extract_hidden_states."""
 
-    max_tp_shards: int | None = None
+    pass
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -937,7 +936,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     # MLA stores a single latent vector per state; there is no separate V.
     head_size_v: int = 0
-    max_tp_shards: int | None = 1
 
     def __post_init__(self):
         assert self.model_version in (None, "deepseek_v4"), (
