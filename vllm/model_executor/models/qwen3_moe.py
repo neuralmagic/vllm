@@ -147,14 +147,23 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.ep_group = get_ep_group().device_group
         self.ep_size = self.ep_group.size()
+
+        # Mixed MoE sparsity: the quantization config may override the expert
+        # count for this layer. The model config's num_experts is the maximum
+        # across all layers, while the checkpoint's gate and expert weights are
+        # sized to the actual per-layer count.
         self.n_routed_experts = config.num_experts
+        if quant_config is not None:
+            layer_num_experts = quant_config.get_num_experts_for_layer(prefix)
+            if layer_num_experts is not None:
+                self.n_routed_experts = layer_num_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        if self.tp_size > config.num_experts:
+        if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
+                f"the number of experts {self.n_routed_experts}."
             )
 
         # Load balancing settings.
@@ -169,7 +178,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.gate = GateLinear(
             config.hidden_size,
-            config.num_experts,
+            self.n_routed_experts,
             quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import re
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -91,6 +92,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         transform_config: dict[str, Any] | None = None,
         total_num_heads: int | None = None,
         total_num_kv_heads: int | None = None,
+        expert_counts_per_layer: list[int] | None = None,
     ):
         super().__init__()
         self.ignore = ignore
@@ -101,6 +103,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
+        self.expert_counts_per_layer = expert_counts_per_layer
 
         if transform_config:
             self.transform_config = TransformConfig.model_validate(transform_config)
@@ -119,6 +122,17 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def get_name(self) -> QuantizationMethods:
         return "compressed-tensors"
+
+    def get_num_experts_for_layer(self, prefix: str) -> int | None:
+        if self.expert_counts_per_layer is None:
+            return None
+        match = re.search(r"\.layers\.(\d+)\.", prefix)
+        if match is None:
+            return None
+        layer_idx = int(match.group(1))
+        if layer_idx >= len(self.expert_counts_per_layer):
+            return None
+        return self.expert_counts_per_layer[layer_idx]
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         """Transform layer paths in config targets to match vLLM's naming.
@@ -252,6 +266,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Check for deprecated sparsity config
         cls._parse_sparsity_config(config=config)
 
+        expert_counts_per_layer = None
+        layer_overrides = config.get("layer_overrides")
+        if layer_overrides:
+            expert_counts_per_layer = layer_overrides.get("num_experts")
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -261,6 +280,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             kv_cache_scheme=config.get("kv_cache_scheme"),
             total_num_heads=config.get("total_num_heads"),
             total_num_kv_heads=config.get("total_num_kv_heads"),
+            expert_counts_per_layer=expert_counts_per_layer,
         )
 
     @classmethod

@@ -222,6 +222,15 @@ def FusedMoEFactory(
     """
     vllm_config = get_current_vllm_config()
 
+    # Mixed MoE sparsity: allow the quantization config to override
+    # num_experts on a per-layer basis. The model config sets
+    # n_routed_experts to the maximum across all layers, and the
+    # quantization config specifies the actual count per layer.
+    if quant_config is not None:
+        layer_num_experts = quant_config.get_num_experts_for_layer(prefix)
+        if layer_num_experts is not None:
+            num_experts = layer_num_experts
+
     layer_name = prefix
 
     moe_activation = MoEActivation.from_str(activation)

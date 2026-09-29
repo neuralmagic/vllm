@@ -262,6 +262,14 @@ class QuantizationConfig(ABC):
         # TODO (@kylesayrs): add implementations for all subclasses
         pass
 
+    def get_num_experts_for_layer(self, prefix: str) -> int | None:
+        """Return the actual number of experts for a given MoE layer.
+
+        Used for mixed MoE sparsity where different layers have different
+        numbers of experts. Returns None to use the default from model config.
+        """
+        return None
+
     def maybe_update_config(  # noqa: B027
         self,
         model_name: str,
