@@ -700,6 +700,8 @@ class OffloadingConnectorScheduler:
                     defer_lookup = True
                 case LookupResult.MISS:
                     break
+                case LookupResult.ABORT:
+                    return 0
         return hit_count if not defer_lookup else None
 
     def _sliding_window_lookup(
@@ -740,6 +742,8 @@ class OffloadingConnectorScheduler:
                     # This gap rules out the incomplete window to its right.
                     pending_in_window = False
                     required_window = sliding_window_size
+                case LookupResult.ABORT:
+                    return 0
             if consecutive_hits == required_window:
                 return (
                     None if defer_lookup or pending_in_window else idx + required_window

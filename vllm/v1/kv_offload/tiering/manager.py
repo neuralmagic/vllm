@@ -449,7 +449,7 @@ class TieringOffloadingManager(OffloadingManager):
                     lookup_duration,
                 )
                 promoted = self._initiate_promotion(i, key, req_context)
-                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
+                return LookupResult.ABORT if not promoted else LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
             self._metrics.on_lookup(

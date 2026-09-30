@@ -123,6 +123,7 @@ class LookupResult(Enum):
     HIT = auto()
     HIT_PENDING = auto()
     RETRY = auto()
+    ABORT = auto()
 
 
 class OffloadPolicy(Enum):
