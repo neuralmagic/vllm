@@ -27,6 +27,9 @@ from typing import NamedTuple
 import numpy as np
 from typing_extensions import override
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    ReqId,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
@@ -74,6 +77,13 @@ class RequestState:
     is_finished: bool = False
     request_level_tiers: set[int] | None = None
     pending_cascade_keys: list[OffloadKey] = field(default_factory=list)
+
+
+@dataclass
+class LookupHitsRecord:
+    key: OffloadKey
+    tier: str | None
+    result: LookupResult
 
 
 class JobMetadata(NamedTuple):
@@ -242,6 +252,9 @@ class TieringOffloadingManager(OffloadingManager):
             tier: i for i, tier in enumerate(self.secondary_tiers)
         }
 
+        self._lookups_this_step: dict[ReqId, list[LookupHitsRecord]] = {}
+        self._reqs_this_step: dict[ReqId, ReqContext] = {}
+
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
         return self._jobs
@@ -387,6 +400,26 @@ class TieringOffloadingManager(OffloadingManager):
         *,
         exclude_tier_idx: int | None = None,
     ) -> LookupResult:
+        result, tier_label = self._lookup(key, req_context, exclude_tier_idx)
+
+        # Record lookup results
+        req_id = req_context.req_id
+        if req_id not in self._lookups_this_step:
+            self._lookups_this_step[req_context.req_id] = []
+        self._lookups_this_step[req_id].append(
+            LookupHitsRecord(key=key, tier=tier_label, result=result)
+        )
+        if req_id not in self._reqs_this_step:
+            self._reqs_this_step[req_id] = req_context
+
+        return result
+
+    def _lookup(
+        self,
+        key: OffloadKey,
+        req_context: ReqContext,
+        exclude_tier_idx: int | None = None,
+    ) -> tuple[LookupResult, None | str]:
         """Check whether a single chunk is offloaded and ready.
 
         Algorithm:
@@ -407,6 +440,7 @@ class TieringOffloadingManager(OffloadingManager):
             RETRY     — promotion started or a secondary tier is busy.
             MISS      — chunk not found in any tier, or primary is full
                         and cannot accept a promotion.
+            with the tier that satisfied the request.
 
         """
         # Poll first so a promotion that finished since the last call is
@@ -426,17 +460,17 @@ class TieringOffloadingManager(OffloadingManager):
             lookup_duration,
         )
         if primary_hit is LookupResult.HIT:
-            return LookupResult.HIT
+            return LookupResult.HIT, self._metrics.primary_tier_label[0]
         if primary_hit is LookupResult.HIT_PENDING:
-            return LookupResult.HIT_PENDING
+            return LookupResult.HIT_PENDING, self._metrics.primary_tier_label[0]
 
         any_retry = False
         for i, tier in enumerate(self.secondary_tiers):
+            tier_labels = self._metrics.tier_label(i)
             if i == exclude_tier_idx:
                 continue
             if not req_context.load_tier_filter.allows(tier.medium, tier.locality):
                 continue
-            labelvalues = self._metrics.tier_label(i)
             start_time = time.monotonic()
             result = tier.lookup(key, req_context)
             lookup_duration = time.monotonic() - start_time
@@ -444,25 +478,29 @@ class TieringOffloadingManager(OffloadingManager):
                 self._metrics.on_lookup(
                     req_context,
                     key,
-                    labelvalues,
+                    tier_labels,
                     result,
                     lookup_duration,
                 )
                 promoted = self._initiate_promotion(i, key, req_context)
-                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
+                return (
+                    (LookupResult.MISS, tier_labels[0])
+                    if not promoted
+                    else (LookupResult.HIT_PENDING, tier_labels[0])
+                )
             if result is LookupResult.RETRY:
                 any_retry = True
             self._metrics.on_lookup(
                 req_context,
                 key,
-                labelvalues,
+                tier_labels,
                 result,
                 lookup_duration,
             )
 
         if any_retry:
-            return LookupResult.RETRY
-        return LookupResult.MISS
+            return (LookupResult.RETRY, None)
+        return (LookupResult.MISS, None)
 
     def _initiate_promotion(
         self,
@@ -880,6 +918,27 @@ class TieringOffloadingManager(OffloadingManager):
             if state is None:
                 continue
             self._metrics.on_request_allocated(state.req_context)
+
+        # reset lookups this step
+        # for every request -
+        #  - if all of the keys are hit-pending / hit and
+        #  - if there is some primary tier cache blocks, touch it
+        for req_id, lookup_results in self._lookups_this_step.items():
+            all_hit = all(
+                x.result in [LookupResult.HIT, LookupResult.HIT_PENDING]
+                for x in lookup_results
+            )
+            if not all_hit:
+                continue
+            primary_keys = [
+                x.key
+                for x in lookup_results
+                if x.tier == self._metrics.primary_tier_label[0]
+            ]
+            self.primary_tier.touch(primary_keys, self._reqs_this_step[req_id])
+
+        self._lookups_this_step.clear()
+        self._reqs_this_step.clear()
 
     @override
     def has_pending_work(self) -> bool:
