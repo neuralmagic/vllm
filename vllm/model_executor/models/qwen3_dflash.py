@@ -28,6 +28,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_and_maybe_dequant_weights,
+    scaled_dequantize,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -115,6 +119,27 @@ def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
         getattr(config, "target_hidden_size", None) or config.hidden_size
     )
     return target_hidden_size * num_features_to_use
+
+
+def _get_dflash_qkv_weight(
+    qkv_proj: nn.Module, out_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Return a DFlash QKV weight in the dense ``[out, in]`` layout."""
+    out_dtype = out_dtype or qkv_proj.params_dtype
+    weight = getattr(qkv_proj, "weight", None)
+    weight_scale = getattr(qkv_proj, "weight_scale", None)
+    fp8_fnuz = getattr(torch, "float8_e4m3fnuz", torch.float8_e4m3fn)
+    if (
+        weight is not None
+        and weight_scale is not None
+        and weight.dtype in (torch.float8_e4m3fn, fp8_fnuz)
+        and weight_scale.numel() in (weight.shape[0], weight.shape[1])
+    ):
+        if weight_scale.numel() == weight.shape[1]:
+            weight = weight.t()
+        return scaled_dequantize(weight, weight_scale, out_dtype=out_dtype)
+
+    return get_and_maybe_dequant_weights(qkv_proj, out_dtype=out_dtype)
 
 
 def _resolve_layer_attention(
@@ -516,7 +541,12 @@ class DFlashQwen3Model(nn.Module):
             for proj in self._context_qkv_projs
         ):
             # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            kv_weights = [
+                _get_dflash_qkv_weight(a.qkv_proj, out_dtype=a.qkv_proj.params_dtype)[
+                    a.q_size :
+                ]
+                for a in layers_attn
+            ]
             self._fused_kv_weight: torch.Tensor | None = torch.cat(kv_weights, dim=0)
             if has_bias:
                 kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
