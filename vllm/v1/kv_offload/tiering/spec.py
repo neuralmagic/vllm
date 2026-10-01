@@ -369,10 +369,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 )
 
                 # Create secondary tiers
-                primary_kv_view = primary_tier.get_kv_memoryview()
                 for i, tier_config in enumerate(self.secondary_tier_configs):
                     tier = SecondaryTierFactory.create_secondary_tier(
-                        tier_config, primary_kv_view, self
+                        tier_config, self, primary_tier
                     )
                     secondary_tiers.append(tier)
                     logger.info(

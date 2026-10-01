@@ -39,6 +39,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     ReqContext,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.backpressure import BackpressureDetector
@@ -59,6 +60,7 @@ from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool, Task
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
 logger = init_logger(__name__)
 
@@ -110,7 +112,7 @@ class FileSystemTierManager(SecondaryTierManager):
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
-        primary_kv_view: memoryview,
+        primary_tier: "CPUPrimaryTierOffloadingManager",
         tier_type: str,
         root_dir: str,
         n_read_threads: int = 16,
@@ -122,7 +124,7 @@ class FileSystemTierManager(SecondaryTierManager):
         """Args:
         offloading_spec: Contains normalized offloading configuration and
             blocks_per_chunk.
-        primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+        primary_tier: The CPU primary tier (provides KV view + prepare_write).
         tier_type: Tier type identifier, set by SecondaryTierFactory.
         root_dir: Root directory for block files.
         n_read_threads: Number of read-priority I/O threads.
@@ -136,7 +138,7 @@ class FileSystemTierManager(SecondaryTierManager):
 
         """
         super().__init__(
-            offloading_spec, primary_kv_view, tier_type, backpressure_detector
+            offloading_spec, primary_tier, tier_type, backpressure_detector
         )
         self.locality = Locality(locality) if locality is not None else None
 
@@ -164,11 +166,8 @@ class FileSystemTierManager(SecondaryTierManager):
         # as multiple threads can finish parts of a job simultaneously.
         self._load_job_failed_keys: dict[JobId, SimpleQueue] = {}
 
-        # Extract block size from primary view
-        assert primary_kv_view.strides is not None, (
-            "primary_kv_view.strides cannot be None"
-        )
-        self._block_size: int = primary_kv_view.strides[0]
+        # _block_size_bytes is set by base class; alias for FS-internal use.
+        self._block_size: int = self._block_size_bytes
 
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
         self.file_mapper = FileMapper.from_offloading_spec(
@@ -208,6 +207,11 @@ class FileSystemTierManager(SecondaryTierManager):
         )
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+
+        # Per-load-job queue for keys successfully allocated via lazy
+        # prepare_write() inside worker threads.  Multiple batches of the same
+        # job each put their allocated keys here; get_finished_jobs() drains it.
+        self._load_job_allocated_q: dict[JobId, SimpleQueue] = {}
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -254,45 +258,89 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
+        """Submit a lazy promotion job.
+
+        CPU slot allocation happens inside each worker-thread batch via
+        prepare_write() (thread-safe via CPUPrimaryTierOffloadingManager lock).
+        This avoids holding CPU slots from lookup time all the way through queue
+        wait and I/O — slots are acquired only when I/O is about to start.
+        """
         job_id = job_metadata.job_id
         keys = list(job_metadata.keys)
-        self._load_job_keys[job_metadata.job_id] = keys
-        self._load_job_failed_keys[job_metadata.job_id] = SimpleQueue()
+        self._load_job_keys[job_id] = keys
+        self._load_job_failed_keys[job_id] = SimpleQueue()
         self._job_block_counts[job_id] = len(keys)
 
+        # Per-job queue: each batch's lazy_load_fn() puts its allocated keys
+        # here after a successful prepare_write().  get_finished_jobs() drains
+        # it to build JobResult.allocated_keys.
+        allocated_keys_q: SimpleQueue = SimpleQueue()
+        self._load_job_allocated_q[job_id] = allocated_keys_q
+
+        req_context = job_metadata.req_context
+
         def make_batch_fn(batch: list[Task]) -> Callable[[], None]:
-            def load_task() -> None:
+            def lazy_load_fn() -> None:
+                batch_keys = [t.key for t in batch]
+                failed_q = self._load_job_failed_keys[job_id]
+
+                # Allocate primary-tier slots for this batch.
+                # _primary_tier.prepare_write() is thread-safe (uses lock).
+                assert self._primary_tier is not None
+                write_result = self._primary_tier.prepare_write(batch_keys, req_context)
+                if write_result is None:
+                    # CPU OOM: mark all batch keys as failed, nothing allocated.
+                    for key in batch_keys:
+                        failed_q.put(key)
+                    raise RuntimeError(
+                        "CPU KV cache OOM during lazy promotion "
+                        f"(job_id={job_id}, batch_size={len(batch_keys)})"
+                    )
+
+                keys_to_store = list(write_result.keys_to_store)
+                assert isinstance(write_result.store_spec, CPULoadStoreSpec)
+                chunk_ids = write_result.store_spec.chunk_ids
+                # Record allocation; get_finished_jobs() drains this queue.
+                allocated_keys_q.put(keys_to_store)
+                self._on_promotion_alloc(len(keys_to_store))
+
+                if not keys_to_store:
+                    # All batch keys already in primary cache — no disk I/O.
+                    return
+
+                paths = [self.file_mapper.get_file_name(k) for k in keys_to_store]
+                offsets = [int(cid) * self._block_size for cid in chunk_ids]
                 try:
                     batch_load_block(
-                        paths=[t.path for t in batch],
-                        offsets=[t.offset for t in batch],
+                        paths=paths,
+                        offsets=offsets,
                         view=self._primary_kv_view,
                         block_size=self._block_size,
                         use_o_direct=self._use_o_direct,
                     )
                 except Exception as exc:
-                    # Record number of successful loads.
                     num_succeeded = getattr(exc, "num_succeeded", 0)
-                    failed_q = self._load_job_failed_keys[job_id]
-                    for t in batch[num_succeeded:]:
-                        failed_q.put(t.key)
-                    # Surfaces errno (e.g. EMFILE "Too many open files") for both
-                    # the C and Python load paths.
+                    for key in keys_to_store[num_succeeded:]:
+                        failed_q.put(key)
                     logger.debug(
                         "Load of %d blocks for job %s failed at block %d: %s",
-                        len(batch),
+                        len(keys_to_store),
                         job_id,
                         num_succeeded,
                         exc,
                     )
                     raise
 
-            return load_task
+            return lazy_load_fn
 
+        # Tasks carry key + path; offset is resolved lazily by the worker.
+        initial_tasks = [
+            Task(key=k, path=self.file_mapper.get_file_name(k), offset=0) for k in keys
+        ]
         self._pool.enqueue_load(
             job_id,
             len(keys),
-            self._tasks_from_jobmetadata(job_metadata),
+            initial_tasks,
             make_batch_fn=make_batch_fn,
         )
 
@@ -317,6 +365,18 @@ class FileSystemTierManager(SecondaryTierManager):
                     )
             load_keys = self._load_job_keys.pop(job_id, None)
             failed_q = self._load_job_failed_keys.pop(job_id, None)
+
+            # Drain the per-job allocated-keys queue (populated by lazy
+            # prepare_write() calls inside worker threads).  None if this is
+            # a store job (no entry in _load_job_allocated_q).
+            allocated_q = self._load_job_allocated_q.pop(job_id, None)
+            allocated_keys: list[OffloadKey] | None = None
+            if allocated_q is not None:
+                accumulated: list[OffloadKey] = []
+                while not allocated_q.empty():
+                    accumulated.extend(allocated_q.get_nowait())
+                allocated_keys = accumulated  # [] if every batch OOM'd
+
             if load_keys is not None and not success:
                 failed: list[OffloadKey] = []
                 if failed_q is not None:
@@ -331,6 +391,7 @@ class FileSystemTierManager(SecondaryTierManager):
                         successful_keys=tuple(successful) if successful else None,
                         transfer_time=transfer_time,
                         transfer_bytes=transfer_bytes,
+                        allocated_keys=allocated_keys,
                     )
                 )
                 continue
@@ -340,6 +401,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     success=success,
                     transfer_time=transfer_time,
                     transfer_bytes=transfer_bytes,
+                    allocated_keys=allocated_keys,
                 )
             )
         return results

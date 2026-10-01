@@ -4,8 +4,9 @@
 
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass
+from dataclasses import field as _field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -17,10 +18,12 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadingMetricMetadata,
     OffloadKey,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.backpressure import (
     BackpressureDetector,
 )
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
         OffloadingConnectorStats,
     )
     from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
 
 # Type alias for job IDs used in async transfer tracking
@@ -72,7 +76,7 @@ class TransferJob:
     chunk_ids: np.ndarray
     is_promotion: bool
     req_context: ReqContext
-    submit_time: float = field(default_factory=time.monotonic)
+    submit_time: float = _field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -88,6 +92,14 @@ class JobResult:
     successful_keys: Collection[OffloadKey] | None = None
     transfer_time: float | None = None
     transfer_bytes: int | None = None
+    # The exact keys for which THIS promotion job allocated primary-tier slots
+    # via prepare_write().  None means prepare_write() was never called (CPU
+    # OOM before any allocation).  An empty list means prepare_write() ran but
+    # all requested keys were already cached (no new slot needed).
+    # _complete_promotion() calls complete_write() only for these keys.
+    # Excluded from __eq__/__hash__: internal to TieringOffloadingManager;
+    # callers should use success/successful_keys for job outcome comparisons.
+    allocated_keys: Collection[OffloadKey] | None = _field(default=None, compare=False)
 
 
 class ParentManager(ABC):
@@ -145,19 +157,22 @@ class SecondaryTierManager(ABC):
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
-        primary_kv_view: memoryview,
+        primary_tier: "CPUPrimaryTierOffloadingManager",
         tier_type: str,
         backpressure_detector: BackpressureDetector | None = None,
     ) -> None:
         """Args:
         offloading_spec: Offloading configuration.
-        primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+        primary_tier: The CPU primary tier; provides the KV cache memoryview
+            and the thread-safe prepare_write() for lazy slot allocation.
         tier_type: Tier type identifier, set by SecondaryTierFactory
             from the registered tier type.
         backpressure_detector: Optional `BackpressureDetector`.
 
         """
         self._offloading_spec = offloading_spec
+        self._primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
+        primary_kv_view: memoryview = primary_tier.get_kv_memoryview()
         self._primary_kv_view: memoryview = primary_kv_view
         assert primary_kv_view.strides is not None, (
             "primary_kv_view.strides cannot be None"
@@ -166,6 +181,12 @@ class SecondaryTierManager(ABC):
         self.tier_type = tier_type
         self.locality: Locality | None = None
         self._bp_detector = backpressure_detector
+
+        # Tracks keys allocated by this tier per in-flight promotion job.
+        self._job_allocated_keys: dict[JobId, list[OffloadKey]] = {}
+        # Called when prepare_write() succeeds; increments per-tier metrics.
+        # Wired up by TieringOffloadingManager after metrics are initialised.
+        self._on_promotion_alloc: Callable[[int], None] = lambda n: None
 
     @property
     def block_size_bytes(self) -> int:
@@ -228,21 +249,57 @@ class SecondaryTierManager(ABC):
         in-flight and submit the transfer, but do NOT perform the data copy
         on the calling thread.
 
-        Preconditions (guaranteed by the framework):
-          - ``job_metadata.chunk_ids`` are allocated primary-tier slots
-            ready to receive data.
-
-        The implementation must copy data from this tier into the
-        primary-tier slots identified by ``chunk_ids``.
+        The implementation is responsible for allocating primary-tier slots
+        via ``_allocate_for_promotion()`` before writing data.
+        ``job_metadata.chunk_ids`` is empty when submitted; the tier
+        resolves it via lazy CPU allocation (either in submit_load() on
+        scheduler-thread tiers, or in the worker thread for pool-based tiers).
 
         Report completion via ``get_finished_jobs()``.
 
         Args:
-            job_metadata: Job metadata including job_id, keys, and chunk_ids
-                          identifying the primary-tier slots to write into.
+            job_metadata: Job metadata including job_id, keys, and
+                          req_context. chunk_ids is empty; the tier allocates
+                          primary-tier slots internally.
 
         """
         pass
+
+    def _allocate_for_promotion(
+        self,
+        job: TransferJob,
+    ) -> "tuple[list[OffloadKey], np.ndarray] | None":
+        """Allocate primary-tier slots for a promotion job.
+
+        Calls prepare_write() on the primary tier, records the allocated
+        keys, and notifies the promotion-allocation metric callback.
+
+        Does NOT mutate job.keys — the caller receives keys_to_store and
+        chunk_ids as separate return values, keeping job.keys intact for
+        _promoting_keys cleanup in _complete_promotion().
+
+        Returns:
+            (keys_to_store, chunk_ids) on success, or None on OOM.
+
+        """
+        write_result: PrepareStoreOutput | None = self._primary_tier.prepare_write(
+            job.keys, job.req_context
+        )
+        if write_result is None:
+            return None
+        keys_to_store = list(write_result.keys_to_store)
+        assert isinstance(write_result.store_spec, CPULoadStoreSpec)
+        chunk_ids = np.array(write_result.store_spec.chunk_ids, dtype=np.int32)
+        self._job_allocated_keys[job.job_id] = keys_to_store
+        self._on_promotion_alloc(len(keys_to_store))
+        return keys_to_store, chunk_ids
+
+    def _pop_allocated_keys(self, job_id: JobId) -> list[OffloadKey] | None:
+        """Return and remove the keys allocated by _allocate_for_promotion().
+
+        Returns None for store jobs (which never call _allocate_for_promotion).
+        """
+        return self._job_allocated_keys.pop(job_id, None)
 
     @abstractmethod
     def get_finished_jobs(self) -> Iterable[JobResult]:

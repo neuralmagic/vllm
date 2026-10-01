@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -40,8 +41,24 @@ class _RequestMetricsState:
 class _TierState:
     active_promotion_count: int = 0
     active_cascade_count: int = 0
-    primary_write_chunk_count: int = 0
     primary_read_chunk_count: int = 0
+    # Thread-safe: FS worker threads increment via on_promotion_alloc callback;
+    # scheduler thread decrements in _complete_promotion().
+    _write_lock: threading.Lock = field(default_factory=threading.Lock)
+    _primary_write_chunk_count: int = 0
+
+    def add_write_chunks(self, n: int) -> None:
+        with self._write_lock:
+            self._primary_write_chunk_count += n
+
+    def sub_write_chunks(self, n: int) -> None:
+        with self._write_lock:
+            self._primary_write_chunk_count -= n
+
+    @property
+    def primary_write_chunk_count(self) -> int:
+        with self._write_lock:
+            return self._primary_write_chunk_count
 
 
 class TieringMetricsTracker:
@@ -114,8 +131,9 @@ class TieringMetricsTracker:
         state = self._tier_states[job_metadata.tier_idx]
         chunk_count = len(transfer_job.chunk_ids)
         if transfer_job.is_promotion:
+            # primary_write_chunk_count is updated lazily via on_promotion_allocated()
+            # when prepare_write() actually runs (scheduler-thread or worker thread).
             state.active_promotion_count += 1
-            state.primary_write_chunk_count += chunk_count
         else:
             state.active_cascade_count += 1
             state.primary_read_chunk_count += chunk_count
@@ -130,6 +148,18 @@ class TieringMetricsTracker:
         self._stats.increase_counter(
             TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES
         )
+
+    def on_promotion_allocated(self, tier_idx: int, n: int) -> None:
+        """Called when prepare_write() succeeds for a promotion job.
+
+        May be called from worker threads (FS tier) or the scheduler thread.
+        Thread-safe via _TierState._write_lock.
+        """
+        self._tier_states[tier_idx].add_write_chunks(n)
+
+    def on_promotion_released(self, tier_idx: int, n: int) -> None:
+        """Called when _complete_promotion() finishes; decrements write count."""
+        self._tier_states[tier_idx].sub_write_chunks(n)
 
     def record_backpressure(
         self,
@@ -192,8 +222,8 @@ class TieringMetricsTracker:
         if transfer_job.is_promotion:
             assert state.active_promotion_count > 0
             state.active_promotion_count -= 1
-            state.primary_write_chunk_count -= chunk_count
-            assert state.primary_write_chunk_count >= 0
+            # primary_write_chunk_count is decremented via on_promotion_released()
+            # in _complete_promotion(), not here.
         else:
             assert state.active_cascade_count > 0
             state.active_cascade_count -= 1
@@ -207,7 +237,13 @@ class TieringMetricsTracker:
     ) -> None:
         transfer_job = job_metadata.transfer_job
         labelvalues = self.tier_label(job_metadata.tier_idx)
-        completed_key_count = len(transfer_job.keys)
+        # For promotions, measure only keys that were actually allocated.
+        # For cascade jobs, all keys in the job were transferred.
+        if transfer_job.is_promotion:
+            assert completed_job.allocated_keys is not None
+            completed_key_count = len(completed_job.allocated_keys)
+        else:
+            completed_key_count = len(transfer_job.keys)
         if not completed_job.success:
             failure_metric = (
                 TieringOffloadingMetrics.PROMOTION_JOB_FAILURES

@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
     from vllm.v1.kv_offload.tiering.backpressure import BackpressureDetector
+    from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
 
 class ExampleSecondaryTierManager(SecondaryTierManager):
@@ -47,7 +48,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
-        primary_kv_view: memoryview,
+        primary_tier: "CPUPrimaryTierOffloadingManager",
         tier_type: str,
         custom_param: int = 0,
         backpressure_detector: "BackpressureDetector | None" = None,
@@ -56,7 +57,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
 
         Args:
             offloading_spec: The offloading spec this tier belongs to.
-            primary_kv_view: Memoryview over the primary tier's KV buffer.
+            primary_tier: The CPU primary tier (provides KV view + prepare_write).
             tier_type: Name identifying this tier type.
             custom_param: Dummy parameter demonstrating custom args.
             backpressure_detector: Optional backpressure detector.
@@ -64,7 +65,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         """
         super().__init__(
             offloading_spec=offloading_spec,
-            primary_kv_view=primary_kv_view,
+            primary_tier=primary_tier,
             tier_type=tier_type,
             backpressure_detector=backpressure_detector,
         )
@@ -78,6 +79,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
 
         # Completed jobs waiting to be retrieved by get_finished_jobs()
         self.completed_jobs: list[JobResult] = []
+        primary_kv_view = self._primary_kv_view
         assert primary_kv_view.strides is not None
         self._chunk_size = primary_kv_view.strides[0]
 
@@ -127,17 +129,20 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
 
         Args:
             job_metadata: Job metadata including job_id, keys, and
-                          spec for writing chunks into the primary tier.
+                          req_context. Allocates primary-tier slots lazily
+                          via _allocate_for_promotion().
 
         """
-        keys = job_metadata.keys
-        chunk_ids = job_metadata.chunk_ids
+        alloc = self._allocate_for_promotion(job_metadata)
+        if alloc is None:
+            # CPU OOM: no slots allocated.
+            self.completed_jobs.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+            return
+        keys_to_store, _chunk_ids = alloc
 
-        assert len(keys) == len(chunk_ids), (
-            f"Length mismatch: {len(keys)} keys but {len(chunk_ids)} chunk_ids"
-        )
-
-        for key in keys:
+        for key in keys_to_store:
             if key not in self.chunks:
                 self.completed_jobs.append(
                     JobResult(job_id=job_metadata.job_id, success=False)
@@ -163,6 +168,9 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         """
         result = self.completed_jobs
         self.completed_jobs = []
+        # Attach allocated_keys for promotion jobs; cleans up _job_allocated_keys.
+        for r in result:
+            r.allocated_keys = self._pop_allocated_keys(r.job_id)
         return result
 
     @override

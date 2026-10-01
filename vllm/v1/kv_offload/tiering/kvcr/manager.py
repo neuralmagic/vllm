@@ -82,6 +82,7 @@ from vllm.v1.kv_offload.tiering.base import (
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
 
 _REQUIRED_ROUTER_CAPABILITIES = ROUTER_HINT_CAPABILITIES
@@ -276,7 +277,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
-        primary_kv_view: memoryview,
+        primary_tier: "CPUPrimaryTierOffloadingManager",
         tier_type: str,
         router_capabilities: Iterable[str] | None = None,
         control_host: str = "0.0.0.0",
@@ -296,7 +297,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         local_dram_backend: str = "UCX",
         remote_fw_dram_backend: str = "UCX",
     ) -> None:
-        super().__init__(offloading_spec, primary_kv_view, tier_type)
+        super().__init__(offloading_spec, primary_tier, tier_type)
         selected_policy = _resolve_policy(policy)
         if (kvcr_service_socket_path is None) != (compatibility_digest is None):
             raise ValueError(
@@ -350,6 +351,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         with socket.socket() as _s:
             _s.bind(("", 0))
             _nixl_listen_port = _s.getsockname()[1]
+        primary_kv_view = self._primary_kv_view
         self._primary_base_addr = ctypes.addressof(
             ctypes.c_char.from_buffer(primary_kv_view)
         )
@@ -464,11 +466,18 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
+        alloc = self._allocate_for_promotion(job_metadata)
+        if alloc is None:
+            # CPU OOM: fail immediately without I/O.
+            self._finished_jobs.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+            return
+        keys_to_store, chunk_ids = alloc
+
         blocks = {
             self._key_adapter.encode(key): [self._make_descriptor(int(chunk_id))]
-            for key, chunk_id in zip(
-                job_metadata.keys, job_metadata.chunk_ids, strict=True
-            )
+            for key, chunk_id in zip(keys_to_store, chunk_ids, strict=True)
         }
         if not blocks:
             self._finished_jobs.append(
@@ -512,6 +521,10 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         results = self._finished_jobs
         self._finished_jobs = []
         results.extend(self._poll_finished_jobs())
+        # Attach allocated_keys for load jobs; no-op (returns None) for
+        # store/pin jobs that never called _allocate_for_promotion().
+        for r in results:
+            r.allocated_keys = self._pop_allocated_keys(r.job_id)
         return results
 
     @override

@@ -107,6 +107,25 @@ def _job_metadata(
     )
 
 
+class _MockPrimaryTier:
+    """Minimal primary-tier stub for submit_load unit tests.
+
+    Returns all requested keys as keys_to_store with sequential chunk_ids.
+    """
+
+    def prepare_write(self, keys, req_context):
+        from vllm.v1.kv_offload.base import PrepareStoreOutput
+
+        keys_list = list(keys)
+        chunk_ids = np.arange(len(keys_list), dtype=np.int32)
+        spec = SimpleNamespace(chunk_ids=chunk_ids)
+        return PrepareStoreOutput(
+            keys_to_store=keys_list,
+            store_spec=spec,
+            evicted_keys=[],
+        )
+
+
 def _make_manager() -> P2PSecondaryTierManager:
     """Create a manager with stubbed __init__."""
     mgr = P2PSecondaryTierManager.__new__(P2PSecondaryTierManager)
@@ -120,6 +139,10 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr._reaped_stores = {}
     mgr._unbound_store_timeout_s = _UNBOUND_STORE_TIMEOUT_S
     mgr._failed_serve_ctxs = []
+    # Base-class attributes needed for lazy CPU slot allocation.
+    mgr._primary_tier = _MockPrimaryTier()
+    mgr._job_allocated_keys = {}
+    mgr._on_promotion_alloc = lambda n: None
     return mgr
 
 

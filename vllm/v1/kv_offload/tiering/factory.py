@@ -10,6 +10,7 @@ from vllm.v1.kv_offload.tiering.base import SecondaryTierManager
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.backpressure import BackpressureDetector
     from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
 logger = init_logger(__name__)
 
@@ -62,8 +63,8 @@ class SecondaryTierFactory:
     def create_secondary_tier(
         cls,
         tier_config: dict,
-        primary_kv_view: memoryview,
         offloading_spec: "OffloadingSpec",
+        primary_tier: "CPUPrimaryTierOffloadingManager",
     ) -> SecondaryTierManager:
         tier_cls = cls.get_tier_class(tier_config)
         config = tier_config.copy()
@@ -90,7 +91,7 @@ class SecondaryTierFactory:
             bp_detector = detector_cls(policy=policy, **bp_config)
         return tier_cls(
             offloading_spec=offloading_spec,
-            primary_kv_view=primary_kv_view,
+            primary_tier=primary_tier,
             tier_type=tier_type,
             backpressure_detector=bp_detector,
             **config,

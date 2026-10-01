@@ -19,6 +19,8 @@ Key Design Principles:
    protecting chunks from eviction until complete_read() is called
 """
 
+import functools
+import threading
 import time
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -64,7 +66,6 @@ class PendingPromotion:
 
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
-    chunk_ids: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -108,12 +109,25 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
         # load/store is for CPU<->GPU transfers.
-        # These aliases avoid calling prepare_load inside a store path.
         self.complete_read = self.complete_load
         self.prepare_write = self.prepare_store
         self.complete_write = self.complete_store
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
+
+        # Serialises concurrent prepare_write() calls from FS worker threads
+        # against scheduler-thread prepare_store() (GPU→CPU) calls.
+        self._alloc_lock = threading.Lock()
+
+    @override
+    def prepare_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> "PrepareStoreOutput | None":
+        """Thread-safe GPU→CPU slot allocation (scheduler thread)."""
+        with self._alloc_lock:
+            return super().prepare_store(keys, req_context)
 
     def prepare_read(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -217,6 +231,17 @@ class TieringOffloadingManager(OffloadingManager):
             primary_chunk_size=primary_view.strides[0],
         )
 
+        # Wire per-tier metric callbacks now that the metrics tracker exists.
+        # _primary_tier is already set via SecondaryTierManager.__init__().
+        for tier_idx, tier in enumerate(self.secondary_tiers):
+            tier._on_promotion_alloc = functools.partial(
+                self._metrics.on_promotion_allocated, tier_idx
+            )
+
+        # Keys currently being promoted (added in _initiate_promotion, removed
+        # in _complete_promotion).
+        self._promoting_keys: set[OffloadKey] = set()
+
         # Pending promotion requests accumulated during lookup() calls; flushed
         # as one batched submit_load() per (tier, request) in on_schedule_end().
         # Outer key: tier index. Inner key: req_context.req_id — the same ReqContext
@@ -276,22 +301,40 @@ class TieringOffloadingManager(OffloadingManager):
         self, job_metadata: JobMetadata, completed_job: JobResult
     ) -> None:
         transfer_job = job_metadata.transfer_job
-        successful_keys = completed_job.successful_keys
+        tier_idx = job_metadata.tier_idx
+
+        # undo keys added in initiate_promotion
+        self._promoting_keys.difference_update(transfer_job.keys)
+
+        allocated = completed_job.allocated_keys
+        if allocated is None:
+            # prepare_write() was never called (CPU OOM before allocation).
+            self._metrics.on_promotion_allocation_failure()
+            return
+
+        # Decrement per-tier write-usage metric by the number of slots that
+        # were actually allocated (may be 0 if all keys were already cached).
+        self._metrics.on_promotion_released(tier_idx, len(allocated))
+
+        if not allocated:
+            # All keys were already in the primary cache; no slots to release.
+            return
+
+        # Call complete_write() only for the exact keys THIS job allocated.
+        # Using transfer_job.keys is unsafe: a key skipped by prepare_write()
+        # (already cached) might have been evicted and reallocated by another
+        # job whose slot would then be corrupted.
+        successful_keys: Collection[OffloadKey]
         failed_keys: Collection[OffloadKey]
         if completed_job.success:
-            successful_keys = transfer_job.keys
+            successful_keys = allocated
             failed_keys = ()
-        elif successful_keys:
-            failed_keys_set = set(transfer_job.keys)
-            assert failed_keys_set.issuperset(successful_keys), (
-                f"Finished promotion job_id {completed_job.job_id} "
-                "reported unknown successful keys"
-            )
-            failed_keys_set.difference_update(successful_keys)
-            failed_keys = failed_keys_set
+        elif completed_job.successful_keys:
+            failed_keys = set(allocated) - set(completed_job.successful_keys)
+            successful_keys = [k for k in allocated if k not in failed_keys]
         else:
             successful_keys = ()
-            failed_keys = transfer_job.keys
+            failed_keys = list(allocated)
 
         if successful_keys:
             self.primary_tier.complete_write(
@@ -448,8 +491,8 @@ class TieringOffloadingManager(OffloadingManager):
                     result,
                     lookup_duration,
                 )
-                promoted = self._initiate_promotion(i, key, req_context)
-                return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
+                self._initiate_promotion(i, key, req_context)
+                return LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
             self._metrics.on_lookup(
@@ -469,50 +512,29 @@ class TieringOffloadingManager(OffloadingManager):
         tier_idx: int,
         key: OffloadKey,
         req_context: ReqContext,
-    ) -> bool:
+    ) -> None:
         """Queue a chunk for promotion from a secondary tier to the primary tier.
 
-        Allocates space in the primary tier immediately (sets ref_cnt=-1 so
-        subsequent lookups within the same step see the slot as in-flight),
-        then defers the actual submit_load() call to _flush_pending_promotions()
-        so all chunks queued during one engine step are submitted as a single
-        batched job.
+        Records the key in _promoting_keys (for inter-step HIT_PENDING dedup)
+        and adds it to _pending_load_submissions for batched submit_load() at
+        end of the scheduler step.  No CPU slot is allocated here — each
+        secondary tier allocates lazily when it actually starts the transfer.
 
         Args:
-            tier_idx: The secondary tier index to promote from
-            key: Chunk to promote
-            req_context: Per-request context forwarded to primary.prepare_write().
-
-        Returns:
-            True if promotion was initiated, False if primary tier is full.
+            tier_idx: The secondary tier index to promote from.
+            key: Chunk to promote.
+            req_context: Per-request context.
 
         """
-        # Allocate space in primary tier for promoted chunk.
-        # Must happen immediately so primary.lookup() returns None (in-flight)
-        # for this key on any subsequent lookup() call within the same step,
-        # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        if key in self._promoting_keys:
+            return
 
-        if primary_write_result is None:
-            # Primary tier is full; caller should treat the chunk as unavailable
-            # rather than retrying indefinitely.
-            self._metrics.on_promotion_allocation_failure()
-            return False
-
-        store_spec = primary_write_result.store_spec
-        assert isinstance(store_spec, CPULoadStoreSpec)
-        # Defer submit_load to on_schedule_end(). Group by (tier, request) so
-        # each request's chunks are submitted as one batched job per tier.
+        self._promoting_keys.add(key)
         tier_pending = self._pending_load_submissions.setdefault(tier_idx, {})
         ctx_id = req_context.req_id
         if ctx_id not in tier_pending:
-            tier_pending[ctx_id] = PendingPromotion(
-                keys=[], chunk_ids=[], req_context=req_context
-            )
-        entry = tier_pending[ctx_id]
-        entry.keys.extend(primary_write_result.keys_to_store)
-        entry.chunk_ids.extend(store_spec.chunk_ids)
-        return True
+            tier_pending[ctx_id] = PendingPromotion(keys=[], req_context=req_context)
+        tier_pending[ctx_id].keys.append(key)
 
     def _flush_pending_promotions(self) -> None:
         """Submit one batched submit_load() per (tier, request).
@@ -530,7 +552,7 @@ class TieringOffloadingManager(OffloadingManager):
                 job_metadata = TransferJob(
                     job_id=job_id,
                     keys=entry.keys,
-                    chunk_ids=np.array(entry.chunk_ids, dtype=np.int32),
+                    chunk_ids=np.array([], dtype=np.int32),
                     is_promotion=True,
                     req_context=entry.req_context,
                 )
@@ -926,10 +948,11 @@ class TieringOffloadingManager(OffloadingManager):
         self._process_finished_jobs()
         assert not self._jobs
 
-        # Deferred promotion submissions reserve primary slots that the
-        # reset below invalidates; their submit_load() has not yet been
-        # called so no tier I/O is touching that memory.
+        # Deferred promotion submissions have not yet called submit_load() so
+        # no tier I/O is touching that memory.  Clear both the submission queue
+        # and the dedup set — any in-flight or pending promotions are gone.
         self._pending_load_submissions.clear()
+        self._promoting_keys.clear()
         self._metrics.assert_idle()
 
         finished_req_ids = []

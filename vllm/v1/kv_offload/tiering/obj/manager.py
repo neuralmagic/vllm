@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from nixl._api import nixl_prepped_dlist_handle, nixl_xfer_handle
 
     from vllm.v1.kv_offload.base import OffloadingSpec
+    from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
 logger = init_logger(__name__)
 
@@ -106,7 +107,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
-        primary_kv_view: memoryview,
+        primary_tier: "CPUPrimaryTierOffloadingManager",
         tier_type: str,
         store_config: dict,
         prefix: str = "",
@@ -117,7 +118,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
     ):
         """Args:
         offloading_spec: Offloading configuration.
-        primary_kv_view: Memoryview of the primary tier's CPU KV cache.
+        primary_tier: The CPU primary tier (provides KV view + prepare_write).
         tier_type: Tier type identifier, set by SecondaryTierFactory.
         store_config: Object store connection parameters (see ObjStoreConfig).
         prefix: Key prefix prepended to all object keys.
@@ -132,7 +133,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         """
         super().__init__(
             offloading_spec,
-            primary_kv_view,
+            primary_tier,
             tier_type,
             backpressure_detector,
         )
@@ -176,6 +177,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
 
         self._probe_connectivity()
 
+        primary_kv_view = self._primary_kv_view
         base_addr = ctypes.addressof(ctypes.c_char.from_buffer(primary_kv_view))
         assert primary_kv_view.strides is not None
         stride = primary_kv_view.strides[0]
@@ -299,11 +301,25 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         )
 
     def submit_load(self, job_metadata: TransferJob) -> None:
-        self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
-        obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
-        self._submit_transfer(
-            job_metadata.job_id, job_metadata.chunk_ids, obj_keys, NIXL_READ
-        )
+        alloc = self._allocate_for_promotion(job_metadata)
+        if alloc is None:
+            # CPU OOM: fail immediately without I/O.
+            self._pending_results.append(
+                JobResult(job_id=job_metadata.job_id, success=False)
+            )
+            return
+        keys_to_store, chunk_ids = alloc
+
+        if not keys_to_store:
+            # All keys already cached; nothing to transfer.
+            self._pending_results.append(
+                JobResult(job_id=job_metadata.job_id, success=True)
+            )
+            return
+
+        self._load_job_keys[job_metadata.job_id] = list(keys_to_store)
+        obj_keys = (self._file_mapper.get_file_name(k) for k in keys_to_store)
+        self._submit_transfer(job_metadata.job_id, chunk_ids, obj_keys, NIXL_READ)
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
@@ -398,6 +414,8 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
                 successful = set(result.successful_keys or ())
                 failed = [k for k in load_keys if k not in successful]
                 self._lookup_manager.mark_miss(failed)
+            # Attach allocated_keys for load/OOM jobs; cleans up dict.
+            result.allocated_keys = self._pop_allocated_keys(result.job_id)
         return results
 
     def take_events(self) -> Iterable[OffloadingEvent]:

@@ -39,6 +39,7 @@ from vllm.v1.kv_offload.tiering.p2p.session import P2PSession
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
     from vllm.v1.kv_offload.tiering.base import ParentManager
+    from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
     from vllm.v1.kv_offload.tiering.p2p.control.base import ControlConnection
 
 logger = init_logger(__name__)
@@ -209,7 +210,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     def __init__(
         self,
         offloading_spec: OffloadingSpec,
-        primary_kv_view: memoryview,
+        primary_tier: CPUPrimaryTierOffloadingManager,
         tier_type: str = "p2p",
         host: str | None = None,
         port: int | None = None,
@@ -220,7 +221,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     ) -> None:
         """Initialize the P2P secondary tier manager.
 
-        All keyword arguments after ``primary_kv_view`` come from the
+        All keyword arguments after ``primary_tier`` come from the
         ``secondary_tiers`` entry in ``kv_connector_extra_config``. See
         ``docs/features/kv_offloading_usage.md`` for the user-facing
         configuration reference.
@@ -228,8 +229,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         Args:
             offloading_spec: Owning ``OffloadingSpec`` (provides normalized
                 model, parallel, and cache layout configuration).
-            primary_kv_view: Memoryview over the CPU primary tier; the
-                NIXL agent registers this region for RDMA transfers.
+            primary_tier: The CPU primary tier; its KV memoryview is
+                registered with the NIXL agent for RDMA transfers.
             tier_type: Tier identifier (defaults to ``"p2p"``).
             host: Address the ZMQ control socket binds to, used verbatim
                 as both the bind address and the identity peers dial back
@@ -281,7 +282,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             )
         super().__init__(
             offloading_spec,
-            primary_kv_view,
+            primary_tier,
             tier_type,
         )
         try:
@@ -333,7 +334,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         ).get_run_config()
         self._data: DataTransport = NixlTransport(
             self._nixl_agent_name,
-            primary_kv_view,
+            self._primary_kv_view,
             config_fields=config_fields,
             backends=backends,
             num_threads=int(num_threads),
@@ -546,8 +547,16 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
         job_id = job_metadata.job_id
-        keys = list(job_metadata.keys)
-        block_ids = job_metadata.chunk_ids
+
+        # Allocate CPU slots first so we know the exact chunk_ids (block_ids)
+        # to pass to the remote peer.  All early-exit failure paths below also
+        # benefit from slot cleanup via _complete_promotion(allocated_keys).
+        alloc = self._allocate_for_promotion(job_metadata)
+        if alloc is None:
+            # CPU OOM.
+            self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+            return
+        keys_to_store, block_ids = alloc
 
         source = job_metadata.req_context.get_state(P2PSourceInfo)
         logger.debug(
@@ -570,9 +579,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         kv_request_id = source.kv_request_id
         peer_id = source.peer_id
 
-        if not keys:
+        if not keys_to_store:
             logger.debug(
-                "P2P %s: submit_load job_id=%d short-circuit success (no keys)",
+                "P2P %s: submit_load job_id=%d short-circuit success (all cached)",
                 self._local_id,
                 job_id,
             )
@@ -600,7 +609,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             len(block_ids),
             session.ready,
         )
-        session.request_blocks(job_id, kv_request_id, keys, block_ids)
+        session.request_blocks(job_id, kv_request_id, keys_to_store, block_ids)
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
@@ -610,6 +619,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         self._poll_once()
         result = self._finished_jobs
         self._finished_jobs = []
+        # Attach allocated_keys for load jobs; cleans up _job_allocated_keys.
+        for r in result:
+            r.allocated_keys = self._pop_allocated_keys(r.job_id)
         return result
 
     @override
