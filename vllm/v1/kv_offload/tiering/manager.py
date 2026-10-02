@@ -115,9 +115,15 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
 
-        # Serialises concurrent prepare_write() calls from FS worker threads
-        # against scheduler-thread prepare_store() (GPU→CPU) calls.
+        # Serialises all cache-policy operations against concurrent FS worker
+        # threads that call prepare_write() (= prepare_store()) from off-thread.
+        # Every method that touches the LRU policy must hold this lock.
         self._alloc_lock = threading.Lock()
+
+    @override
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        with self._alloc_lock:
+            return super().lookup(key, req_context)
 
     @override
     def prepare_store(
@@ -125,9 +131,36 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> "PrepareStoreOutput | None":
-        """Thread-safe GPU→CPU slot allocation (scheduler thread)."""
         with self._alloc_lock:
             return super().prepare_store(keys, req_context)
+
+    @override
+    def complete_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ) -> None:
+        with self._alloc_lock:
+            return super().complete_store(keys, req_context, success)
+
+    @override
+    def prepare_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> LoadStoreSpec:
+        with self._alloc_lock:
+            return super().prepare_load(keys, req_context)
+
+    @override
+    def complete_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        with self._alloc_lock:
+            return super().complete_load(keys, req_context)
 
     def prepare_read(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -137,7 +170,8 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         Cascade reads are implementation details of tiering, not additional
         request accesses, so they must not alter request-scoped recency.
         """
-        return self._prepare_load(keys, req_context, record_access=False)
+        with self._alloc_lock:
+            return self._prepare_load(keys, req_context, record_access=False)
 
     def get_kv_memoryview(self) -> memoryview:
         """Return the memoryview over the primary tier's KV cache buffer.
