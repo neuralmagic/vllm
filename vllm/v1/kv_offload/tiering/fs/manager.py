@@ -39,7 +39,6 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     ReqContext,
 )
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.backpressure import BackpressureDetector
@@ -208,11 +207,6 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
-        # Per-load-job queue for keys successfully allocated via lazy
-        # prepare_write() inside worker threads.  Multiple batches of the same
-        # job each put their allocated keys here; get_finished_jobs() drains it.
-        self._load_job_allocated_q: dict[JobId, SimpleQueue] = {}
-
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -225,12 +219,27 @@ class FileSystemTierManager(SecondaryTierManager):
         return LookupResult.HIT if result else LookupResult.MISS
 
     def _tasks_from_jobmetadata(self, job_metadata: TransferJob) -> Iterable[Task]:
-        for key, bid in zip(job_metadata.keys, job_metadata.chunk_ids):
-            yield Task(
-                key=key,
-                path=self.file_mapper.get_file_name(key),
-                offset=int(bid) * self._block_size,
-            )
+        """Build tasks from job metadata.
+
+        For store jobs chunk_ids are known upfront, so offset is set
+        immediately.  For load jobs chunk_ids is empty (offsets are resolved
+        later by alloc_fn after prepare_write), so offset is None.
+        """
+        if job_metadata.chunk_ids.size == 0:
+            # Load job: offsets not yet known.
+            for key in job_metadata.keys:
+                yield Task(
+                    key=key,
+                    path=self.file_mapper.get_file_name(key),
+                    offset=None,
+                )
+        else:
+            for key, bid in zip(job_metadata.keys, job_metadata.chunk_ids):
+                yield Task(
+                    key=key,
+                    path=self.file_mapper.get_file_name(key),
+                    offset=int(bid) * self._block_size,
+                )
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
@@ -239,10 +248,11 @@ class FileSystemTierManager(SecondaryTierManager):
             self._store_job_keys[job_metadata.job_id] = keys
 
         def make_batch_fn(batch: list[Task]) -> Callable[[], None]:
+            assert all(t.offset is not None for t in batch)
             return functools.partial(
                 batch_store_block,
                 paths=[t.path for t in batch],
-                offsets=[t.offset for t in batch],
+                offsets=[t.offset for t in batch],  # type: ignore[misc]
                 view=self._primary_kv_view,
                 block_size=self._block_size,
                 use_o_direct=self._use_o_direct,
@@ -258,90 +268,83 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
-        """Submit a lazy promotion job.
+        """Submit a promotion job with deferred CPU allocation.
 
-        CPU slot allocation happens inside each worker-thread batch via
-        prepare_write() (thread-safe via CPUPrimaryTierOffloadingManager lock).
-        This avoids holding CPU slots from lookup time all the way through queue
-        wait and I/O — slots are acquired only when I/O is about to start.
+        File paths are resolved on the calling thread (main engine thread);
+        CPU slot allocation via prepare_write() is deferred to the first
+        worker thread that picks up the job.  This minimises the time slots
+        are held while keeping path computation off the critical I/O path.
         """
         job_id = job_metadata.job_id
         keys = list(job_metadata.keys)
+
         self._load_job_keys[job_id] = keys
         self._load_job_failed_keys[job_id] = SimpleQueue()
         self._job_block_counts[job_id] = len(keys)
 
-        # Per-job queue: each batch's lazy_load_fn() puts its allocated keys
-        # here after a successful prepare_write().  get_finished_jobs() drains
-        # it to build JobResult.allocated_keys.
-        allocated_keys_q: SimpleQueue = SimpleQueue()
-        self._load_job_allocated_q[job_id] = allocated_keys_q
+        # Pre-compute paths on the main thread — avoids hash computation
+        # inside worker threads.  Offsets are None (load job) and filled in
+        # by alloc_fn after prepare_write() tells us which chunk_ids to use.
+        initial_tasks = list(self._tasks_from_jobmetadata(job_metadata))
 
-        req_context = job_metadata.req_context
+        failed_q = self._load_job_failed_keys[job_id]
+
+        def alloc_fn() -> tuple[list[Task], list] | None:
+            """Called by the first worker thread to dequeue this job.
+
+            Acquires CPU slots for all keys, filters to keys that need I/O,
+            and sets correct offsets on each Task.  Returns
+            (filtered_tasks, keys_to_store) or None on CPU OOM.
+            """
+            alloc = self._allocate_for_promotion(job_metadata)
+            if alloc is None:
+                return None
+            keys_to_store, chunk_ids = alloc
+            key_to_offset = {
+                k: int(cid) * self._block_size
+                for k, cid in zip(keys_to_store, chunk_ids)
+            }
+            filtered = [
+                Task(key=t.key, path=t.path, offset=key_to_offset[t.key])
+                for t in initial_tasks
+                if t.key in key_to_offset
+            ]
+            return filtered, keys_to_store
 
         def make_batch_fn(batch: list[Task]) -> Callable[[], None]:
-            def lazy_load_fn() -> None:
-                batch_keys = [t.key for t in batch]
-                failed_q = self._load_job_failed_keys[job_id]
+            """Pure I/O closure — paths and offsets are already resolved."""
+            assert all(t.offset is not None for t in batch)
 
-                # Allocate primary-tier slots for this batch.
-                # _primary_tier.prepare_write() is thread-safe (uses lock).
-                assert self._primary_tier is not None
-                write_result = self._primary_tier.prepare_write(batch_keys, req_context)
-                if write_result is None:
-                    # CPU OOM: mark all batch keys as failed, nothing allocated.
-                    for key in batch_keys:
-                        failed_q.put(key)
-                    raise RuntimeError(
-                        "CPU KV cache OOM during lazy promotion "
-                        f"(job_id={job_id}, batch_size={len(batch_keys)})"
-                    )
-
-                keys_to_store = list(write_result.keys_to_store)
-                assert isinstance(write_result.store_spec, CPULoadStoreSpec)
-                chunk_ids = write_result.store_spec.chunk_ids
-                # Record allocation; get_finished_jobs() drains this queue.
-                allocated_keys_q.put(keys_to_store)
-                self._on_promotion_alloc(len(keys_to_store))
-
-                if not keys_to_store:
-                    # All batch keys already in primary cache — no disk I/O.
-                    return
-
-                paths = [self.file_mapper.get_file_name(k) for k in keys_to_store]
-                offsets = [int(cid) * self._block_size for cid in chunk_ids]
+            def load_fn() -> None:
                 try:
                     batch_load_block(
-                        paths=paths,
-                        offsets=offsets,
+                        paths=[t.path for t in batch],
+                        offsets=[t.offset for t in batch],  # type: ignore[misc]
                         view=self._primary_kv_view,
                         block_size=self._block_size,
                         use_o_direct=self._use_o_direct,
                     )
                 except Exception as exc:
                     num_succeeded = getattr(exc, "num_succeeded", 0)
-                    for key in keys_to_store[num_succeeded:]:
-                        failed_q.put(key)
+                    for t in batch[num_succeeded:]:
+                        failed_q.put(t.key)
                     logger.debug(
                         "Load of %d blocks for job %s failed at block %d: %s",
-                        len(keys_to_store),
+                        len(batch),
                         job_id,
                         num_succeeded,
                         exc,
                     )
                     raise
 
-            return lazy_load_fn
+            return load_fn
 
-        # Tasks carry key + path; offset is resolved lazily by the worker.
-        initial_tasks = [
-            Task(key=k, path=self.file_mapper.get_file_name(k), offset=0) for k in keys
-        ]
         self._pool.enqueue_load(
             job_id,
             len(keys),
             initial_tasks,
             make_batch_fn=make_batch_fn,
+            alloc_fn=alloc_fn,
         )
 
     @override
@@ -366,34 +369,42 @@ class FileSystemTierManager(SecondaryTierManager):
             load_keys = self._load_job_keys.pop(job_id, None)
             failed_q = self._load_job_failed_keys.pop(job_id, None)
 
-            # Drain the per-job allocated-keys queue (populated by lazy
-            # prepare_write() calls inside worker threads).  None if this is
-            # a store job (no entry in _load_job_allocated_q).
-            allocated_q = self._load_job_allocated_q.pop(job_id, None)
-            allocated_keys: list[OffloadKey] | None = None
-            if allocated_q is not None:
-                accumulated: list[OffloadKey] = []
-                while not allocated_q.empty():
-                    accumulated.extend(allocated_q.get_nowait())
-                allocated_keys = accumulated  # [] if every batch OOM'd
+            # None for store jobs or CPU OOM (alloc_fn returned None).
+            # A list (possibly empty) when prepare_write() succeeded.
+            allocated_keys = self._pop_allocated_keys(job_id)
 
             if load_keys is not None and not success:
-                failed: list[OffloadKey] = []
-                if failed_q is not None:
-                    while not failed_q.empty():
-                        failed.append(failed_q.get_nowait())
-                successful = set(load_keys) - set(failed)
-                self._lookup_manager.mark_miss(failed)
-                results.append(
-                    JobResult(
-                        job_id=job_id,
-                        success=False,
-                        successful_keys=tuple(successful) if successful else None,
-                        transfer_time=transfer_time,
-                        transfer_bytes=transfer_bytes,
-                        allocated_keys=allocated_keys,
+                if allocated_keys is None:
+                    # CPU OOM: prepare_write() was never called. The data is
+                    # still on disk — do NOT mark_miss, the scheduler should
+                    # retry promotion when memory is available.
+                    results.append(
+                        JobResult(
+                            job_id=job_id,
+                            success=False,
+                            allocated_keys=None,
+                            transfer_time=transfer_time,
+                            transfer_bytes=transfer_bytes,
+                        )
                     )
-                )
+                else:
+                    # I/O failure: drain per-key failures reported by load_fn.
+                    failed: list[OffloadKey] = []
+                    if failed_q is not None:
+                        while not failed_q.empty():
+                            failed.append(failed_q.get_nowait())
+                    successful = set(load_keys) - set(failed)
+                    self._lookup_manager.mark_miss(failed)
+                    results.append(
+                        JobResult(
+                            job_id=job_id,
+                            success=False,
+                            successful_keys=tuple(successful) if successful else None,
+                            transfer_time=transfer_time,
+                            transfer_bytes=transfer_bytes,
+                            allocated_keys=allocated_keys,
+                        )
+                    )
                 continue
             results.append(
                 JobResult(

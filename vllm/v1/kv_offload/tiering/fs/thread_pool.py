@@ -17,7 +17,12 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import Locality, OffloadKey
 from vllm.v1.kv_offload.tiering.base import JobId
 from vllm.v1.kv_offload.tiering.fs.dispatch import (
+    Job,
+    JobSentinel,
+    JobState,
+    LoadJob,
     LoadQueue,
+    StoreJob,
     StoreQueue,
     WorkDispatcher,
     make_batches,
@@ -32,50 +37,7 @@ class Task:
 
     key: OffloadKey
     path: str
-    offset: int
-
-
-class JobState:
-    """Thread-safe completion tracker for a set of per-block I/O tasks.
-
-    Each task calls task_done(success) when it finishes.
-    """
-
-    __slots__ = (
-        "_job_id",
-        "_n_tasks",
-        "_completed",
-        "_success",
-        "_transfer_start",
-        "_transfer_end",
-        "_lock",
-    )
-
-    def __init__(self, job_id: JobId, n_tasks: int) -> None:
-        self._job_id: JobId = job_id
-        self._n_tasks = n_tasks
-        self._completed = 0
-        self._success = True
-        self._transfer_start = float("inf")
-        self._transfer_end = 0.0
-        self._lock = threading.Lock()
-
-    @property
-    def job_id(self) -> JobId:
-        return self._job_id
-
-    def task_done(
-        self, batch_size: int, success: bool, start_time: float, end_time: float
-    ) -> tuple[bool, bool, float]:
-        """Returns (job_finished, success, transfer_time)."""
-        with self._lock:
-            self._completed += batch_size
-            self._transfer_start = min(self._transfer_start, start_time)
-            self._transfer_end = max(self._transfer_end, end_time)
-            if not success:
-                self._success = False
-            transfer_time = self._transfer_end - self._transfer_start
-            return self._completed == self._n_tasks, self._success, transfer_time
+    offset: int | None  # None for load jobs until alloc_fn resolves chunk_ids
 
 
 class DualQueueThreadPool:
@@ -134,28 +96,17 @@ class DualQueueThreadPool:
             t.start()
             self._threads.append(t)
 
-    def _enqueue(
-        self,
-        make_batch_fn: Callable[[list[Task]], Callable[[], None]],
-        job_id: JobId,
-        tasks: Iterable[Task],
-        n_tasks: int,
-        is_load: bool,
-    ) -> None:
-        """Pre-batch tasks outside the lock, then hand off to the scheduler."""
+    def _submit_job(self, job_id: JobId, job: Job, n_tasks: int, is_load: bool) -> None:
+        """Register a job with the dispatcher and wake worker threads.
+
+        If n_tasks is 0 the job completes immediately with success.
+        """
         if n_tasks == 0:
             self._finished_q.append((job_id, True, 0.0))
             return
-        state = JobState(job_id, n_tasks)
-        task_lst = list(tasks)
-        assert len(task_lst) == n_tasks, "Unaccounted tasks"
-        # Build batches before acquiring the lock; it is O(n_tasks)
-        n_threads = self._dispatcher.n_batch_threads(is_load)
-        work_items = make_batches(state, task_lst, make_batch_fn, n_threads)
         with self._condition:
             self._inflight_jobs += 1
-            n_wake = self._dispatcher.submit(job_id, work_items, n_tasks, is_load)
-            # TODO (varun): Wake threads based on load / store
+            n_wake = self._dispatcher.submit(job_id, job, n_tasks, is_load)
             self._condition.notify(n_wake)
 
     def enqueue_load(
@@ -164,9 +115,21 @@ class DualQueueThreadPool:
         n_tasks: int,
         tasks: Iterable[Task],
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
+        alloc_fn: Callable[[], tuple[list, list] | None],
     ) -> None:
-        """Enqueue load tasks for a job (high-priority for load-priority threads)."""
-        self._enqueue(make_batch_fn, job_id, tasks, n_tasks=n_tasks, is_load=True)
+        """Enqueue a load job (high-priority for load-priority threads).
+
+        CPU slot allocation and task batching are deferred to the first worker
+        thread that picks up the job (via alloc_fn). File paths are
+        pre-computed by the caller on the calling thread.
+        """
+        task_lst = list(tasks)
+        job = LoadJob(
+            alloc_fn=alloc_fn,
+            make_batch_fn=make_batch_fn,
+            n_threads=self._dispatcher.n_batch_threads(is_load=True),
+        )
+        self._submit_job(job_id, job, len(task_lst), is_load=True)
 
     def enqueue_store(
         self,
@@ -175,14 +138,19 @@ class DualQueueThreadPool:
         tasks: Iterable[Task],
         make_batch_fn: Callable[[list[Task]], Callable[[], None]],
     ) -> None:
-        """Enqueue store tasks for a job (high-priority for store-priority threads)."""
-        self._enqueue(
-            make_batch_fn,
-            job_id,
-            tasks,
-            n_tasks=n_tasks,
-            is_load=False,
-        )
+        """Enqueue a store job (high-priority for store-priority threads).
+
+        Tasks are pre-batched outside the lock before submission.
+        """
+        task_lst = list(tasks)
+        assert len(task_lst) == n_tasks, "Unaccounted tasks"
+        n_threads = self._dispatcher.n_batch_threads(is_load=False)
+        state = JobState(job_id, n_tasks)
+        # Build batches outside the lock — O(n_tasks) list-slicing and closure
+        # construction must not block threads waiting on the condition variable.
+        work_items = make_batches(state, task_lst, make_batch_fn, n_threads)
+        job = StoreJob(work_items)
+        self._submit_job(job_id, job, n_tasks, is_load=False)
 
     def get_finished(self) -> list[tuple[JobId, bool, float]]:
         # No lock needed: deque is thread-safe for concurrent append/popleft,
@@ -220,6 +188,8 @@ class DualQueueThreadPool:
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, drain primary queue first, steal from secondary when idle.
         while True:
+            io_work: tuple | None = None
+            sentinel_job_id: JobId | None = None
             with self._condition:
                 self._condition.wait_for(
                     lambda: self._stop or self._dispatcher.has_work(load_priority)
@@ -229,7 +199,21 @@ class DualQueueThreadPool:
                 work = self._dispatcher.fetch_work(load_priority)
                 if work is None:
                     continue
-                fn, batch_size, state = work
+                if isinstance(work, JobSentinel):
+                    # Job resolved synchronously (OOM or all keys cached).
+                    self._finished_q.append((work.job_id, work.success, 0.0))
+                    self._inflight_jobs -= 1
+                    sentinel_job_id = work.job_id
+                else:
+                    io_work = work
+
+            if sentinel_job_id is not None:
+                with self._idle_condition:
+                    self._idle_condition.notify_all()
+                continue
+
+            assert io_work is not None
+            fn, batch_size, state = io_work
             try:
                 start_time = time.monotonic()
                 fn()

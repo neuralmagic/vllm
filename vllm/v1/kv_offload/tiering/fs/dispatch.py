@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
+import threading
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -12,6 +13,120 @@ from typing import Any
 
 from vllm.v1.kv_offload.base import Locality
 from vllm.v1.kv_offload.tiering.base import JobId
+
+
+class JobState:
+    """Thread-safe completion tracker for a set of per-block I/O tasks.
+
+    Each task calls task_done(success) when it finishes.
+    """
+
+    __slots__ = (
+        "_job_id",
+        "_n_tasks",
+        "_completed",
+        "_success",
+        "_transfer_start",
+        "_transfer_end",
+        "_lock",
+    )
+
+    def __init__(self, job_id: JobId, n_tasks: int) -> None:
+        self._job_id: JobId = job_id
+        self._n_tasks = n_tasks
+        self._completed = 0
+        self._success = True
+        self._transfer_start = float("inf")
+        self._transfer_end = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def job_id(self) -> JobId:
+        return self._job_id
+
+    def task_done(
+        self, batch_size: int, success: bool, start_time: float, end_time: float
+    ) -> tuple[bool, bool, float]:
+        """Returns (job_finished, success, transfer_time)."""
+        with self._lock:
+            self._completed += batch_size
+            self._transfer_start = min(self._transfer_start, start_time)
+            self._transfer_end = max(self._transfer_end, end_time)
+            if not success:
+                self._success = False
+            transfer_time = self._transfer_end - self._transfer_start
+            return self._completed == self._n_tasks, self._success, transfer_time
+
+
+@dataclasses.dataclass
+class JobSentinel:
+    """Returned by fetch_work when a load job completes synchronously.
+
+    This happens when prepare_write() fails (CPU OOM, success=False) or
+    when all keys were already cached (success=True). In both cases no
+    worker I/O is needed, but _inflight_jobs must still be decremented.
+    """
+
+    job_id: JobId
+    success: bool
+
+
+class Job(ABC):
+    """A unit of work at the job level.
+
+    One Job is registered per job_id in the dispatcher. When the first
+    worker thread picks up the job, populate() is called to fill work_q
+    with executable WorkItems, or to return a JobSentinel for jobs that
+    resolve synchronously (OOM or all-cached).
+    """
+
+    @abstractmethod
+    def populate(self, work_q: deque, job_id: JobId) -> JobSentinel | None: ...
+
+
+class StoreJob(Job):
+    """Pre-batched store job: populate is a simple deque extend."""
+
+    def __init__(self, work_items: list[WorkItem]) -> None:
+        self._work_items = work_items
+
+    def populate(self, work_q: deque, job_id: JobId) -> None:
+        work_q.extend(self._work_items)
+        return None
+
+
+class LoadJob(Job):
+    """Load job with deferred CPU allocation.
+
+    alloc_fn is called by the first worker thread to dequeue this job
+    (inside _maybe_populate_work_q, under the condition lock). It calls
+    prepare_write() for all job keys and returns the filtered task list
+    with correct offsets, or None on CPU OOM.
+    """
+
+    def __init__(
+        self,
+        alloc_fn: Callable[[], tuple[list, list] | None],
+        make_batch_fn: Callable,
+        n_threads: int,
+    ) -> None:
+        self._alloc_fn = alloc_fn
+        self._make_batch_fn = make_batch_fn
+        self._n_threads = n_threads
+
+    def populate(self, work_q: deque, job_id: JobId) -> JobSentinel | None:
+        result = self._alloc_fn()
+        if result is None:
+            return JobSentinel(job_id=job_id, success=False)
+        filtered_tasks, _keys_to_store = result
+        if not filtered_tasks:
+            return JobSentinel(job_id=job_id, success=True)
+        state = JobState(job_id, len(filtered_tasks))
+        work_items = make_batches(
+            state, filtered_tasks, self._make_batch_fn, self._n_threads
+        )
+        work_q.extend(work_items)
+        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,25 +391,20 @@ class WorkDispatcher:
         # Work queues that the threads draw work from
         self._load_q: deque[WorkItem] = deque()
         self._store_q: deque[WorkItem] = deque()
-        self._jobs: dict[JobId, list[WorkItem]] = {}
+        self._jobs: dict[JobId, Job] = {}
 
     def submit(
         self,
         job_id: JobId,
-        work_items: list[WorkItem],
+        job: Job,
         n_tasks: int,
         is_load: bool,
     ) -> int:
-        """Register a pre-batched job and return the number of threads to wake.
-
-        work_items must be built by make_batches() outside the lock before
-        calling submit() under the lock.
-        """
-        self._jobs[job_id] = work_items
-        n_wake_threads = 0
+        """Register a job and return the number of threads to wake."""
+        self._jobs[job_id] = job
         if is_load:
             self._load_job_q.put(job_id, n_tasks)
-            n_wake_threads = self._n_read_batch_threads
+            return self._n_read_batch_threads
         else:
             self._store_job_q.put(job_id, n_tasks)
             # Update running mean — used as the steal quanta for write threads.
@@ -302,9 +412,7 @@ class WorkDispatcher:
             self._avg_store_tasks += (
                 n_tasks - self._avg_store_tasks
             ) / self._n_store_jobs
-            n_wake_threads = self._n_write_batch_threads
-
-        return n_wake_threads
+            return self._n_write_batch_threads
 
     def has_work(self, load_priority: bool) -> bool:
         has_load_work = bool(self._load_q or self._load_job_q.maybe_has_work())
@@ -314,18 +422,26 @@ class WorkDispatcher:
     def n_batch_threads(self, is_load: bool) -> int:
         return self._n_read_batch_threads if is_load else self._n_write_batch_threads
 
-    def _maybe_populate_work_q(self, work_q: deque, job_q: JobQueue):
-        """Move the next job's pre-batched items into work_q.
+    def _maybe_populate_work_q(
+        self, work_q: deque, job_q: JobQueue
+    ) -> JobSentinel | None:
+        """Move the next job's work items into work_q.
 
-        O(n_batch_threads) deque appends — no batching or closure
-        construction under the lock.
+        Calls job.populate() polymorphically — StoreJob extends work_q
+        directly; LoadJob calls alloc_fn() first, then builds WorkItems.
+        Only the first thread to find work_q empty does this; all others
+        find it non-empty and return immediately.
+
+        Returns a JobSentinel when the job resolves synchronously (CPU OOM
+        or all keys already cached), so the caller records the result
+        without dispatching any I/O tasks.
         """
         if work_q:
-            return
+            return None
         job_id = job_q.get()
         if job_id is None:
-            return
-        work_q.extend(self._jobs.pop(job_id))
+            return None
+        return self._jobs.pop(job_id).populate(work_q, job_id)
 
     def _steal_from_load_q(self) -> tuple:
         """Pop the head of _load_q and return a quanta-sized work item.
@@ -343,19 +459,29 @@ class WorkDispatcher:
         return stolen.unpack()
 
     def _pop(self, work_q: deque, job_q: JobQueue):
-        """Populate work_q from job_q if empty, then pop and unpack one item."""
-        self._maybe_populate_work_q(work_q, job_q)
+        """Populate work_q from job_q if empty, then pop and unpack one item.
+
+        Returns a JobSentinel if the job resolved synchronously (OOM or
+        all-cached), a (fn, batch_size, state) tuple if there is I/O work,
+        or None if there is nothing to do.
+        """
+        sentinel = self._maybe_populate_work_q(work_q, job_q)
+        if sentinel is not None:
+            return sentinel
         return work_q.popleft().unpack() if work_q else None
 
     def fetch_work(self, load_priority: bool):
         if load_priority:
+            # JobSentinel is truthy, so `or` short-circuits and returns it.
             return self._pop(self._load_q, self._load_job_q) or self._pop(
                 self._store_q, self._store_job_q
             )
         else:
             if (item := self._pop(self._store_q, self._store_job_q)) is not None:
                 return item
-            self._maybe_populate_work_q(self._load_q, self._load_job_q)
+            sentinel = self._maybe_populate_work_q(self._load_q, self._load_job_q)
+            if sentinel is not None:
+                return sentinel
             return self._steal_from_load_q() if self._load_q else None
 
     def clear(
