@@ -33,7 +33,7 @@ def restore_registry():
 
 def _make_mock_args():
     """Build common mock args for create_secondary_tier."""
-    return MagicMock(), MagicMock()  # primary_kv_view, offloading_spec
+    return MagicMock(), MagicMock()  # offloading_spec, primary_tier
 
 
 # ---------------------------------------------------------------------------
@@ -64,11 +64,11 @@ def test_example_tier_registered():
 
 def test_create_tier_from_registry():
     """Registered tier_type creates instance with correct tier_type."""
-    primary_kv_view, offloading_spec = _make_mock_args()
+    offloading_spec, primary_tier = _make_mock_args()
     tier_config = {"type": "example"}
 
     tier = SecondaryTierFactory.create_secondary_tier(
-        tier_config, primary_kv_view, offloading_spec
+        tier_config, offloading_spec, primary_tier
     )
 
     assert isinstance(tier, SecondaryTierManager)
@@ -77,7 +77,7 @@ def test_create_tier_from_registry():
 
 def test_create_multiple_tiers():
     """Multiple tier configs can be created with correct tier_types."""
-    primary_kv_view, offloading_spec = _make_mock_args()
+    offloading_spec, primary_tier = _make_mock_args()
     configs = [
         {"type": "example", "custom_param": 1},
         {"type": "example", "custom_param": 2},
@@ -85,7 +85,7 @@ def test_create_multiple_tiers():
 
     tiers = [
         SecondaryTierFactory.create_secondary_tier(
-            cfg.copy(), primary_kv_view, offloading_spec
+            cfg.copy(), offloading_spec, primary_tier
         )
         for cfg in configs
     ]
@@ -108,11 +108,11 @@ def test_register_new_tier_type():
         "ExampleSecondaryTierManager",
     )
 
-    primary_kv_view, offloading_spec = _make_mock_args()
+    offloading_spec, primary_tier = _make_mock_args()
     tier = SecondaryTierFactory.create_secondary_tier(
         {"type": "custom_tier", "custom_param": 99},
-        primary_kv_view,
         offloading_spec,
+        primary_tier,
     )
 
     assert tier.tier_type == "custom_tier"
@@ -126,18 +126,18 @@ def test_register_new_tier_type():
 
 def test_missing_tier_type_raises():
     """tier_config without 'type' → ValueError."""
-    primary_kv_view, offloading_spec = _make_mock_args()
+    offloading_spec, primary_tier = _make_mock_args()
     tier_config: dict[str, str] = {}
 
     with pytest.raises(ValueError, match="must include 'type'"):
         SecondaryTierFactory.create_secondary_tier(
-            tier_config, primary_kv_view, offloading_spec
+            tier_config, offloading_spec, primary_tier
         )
 
 
 def test_unknown_tier_type_raises():
     """Unrecognized tier_type without module_path → ValueError."""
-    primary_kv_view, offloading_spec = _make_mock_args()
+    offloading_spec, primary_tier = _make_mock_args()
     tier_config = {"type": "nonexistent_tier"}
 
     with pytest.raises(
@@ -145,7 +145,7 @@ def test_unknown_tier_type_raises():
         match=r"Unknown secondary tier type.*also set 'module_path'",
     ):
         SecondaryTierFactory.create_secondary_tier(
-            tier_config, primary_kv_view, offloading_spec
+            tier_config, offloading_spec, primary_tier
         )
 
 
@@ -164,7 +164,7 @@ def test_create_tier_from_module_path():
     """Full end-to-end: create_secondary_tier with module_path."""
     assert "ExampleSecondaryTierManager" not in SecondaryTierFactory._registry
 
-    primary_kv_view, offloading_spec = _make_mock_args()
+    offloading_spec, primary_tier = _make_mock_args()
     tier_config = {
         "type": "ExampleSecondaryTierManager",
         "module_path": "vllm.v1.kv_offload.tiering.example.manager",
@@ -172,7 +172,7 @@ def test_create_tier_from_module_path():
     }
 
     tier = SecondaryTierFactory.create_secondary_tier(
-        tier_config, primary_kv_view, offloading_spec
+        tier_config, offloading_spec, primary_tier
     )
 
     assert isinstance(tier, ExampleSecondaryTierManager)
@@ -181,7 +181,7 @@ def test_create_tier_from_module_path():
 
 def test_module_path_invalid_module_raises():
     """Non-existent module_path → ModuleNotFoundError."""
-    primary_kv_view, offloading_spec = _make_mock_args()
+    offloading_spec, primary_tier = _make_mock_args()
     tier_config = {
         "type": "SomeTier",
         "module_path": "nonexistent.module.path",
@@ -189,7 +189,7 @@ def test_module_path_invalid_module_raises():
 
     with pytest.raises(ModuleNotFoundError):
         SecondaryTierFactory.create_secondary_tier(
-            tier_config, primary_kv_view, offloading_spec
+            tier_config, offloading_spec, primary_tier
         )
 
 

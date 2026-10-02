@@ -14,8 +14,10 @@ import pytest
 from vllm.v1.kv_offload.base import Locality
 from vllm.v1.kv_offload.tiering.fs.dispatch import (
     FCFSQueue,
+    LoadJob,
     LoadQueue,
     SJFBucketQueue,
+    StoreJob,
     StoreQueue,
     WorkDispatcher,
     make_batches,
@@ -60,12 +62,13 @@ def _submit_load(
     job_id: int,
     tasks: list[Any],
 ) -> int:
-    state = object()
     n_threads = dispatcher.n_batch_threads(is_load=True)
-    work_items = make_batches(state, tasks, _identity_batch, n_threads)
-    return dispatcher.submit(
-        job_id=job_id, work_items=work_items, n_tasks=len(tasks), is_load=True
+    job = LoadJob(
+        alloc_fn=lambda: (tasks, []),
+        make_batch_fn=_identity_batch,
+        n_threads=n_threads,
     )
+    return dispatcher.submit(job_id=job_id, job=job, n_tasks=len(tasks), is_load=True)
 
 
 def _submit_store(
@@ -77,7 +80,7 @@ def _submit_store(
     n_threads = dispatcher.n_batch_threads(is_load=False)
     work_items = make_batches(state, tasks, _identity_batch, n_threads)
     return dispatcher.submit(
-        job_id=job_id, work_items=work_items, n_tasks=len(tasks), is_load=False
+        job_id=job_id, job=StoreJob(work_items), n_tasks=len(tasks), is_load=False
     )
 
 

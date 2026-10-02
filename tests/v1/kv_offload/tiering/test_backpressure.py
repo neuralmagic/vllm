@@ -57,6 +57,13 @@ def _mock_mmap_region(num_blocks: int, row_bytes: int = 16):
     return mock
 
 
+def _make_mock_primary(kv_view: memoryview) -> MagicMock:
+    """Minimal primary-tier stub: exposes get_kv_memoryview() only."""
+    mock = MagicMock()
+    mock.get_kv_memoryview.return_value = kv_view
+    return mock
+
+
 def to_keys(int_ids: Iterable[int]) -> list[OffloadKey]:
     return [make_offload_key(str(i).encode(), 0) for i in int_ids]
 
@@ -71,11 +78,11 @@ class DelayedSecondaryTierManager(SecondaryTierManager):
     """
 
     def __init__(
-        self, offloading_spec, primary_kv_view, tier_type, backpressure_detector=None
+        self, offloading_spec, primary_tier, tier_type, backpressure_detector=None
     ):
         super().__init__(
             offloading_spec,
-            primary_kv_view,
+            primary_tier,
             tier_type,
             backpressure_detector=backpressure_detector,
         )
@@ -228,7 +235,7 @@ class TestBackpressure:
         mock_view = mock_region.create_kv_memoryview()
         self.tier = DelayedSecondaryTierManager(
             offloading_spec=_MOCK_OFFLOADING_SPEC,
-            primary_kv_view=mock_view,
+            primary_tier=_make_mock_primary(mock_view),
             tier_type="delayed",
             backpressure_detector=EMABackpressureDetector(
                 high_water_s=_BP_HIGH_WATER_S,

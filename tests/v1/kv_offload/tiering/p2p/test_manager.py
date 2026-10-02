@@ -108,20 +108,26 @@ def _job_metadata(
 
 
 class _MockPrimaryTier:
-    """Minimal primary-tier stub for submit_load unit tests.
+    """Minimal primary-tier stub for unit tests.
 
     Returns all requested keys as keys_to_store with sequential chunk_ids.
+    get_kv_memoryview() returns a minimal 1-byte-per-block view so the base
+    class __init__ can derive block_size_bytes without needing real GPU memory.
     """
+
+    def get_kv_memoryview(self) -> memoryview:
+        # strides[0] == 1 (block_size_bytes); sufficient for tests that
+        # mock NixlTransport and do not perform real RDMA transfers.
+        return memoryview(bytearray(16))
 
     def prepare_write(self, keys, req_context):
         from vllm.v1.kv_offload.base import PrepareStoreOutput
+        from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
         keys_list = list(keys)
-        chunk_ids = np.arange(len(keys_list), dtype=np.int32)
-        spec = SimpleNamespace(chunk_ids=chunk_ids)
         return PrepareStoreOutput(
             keys_to_store=keys_list,
-            store_spec=spec,
+            store_spec=CPULoadStoreSpec(list(range(len(keys_list)))),
             evicted_keys=[],
         )
 
@@ -170,7 +176,7 @@ class TestInitHashSeed:
         )
         return P2PSecondaryTierManager(
             offloading_spec=_init_offloading_spec(),
-            primary_kv_view=memoryview(bytearray(16)),
+            primary_tier=_MockPrimaryTier(),
         )
 
     def test_missing_pythonhashseed_uses_default(self, monkeypatch):
@@ -224,7 +230,7 @@ class TestBackpressureRejected:
         with pytest.raises(ValueError, match="not supported for the P2P"):
             P2PSecondaryTierManager(
                 offloading_spec=_init_offloading_spec(),
-                primary_kv_view=memoryview(bytearray(16)),
+                primary_tier=_MockPrimaryTier(),
                 backpressure_detector=object(),
             )
 
@@ -232,7 +238,7 @@ class TestBackpressureRejected:
         self._patch_transports(monkeypatch)
         mgr = P2PSecondaryTierManager(
             offloading_spec=_init_offloading_spec(),
-            primary_kv_view=memoryview(bytearray(16)),
+            primary_tier=_MockPrimaryTier(),
         )
         assert mgr.bp_detector is None
 
@@ -1804,7 +1810,7 @@ class TestBindHostPortDefaults:
                 parallel=SimpleNamespace(data_parallel_index=dp_index)
             ),
         )
-        mgr = P2PSecondaryTierManager(spec, memoryview(b""), **kwargs)
+        mgr = P2PSecondaryTierManager(spec, _MockPrimaryTier(), **kwargs)
         mgr._test_calls = calls
         return mgr
 

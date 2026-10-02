@@ -128,10 +128,19 @@ def test_tiering_metrics_tracker_records_finished_job_metrics():
         jobs[0], JobResult(job_id=0, success=True, transfer_time=0.5)
     )
     tracker.on_job_finished(
-        jobs[1], JobResult(job_id=1, success=True, transfer_time=0.25)
+        jobs[1],
+        JobResult(
+            job_id=1,
+            success=True,
+            transfer_time=0.25,
+            allocated_keys=[promotion_key],
+        ),
     )
     tracker.on_job_finished(jobs[2], JobResult(job_id=2, success=False))
-    tracker.on_job_finished(jobs[3], JobResult(job_id=3, success=False))
+    tracker.on_job_finished(
+        jobs[3],
+        JobResult(job_id=3, success=False, allocated_keys=[failed_promotion_key]),
+    )
 
     stats = tracker.take_stats()
     assert stats is not None
@@ -166,6 +175,7 @@ def test_tiering_metrics_tracker_records_partial_promotion_success_bytes():
             success=False,
             successful_keys=(keys[0], keys[2]),
             transfer_time=0.5,
+            allocated_keys=keys,
         ),
     )
 
@@ -195,6 +205,9 @@ def test_tiering_metrics_tracker_reports_active_job_and_primary_usage_gauges():
     )
     tracker.on_job_registered(fs_job)
     tracker.on_job_registered(p2p_job)
+    # primary_write_chunk_count is updated lazily when prepare_write() succeeds;
+    # drive that callback explicitly to reflect the 3-key allocation.
+    tracker.on_promotion_allocated(tier_idx=1, n=3)
 
     stats = tracker.take_stats()
     assert stats is not None

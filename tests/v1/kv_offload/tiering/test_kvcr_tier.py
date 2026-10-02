@@ -41,6 +41,13 @@ from vllm.v1.kv_offload.tiering.kvcr import manager as kvcr_manager
 from vllm.v1.kv_offload.tiering.kvcr.manager import KVCRSecondaryTierManager
 
 
+def _make_mock_primary(kv_view: memoryview):
+    """Minimal primary-tier stub: exposes get_kv_memoryview() only."""
+    from types import SimpleNamespace as _SN
+
+    return _SN(get_kv_memoryview=lambda: kv_view)
+
+
 def _op_entries(
     entries: Mapping[BlockKey, bool],
 ) -> dict[BlockKey, OpEntryResult]:
@@ -210,7 +217,7 @@ def _make_tier(
                 self_describing_kv_events=self_describing_kv_events,
             ),
         ),
-        primary_kv_view=memoryview(np.zeros((4, 16), dtype=np.int8)),
+        primary_tier=_make_mock_primary(memoryview(np.zeros((4, 16), dtype=np.int8))),
         tier_type="kvcr",
         router_capabilities=["router_hint"],
         control_host="127.0.0.1",

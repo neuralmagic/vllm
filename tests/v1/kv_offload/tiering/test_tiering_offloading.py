@@ -66,6 +66,31 @@ def _mock_mmap_region(num_chunks: int, row_bytes: int = 16):
     return mock
 
 
+def _make_mock_primary(kv_view: memoryview) -> MagicMock:
+    """Minimal primary-tier stub for secondary tier unit tests.
+
+    Implements get_kv_memoryview() and prepare_write() so that
+    ExampleSecondaryTierManager._allocate_for_promotion() can run
+    correctly during promotion tests.
+    """
+    from vllm.v1.kv_offload.base import PrepareStoreOutput
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+    mock = MagicMock()
+    mock.get_kv_memoryview.return_value = kv_view
+
+    def prepare_write(keys, req_context):
+        keys_list = list(keys)
+        return PrepareStoreOutput(
+            keys_to_store=keys_list,
+            store_spec=CPULoadStoreSpec(list(range(len(keys_list)))),
+            evicted_keys=[],
+        )
+
+    mock.prepare_write.side_effect = prepare_write
+    return mock
+
+
 def to_keys(int_ids: Iterable[int]) -> list[OffloadKey]:
     return [make_offload_key(str(i).encode(), 0) for i in int_ids]
 
@@ -188,7 +213,7 @@ def test_tiering_manager_aggregates_secondary_stats():
     )
     secondary_tier = MetricsSecondaryTierManager(
         offloading_spec=_MOCK_OFFLOADING_SPEC,
-        primary_kv_view=mock_region.create_kv_memoryview(),
+        primary_tier=_make_mock_primary(mock_region.create_kv_memoryview()),
         tier_type="test_metrics",
     )
     secondary_stats = OffloadingConnectorStats()
@@ -227,7 +252,7 @@ class TestExampleSecondaryTierManager:
         mock_view = memoryview(torch.zeros((10, 16), dtype=torch.int8).numpy())
         tier = ExampleSecondaryTierManager(
             offloading_spec=_MOCK_OFFLOADING_SPEC,
-            primary_kv_view=mock_view,
+            primary_tier=_make_mock_primary(mock_view),
             tier_type="example",
             custom_param=67,
         )
@@ -288,17 +313,17 @@ class TestTieringOffloadingManager:
             num_chunks=5, mmap_region=mock_region
         )
 
-        mock_view = mock_region.create_kv_memoryview()
-
-        # Create secondary tiers with the primary view
+        # Create secondary tiers backed by the real primary tier so that
+        # _allocate_for_promotion → prepare_write and _complete_promotion →
+        # complete_write operate on the same object.
         self.secondary_tier1 = ExampleSecondaryTierManager(
             offloading_spec=_MOCK_OFFLOADING_SPEC,
-            primary_kv_view=mock_view,
+            primary_tier=self.primary_tier,
             tier_type="example",
         )
         self.secondary_tier2 = ExampleSecondaryTierManager(
             offloading_spec=_MOCK_OFFLOADING_SPEC,
-            primary_kv_view=mock_view,
+            primary_tier=self.primary_tier,
             tier_type="example",
         )
 
@@ -338,7 +363,7 @@ class TestTieringOffloadingManager:
             ),
             0,
         )
-        failed = JobResult(job_id=job_id, success=False)
+        failed = JobResult(job_id=job_id, success=False, allocated_keys=to_keys([1, 2]))
         with (
             patch.object(
                 self.secondary_tier1, "get_finished_jobs", return_value=[failed]
@@ -365,7 +390,7 @@ class TestTieringOffloadingManager:
             ),
             0,
         )
-        ok = JobResult(job_id=job_id, success=True)
+        ok = JobResult(job_id=job_id, success=True, allocated_keys=to_keys([1]))
         with (
             patch.object(self.secondary_tier1, "get_finished_jobs", return_value=[ok]),
             patch.object(self.primary_tier, "complete_write") as completed,
@@ -547,6 +572,10 @@ class TestTieringOffloadingManager:
             self.secondary_tier1.chunks[chunk] = True
 
         def submit_partial(job_metadata: TransferJob) -> None:
+            # Allocate primary slots so get_finished_jobs() can attach
+            # allocated_keys and _complete_promotion() can call complete_write().
+            alloc = self.secondary_tier1._allocate_for_promotion(job_metadata)
+            assert alloc is not None, "unexpected OOM in mock primary tier"
             successful_keys = (
                 None
                 if successful_indices is None

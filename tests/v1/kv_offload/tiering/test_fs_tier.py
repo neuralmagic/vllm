@@ -98,6 +98,41 @@ def _make_offloading_spec(
 _MOCK_OFFLOADING_SPEC = _make_offloading_spec(enable_kv_cache_events=False)
 
 
+def _make_mock_primary(kv_view: memoryview) -> MagicMock:
+    """Minimal primary-tier stub for FS-tier unit tests.
+
+    Returns a mock whose get_kv_memoryview() yields ``kv_view`` and whose
+    prepare_write() allocates sequential chunk IDs [0..n-1] by default.
+
+    Tests that need specific destination chunk IDs (e.g. data-integrity checks)
+    can set ``mock._next_chunk_ids`` to a list before calling submit_load;
+    prepare_write() will use those IDs for that one call and then revert to
+    the default sequential allocation.
+    """
+    from vllm.v1.kv_offload.base import PrepareStoreOutput
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+    mock = MagicMock()
+    mock.get_kv_memoryview.return_value = kv_view
+    mock._next_chunk_ids = None  # set before submit_load to control allocation
+
+    def prepare_write(keys, req_context):
+        keys_list = list(keys)
+        if mock._next_chunk_ids is not None:
+            chunk_ids = mock._next_chunk_ids
+            mock._next_chunk_ids = None  # consume once
+        else:
+            chunk_ids = list(range(len(keys_list)))
+        return PrepareStoreOutput(
+            keys_to_store=keys_list,
+            store_spec=CPULoadStoreSpec(chunk_ids),
+            evicted_keys=[],
+        )
+
+    mock.prepare_write.side_effect = prepare_write
+    return mock
+
+
 def key(n: int) -> OffloadKey:
     return make_offload_key(n.to_bytes(8, "big"), 0)
 
@@ -180,7 +215,7 @@ def fs_tier(tmp_path):
     mock_view = memoryview(tensor.numpy())
     tier = FileSystemTierManager(
         offloading_spec=_MOCK_OFFLOADING_SPEC,
-        primary_kv_view=mock_view,
+        primary_tier=_make_mock_primary(mock_view),
         tier_type="fs",
         root_dir=str(tmp_path),
         n_read_threads=4,
@@ -196,7 +231,7 @@ def fs_tier_with_events(tmp_path):
     mock_view = memoryview(tensor.numpy())
     tier = FileSystemTierManager(
         offloading_spec=_make_offloading_spec(enable_kv_cache_events=True),
-        primary_kv_view=mock_view,
+        primary_tier=_make_mock_primary(mock_view),
         tier_type="fs",
         root_dir=str(tmp_path),
         n_read_threads=4,
@@ -267,7 +302,7 @@ def test_invalid_path_raises_at_construction():
     with pytest.raises(OSError):
         FileSystemTierManager(
             offloading_spec=_MOCK_OFFLOADING_SPEC,
-            primary_kv_view=mock_view,
+            primary_tier=_make_mock_primary(mock_view),
             tier_type="fs",
             root_dir="/dev/null/invalid_path",
         )
@@ -280,7 +315,7 @@ def test_invalid_locality_raises_at_construction(tmp_path, locality):
     with pytest.raises(ValueError, match="Locality"):
         FileSystemTierManager(
             offloading_spec=_MOCK_OFFLOADING_SPEC,
-            primary_kv_view=memoryview(tensor.numpy()),
+            primary_tier=_make_mock_primary(memoryview(tensor.numpy())),
             tier_type="fs",
             root_dir=str(tmp_path),
             locality=locality,
@@ -297,8 +332,8 @@ def test_factory_forwards_locality_to_fs_tier(tmp_path):
             "n_write_threads": 1,
             "locality": "LOCAL",
         },
-        memoryview(tensor.numpy()),
         _MOCK_OFFLOADING_SPEC,
+        _make_mock_primary(memoryview(tensor.numpy())),
     )
     try:
         assert isinstance(tier, FileSystemTierManager)
@@ -395,8 +430,9 @@ def test_store_load_data_integrity(fs_tier, monkeypatch, use_c_ext, batch_size):
     # reset tensor to prove data is read from disk
     tensor[:] = 0.0
 
-    # Load into a range disjoint by index from the store ids, to also
-    # exercise loading a chunk into a different id than it was stored from.
+    # Tell prepare_write to allocate load_chunk_ids so data lands in a range
+    # disjoint from the store source, exercising loading into a different slot.
+    tier._primary_tier._next_chunk_ids = load_chunk_ids
     tier.submit_load(make_job(2, keys, load_chunk_ids, is_promotion=True))
     load_results = drain(tier)
     assert len(load_results) == 1
@@ -421,7 +457,7 @@ def test_store_load_roundtrip_without_o_direct(tmp_path, monkeypatch):
     tensor = _page_aligned_rand_tensor(4, _BLOCK_ELEMENTS)
     tier = FileSystemTierManager(
         offloading_spec=_MOCK_OFFLOADING_SPEC,
-        primary_kv_view=memoryview(tensor.numpy()),
+        primary_tier=_make_mock_primary(memoryview(tensor.numpy())),
         tier_type="fs",
         root_dir=str(tmp_path),
         n_read_threads=4,
@@ -436,11 +472,12 @@ def test_store_load_roundtrip_without_o_direct(tmp_path, monkeypatch):
         assert all(r.success for r in drain(tier))
 
         tensor[:2] = 0.0
+        tier._primary_tier._next_chunk_ids = [2, 3]
         tier.submit_load(make_job(2, keys, [2, 3], is_promotion=True))
         assert all(r.success for r in drain(tier))
 
-        for i, bid in enumerate([2, 3]):
-            assert torch.allclose(tensor[bid], expected[i])
+        assert torch.allclose(tensor[2], expected[0])
+        assert torch.allclose(tensor[3], expected[1])
     finally:
         tier.shutdown()
 
@@ -716,7 +753,7 @@ def test_batched_load_first_block_fails_marks_whole_batch(
     mock_view = memoryview(tensor.numpy())
     tier = FileSystemTierManager(
         offloading_spec=_MOCK_OFFLOADING_SPEC,
-        primary_kv_view=mock_view,
+        primary_tier=_make_mock_primary(mock_view),
         tier_type="fs",
         root_dir=str(tmp_path),
         n_read_threads=1,
@@ -816,7 +853,7 @@ def test_store_event_uses_configured_locality(tmp_path, locality, expected):
     locality_config = {} if locality is None else {"locality": locality}
     tier = FileSystemTierManager(
         offloading_spec=_make_offloading_spec(enable_kv_cache_events=True),
-        primary_kv_view=memoryview(tensor.numpy()),
+        primary_tier=_make_mock_primary(memoryview(tensor.numpy())),
         tier_type="fs",
         root_dir=str(tmp_path),
         enable_kv_events=True,
@@ -918,7 +955,7 @@ def test_events_require_global_kv_events_flag(tmp_path):
     tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
     tier = FileSystemTierManager(
         offloading_spec=_make_offloading_spec(enable_kv_cache_events=False),
-        primary_kv_view=memoryview(tensor.numpy()),
+        primary_tier=_make_mock_primary(memoryview(tensor.numpy())),
         tier_type="fs",
         root_dir=str(tmp_path),
         enable_kv_events=True,
@@ -950,7 +987,7 @@ def test_cascade_store_emits_fs_event_through_tiering_manager(tmp_path):
     primary = CPUPrimaryTierOffloadingManager(num_chunks=4, mmap_region=mock_region)
     tier = FileSystemTierManager(
         offloading_spec=_make_offloading_spec(enable_kv_cache_events=True),
-        primary_kv_view=primary.get_kv_memoryview(),
+        primary_tier=primary,
         tier_type="fs",
         root_dir=str(tmp_path),
         enable_kv_events=True,
@@ -987,7 +1024,7 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         offloading_spec=_make_offloading_spec(
             tp_size=2, world_size=2, rank=0, replicated_layout=True
         ),
-        primary_kv_view=memoryview(writer_tensor.numpy()),
+        primary_tier=_make_mock_primary(memoryview(writer_tensor.numpy())),
         tier_type="fs",
         root_dir=root,
         n_read_threads=2,
@@ -1006,7 +1043,7 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         offloading_spec=_make_offloading_spec(
             tp_size=4, world_size=4, rank=3, replicated_layout=True
         ),
-        primary_kv_view=memoryview(reader_tensor.numpy()),
+        primary_tier=_make_mock_primary(memoryview(reader_tensor.numpy())),
         tier_type="fs",
         root_dir=root,
         n_read_threads=2,
@@ -1016,6 +1053,7 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert reader.file_mapper.base_path == writer_base
         assert reader.file_mapper.get_file_name(key(7)) == writer_path
         assert lookup_and_wait(reader, [key(7)]) == [LookupResult.HIT]
+        reader._primary_tier._next_chunk_ids = [1]
         reader.submit_load(make_job(2, [key(7)], [1], is_promotion=True))
         assert all(r.success for r in drain(reader))
         assert torch.allclose(reader_tensor[1], expected)

@@ -225,6 +225,26 @@ def _make_events_spec(enable_kv_cache_events: bool) -> SimpleNamespace:
     )
 
 
+def _make_mock_primary(kv_view: memoryview) -> MagicMock:
+    """Minimal primary-tier stub with prepare_write returning sequential IDs."""
+    from vllm.v1.kv_offload.base import PrepareStoreOutput
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+    mock = MagicMock()
+    mock.get_kv_memoryview.return_value = kv_view
+
+    def prepare_write(keys, req_context):
+        keys_list = list(keys)
+        return PrepareStoreOutput(
+            keys_to_store=keys_list,
+            store_spec=CPULoadStoreSpec(list(range(len(keys_list)))),
+            evicted_keys=[],
+        )
+
+    mock.prepare_write.side_effect = prepare_write
+    return mock
+
+
 def _make_tier(
     num_blocks: int = 4,
     offloading_spec: SimpleNamespace = _OFFLOADING_SPEC,
@@ -236,6 +256,7 @@ def _make_tier(
     if primary_kv_view is None:
         tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         primary_kv_view = memoryview(tensor.numpy())
+    primary_tier = _make_mock_primary(primary_kv_view)
     with (
         patch("vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"),
         patch(
@@ -245,7 +266,7 @@ def _make_tier(
     ):
         tier = ObjectStoreSecondaryTierManager(
             offloading_spec=offloading_spec,
-            primary_kv_view=primary_kv_view,
+            primary_tier=primary_tier,
             tier_type="obj",
             store_config=_STORE_CONFIG,
             prefix=_RUN_PREFIX,
