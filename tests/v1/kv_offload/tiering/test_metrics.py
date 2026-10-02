@@ -237,3 +237,34 @@ def test_tiering_metrics_tracker_records_promotion_allocation_failures():
     assert stats is not None
     values = stats.data["data"]
     assert values[TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES][()] == 1
+
+
+def test_tiering_metrics_tracker_oom_job_counts_as_job_failure():
+    """on_job_finished with allocated_keys=None (CPU OOM) records
+    PROMOTION_JOB_FAILURES but no bytes/time metrics (nothing was transferred).
+    PROMOTION_ALLOCATION_FAILURES is tracked separately via
+    on_promotion_allocation_failure()."""
+    tracker = TieringMetricsTracker(
+        tier_types=["fs"],
+        num_primary_chunks=1,
+        primary_chunk_size=16,
+    )
+    key = to_keys([0])[0]
+    job = JobMetadata(
+        TransferJob(0, [key], np.array([0]), is_promotion=True, req_context=_CTX),
+        0,
+    )
+    tracker.on_job_registered(job)
+
+    # OOM result: allocated_keys=None (prepare_write never ran).
+    tracker.on_job_finished(job, JobResult(job_id=0, success=False))
+
+    stats = tracker.take_stats()
+    assert stats is not None
+    values = stats.data["data"]
+    label = ("1:fs",)
+    assert values[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES][label] == 1
+    # No bytes/time — nothing was transferred.
+    assert TieringOffloadingMetrics.READ_BYTES not in values
+    assert TieringOffloadingMetrics.READ_TIME not in values
+    tracker.assert_idle()

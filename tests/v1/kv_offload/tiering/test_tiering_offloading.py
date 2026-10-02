@@ -116,6 +116,10 @@ def histogram_count_key(metric_name: str, labelvalues: tuple[str, ...]) -> str:
     return f"{metric_name}:{labelvalues}_count"
 
 
+def gauge_key(metric_name: str, labelvalues: tuple[str, ...]) -> str:
+    return f"{metric_name}:{labelvalues}" if labelvalues else metric_name
+
+
 def has_histogram_count(reduced: dict[str, int | float], metric_name: str) -> bool:
     return any(
         key.startswith(f"{metric_name}:") and key.endswith("_count") for key in reduced
@@ -933,6 +937,205 @@ class TestTieringOffloadingManager:
         job_metadata = self.secondary_tier1.submit_load.call_args.args[0]
         assert list(job_metadata.keys) == [shared_chunk]
         assert job_metadata.req_context is ctx_a
+
+    # ------------------------------------------------------------------ #
+    # Lazy allocation tests                                                #
+    # ------------------------------------------------------------------ #
+
+    def test_lazy_allocation_deferred_until_submit_load(self, manager_setup):
+        """prepare_write is not called during lookup(); only when submit_load fires.
+
+        on_schedule_end() polls finished jobs first, then flushes pending
+        promotions (submit_load).  So after step 1 the primary slot is
+        write-pending (HIT_PENDING), and after step 2 it is fully ready (HIT).
+        The write-usage gauge mirrors this lifecycle: rises in step 1, falls
+        in step 2.
+        """
+        chunk = to_keys([0])[0]
+        self.secondary_tier1.chunks[chunk] = True
+        self._start_request()
+
+        # lookup() defers submission; primary must not have the chunk yet.
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.MISS
+
+        # Step 1: flushes submit_load → prepare_write allocates a slot (write-pending).
+        self._simulate_on_schedule_end()
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+
+        # Gauge rises: one slot allocated but not yet released.
+        stats = self.manager.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced.get(
+            gauge_key(
+                TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC, ("1:example",)
+            ),
+            0.0,
+        ) == pytest.approx(1 / 5)
+
+        # Step 2: _process_finished_jobs → complete_write → chunk ready.
+        self._simulate_on_schedule_end()
+        assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT
+
+        # Gauge falls back to zero after _complete_promotion releases the slot.
+        stats = self.manager.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced.get(
+            gauge_key(
+                TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC, ("1:example",)
+            ),
+            0.0,
+        ) == pytest.approx(0.0)
+
+    def test_lazy_allocation_oom_leaves_chunk_out_of_primary(self, manager_setup):
+        """When prepare_write returns None (CPU OOM), the chunk is not promoted
+        and PROMOTION_ALLOCATION_FAILURES is incremented end-to-end.
+
+        OOM is triggered naturally: all 5 primary slots are held as write-pending
+        (prepare_store called but not complete_store), leaving no room for eviction.
+        """
+        # Fill all 5 primary slots with write-pending chunks; do NOT complete.
+        pinned_ctx = ReqContext(req_id="pinned")
+        self._start_request(pinned_ctx)
+        pinned = to_keys(range(5))
+        result = self.manager.prepare_store(pinned, pinned_ctx)
+        assert result is not None and len(result.keys_to_store) == 5
+
+        # Place an extra chunk only in secondary (primary is full, no free slots).
+        # Use key id 5 — distinct from the five pinned keys (ids 0..4).
+        (extra,) = to_keys([5])
+        self.secondary_tier1.chunks[extra] = True
+        extra_ctx = ReqContext(req_id="extra")
+        self._start_request(extra_ctx)
+        assert self.manager.lookup(extra, extra_ctx) is LookupResult.HIT_PENDING
+
+        # Step 1: submit_load fires → prepare_write returns None (OOM).
+        self._simulate_on_schedule_end()
+
+        # Step 2: process finished job with allocated_keys=None.
+        self._simulate_on_schedule_end()
+
+        assert self.primary_tier.lookup(extra, extra_ctx) is LookupResult.MISS
+
+        stats = self.manager.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert (
+            reduced.get(TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES, 0) == 1
+        )
+
+    def test_lazy_allocation_all_cached_skips_complete_write(self, manager_setup):
+        """When all promoted keys are already in the primary cache by the time
+        submit_load runs, prepare_write returns keys_to_store=[] and the
+        write-usage gauge stays at zero throughout (no slots allocated).
+
+        This simulates a concurrent GPU→CPU store that lands between lookup()
+        and the deferred submit_load().
+        """
+        chunks = to_keys(range(2))
+        for chunk in chunks:
+            self.secondary_tier1.chunks[chunk] = True
+        self._start_request()
+
+        # Secondary hit: promotions enqueued for both chunks.
+        for chunk in chunks:
+            assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+
+        # Simulate a concurrent GPU store landing before submit_load fires:
+        # insert chunks directly into primary (bypassing cascade logic) so that
+        # prepare_write finds them already present and returns keys_to_store=[].
+        store_result = self.primary_tier.prepare_store(chunks, _CTX)
+        assert store_result is not None
+        self.primary_tier.complete_store(chunks, _CTX, success=True)
+
+        # Step 1: submit_load fires → prepare_write sees both chunks already cached
+        # → keys_to_store=[] → allocated_keys=[] (0 new slots).
+        self._simulate_on_schedule_end()
+
+        # No slot was allocated, so the gauge must stay at zero.
+        stats = self.manager.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced.get(
+            gauge_key(
+                TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC, ("1:example",)
+            ),
+            0.0,
+        ) == pytest.approx(0.0)
+
+        # Step 2: _complete_promotion → allocated_keys=[] → early return, no
+        # complete_write. Chunks are ready from the direct store above.
+        self._simulate_on_schedule_end()
+        for chunk in chunks:
+            assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT
+
+    def test_lazy_allocation_partially_cached_only_new_keys_finalized(
+        self, manager_setup
+    ):
+        """When some promoted keys are already in the primary cache by the time
+        submit_load runs, prepare_write returns only the un-cached subset and
+        complete_write is called for exactly those newly-allocated keys.
+
+        Invariant: a key skipped by prepare_write() must NOT be passed to
+        complete_write() — its primary slot may belong to another job.
+
+        Setup mirrors the all-cached test: a concurrent GPU store lands for
+        chunks[1] only, between lookup() and the deferred submit_load().
+        """
+        chunks = to_keys(range(3))
+        cached_chunk = chunks[1]
+
+        for chunk in chunks:
+            self.secondary_tier1.chunks[chunk] = True
+        self._start_request()
+
+        # Secondary hit: all three trigger promotion.
+        for chunk in chunks:
+            assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+
+        # Concurrent GPU store lands for cached_chunk only before submit_load.
+        store_result = self.primary_tier.prepare_store([cached_chunk], _CTX)
+        assert store_result is not None
+        self.primary_tier.complete_store([cached_chunk], _CTX, success=True)
+
+        # Step 1: submit_load fires → prepare_write([k0, k1, k2]) sees k1 already
+        # present → keys_to_store=[k0, k2] → 2 slots allocated (write-pending).
+        self._simulate_on_schedule_end()
+
+        assert self.primary_tier.lookup(chunks[0], _CTX) is LookupResult.HIT_PENDING
+        assert self.primary_tier.lookup(chunks[1], _CTX) is LookupResult.HIT
+        assert self.primary_tier.lookup(chunks[2], _CTX) is LookupResult.HIT_PENDING
+
+        # Gauge reflects the two newly allocated (not-yet-released) slots.
+        stats = self.manager.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced.get(
+            gauge_key(
+                TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC, ("1:example",)
+            ),
+            0.0,
+        ) == pytest.approx(2 / 5)
+
+        # Step 2: _complete_promotion → complete_write([k0, k2], True) only.
+        self._simulate_on_schedule_end()
+
+        # All three chunks now accessible in primary.
+        for chunk in chunks:
+            assert self.primary_tier.lookup(chunk, _CTX) is LookupResult.HIT
+
+        # Gauge released back to zero.
+        stats = self.manager.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced.get(
+            gauge_key(
+                TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC, ("1:example",)
+            ),
+            0.0,
+        ) == pytest.approx(0.0)
 
     def test_complete_store_forwards_req_context_to_submit_store(self, manager_setup):
         """complete_store cascades to secondary tiers with the correct req_context."""

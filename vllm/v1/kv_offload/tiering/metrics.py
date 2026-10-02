@@ -240,7 +240,16 @@ class TieringMetricsTracker:
         # For promotions, measure only keys that were actually allocated.
         # For cascade jobs, all keys in the job were transferred.
         if transfer_job.is_promotion:
-            assert completed_job.allocated_keys is not None
+            if completed_job.allocated_keys is None:
+                # CPU OOM: prepare_write() never ran — record the job failure
+                # but skip bytes/time metrics since nothing was transferred.
+                # PROMOTION_ALLOCATION_FAILURES is recorded separately via
+                # on_promotion_allocation_failure() in _complete_promotion().
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.PROMOTION_JOB_FAILURES,
+                    labelvalues=labelvalues,
+                )
+                return
             completed_key_count = len(completed_job.allocated_keys)
         else:
             completed_key_count = len(transfer_job.keys)
