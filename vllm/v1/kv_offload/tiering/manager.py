@@ -120,10 +120,35 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         # Every method that touches the LRU policy must hold this lock.
         self._alloc_lock = threading.Lock()
 
+        # Keys that returned HIT for the current request's lookup. These are
+        # excluded from eviction (via _extra_eviction_protected) until
+        # prepare_load() pins them via ref_cnt. Cleared by
+        # TieringOffloadingManager.lookup() on each request transition.
+        # Always accessed under _alloc_lock.
+        self._scheduler_hit_keys: set[OffloadKey] = set()
+
+    @override
+    def _extra_eviction_protected(self) -> set[OffloadKey]:
+        # Called inside prepare_store() which already holds _alloc_lock.
+        return self._scheduler_hit_keys
+
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         with self._alloc_lock:
-            return super().lookup(key, req_context)
+            result = super().lookup(key, req_context)
+            if result is LookupResult.HIT:
+                self._scheduler_hit_keys.add(key)
+            return result
+
+    def clear_scheduler_hit_keys(self) -> None:
+        """Clear the per-request HIT protection set.
+
+        Called by TieringOffloadingManager.lookup() when switching to a new
+        request, and during reset_cache(). Acquires _alloc_lock so it is safe
+        to call concurrently with FS worker threads running prepare_write().
+        """
+        with self._alloc_lock:
+            self._scheduler_hit_keys.clear()
 
     @override
     def prepare_store(
@@ -285,6 +310,12 @@ class TieringOffloadingManager(OffloadingManager):
         # Gate for once-per-step execution of _maybe_process_finished_jobs().
         # Reset at the end of each step in on_schedule_end().
         self._processed_jobs_this_step: bool = False
+
+        # Tracks which request's lookup is currently in progress on the
+        # scheduler thread. When the req_id changes, primary_tier's
+        # _scheduler_hit_keys is cleared (the previous request's prepare_load
+        # has already run and pinned those chunks via ref_cnt).
+        self._current_lookup_req_id: str | None = None
 
         # Per-request state for prepared GPU->primary stores and finalization.
         # Secondary tiers are finalized only after pending primary stores reach
@@ -491,6 +522,13 @@ class TieringOffloadingManager(OffloadingManager):
         # so chunks freed by cascade or promotion completions are evictable
         # in time for a promotion this lookup may initiate.
         self._maybe_process_finished_jobs()
+
+        # On a new request: clear the previous request's HIT protection set.
+        # By this point the previous request's prepare_load() has already run
+        # and pinned those chunks via ref_cnt, so the set is no longer needed.
+        if req_context.req_id != self._current_lookup_req_id:
+            self.primary_tier.clear_scheduler_hit_keys()
+            self._current_lookup_req_id = req_context.req_id
 
         start_time = time.monotonic()
         primary_hit = self.primary_tier.lookup(key, req_context)
@@ -937,6 +975,15 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             self._metrics.on_request_allocated(state.req_context)
 
+        # Clear the per-request HIT protection set at step boundary. All
+        # prepare_load() calls for this step have already run, so the chunks
+        # are pinned via ref_cnt and no longer need set-based protection.
+        # Resetting _current_lookup_req_id ensures the first lookup of the
+        # next step always triggers the per-request clear (a harmless no-op
+        # since the set is already empty, but keeps tracking consistent).
+        self.primary_tier.clear_scheduler_hit_keys()
+        self._current_lookup_req_id = None
+
     @override
     def has_pending_work(self) -> bool:
         # In-flight primary<->secondary transfers (pending promotions are
@@ -987,6 +1034,8 @@ class TieringOffloadingManager(OffloadingManager):
         # and the dedup set — any in-flight or pending promotions are gone.
         self._pending_load_submissions.clear()
         self._promoting_keys.clear()
+        self.primary_tier.clear_scheduler_hit_keys()
+        self._current_lookup_req_id = None
         self._metrics.assert_idle()
 
         finished_req_ids = []

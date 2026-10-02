@@ -184,6 +184,15 @@ class CPUOffloadingManager(OffloadingManager):
         self._get_request_cache_access(req_context)
         return RequestOffloadingContext()
 
+    def _extra_eviction_protected(self) -> set[OffloadKey]:
+        """Additional keys to exclude from eviction candidates in prepare_store().
+
+        Overridden by CPUPrimaryTierOffloadingManager to prevent FS worker
+        threads from evicting chunks that returned HIT in the current request's
+        lookup but have not yet been pinned by prepare_load().
+        """
+        return set()
+
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         chunk = self._policy.get(key)
@@ -313,7 +322,9 @@ class CPUOffloadingManager(OffloadingManager):
 
             # Chunks from the original input are excluded from eviction candidates:
             # a chunk that was already stored must remain in the cache after this call.
-            protected = set(keys)
+            # _extra_eviction_protected() adds any keys that returned HIT in the
+            # current request's lookup but are not yet pinned by prepare_load().
+            protected = set(keys) | self._extra_eviction_protected()
             evicted = self._policy.evict(num_chunks_to_evict, protected)
             if evicted is None:
                 return None

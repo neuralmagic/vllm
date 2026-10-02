@@ -1738,5 +1738,97 @@ def test_parse_tier_filter_skips_bad_entries():
     )
 
 
+class TestSchedulerHitProtection:
+    """Tests for the TOCTOU eviction race fix.
+
+    FS worker threads call prepare_write() (which evicts ref_cnt=0 chunks)
+    concurrently with the scheduler thread's lookup() -> prepare_load().
+    _scheduler_hit_keys prevents eviction of HIT chunks until prepare_load()
+    pins them via ref_cnt.
+    """
+
+    def test_hit_protection_lifecycle(self):
+        """End-to-end lifecycle of the eviction protection mechanism.
+
+        Phase 1 — protection active:
+          Scheduler thread lookup() -> HIT populates _scheduler_hit_keys.
+          Concurrent FS worker prepare_write() cannot evict the protected chunk.
+
+        Phase 2 — per-request clear:
+          First lookup for the next request clears the previous request's keys.
+
+        Phase 3 — on_schedule_end clear:
+          on_schedule_end() clears the set; the FS worker can now evict.
+        """
+        num_chunks = 2
+        mock_region = _mock_mmap_region(num_chunks)
+        primary = CPUPrimaryTierOffloadingManager(
+            num_chunks=num_chunks, mmap_region=mock_region
+        )
+        # No secondary tiers: complete_store sets ref_cnt=0 immediately.
+        manager = TieringOffloadingManager(primary_tier=primary, secondary_tiers=[])
+
+        # Fill the primary cache with [key0(LRU), key1(MRU)].
+        fill_ctx = ReqContext(req_id="filler")
+        manager.on_new_request(fill_ctx)
+        keys = to_keys(range(num_chunks))
+        key0, key1 = keys
+        result = manager.prepare_store(keys, fill_ctx)
+        assert result is not None
+        manager.complete_store(keys, fill_ctx, success=True)
+        assert count_hits(primary, keys) == num_chunks
+
+        new_key = to_keys([num_chunks])[0]
+        promo_ctx = ReqContext(req_id="fs_worker")
+
+        # --- Phase 1: protection active ---
+        ctx1 = ReqContext(req_id="req1")
+        manager.on_new_request(ctx1)
+
+        # Scheduler thread: lookup(key0) -> HIT, protection set populated.
+        assert manager.lookup(key0, ctx1) is LookupResult.HIT
+        assert key0 in primary._scheduler_hit_keys
+
+        # FS worker: needs to evict key0 (LRU) to promote new_key, but key0
+        # is protected. key1 (MRU) is the only other slot; it is evicted instead.
+        write_result = primary.prepare_write([new_key], promo_ctx)
+        assert write_result is not None
+        assert primary._policy.get(key0) is not None, "key0 must survive"
+        assert primary._policy.get(key1) is None, "key1 evicted as fallback"
+        # Complete the promotion: new_key is now evictable (ref_cnt=0).
+        # Cache now holds [key0, new_key].
+        primary.complete_write([new_key], promo_ctx, success=True)
+
+        # --- Phase 2: per-request clear ---
+        ctx2 = ReqContext(req_id="req2")
+        manager.on_new_request(ctx2)
+
+        # req1's prepare_load pins key0 before the transition.
+        manager.prepare_load([key0], ctx1)
+        assert primary._policy.get(key0).ref_cnt == 1
+
+        # First lookup for req2 clears req1's keys and adds new_key.
+        # new_key is in the cache (just promoted above).
+        assert manager.lookup(new_key, ctx2) is LookupResult.HIT
+        assert key0 not in primary._scheduler_hit_keys
+        assert new_key in primary._scheduler_hit_keys
+
+        # Unpin key0 (simulate GPU load completion).
+        manager.complete_load([key0], ctx1)
+        assert primary._policy.get(key0).ref_cnt == 0
+
+        # --- Phase 3: on_schedule_end clear ---
+        sched_ctx = ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        manager.on_schedule_end(sched_ctx)
+
+        assert len(primary._scheduler_hit_keys) == 0
+        assert manager._current_lookup_req_id is None
+
+        # After the clear, key0 and new_key are evictable; FS worker can evict.
+        another_key = to_keys([num_chunks + 1])[0]
+        write_result = primary.prepare_write([another_key], promo_ctx)
+        assert write_result is not None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
