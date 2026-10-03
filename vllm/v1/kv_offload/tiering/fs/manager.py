@@ -225,6 +225,8 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
+        assert job_metadata.keys is not None
+        assert job_metadata.chunk_ids is not None
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
@@ -242,25 +244,38 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
+        assert not job_metadata.is_materialized(), (
+            "FS tier should allocate CPU cache lazily"
+        )
+        assert job_metadata.primary_alloc_fn is not None, (
+            "primary_alloc_fn required for lazy allocation"
+        )
         job_id = job_metadata.job_id
-        # Track this load's keys so a failed promotion can mark only its failed
-        # keys as a miss (see get_finished_jobs).
-        keys = list(job_metadata.keys)
-        self._load_job_keys[job_id] = keys
-        self._job_block_counts[job_id] = len(keys)
-        paths = [self.file_mapper.get_file_name(key) for key in keys]
-        assert job_metadata.chunk_ids is not None
-        offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def load_task() -> None:
+            # Allocate CPU cache blocks
+            job_metadata.materialize()
+            assert job_metadata.keys is not None
+            assert job_metadata.chunk_ids is not None
+            # Track this load's keys so a failed promotion can mark only its failed
+            # keys as a miss (see get_finished_jobs).
+            self._job_block_counts[job_id] = len(job_metadata.keys)
+            self._load_job_keys[job_id] = list(job_metadata.keys)
+            # TODO (varun): Path generation is expensive. Consider doing in
+            # Scheduler thread.
+            paths = [self.file_mapper.get_file_name(k) for k in job_metadata.keys]
+            offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
+            assert len(paths) == len(offsets)
+
             try:
-                batch_load_block(
-                    paths,
-                    self._primary_kv_view,
-                    offsets,
-                    self._block_size,
-                    self._use_o_direct,
-                )
+                if paths:
+                    batch_load_block(
+                        paths,
+                        self._primary_kv_view,
+                        offsets,
+                        self._block_size,
+                        self._use_o_direct,
+                    )
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
                 # before the failure so get_finished_jobs can keep them; this

@@ -70,15 +70,48 @@ PrimaryAllocFn = Callable[
 
 @dataclass
 class TransferJob:
-    """Metadata for an in-flight async transfer job."""
+    """Metadata for an in-flight async transfer job.
+
+    Secondary tiers can choose to lazily allocate the CPU cache blocks.
+    The *materialize* functions are utilities to realize lazy allocation.
+    """
 
     job_id: JobId
-    keys: Collection[OffloadKey]
+    # keys requested to load / store
+    _keys: Collection[OffloadKey]
     chunk_ids: np.ndarray | None
     is_promotion: bool
     req_context: ReqContext
     submit_time: float = field(default_factory=time.monotonic)
+
     primary_alloc_fn: PrimaryAllocFn | None = None
+    # keys for which cache blocks are allocated.
+    _allocated_keys: Collection[OffloadKey] | None = None
+
+    def __post_init__(self):
+        if self.primary_alloc_fn is None:
+            assert self.chunk_ids is not None
+            assert len(self.chunk_ids) == len(self._keys)
+            self._allocated_keys = self._keys
+
+    @property
+    def keys(self) -> Collection[OffloadKey] | None:
+        return self._allocated_keys
+
+    def is_materialized(self) -> bool:
+        return self.keys is not None and self.chunk_ids is not None
+
+    def materialize(self):
+        if self.is_materialized():
+            return
+        assert self.primary_alloc_fn is not None
+        alloc = self.primary_alloc_fn(self._keys, self.req_context)
+        if alloc is None:
+            # This is technically a transfer job with 0 keys now.
+            self._allocated_keys = []
+            self.chunk_ids = np.array()
+            return
+        self._allocated_keys, self.chunk_ids = alloc
 
 
 @dataclass

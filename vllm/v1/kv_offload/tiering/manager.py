@@ -369,6 +369,12 @@ class TieringOffloadingManager(OffloadingManager):
         self, job_metadata: JobMetadata, completed_job: JobResult
     ) -> None:
         transfer_job = job_metadata.transfer_job
+        assert transfer_job.keys is not None
+        assert transfer_job.chunk_ids is not None
+
+        # Update promoting_keys
+        self._promoting_keys.difference_update(transfer_job._keys)
+
         successful_keys = completed_job.successful_keys
         failed_keys: Collection[OffloadKey]
         if completed_job.success:
@@ -431,6 +437,7 @@ class TieringOffloadingManager(OffloadingManager):
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary chunks.
+                    assert transfer_job.keys is not None
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
@@ -456,6 +463,7 @@ class TieringOffloadingManager(OffloadingManager):
             return
         was_under_pressure = detector.is_under_pressure()
         tj = job_metadata.transfer_job
+        assert tj.keys is not None
         num_bytes = (
             completed_job.transfer_bytes
             if completed_job.transfer_bytes is not None
@@ -583,7 +591,7 @@ class TieringOffloadingManager(OffloadingManager):
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
-        self._metrics.on_promotion_chunk_count(tier_idx, store_spec.chunk_ids)
+        self._metrics.on_promotion_chunk_count(tier_idx, len(store_spec.chunk_ids))
         return primary_write_result.keys_to_store, store_spec.chunk_ids
 
     def _initiate_promotion(
@@ -666,11 +674,11 @@ class TieringOffloadingManager(OffloadingManager):
 
             for entry in pending_by_ctx.values():
                 job_id = self._next_job_id()
-                if is_lazy_alloc is None:
+                if is_lazy_alloc:
                     assert entry.chunk_ids is None
                 job_metadata = TransferJob(
                     job_id=job_id,
-                    keys=entry.keys,
+                    _keys=entry.keys,
                     chunk_ids=None
                     if is_lazy_alloc
                     else np.array(entry.chunk_ids, dtype=np.int32),
@@ -918,7 +926,7 @@ class TieringOffloadingManager(OffloadingManager):
         job_id = self._next_job_id()
         job_metadata = TransferJob(
             job_id=job_id,
-            keys=keys,
+            _keys=keys,
             chunk_ids=primary_chunks_spec.chunk_ids,
             is_promotion=False,
             req_context=req_context,

@@ -215,6 +215,7 @@ class TieringMetricsTracker:
     ) -> None:
         transfer_job = job_metadata.transfer_job
         labelvalues = self.tier_label(job_metadata.tier_idx)
+        assert transfer_job.keys is not None
         completed_key_count = len(transfer_job.keys)
         if not completed_job.success:
             failure_metric = (
