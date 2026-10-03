@@ -20,6 +20,7 @@ Key Design Principles:
 """
 
 import functools
+import threading
 import time
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -90,6 +91,15 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     from the secondary tier perspective, where read/write refers to secondary
     accessing primary. This avoids confusion when reading TieringOffloadingManager
     code (e.g. calling prepare_load inside a cascade/store path would be misleading).
+
+    All methods that touch the manager's OffloadKey cache is protected by a lock.
+    This lock protects the cache from a potential parallel access from FS tier
+    threads that can do lazy cache allocation.
+
+    _scheduler_hit_keys holds keys whose lookup() returned HIT this step.
+    They are excluded from eviction candidates until GPU prepare_load() pins them.
+    This is to protect the keys from inadverdant evicts by a lazy cache allocating
+    FS tier.
     """
 
     def __init__(
@@ -116,6 +126,60 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
 
+        # Serialises all LRU-touching operations so FS worker threads can call
+        # prepare_store (via primary_alloc_fn) concurrently with the scheduler.
+        self._lock = threading.Lock()
+
+        # Keys whose lookup() returned HIT this step. Excluded from eviction
+        # until prepare_load() pins them. Cleared when the scheduler moves to
+        # a new request (see clear_scheduler_hit_keys()).
+        self._scheduler_hit_keys: set[OffloadKey] = set()
+
+    @override
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        with self._lock:
+            result = super().lookup(key, req_context)
+        if result is LookupResult.HIT:
+            self._scheduler_hit_keys.add(key)
+        return result
+
+    @override
+    def prepare_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
+        with self._lock:
+            return super().prepare_store(keys, req_context)
+
+    @override
+    def complete_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ) -> None:
+        with self._lock:
+            return super().complete_store(keys, req_context, success)
+
+    @override
+    def prepare_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> LoadStoreSpec:
+        with self._lock:
+            return super().prepare_load(keys, req_context)
+
+    @override
+    def complete_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        with self._lock:
+            return super().complete_load(keys, req_context)
+
     def prepare_read(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> LoadStoreSpec:
@@ -124,7 +188,27 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         Cascade reads are implementation details of tiering, not additional
         request accesses, so they must not alter request-scoped recency.
         """
-        return self._prepare_load(keys, req_context, record_access=False)
+        with self._lock:
+            return self._prepare_load(keys, req_context, record_access=False)
+
+    @override
+    def _extra_eviction_protected(self) -> set[OffloadKey]:
+        """Keys to exclude from eviction beyond the normal input-key set.
+
+        Returns _scheduler_hit_keys so lookup() HITs are not evicted before
+        prepare_load() pins them via ref_cnt (TOCTOU protection).
+        Called inside _lock via prepare_store/prepare_write.
+        """
+        return self._scheduler_hit_keys
+
+    def clear_scheduler_hit_keys(self) -> None:
+        """Clear the per-step TOCTOU protection set.
+
+        Called by TieringOffloadingManager when the scheduler moves to a new
+        request, at which point the previous request's prepare_load() has
+        already run and the protection is no longer needed.
+        """
+        self._scheduler_hit_keys.clear()
 
     def get_kv_memoryview(self) -> memoryview:
         """Return the memoryview over the primary tier's KV cache buffer.
@@ -245,6 +329,11 @@ class TieringOffloadingManager(OffloadingManager):
 
         # set of keys being promoted
         self._promoting_keys: set[OffloadKey] = set()
+
+        # Tracks the current request being looked up. When it changes,
+        # primary_tier._scheduler_hit_keys is cleared — the previous request's
+        # prepare_load() has already pinned those chunks via ref_cnt.
+        self._current_lookup_req_id: str | None = None
 
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
@@ -418,6 +507,13 @@ class TieringOffloadingManager(OffloadingManager):
         # so chunks freed by cascade or promotion completions are evictable
         # in time for a promotion this lookup may initiate.
         self._maybe_process_finished_jobs()
+
+        # Clear the TOCTOU protection set when the request changes so
+        # eviction is not unnecessarily blocked across requests.
+        req_id = req_context.req_id
+        if req_id != self._current_lookup_req_id:
+            self.primary_tier.clear_scheduler_hit_keys()
+            self._current_lookup_req_id = req_id
 
         start_time = time.monotonic()
         primary_hit = self.primary_tier.lookup(key, req_context)
