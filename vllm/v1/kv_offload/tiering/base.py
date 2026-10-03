@@ -4,7 +4,7 @@
 
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -63,16 +63,22 @@ class TieringOffloadingMetrics:
     BACKPRESSURE_BLOCKS_DROPPED = "vllm:kv_offload_tiering_backpressure_blocks_dropped"
 
 
+PrimaryAllocFn = Callable[
+    [Collection[OffloadKey], ReqContext], tuple[list[OffloadKey], list[int]] | None
+]
+
+
 @dataclass
 class TransferJob:
     """Metadata for an in-flight async transfer job."""
 
     job_id: JobId
     keys: Collection[OffloadKey]
-    chunk_ids: np.ndarray
+    chunk_ids: np.ndarray | None
     is_promotion: bool
     req_context: ReqContext
     submit_time: float = field(default_factory=time.monotonic)
+    primary_alloc_fn: PrimaryAllocFn | None = None
 
 
 @dataclass
@@ -257,6 +263,10 @@ class SecondaryTierManager(ABC):
 
         """
         pass
+
+    def supports_lazy_promotion_allocation(self) -> bool:
+        """Return true iff the supports/requests deferring of CPU block allocation."""
+        return False
 
     def has_pending_work(self) -> bool:
         """Whether this tier needs the engine to keep stepping.

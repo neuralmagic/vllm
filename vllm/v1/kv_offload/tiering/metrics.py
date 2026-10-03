@@ -112,10 +112,13 @@ class TieringMetricsTracker:
     def on_job_registered(self, job_metadata: _JobMetadataLike) -> None:
         transfer_job = job_metadata.transfer_job
         state = self._tier_states[job_metadata.tier_idx]
-        chunk_count = len(transfer_job.chunk_ids)
+        chunk_count = (
+            0 if transfer_job.chunk_ids is None else len(transfer_job.chunk_ids)
+        )
         if transfer_job.is_promotion:
             state.active_promotion_count += 1
-            state.primary_write_chunk_count += chunk_count
+            # promotion write chunk count is handled separately by
+            # on_promotion_chunk_count to accommodate lazy allocation.
         else:
             state.active_cascade_count += 1
             state.primary_read_chunk_count += chunk_count
@@ -125,6 +128,10 @@ class TieringMetricsTracker:
     ) -> None:
         self._observe_finished_job_stats(job_metadata, result)
         self._decrement_tier_state(job_metadata)
+
+    def on_promotion_chunk_count(self, tier_idx: int, chunk_alloc_count: int):
+        state = self._tier_states[tier_idx]
+        state.primary_write_chunk_count += chunk_alloc_count
 
     def on_promotion_allocation_failure(self) -> None:
         self._stats.increase_counter(
@@ -188,6 +195,7 @@ class TieringMetricsTracker:
     def _decrement_tier_state(self, job_metadata: _JobMetadataLike) -> None:
         transfer_job = job_metadata.transfer_job
         state = self._tier_states[job_metadata.tier_idx]
+        assert transfer_job.chunk_ids is not None
         chunk_count = len(transfer_job.chunk_ids)
         if transfer_job.is_promotion:
             assert state.active_promotion_count > 0

@@ -19,6 +19,7 @@ Key Design Principles:
    protecting chunks from eviction until complete_read() is called
 """
 
+import functools
 import time
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -64,7 +65,7 @@ class PendingPromotion:
 
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
-    chunk_ids: list[int] = field(default_factory=list)
+    chunk_ids: list[int] | None = None
 
 
 @dataclass(slots=True)
@@ -241,6 +242,9 @@ class TieringOffloadingManager(OffloadingManager):
         self._tier_index: dict[SecondaryTierManager, int] = {
             tier: i for i, tier in enumerate(self.secondary_tiers)
         }
+
+        # set of keys being promoted
+        self._promoting_keys: set[OffloadKey] = set()
 
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
@@ -464,6 +468,28 @@ class TieringOffloadingManager(OffloadingManager):
             return LookupResult.RETRY
         return LookupResult.MISS
 
+    def _promotion_allocation(
+        self,
+        tier_idx: int,
+        offload_keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> tuple[list[OffloadKey], list[int]] | None:
+        """Allocate primary tier slots for promotion"""
+        primary_write_result = self.primary_tier.prepare_write(
+            offload_keys, req_context
+        )
+
+        if primary_write_result is None:
+            # Primary tier is full; caller should treat the chunk as unavailable
+            # rather than retrying indefinitely.
+            self._metrics.on_promotion_allocation_failure()
+            return None
+
+        store_spec = primary_write_result.store_spec
+        assert isinstance(store_spec, CPULoadStoreSpec)
+        self._metrics.on_promotion_chunk_count(tier_idx, store_spec.chunk_ids)
+        return primary_write_result.keys_to_store, store_spec.chunk_ids
+
     def _initiate_promotion(
         self,
         tier_idx: int,
@@ -487,31 +513,40 @@ class TieringOffloadingManager(OffloadingManager):
             True if promotion was initiated, False if primary tier is full.
 
         """
-        # Allocate space in primary tier for promoted chunk.
-        # Must happen immediately so primary.lookup() returns None (in-flight)
-        # for this key on any subsequent lookup() call within the same step,
-        # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        if key in self._promoting_keys:
+            return True
 
-        if primary_write_result is None:
-            # Primary tier is full; caller should treat the chunk as unavailable
-            # rather than retrying indefinitely.
-            self._metrics.on_promotion_allocation_failure()
-            return False
+        is_lazy_cpu_alloc = self.secondary_tiers[
+            tier_idx
+        ].supports_lazy_promotion_allocation()
+        # Establish what keys to store and their corresponding chunk-ids
+        if is_lazy_cpu_alloc:
+            keys_to_store, chunk_ids = [key], None
+        else:
+            alloc = self._promotion_allocation(tier_idx, [key], req_context)
+            if alloc is None:
+                # Primary tier is full; caller should treat the chunk as
+                # unavailable rather than retrying indefinitely.
+                return False
+            keys_to_store, chunk_ids = alloc
 
-        store_spec = primary_write_result.store_spec
-        assert isinstance(store_spec, CPULoadStoreSpec)
         # Defer submit_load to on_schedule_end(). Group by (tier, request) so
         # each request's chunks are submitted as one batched job per tier.
         tier_pending = self._pending_load_submissions.setdefault(tier_idx, {})
         ctx_id = req_context.req_id
         if ctx_id not in tier_pending:
             tier_pending[ctx_id] = PendingPromotion(
-                keys=[], chunk_ids=[], req_context=req_context
+                keys=[],
+                chunk_ids=None if is_lazy_cpu_alloc else [],
+                req_context=req_context,
             )
         entry = tier_pending[ctx_id]
-        entry.keys.extend(primary_write_result.keys_to_store)
-        entry.chunk_ids.extend(store_spec.chunk_ids)
+        entry.keys.extend(keys_to_store)
+        if chunk_ids is not None:
+            assert entry.chunk_ids is not None
+            entry.chunk_ids.extend(chunk_ids)
+
+        self._promoting_keys.update(tuple(keys_to_store))
         return True
 
     def _flush_pending_promotions(self) -> None:
@@ -525,14 +560,27 @@ class TieringOffloadingManager(OffloadingManager):
 
         for tier_idx, pending_by_ctx in self._pending_load_submissions.items():
             tier = self.secondary_tiers[tier_idx]
+
+            is_lazy_alloc = tier.supports_lazy_promotion_allocation()
+            primary_alloc_fn = None
+            if is_lazy_alloc:
+                primary_alloc_fn = functools.partial(
+                    self._promotion_allocation, tier_idx=tier_idx
+                )
+
             for entry in pending_by_ctx.values():
                 job_id = self._next_job_id()
+                if is_lazy_alloc is None:
+                    assert entry.chunk_ids is None
                 job_metadata = TransferJob(
                     job_id=job_id,
                     keys=entry.keys,
-                    chunk_ids=np.array(entry.chunk_ids, dtype=np.int32),
+                    chunk_ids=None
+                    if is_lazy_alloc
+                    else np.array(entry.chunk_ids, dtype=np.int32),
                     is_promotion=True,
                     req_context=entry.req_context,
+                    primary_alloc_fn=primary_alloc_fn if is_lazy_alloc else None,
                 )
                 self._register_job(job_metadata, tier_idx)
                 tier.submit_load(job_metadata)
