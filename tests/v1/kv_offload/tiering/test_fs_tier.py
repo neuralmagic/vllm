@@ -34,7 +34,7 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
-from vllm.v1.kv_offload.tiering.base import TransferJob
+from vllm.v1.kv_offload.tiering.base import LazyTransferJob, TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
@@ -109,11 +109,21 @@ def make_job(
 ) -> TransferJob:
     if chunk_ids is None:
         chunk_ids = list(range(len(keys)))
+    if is_promotion:
+        chunk_ids_list = list(chunk_ids)
+        return LazyTransferJob(
+            job_id=job_id,
+            _keys=keys,
+            _chunk_ids=None,
+            is_promotion=True,
+            req_context=_CTX,
+            primary_alloc_fn=lambda k, ctx: (list(k), chunk_ids_list),
+        )
     return TransferJob(
         job_id=job_id,
-        keys=keys,
-        chunk_ids=np.array(chunk_ids, dtype=np.int64),
-        is_promotion=is_promotion,
+        _keys=keys,
+        _chunk_ids=np.array(chunk_ids, dtype=np.int64),
+        is_promotion=False,
         req_context=_CTX,
     )
 

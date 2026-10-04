@@ -331,8 +331,8 @@ class TestTieringOffloadingManager:
         self.manager._register_job(
             TransferJob(
                 job_id=job_id,
-                keys=to_keys([1, 2]),
-                chunk_ids=np.array([0, 1], dtype=np.int64),
+                _keys=to_keys([1, 2]),
+                _chunk_ids=np.array([0, 1], dtype=np.int64),
                 is_promotion=True,
                 req_context=_CTX,
             ),
@@ -358,8 +358,8 @@ class TestTieringOffloadingManager:
         self.manager._register_job(
             TransferJob(
                 job_id=job_id,
-                keys=to_keys([1]),
-                chunk_ids=np.array([0], dtype=np.int64),
+                _keys=to_keys([1]),
+                _chunk_ids=np.array([0], dtype=np.int64),
                 is_promotion=True,
                 req_context=_CTX,
             ),
