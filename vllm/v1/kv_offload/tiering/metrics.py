@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
 from vllm.v1.kv_offload.tiering.base import (
     JobResult,
+    LazyTransferJob,
     SecondaryTierManager,
     TieringOffloadingMetrics,
     TransferJob,
@@ -112,16 +113,14 @@ class TieringMetricsTracker:
     def on_job_registered(self, job_metadata: _JobMetadataLike) -> None:
         transfer_job = job_metadata.transfer_job
         state = self._tier_states[job_metadata.tier_idx]
-        chunk_count = (
-            0 if transfer_job.chunk_ids is None else len(transfer_job.chunk_ids)
-        )
         if transfer_job.is_promotion:
             state.active_promotion_count += 1
-            # promotion write chunk count is handled separately by
-            # on_promotion_chunk_count to accommodate lazy allocation.
+            # primary_write_chunk_count is handled separately by
+            # on_promotion_chunk_count during actual allocation.
         else:
+            assert not transfer_job.is_lazy()
             state.active_cascade_count += 1
-            state.primary_read_chunk_count += chunk_count
+            state.primary_read_chunk_count += len(transfer_job.chunk_ids)
 
     def on_job_finished(
         self, job_metadata: _JobMetadataLike, result: JobResult
@@ -194,8 +193,8 @@ class TieringMetricsTracker:
 
     def _decrement_tier_state(self, job_metadata: _JobMetadataLike) -> None:
         transfer_job = job_metadata.transfer_job
+        assert transfer_job.is_materialized(), "Job must be materialzed before finish"
         state = self._tier_states[job_metadata.tier_idx]
-        assert transfer_job.chunk_ids is not None
         chunk_count = len(transfer_job.chunk_ids)
         if transfer_job.is_promotion:
             assert state.active_promotion_count > 0
@@ -214,6 +213,12 @@ class TieringMetricsTracker:
         completed_job: JobResult,
     ) -> None:
         transfer_job = job_metadata.transfer_job
+        assert transfer_job.is_materialized(), "Job must materialize before finish"
+        if isinstance(transfer_job, LazyTransferJob) and not transfer_job.lazy_success:
+            # lazy allocation failed. Failure is captured by
+            # PROMOTION_ALLOCATION_FAILURES already.
+            return
+
         labelvalues = self.tier_label(job_metadata.tier_idx)
         assert transfer_job.keys is not None
         completed_key_count = len(transfer_job.keys)

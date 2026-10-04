@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
+from typing_extensions import override
 
 from vllm.v1.kv_offload.base import (
     Locality,
@@ -77,29 +78,60 @@ class TransferJob:
     """
 
     job_id: JobId
-    # keys requested to load / store
     _keys: Collection[OffloadKey]
-    chunk_ids: np.ndarray | None
+    _chunk_ids: np.ndarray
     is_promotion: bool
     req_context: ReqContext
     submit_time: float = field(default_factory=time.monotonic)
 
-    primary_alloc_fn: PrimaryAllocFn | None = None
-    # keys for which cache blocks are allocated.
-    _allocated_keys: Collection[OffloadKey] | None = None
-
-    def __post_init__(self):
-        if self.primary_alloc_fn is None:
-            assert self.chunk_ids is not None
-            assert len(self.chunk_ids) == len(self._keys)
-            self._allocated_keys = self._keys
+    @property
+    def keys(self) -> Collection[OffloadKey]:
+        return self._keys
 
     @property
-    def keys(self) -> Collection[OffloadKey] | None:
-        return self._allocated_keys
+    def chunk_ids(self) -> np.ndarray:
+        return self._chunk_ids
+
+    def is_lazy(self) -> bool:
+        return False
 
     def is_materialized(self) -> bool:
-        return self.keys is not None and self.chunk_ids is not None
+        return True
+
+
+@dataclass
+class LazyTransferJob(TransferJob):
+    # State; Was lazy allocation successful?
+    lazy_success: bool | None = None
+    # Keys / chunk_ids after allocation
+    _lazy_keys: Collection[OffloadKey] | None = None
+    _lazy_chunk_ids: np.ndarray | None = None
+    # Allocator fn
+    primary_alloc_fn: PrimaryAllocFn = field(kw_only=True)
+
+    def __post_init__(self):
+        assert self.is_promotion, (
+            "Store jobs have pre-allocated chunk_ids. It can't be lazy"
+        )
+
+    @override
+    def is_lazy(self) -> bool:
+        return True
+
+    def is_materialized(self) -> bool:
+        return self._lazy_keys is not None and self._lazy_chunk_ids is not None
+
+    @property
+    def keys(self) -> Collection[OffloadKey]:
+        assert self.is_materialized(), "Cannot access keys before materialization"
+        assert self._lazy_keys is not None
+        return self._lazy_keys
+
+    @property
+    def chunk_ids(self) -> np.ndarray:
+        assert self.is_materialized(), "Cannot access chunk_ids before materialization"
+        assert self._lazy_chunk_ids is not None
+        return self._lazy_chunk_ids
 
     def materialize(self):
         if self.is_materialized():
@@ -108,10 +140,12 @@ class TransferJob:
         alloc = self.primary_alloc_fn(self._keys, self.req_context)
         if alloc is None:
             # This is technically a transfer job with 0 keys now.
-            self._allocated_keys = []
-            self.chunk_ids = np.array()
+            self._lazy_keys = []
+            self._lazy_chunk_ids = np.array()
+            self.lazy_success = False
             return
-        self._allocated_keys, self.chunk_ids = alloc
+        self.lazy_success = True
+        self._lazy_keys, self._lazy_chunk_ids = alloc
 
 
 @dataclass

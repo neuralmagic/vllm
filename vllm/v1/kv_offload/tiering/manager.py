@@ -51,6 +51,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobResult,
+    LazyTransferJob,
     ParentManager,
     SecondaryTierManager,
     TransferJob,
@@ -66,7 +67,7 @@ class PendingPromotion:
 
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
-    chunk_ids: list[int] | None = None
+    chunk_ids: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -375,6 +376,9 @@ class TieringOffloadingManager(OffloadingManager):
         # Update promoting_keys
         self._promoting_keys.difference_update(transfer_job._keys)
 
+        if isinstance(transfer_job, LazyTransferJob) and not transfer_job.lazy_success:
+            return
+
         successful_keys = completed_job.successful_keys
         failed_keys: Collection[OffloadKey]
         if completed_job.success:
@@ -625,7 +629,8 @@ class TieringOffloadingManager(OffloadingManager):
         ].supports_lazy_promotion_allocation()
         # Establish what keys to store and their corresponding chunk-ids
         if is_lazy_cpu_alloc:
-            keys_to_store, chunk_ids = [key], None
+            keys_to_store = [key]
+            chunk_ids: list[int] = []
         else:
             alloc = self._promotion_allocation(tier_idx, [key], req_context)
             if alloc is None:
@@ -641,15 +646,12 @@ class TieringOffloadingManager(OffloadingManager):
         if ctx_id not in tier_pending:
             tier_pending[ctx_id] = PendingPromotion(
                 keys=[],
-                chunk_ids=None if is_lazy_cpu_alloc else [],
+                chunk_ids=[],
                 req_context=req_context,
             )
         entry = tier_pending[ctx_id]
         entry.keys.extend(keys_to_store)
-        if chunk_ids is not None:
-            assert entry.chunk_ids is not None
-            entry.chunk_ids.extend(chunk_ids)
-
+        entry.chunk_ids.extend(chunk_ids)
         self._promoting_keys.update(tuple(keys_to_store))
         return True
 
@@ -664,28 +666,29 @@ class TieringOffloadingManager(OffloadingManager):
 
         for tier_idx, pending_by_ctx in self._pending_load_submissions.items():
             tier = self.secondary_tiers[tier_idx]
-
             is_lazy_alloc = tier.supports_lazy_promotion_allocation()
-            primary_alloc_fn = None
-            if is_lazy_alloc:
-                primary_alloc_fn = functools.partial(
-                    self._promotion_allocation, tier_idx=tier_idx
-                )
-
             for entry in pending_by_ctx.values():
                 job_id = self._next_job_id()
                 if is_lazy_alloc:
-                    assert entry.chunk_ids is None
-                job_metadata = TransferJob(
-                    job_id=job_id,
-                    _keys=entry.keys,
-                    chunk_ids=None
-                    if is_lazy_alloc
-                    else np.array(entry.chunk_ids, dtype=np.int32),
-                    is_promotion=True,
-                    req_context=entry.req_context,
-                    primary_alloc_fn=primary_alloc_fn if is_lazy_alloc else None,
-                )
+                    assert len(entry.chunk_ids) == 0
+                    job_metadata: TransferJob = LazyTransferJob(
+                        job_id=job_id,
+                        _keys=entry.keys,
+                        _chunk_ids=None,  # lazy alloc
+                        is_promotion=True,
+                        req_context=entry.req_context,
+                        primary_alloc_fn=functools.partial(
+                            self._promotion_allocation, tier_idx=tier_idx
+                        ),
+                    )
+                else:
+                    job_metadata = TransferJob(
+                        job_id=job_id,
+                        _keys=entry.keys,
+                        _chunk_ids=np.array(entry.chunk_ids, dtype=np.int32),
+                        is_promotion=True,
+                        req_context=entry.req_context,
+                    )
                 self._register_job(job_metadata, tier_idx)
                 tier.submit_load(job_metadata)
 
@@ -927,7 +930,7 @@ class TieringOffloadingManager(OffloadingManager):
         job_metadata = TransferJob(
             job_id=job_id,
             _keys=keys,
-            chunk_ids=primary_chunks_spec.chunk_ids,
+            _chunk_ids=primary_chunks_spec.chunk_ids,
             is_promotion=False,
             req_context=req_context,
         )
@@ -1022,6 +1025,10 @@ class TieringOffloadingManager(OffloadingManager):
         # lookup() calls within it skip redundant _process_finished_jobs().
         self._processed_jobs_this_step = False
 
+        # Reset any lingering lookup state
+        self.primary_tier.clear_scheduler_hit_keys()
+        self._current_lookup_req_id = None
+
         self._flush_pending_promotions()
         self._flush_pending_cascades()
         for tier in self.secondary_tiers:
@@ -1096,6 +1103,9 @@ class TieringOffloadingManager(OffloadingManager):
             finished_req_ids.append(req_id)
 
         self.primary_tier.reset_cache()
+        # Reset any lookup state
+        self.primary_tier.clear_scheduler_hit_keys()
+        self._current_lookup_req_id = None
 
         for req_id in finished_req_ids:
             del self._req_state[req_id]
