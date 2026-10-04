@@ -19,11 +19,15 @@ def can_use_dsv4_topk(
     renormalize: bool,
     indices_dtype: torch.dtype,
 ) -> bool:
+    # The Triton kernel masks experts beyond ``NUM_EXPERTS`` via ``BLOCK_N``,
+    # so it handles arbitrary expert counts (e.g. the non-uniform per-layer
+    # counts in REAP-pruned DeepSeek V4 checkpoints), not just 256/384. It only
+    # requires at least ``_TOPK`` experts to select from.
     return (
         current_platform.is_cuda()
         and gating_output.dtype == torch.float32
         and gating_output.ndim == 2
-        and gating_output.shape[1] in (256, 384)
+        and gating_output.shape[1] >= _TOPK
         and gating_output.is_contiguous()
         and correction_bias is not None
         and correction_bias.dtype == torch.float32
