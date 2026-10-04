@@ -269,7 +269,12 @@ class CompressedTensorsConfig(QuantizationConfig):
         expert_counts_per_layer = None
         layer_overrides = config.get("layer_overrides")
         if layer_overrides:
-            expert_counts_per_layer = layer_overrides.get("num_experts")
+            # Checkpoints differ on the key name for the per-layer expert count:
+            # DeepSeek V4 uses ``n_routed_experts`` while others use
+            # ``num_experts``. Accept either.
+            expert_counts_per_layer = layer_overrides.get(
+                "n_routed_experts"
+            ) or layer_overrides.get("num_experts")
 
         return cls(
             target_scheme_map=target_scheme_map,

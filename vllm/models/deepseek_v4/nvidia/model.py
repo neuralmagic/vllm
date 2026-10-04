@@ -823,6 +823,14 @@ class DeepseekV4MoE(nn.Module):
         self.n_routed_experts = (
             config.n_routed_experts if n_routed_experts is None else n_routed_experts
         )
+        # Mixed MoE sparsity: the quantization config may override the expert
+        # count for this layer. The model config's n_routed_experts is the
+        # maximum across all layers, while this layer's gate and expert weights
+        # are sized to the actual per-layer count.
+        if quant_config is not None:
+            layer_num_experts = quant_config.get_num_experts_for_layer(prefix)
+            if layer_num_experts is not None:
+                self.n_routed_experts = layer_num_experts
         self.n_activated_experts = (
             config.num_experts_per_tok
             if n_activated_experts is None
