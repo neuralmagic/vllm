@@ -123,6 +123,10 @@ def test_tiering_metrics_tracker_records_finished_job_metrics():
     ]
     for job in jobs:
         tracker.on_job_registered(job)
+        if job.transfer_job.is_promotion:
+            tracker.on_promotion_chunk_count(
+                job.tier_idx, len(job.transfer_job.chunk_ids)
+            )
 
     tracker.on_job_finished(
         jobs[0], JobResult(job_id=0, success=True, transfer_time=0.5)
@@ -158,6 +162,7 @@ def test_tiering_metrics_tracker_records_partial_promotion_success_bytes():
         0,
     )
     tracker.on_job_registered(job)
+    tracker.on_promotion_chunk_count(job.tier_idx, len(job.transfer_job.chunk_ids))
 
     tracker.on_job_finished(
         job,
@@ -195,6 +200,9 @@ def test_tiering_metrics_tracker_reports_active_job_and_primary_usage_gauges():
     )
     tracker.on_job_registered(fs_job)
     tracker.on_job_registered(p2p_job)
+    tracker.on_promotion_chunk_count(
+        p2p_job.tier_idx, len(p2p_job.transfer_job.chunk_ids)
+    )
 
     stats = tracker.take_stats()
     assert stats is not None
