@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import numpy as np
 from typing_extensions import override
@@ -93,13 +93,14 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     accessing primary. This avoids confusion when reading TieringOffloadingManager
     code (e.g. calling prepare_load inside a cascade/store path would be misleading).
 
-    All methods that touch the manager's OffloadKey cache is protected by a lock.
-    This lock protects the cache from a potential parallel access from FS tier
-    threads that can do lazy cache allocation.
+    Thread-safety is handled externally by wrapping this object in a
+    _LockedPrimaryTier proxy when secondary tiers with background worker threads
+    are present (supports_lazy_promotion_allocation() == True). This class itself
+    is single-threaded.
 
     _scheduler_hit_keys holds keys whose lookup() returned HIT this step.
     They are excluded from eviction candidates until GPU prepare_load() pins them.
-    This is to protect the keys from inadverdant evicts by a lazy cache allocating
+    This is to protect the keys from inadvertent evicts by a lazy cache allocating
     FS tier.
     """
 
@@ -127,10 +128,6 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
 
-        # Serialises all LRU-touching operations so FS worker threads can call
-        # prepare_store (via primary_alloc_fn) concurrently with the scheduler.
-        self._lock = threading.Lock()
-
         # Keys whose lookup() returned HIT this step. Excluded from eviction
         # until prepare_load() pins them. Cleared when the scheduler moves to
         # a new request (see clear_scheduler_hit_keys()).
@@ -138,48 +135,10 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        with self._lock:
-            result = super().lookup(key, req_context)
+        result = super().lookup(key, req_context)
         if result is LookupResult.HIT:
             self._scheduler_hit_keys.add(key)
         return result
-
-    @override
-    def prepare_store(
-        self,
-        keys: Collection[OffloadKey],
-        req_context: ReqContext,
-    ) -> PrepareStoreOutput | None:
-        with self._lock:
-            return super().prepare_store(keys, req_context)
-
-    @override
-    def complete_store(
-        self,
-        keys: Collection[OffloadKey],
-        req_context: ReqContext,
-        success: bool = True,
-    ) -> None:
-        with self._lock:
-            return super().complete_store(keys, req_context, success)
-
-    @override
-    def prepare_load(
-        self,
-        keys: Collection[OffloadKey],
-        req_context: ReqContext,
-    ) -> LoadStoreSpec:
-        with self._lock:
-            return super().prepare_load(keys, req_context)
-
-    @override
-    def complete_load(
-        self,
-        keys: Collection[OffloadKey],
-        req_context: ReqContext,
-    ) -> None:
-        with self._lock:
-            return super().complete_load(keys, req_context)
 
     def prepare_read(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -189,8 +148,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         Cascade reads are implementation details of tiering, not additional
         request accesses, so they must not alter request-scoped recency.
         """
-        with self._lock:
-            return self._prepare_load(keys, req_context, record_access=False)
+        return self._prepare_load(keys, req_context, record_access=False)
 
     @override
     def _extra_eviction_protected(self) -> set[OffloadKey]:
@@ -258,6 +216,32 @@ class _SecondaryTierFacingParent(ParentManager):
         )
 
 
+class _LockedPrimaryTier:
+    __slots__ = ("_primary_tier", "_lock")
+
+    def __init__(self, obj: CPUPrimaryTierOffloadingManager) -> None:
+        self._primary_tier = obj
+        self._lock = threading.Lock()
+
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        # lookup is called much more frequently than other members of
+        # primary tier. Special casing it avoids __getattr__ / functools mechanics.
+        with self._lock:
+            return self._primary_tier.lookup(key, req_context)
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._primary_tier, name)
+        if callable(attr):
+
+            @functools.wraps(attr)
+            def locked(*args, **kwargs):
+                with self._lock:
+                    return attr(*args, **kwargs)
+
+            return locked
+        return attr
+
+
 class TieringOffloadingManager(OffloadingManager):
     """Orchestrates multi-tier KV cache offloading.
 
@@ -286,8 +270,20 @@ class TieringOffloadingManager(OffloadingManager):
                             Network). Can be None or empty list.
 
         """
-        self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+
+        # Wrap primary_tier in a locking proxy only when background worker
+        # threads are present (lazy-allocation secondary tiers). Otherwise use
+        # the raw object — no lock overhead for single-threaded configs.
+        if any(
+            tier.supports_lazy_promotion_allocation() for tier in self.secondary_tiers
+        ):
+            self.primary_tier: CPUPrimaryTierOffloadingManager = cast(
+                CPUPrimaryTierOffloadingManager,
+                _LockedPrimaryTier(primary_tier),
+            )
+        else:
+            self.primary_tier = primary_tier
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
