@@ -229,6 +229,11 @@ class _LockedPrimaryTier:
         with self._lock:
             return self._primary_tier.lookup(key, req_context)
 
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        # take_events() is a generator in the base class. Can't naively lock it.
+        with self._lock:
+            return list(self._primary_tier.take_events())
+
     def __getattr__(self, name: str):
         attr = getattr(self._primary_tier, name)
         if callable(attr):
@@ -361,8 +366,6 @@ class TieringOffloadingManager(OffloadingManager):
         self, job_metadata: JobMetadata, completed_job: JobResult
     ) -> None:
         transfer_job = job_metadata.transfer_job
-        assert transfer_job.keys is not None
-        assert transfer_job.chunk_ids is not None
 
         # Update promoting_keys
         self._promoting_keys.difference_update(transfer_job._keys)
@@ -432,7 +435,6 @@ class TieringOffloadingManager(OffloadingManager):
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary chunks.
-                    assert transfer_job.keys is not None
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
@@ -458,7 +460,6 @@ class TieringOffloadingManager(OffloadingManager):
             return
         was_under_pressure = detector.is_under_pressure()
         tj = job_metadata.transfer_job
-        assert tj.keys is not None
         num_bytes = (
             completed_job.transfer_bytes
             if completed_job.transfer_bytes is not None

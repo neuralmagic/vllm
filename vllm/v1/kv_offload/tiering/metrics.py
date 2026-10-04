@@ -118,7 +118,7 @@ class TieringMetricsTracker:
             # primary_write_chunk_count is handled separately by
             # on_promotion_chunk_count during actual allocation.
         else:
-            assert not transfer_job.is_lazy()
+            assert not isinstance(transfer_job, LazyTransferJob)
             state.active_cascade_count += 1
             state.primary_read_chunk_count += len(transfer_job.chunk_ids)
 

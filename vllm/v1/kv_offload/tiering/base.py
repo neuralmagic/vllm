@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
-from typing_extensions import override
 
 from vllm.v1.kv_offload.base import (
     Locality,
@@ -92,9 +91,6 @@ class TransferJob:
     def chunk_ids(self) -> np.ndarray:
         return self._chunk_ids
 
-    def is_lazy(self) -> bool:
-        return False
-
     def is_materialized(self) -> bool:
         return True
 
@@ -113,10 +109,6 @@ class LazyTransferJob(TransferJob):
         assert self.is_promotion, (
             "Store jobs have pre-allocated chunk_ids. It can't be lazy"
         )
-
-    @override
-    def is_lazy(self) -> bool:
-        return True
 
     def is_materialized(self) -> bool:
         return self._lazy_keys is not None and self._lazy_chunk_ids is not None
