@@ -1070,6 +1070,15 @@ class TieringOffloadingManager(OffloadingManager):
         # Deferred promotion submissions reserve primary slots that the
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
+        # TODO (varun) : FIX THIS ! Maybe it is better to group counts + chunks
+        # For non-lazy promotions, _promotion_allocation already called
+        # on_promotion_chunk_count; undo that accounting before clearing.
+        for tier_idx, pending_by_ctx in self._pending_load_submissions.items():
+            for entry in pending_by_ctx.values():
+                if entry.chunk_ids:
+                    self._metrics.on_promotion_chunk_count(
+                        tier_idx, -len(entry.chunk_ids)
+                    )
         self._pending_load_submissions.clear()
         self._metrics.assert_idle()
 
