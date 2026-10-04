@@ -328,16 +328,16 @@ class TestTieringOffloadingManager:
         self._start_request()
         # Register an in-flight promotion job for tier1 by hand.
         job_id = self.manager._next_job_id()
-        self.manager._register_job(
-            TransferJob(
-                job_id=job_id,
-                _keys=to_keys([1, 2]),
-                _chunk_ids=np.array([0, 1], dtype=np.int64),
-                is_promotion=True,
-                req_context=_CTX,
-            ),
-            0,
+        transfer_job = TransferJob(
+            job_id=job_id,
+            _keys=to_keys([1, 2]),
+            _chunk_ids=np.array([0, 1], dtype=np.int64),
+            is_promotion=True,
+            req_context=_CTX,
         )
+        self.manager._register_job(transfer_job, 0)
+        self.manager._metrics.on_promotion_chunk_count(0, 2)
+
         failed = JobResult(job_id=job_id, success=False)
         with (
             patch.object(
@@ -355,16 +355,16 @@ class TestTieringOffloadingManager:
 
         self._start_request()
         job_id = self.manager._next_job_id()
-        self.manager._register_job(
-            TransferJob(
-                job_id=job_id,
-                _keys=to_keys([1]),
-                _chunk_ids=np.array([0], dtype=np.int64),
-                is_promotion=True,
-                req_context=_CTX,
-            ),
-            0,
+        transfer_job = TransferJob(
+            job_id=job_id,
+            _keys=to_keys([1]),
+            _chunk_ids=np.array([0], dtype=np.int64),
+            is_promotion=True,
+            req_context=_CTX,
         )
+        self.manager._register_job(transfer_job, 0)
+        self.manager._metrics.on_promotion_chunk_count(0, 1)
+
         ok = JobResult(job_id=job_id, success=True)
         with (
             patch.object(self.secondary_tier1, "get_finished_jobs", return_value=[ok]),
