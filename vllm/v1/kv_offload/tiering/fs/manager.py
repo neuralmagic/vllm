@@ -44,6 +44,7 @@ from vllm.v1.kv_offload.tiering.backpressure import BackpressureDetector
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
     JobResult,
+    LazyTransferJob,
     RequestOffloadingContext,
     ScheduleEndContext,
     SecondaryTierManager,
@@ -225,12 +226,9 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
-        assert job_metadata.keys is not None
-        assert job_metadata.chunk_ids is not None
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
-        assert job_metadata.chunk_ids is not None
         task = functools.partial(
             batch_store_block,
             [self.file_mapper.get_file_name(key) for key in keys],
@@ -244,11 +242,9 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
+        assert isinstance(job_metadata, LazyTransferJob)
         assert not job_metadata.is_materialized(), (
             "FS tier should allocate CPU cache lazily"
-        )
-        assert job_metadata.primary_alloc_fn is not None, (
-            "primary_alloc_fn required for lazy allocation"
         )
         job_id = job_metadata.job_id
 

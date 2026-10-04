@@ -106,8 +106,8 @@ class LazyTransferJob(TransferJob):
     primary_alloc_fn: PrimaryAllocFn = field(kw_only=True)
 
     def __post_init__(self):
-        assert self.is_promotion, (
-            "Store jobs have pre-allocated chunk_ids. It can't be lazy"
+        assert self.is_promotion is not None, (
+            "Lazy allocation jobs need an allocation function"
         )
 
     def is_materialized(self) -> bool:
