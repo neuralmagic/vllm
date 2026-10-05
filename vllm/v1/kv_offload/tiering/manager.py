@@ -661,11 +661,11 @@ class TieringOffloadingManager(OffloadingManager):
                     job_metadata: TransferJob = LazyTransferJob(
                         job_id=job_id,
                         _keys=entry.keys,
-                        _chunk_ids=None,  # lazy alloc
+                        _chunk_ids=np.array([]),  # lazy alloc
                         is_promotion=True,
                         req_context=entry.req_context,
                         primary_alloc_fn=functools.partial(
-                            self._promotion_allocation, tier_idx=tier_idx
+                            self._promotion_allocation, tier_idx
                         ),
                     )
                 else:
@@ -1068,6 +1068,12 @@ class TieringOffloadingManager(OffloadingManager):
         # so manager bookkeeping is consistent before the primary reset.
         self._process_finished_jobs()
         assert not self._jobs
+
+        # _promoting_keys are updated as soon as promotions are initiated.
+        # Work in _pending_load_submissions are never submitted (cleared below).
+        for _, pending_by_ctx in self._pending_load_submissions.items():
+            for entry in pending_by_ctx.values():
+                self._promoting_keys.difference_update(entry.keys)
 
         # Deferred promotion submissions reserve primary slots that the
         # reset below invalidates; their submit_load() has not yet been

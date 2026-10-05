@@ -251,6 +251,7 @@ class FileSystemTierManager(SecondaryTierManager):
         def load_task() -> None:
             # Allocate CPU cache blocks
             job_metadata.materialize()
+            assert job_metadata.is_materialized()
             assert job_metadata.keys is not None
             assert job_metadata.chunk_ids is not None
             # Track this load's keys so a failed promotion can mark only its failed

@@ -133,7 +133,7 @@ class LazyTransferJob(TransferJob):
         if alloc is None:
             # This is technically a transfer job with 0 keys now.
             self._lazy_keys = []
-            self._lazy_chunk_ids = np.array()
+            self._lazy_chunk_ids = np.array([])
             self.lazy_success = False
             return
         self.lazy_success = True
