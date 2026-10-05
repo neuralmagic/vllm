@@ -115,8 +115,12 @@ class TieringMetricsTracker:
         state = self._tier_states[job_metadata.tier_idx]
         if transfer_job.is_promotion:
             state.active_promotion_count += 1
-            # primary_write_chunk_count is handled separately by
-            # on_promotion_chunk_count during actual allocation.
+            if transfer_job.is_materialized():
+                # Handle only eager allocation here. LazyTransferJob updates
+                # chunk count during allocation.
+                self.on_promotion_chunk_count(
+                    job_metadata.tier_idx, len(transfer_job.chunk_ids)
+                )
         else:
             assert not isinstance(transfer_job, LazyTransferJob)
             state.active_cascade_count += 1

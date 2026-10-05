@@ -580,7 +580,9 @@ class TieringOffloadingManager(OffloadingManager):
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
-        self._metrics.on_promotion_chunk_count(tier_idx, len(store_spec.chunk_ids))
+
+        if self.secondary_tiers[tier_idx].supports_lazy_promotion_allocation():
+            self._metrics.on_promotion_chunk_count(tier_idx, len(store_spec.chunk_ids))
         return primary_write_result.keys_to_store, store_spec.chunk_ids
 
     def _initiate_promotion(
@@ -1070,15 +1072,6 @@ class TieringOffloadingManager(OffloadingManager):
         # Deferred promotion submissions reserve primary slots that the
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
-        # TODO (varun) : FIX THIS ! Maybe it is better to group counts + chunks
-        # For non-lazy promotions, _promotion_allocation already called
-        # on_promotion_chunk_count; undo that accounting before clearing.
-        for tier_idx, pending_by_ctx in self._pending_load_submissions.items():
-            for entry in pending_by_ctx.values():
-                if entry.chunk_ids:
-                    self._metrics.on_promotion_chunk_count(
-                        tier_idx, -len(entry.chunk_ids)
-                    )
         self._pending_load_submissions.clear()
         self._metrics.assert_idle()
 
