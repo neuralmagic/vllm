@@ -124,6 +124,13 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self._scheduler_hit_keys: set[OffloadKey] = set()
         self._current_lookup_req_id: str | None = None
 
+        # Keys that complete_store() has marked ready but whose cascade
+        # prepare_read() calls have not yet incremented ref_cnt. Excluded
+        # from eviction to close the TOCTOU window between complete_store()
+        # releasing the primary-tier lock and create_store_job() re-acquiring
+        # it via prepare_read(). Managed exclusively on the scheduler thread.
+        self._cascade_store_protected_keys: set[OffloadKey] = set()
+
     def _clear_scheduler_hit_keys(self) -> None:
         """Clear the per-step TOCTOU protection set and reset request tracking."""
         self._scheduler_hit_keys.clear()
@@ -143,11 +150,14 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     def _extra_eviction_protected(self) -> set[OffloadKey]:
         """Keys to exclude from eviction beyond the normal input-key set.
 
-        Returns _scheduler_hit_keys so lookup() HITs are not evicted before
-        prepare_load() pins them via ref_cnt (TOCTOU protection).
+        Returns the union of:
+        - _scheduler_hit_keys: lookup() HITs not yet pinned by prepare_load().
+        - _cascade_store_protected_keys: keys marked ready by complete_store()
+          but not yet pinned by cascade prepare_read() calls.
+        Both sets guard TOCTOU windows on the scheduler thread.
         Called inside _lock via prepare_store/prepare_write.
         """
-        return self._scheduler_hit_keys
+        return self._scheduler_hit_keys | self._cascade_store_protected_keys
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
@@ -873,8 +883,22 @@ class TieringOffloadingManager(OffloadingManager):
             req_context: Per-request context forwarded to primary.prepare_read().
 
         """
+        keys = list(keys)
+        primary = self.primary_tier
+        # Guard: only CPUPrimaryTierOffloadingManager carries the protection set.
+        cpu_primary = (
+            primary._primary_tier
+            if isinstance(primary, _LockedPrimaryTier)
+            else primary
+            if isinstance(primary, CPUPrimaryTierOffloadingManager)
+            else None
+        )
+
+        if success and cpu_primary is not None:
+            cpu_primary._cascade_store_protected_keys.update(keys)
+
         # Step 1: Complete store in primary tier (makes chunks loadable)
-        self.primary_tier.complete_store(keys, req_context, success)
+        primary.complete_store(keys, req_context, success)
 
         if success:
             # Step 2: Cascade to ALL secondary tiers
@@ -887,6 +911,9 @@ class TieringOffloadingManager(OffloadingManager):
                     continue
                 job_metadata = self.create_store_job(keys, req_context, tier_idx)
                 tier.submit_store(job_metadata)
+
+            if cpu_primary is not None:
+                cpu_primary._cascade_store_protected_keys.difference_update(keys)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
