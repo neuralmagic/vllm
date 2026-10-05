@@ -1866,6 +1866,107 @@ class TestTieringOffloadingManagerWithFsTier:
         manager._metrics.assert_idle()
 
 
+class TestPromotionAllocation:
+    """Unit tests for TieringOffloadingManager._promotion_allocation."""
+
+    def _make_manager(self, num_chunks: int, secondary_tiers):
+        mmap = _mock_mmap_region(num_chunks)
+        primary = CPUPrimaryTierOffloadingManager(
+            num_chunks=num_chunks, mmap_region=mmap
+        )
+        return TieringOffloadingManager(
+            primary_tier=primary, secondary_tiers=secondary_tiers
+        ), mmap
+
+    def _make_eager_tier(self, mmap):
+        return ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mmap.create_kv_memoryview(),
+            tier_type="example",
+        )
+
+    def test_returns_none_and_fires_failure_metric_when_primary_full(self):
+        """When prepare_write returns None (primary full), _promotion_allocation
+        returns None and increments the allocation-failure counter."""
+        num_chunks = 1
+        manager, mmap = self._make_manager(
+            num_chunks, [self._make_eager_tier(_mock_mmap_region(num_chunks))]
+        )
+        req_ctx = ReqContext(req_id="req")
+        key = to_keys([1])[0]
+
+        # Fill the single primary chunk so prepare_write returns None
+        out = manager.primary_tier.prepare_store([key], req_ctx)
+        assert out is not None
+
+        failure_key = TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES
+        assert manager._metrics._stats._values.get(failure_key, {}).get((), 0) == 0
+
+        # Trigger a failure
+        result = manager._promotion_allocation(0, to_keys([2]), req_ctx)
+        assert result is None
+        assert manager._metrics._stats._values.get(failure_key, {}).get((), 0) == 1
+
+        # Release blocks by completing the store
+        manager.primary_tier.complete_store([key], req_ctx, success=True)
+
+    def test_eager_tier_returns_allocation_without_chunk_count_metric(self):
+        """For an eager tier, _promotion_allocation returns (keys, chunk_ids)
+        and does NOT call on_promotion_chunk_count."""
+        num_chunks = 4
+        manager, mmap = self._make_manager(
+            num_chunks, [self._make_eager_tier(_mock_mmap_region(num_chunks))]
+        )
+        req_ctx = ReqContext(req_id="req")
+        key = to_keys([1])[0]
+
+        tier_state = manager._metrics._tier_states[0]
+        assert tier_state.primary_write_chunk_count == 0
+
+        result = manager._promotion_allocation(0, [key], req_ctx)
+
+        assert result is not None
+        keys_out, chunk_ids_out = result
+        assert key in keys_out
+        assert len(chunk_ids_out) > 0
+        # Eager tier must NOT increment primary_write_chunk_count; This happens
+        # in job registration.
+        assert tier_state.primary_write_chunk_count == 0
+
+    def test_lazy_tier_returns_allocation_and_fires_chunk_count_metric(
+        self, fs_manager_setup
+    ):
+        """For a lazy (FS) tier, _promotion_allocation returns (keys, chunk_ids)
+        and calls on_promotion_chunk_count with the allocated chunk count.
+
+        on_promotion_chunk_count is patched so the metric side-effect does not
+        dirty the manager state that reset_cache() asserts on teardown.
+        """
+        manager, _, _ = fs_manager_setup
+        req_ctx = ReqContext(req_id="req")
+        key = to_keys([1])[0]
+
+        calls = []
+
+        def capturing_chunk_count(tier_idx, chunk_alloc_count):
+            calls.append((tier_idx, chunk_alloc_count))
+
+        with patch.object(
+            manager._metrics,
+            "on_promotion_chunk_count",
+            side_effect=capturing_chunk_count,
+        ):
+            result = manager._promotion_allocation(0, [key], req_ctx)
+
+        assert result is not None
+        keys_out, chunk_ids_out = result
+        assert key in keys_out
+        assert len(chunk_ids_out) > 0
+        # Lazy tier MUST call on_promotion_chunk_count once with the right args
+        assert len(calls) == 1
+        assert calls[0] == (0, len(chunk_ids_out))
+
+
 class TestLockedPrimaryTier:
     """Tests for the _LockedPrimaryTier threading proxy."""
 
