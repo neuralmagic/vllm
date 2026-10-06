@@ -46,7 +46,11 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.manager import (
+    REQUEST_FINALIZED,
+    CPUOffloadingManager,
+    _RequestFinalized,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.tiering.base import (
     JobId,
@@ -178,6 +182,30 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         request accesses, so they must not alter request-scoped recency.
         """
         return self._prepare_load(keys, req_context, record_access=False)
+
+    def safe_prepare_write(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> "PrepareStoreOutput | None | _RequestFinalized":
+        """prepare_write that gracefully handles a finalized request.
+
+        Called from _promotion_allocation, which runs on an FS worker thread
+        through _LockedPrimaryTier. The lock ensures this check-then-call is
+        atomic with on_request_finished (which sets state.finished = True under
+        the same lock).
+
+        Returns:
+            PrepareStoreOutput  — allocation succeeded.
+            None                — allocation failed (primary tier full).
+            REQUEST_FINALIZED   — request already finalized; skip silently,
+                                  do not record a promotion failure metric.
+
+        """
+        state = self._get_request_cache_access(req_context)
+        if state.finished:
+            return REQUEST_FINALIZED
+        return self.prepare_write(keys, req_context)
 
     def get_kv_memoryview(self) -> memoryview:
         """Return the memoryview over the primary tier's KV cache buffer.
@@ -578,10 +606,14 @@ class TieringOffloadingManager(OffloadingManager):
         req_context: ReqContext,
     ) -> tuple[list[OffloadKey], list[int]] | None:
         """Allocate primary tier slots for promotion"""
-        primary_write_result = self.primary_tier.prepare_write(
+        primary_write_result = self.primary_tier.safe_prepare_write(
             offload_keys, req_context
         )
 
+        if isinstance(primary_write_result, _RequestFinalized):
+            # Request finished before the promotion could allocate; skip
+            # silently — this is not an allocation failure.
+            return None
         if primary_write_result is None:
             # Primary tier is full; caller should treat the chunk as unavailable
             # rather than retrying indefinitely.
