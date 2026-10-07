@@ -369,6 +369,7 @@ class TieringOffloadingManager(OffloadingManager):
 
         # set of keys being promoted
         self._promoting_keys: set[OffloadKey] = set()
+        self._promotion_failed_requests: set[str] = set()
 
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
@@ -409,6 +410,8 @@ class TieringOffloadingManager(OffloadingManager):
         self._promoting_keys.difference_update(transfer_job._keys)
 
         if isinstance(transfer_job, LazyTransferJob) and not transfer_job.lazy_success:
+            # promotion failed. lets not doom the request to retry cycle.
+            self._promotion_failed_requests.add(transfer_job.req_context.req_id)
             return
 
         successful_keys = completed_job.successful_keys
@@ -650,6 +653,9 @@ class TieringOffloadingManager(OffloadingManager):
             True if promotion was initiated, False if primary tier is full.
 
         """
+        if req_context.req_id in self._promotion_failed_requests:
+            return False
+
         if key in self._promoting_keys:
             return True
 
@@ -1050,6 +1056,7 @@ class TieringOffloadingManager(OffloadingManager):
             tier.on_request_finished(state.req_context)
         self._metrics.on_request_finished(state.req_context)
         del self._req_state[req_id]
+        self._promotion_failed_requests.discard(req_id)
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
