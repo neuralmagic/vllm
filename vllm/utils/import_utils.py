@@ -441,7 +441,16 @@ def has_deep_ep() -> bool:
     return _has_module("deep_ep")
 
 
-DEEPEP_V2_MIN_NCCL_VERSION_RAW = 23004  # 2.30.4
+def has_deep_ep_v1() -> bool:
+    """Whether deep_ep with the legacy Buffer API is available."""
+    if not _has_module("deep_ep"):
+        return False
+    import deep_ep  # type: ignore[import-not-found]
+
+    return hasattr(deep_ep, "Buffer")
+
+
+DEEPEP_V2_MIN_NCCL_VERSION_RAW = 23203  # 2.32.3
 
 
 def _get_runtime_nccl_version() -> int | None:
@@ -470,18 +479,18 @@ def _format_nccl_raw_version(raw: int) -> str:
 
 
 def deep_ep_v2_unavailable_reason() -> str | None:
-    """Why the deep_ep v2 (ElasticBuffer) API cannot be used, or None if it can.
+    """Why the DeepEP v2 EPBuffer API cannot be used, or None if it can.
 
-    Requires both the ElasticBuffer class in the deep_ep module and
-    NCCL >= 2.30.4 (GIN backend), checked against the runtime library.
+    Requires both the EPBuffer class in the deep_ep module and
+    NCCL >= 2.32.3 (GIN backend), checked against the runtime library.
     """
     install_doc = "See tools/ep_kernels/README.md."
     if not _has_module("deep_ep"):
         return f"DeepEP is not installed. {install_doc}"
     import deep_ep  # type: ignore[import-not-found]
 
-    if not hasattr(deep_ep, "ElasticBuffer"):
-        return f"The installed DeepEP predates v2 (no ElasticBuffer). {install_doc}"
+    if not hasattr(deep_ep, "EPBuffer"):
+        return f"The installed DeepEP predates v2.5 (no EPBuffer). {install_doc}"
     nccl_ver = _get_runtime_nccl_version()
     if nccl_ver is None or nccl_ver < DEEPEP_V2_MIN_NCCL_VERSION_RAW:
         import torch
@@ -499,7 +508,7 @@ def deep_ep_v2_unavailable_reason() -> str | None:
 
 
 def has_deep_ep_v2() -> bool:
-    """Whether deep_ep with ElasticBuffer (v2 API) is available."""
+    """Whether deep_ep with EPBuffer (v2 API) is available."""
     try:
         reason = deep_ep_v2_unavailable_reason()
     except Exception:

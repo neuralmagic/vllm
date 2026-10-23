@@ -28,7 +28,7 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
-from vllm.utils.import_utils import has_deep_ep, has_deep_gemm
+from vllm.utils.import_utils import has_deep_ep_v1, has_deep_gemm
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -37,7 +37,7 @@ from ...utils import multi_gpu_test
 from .parallel_utils import ProcessGroupInfo, parallel_launch
 from .utils import make_dummy_moe_config, make_test_weights
 
-if has_deep_ep():
+if has_deep_ep_v1():
     from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
         DeepEPHTPrepareAndFinalize,
     )
@@ -56,7 +56,7 @@ if has_deep_gemm():
     )
 
 requires_deep_ep = pytest.mark.skipif(
-    not has_deep_ep(),
+    not has_deep_ep_v1(),
     reason="Requires deep_ep kernels",
 )
 

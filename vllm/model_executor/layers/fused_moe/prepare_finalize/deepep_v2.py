@@ -68,7 +68,7 @@ def _unpack_mxfp8_scale(
 
 
 class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
-    """Prepare/Finalize using DeepEP v2 ElasticBuffer (unified API).
+    """Prepare/Finalize using the DeepEP v2 EPBuffer API.
 
     Supports two modes controlled by the `use_cudagraph` constructor arg:
 
@@ -106,7 +106,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def __init__(
         self,
-        buffer: deep_ep.ElasticBuffer,
+        buffer: deep_ep.EPBuffer,
         num_dispatchers: int,
         dp_size: int,
         rank_expert_offset: int,
@@ -224,6 +224,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             num_experts=num_experts,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             do_expand=do_expand,
+            do_zero_padding=do_expand,
             do_cpu_sync=do_cpu_sync,
             async_with_compute_stream=False,
         )

@@ -238,7 +238,7 @@ requires_ptrace = pytest.mark.skipif(
 )
 requires_deep_ep_v2 = pytest.mark.skipif(
     not has_deep_ep_v2(),
-    reason="DeepEP v2 (ElasticBuffer) not available or NCCL < 2.30.4",
+    reason="DeepEP v2 (EPBuffer) not available or NCCL < 2.32.3",
 )
 
 # NOTE: No module-level pytestmark here. The FlashInfer lifecycle tests have
@@ -1347,11 +1347,11 @@ def test_one_sided_combine_low_precision(world_size, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 6: DeepEP v2 (ElasticBuffer) manager lifecycle
+# Test 6: DeepEP v2 (EPBuffer) manager lifecycle
 # ---------------------------------------------------------------------------
 #
-# Tests DeepEPV2All2AllManager which wraps DeepEP's ElasticBuffer API using
-# the NCCL GIN backend. Requires DeepEP >= 2.0 and NCCL >= 2.30.4.
+# Tests DeepEPV2All2AllManager which wraps DeepEP's EPBuffer API using
+# the NCCL GIN backend. Requires DeepEP >= 2.5 and NCCL >= 2.32.3.
 #
 # Uses EP group because the DeepEP v2 manager is constructed with an
 # EP-scoped communicator in production. With tp=world_size the EP group
@@ -1418,5 +1418,5 @@ def _deepep_v2_lifecycle_worker(rank, world_size):
 @requires_deep_ep_v2
 @pytest.mark.parametrize("world_size", [2])
 def test_deepep_v2_manager_lifecycle(world_size):
-    """Test DeepEP v2 ElasticBuffer manager init, caching, and destroy."""
+    """Test DeepEP v2 EPBuffer manager init, caching, and destroy."""
     _spawn_workers(_deepep_v2_lifecycle_worker, world_size)

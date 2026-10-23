@@ -67,7 +67,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
 )
-from vllm.utils.import_utils import has_deep_ep, has_mori, has_nixl_ep
+from vllm.utils.import_utils import has_deep_ep_v1, has_mori, has_nixl_ep
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import (
@@ -120,7 +120,7 @@ if has_flashinfer_nvlink_two_sided():
 if has_flashinfer_nvlink_one_sided():
     BACKENDS += ["flashinfer_nvlink_one_sided"]
 
-if has_deep_ep():
+if has_deep_ep_v1():
     BACKENDS += ["deepep_high_throughput", "deepep_low_latency"]
 
 if has_nixl_ep():

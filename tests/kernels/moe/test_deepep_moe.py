@@ -26,14 +26,14 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.platforms import current_platform
-from vllm.utils.import_utils import has_deep_ep
+from vllm.utils.import_utils import has_deep_ep_v1
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...utils import multi_gpu_test
 from .parallel_utils import ProcessGroupInfo, parallel_launch
 
-if has_deep_ep():
+if has_deep_ep_v1():
     from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
         DeepEPHTPrepareAndFinalize,
     )
@@ -44,7 +44,7 @@ if has_deep_ep():
     from .parallel_utils import DeepEPHTArgs, DeepEPLLArgs, make_deepep_a2a
 
 requires_deep_ep = pytest.mark.skipif(
-    not has_deep_ep(),
+    not has_deep_ep_v1(),
     reason="Requires deep_ep kernels",
 )
 

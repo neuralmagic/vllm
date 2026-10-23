@@ -12,7 +12,7 @@ import torch
 
 from tests.utils import RemoteOpenAIServer
 from vllm.platforms import current_platform
-from vllm.utils.import_utils import has_deep_ep
+from vllm.utils.import_utils import has_deep_ep_v1
 
 # Detect Blackwell / B200 (compute capability 10.x)
 try:
@@ -47,7 +47,7 @@ DEEPEP_BACKENDS = [
 ]
 
 
-@pytest.mark.skipif(not has_deep_ep(), reason="These tests require deep_ep to run")
+@pytest.mark.skipif(not has_deep_ep_v1(), reason="These tests require DeepEP v1")
 @pytest.mark.parametrize("all2all_backend", DEEPEP_BACKENDS)
 @pytest.mark.xfail(
     IS_BLACKWELL,

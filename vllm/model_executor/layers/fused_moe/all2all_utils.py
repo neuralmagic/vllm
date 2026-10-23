@@ -36,7 +36,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.passthrough import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import (
-    has_deep_ep,
+    has_deep_ep_v1,
     has_deep_ep_v2,
     has_moonep,
     has_mori,
@@ -109,7 +109,7 @@ def flashinfer_one_sided_dispatch_layout(
 logger = init_logger(__name__)
 
 if current_platform.is_cuda_alike():
-    if has_deep_ep():
+    if has_deep_ep_v1():
         from .prepare_finalize.deepep_ht import DeepEPHTPrepareAndFinalize
         from .prepare_finalize.deepep_ll import (
             DEEPEP_QUANT_BLOCK_SHAPE,

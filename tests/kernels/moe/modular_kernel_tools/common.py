@@ -55,7 +55,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.utils.import_utils import (
     has_aiter,
-    has_deep_ep,
+    has_deep_ep_v1,
     has_deep_ep_v2,
     has_deep_gemm,
     has_mori,
@@ -397,7 +397,7 @@ class Config:
             return False, "Needs DeepGEMM but not block quantized."
 
         # Check dependencies (turn into asserts?)
-        if self.needs_deep_ep() and not has_deep_ep():
+        if self.needs_deep_ep() and not has_deep_ep_v1():
             return False, "Needs DeepEP, but DeepEP not available."
         if self.needs_deep_ep_v2() and not has_deep_ep_v2():
             return False, "Needs DeepEP v2, but DeepEP v2 not available."

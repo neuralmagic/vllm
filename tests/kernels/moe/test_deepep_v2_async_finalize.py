@@ -21,7 +21,7 @@ from vllm.utils.import_utils import has_deep_ep_v2
 
 requires_deep_ep_v2 = pytest.mark.skipif(
     not has_deep_ep_v2(),
-    reason="Requires DeepEP v2 (ElasticBuffer)",
+    reason="Requires DeepEP v2 (EPBuffer)",
 )
 
 if has_deep_ep_v2():

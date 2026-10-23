@@ -40,7 +40,7 @@ from vllm.utils.flashinfer import (
 )
 from vllm.utils.import_utils import (
     has_aiter,
-    has_deep_ep,
+    has_deep_ep_v1,
     has_deep_ep_v2,
     has_deep_gemm,
     has_mori,
@@ -206,7 +206,7 @@ register_experts(
 )
 
 # Disable on blackwell for now
-if has_deep_ep() and not current_platform.has_device_capability(100):
+if has_deep_ep_v1() and not current_platform.has_device_capability(100):
     from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
         DeepEPHTPrepareAndFinalize,
     )

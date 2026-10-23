@@ -23,7 +23,7 @@ from vllm.utils.flashinfer import (
 from vllm.utils.import_utils import (
     check_moonep_system_support,
     deep_ep_v2_unavailable_reason,
-    has_deep_ep,
+    has_deep_ep_v1,
     has_deep_ep_v2,
     has_mori,
 )
@@ -204,7 +204,7 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
     """All2All communication based on DeepEP High-Throughput kernels."""
 
     def __init__(self, cpu_group, tcp_store_group=None):
-        assert has_deep_ep(), (
+        assert has_deep_ep_v1(), (
             "DeepEP kernels not found. Please follow https://github.com/vllm-project/vllm/blob/main/tools/ep_kernels/README.md"
             " to install DeepEP kernels."
         )  # noqa
@@ -1038,7 +1038,7 @@ class MoriAll2AllManager(All2AllManagerBase):
 
 
 class DeepEPV2All2AllManager(All2AllManagerBase):
-    """All2All communication based on DeepEP v2 ElasticBuffer (unified API).
+    """All2All communication based on the DeepEP v2 EPBuffer API.
     Uses NCCL Gin backend with analytical SM calculation.
     """
 
@@ -1108,8 +1108,8 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             self._check_gin_support(buffer_kwargs["group"])
             self._gin_checked = True
         logger.debug("DeepEP v2 all2all args %s", buffer_kwargs)
-        handle: deep_ep.ElasticBuffer = self.handle_cache.get_or_create(
-            buffer_kwargs, deep_ep.ElasticBuffer
+        handle: deep_ep.EPBuffer = self.handle_cache.get_or_create(
+            buffer_kwargs, deep_ep.EPBuffer
         )
         if self._num_sms is None:
             self._num_sms = handle.get_theoretical_num_sms(
