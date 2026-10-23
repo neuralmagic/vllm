@@ -67,7 +67,12 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
 )
-from vllm.utils.import_utils import has_deep_ep_v1, has_mori, has_nixl_ep
+from vllm.utils.import_utils import (
+    has_deep_ep_v1,
+    has_deep_ep_v2,
+    has_mori,
+    has_nixl_ep,
+)
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import (
@@ -123,10 +128,18 @@ if has_flashinfer_nvlink_one_sided():
 if has_deep_ep_v1():
     BACKENDS += ["deepep_high_throughput", "deepep_low_latency"]
 
+if has_deep_ep_v2():
+    BACKENDS += ["deepep_v2"]
+
+DEEPEP_BACKENDS = {
+    "deepep_high_throughput",
+    "deepep_low_latency",
+    "deepep_v2",
+}
+DEEPEP_V1_BACKENDS = {"deepep_high_throughput", "deepep_low_latency"}
+
 if has_nixl_ep():
     BACKENDS += ["nixl_ep"]
-
-DEEPEP_BACKENDS = {"deepep_high_throughput", "deepep_low_latency"}
 
 # These tests run on one node, where NVSHMEM reaches peers over NVLink, so
 # keep it off the NICs to avoid depending on IB setup on shared CI hosts.
@@ -155,6 +168,7 @@ BACKEND_SUPPORTED_QUANTS: dict[str, set[str | None]] = {
     "flashinfer_nvlink_one_sided": {None, "fp8_blocked",                 "modelopt_fp4"}, # noqa: E501
     "deepep_low_latency":          {None, "fp8_blocked",                 "modelopt_fp4"}, # noqa: E501
     "deepep_high_throughput":      {None, "fp8_blocked", "modelopt_fp8", "modelopt_fp4"}, # noqa: E501
+    "deepep_v2":                   {None, "fp8_blocked", "modelopt_fp8", "modelopt_fp4"}, # noqa: E501
     "nixl_ep":                     {None, "fp8_blocked", "modelopt_fp8"},
 }
 
@@ -167,6 +181,7 @@ BACKEND_EP_DP_TP_SUPPORT: dict[str, tuple[bool, bool, bool, bool]] = {
     "flashinfer_nvlink_one_sided": (True,  True, False, False),
     "deepep_low_latency":          (True, False, False,  True),
     "deepep_high_throughput":      (True, False, False,  True),
+    "deepep_v2":                   (True, False, False,  True),
     "nixl_ep":                     (True, False, False,  True),
 }
 # fmt: on
@@ -278,6 +293,15 @@ def maybe_roundup_layer_hidden_size(
 
         hidden_size = DeepEPLLPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
+        )
+
+    if backend == "deepep_v2":
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_v2 import (
+            DeepEPV2PrepareAndFinalize,
+        )
+
+        hidden_size = DeepEPV2PrepareAndFinalize.maybe_roundup_layer_hidden_size(
+            hidden_size, act_dtype
         )
 
     return hidden_size
@@ -528,10 +552,7 @@ def is_valid_config(config: MoETestConfig) -> tuple[bool, str | None]:
         )
 
     # TODO: disable for now
-    if config.use_routed_input_transform and config.backend in [
-        "deepep_low_latency",
-        "deepep_high_throughput",
-    ]:
+    if config.use_routed_input_transform and config.backend in DEEPEP_BACKENDS:
         return (
             False,
             "routed_input_transform not supported with DeepEP backends because "
@@ -2241,8 +2262,8 @@ def test_moe_layer(
 
     rocm_deepep = current_platform.is_rocm() and backend in DEEPEP_BACKENDS
     parallel_worker = _parallel_worker_rocm_deepep if rocm_deepep else _parallel_worker
-    cuda_deepep = current_platform.is_cuda() and backend in DEEPEP_BACKENDS
-    env_dict = DEEPEP_SINGLE_NODE_NVSHMEM_ENV if cuda_deepep else None
+    cuda_deepep_v1 = current_platform.is_cuda() and backend in DEEPEP_V1_BACKENDS
+    env_dict = DEEPEP_SINGLE_NODE_NVSHMEM_ENV if cuda_deepep_v1 else None
     launch_failures: list[str] = []
 
     try:

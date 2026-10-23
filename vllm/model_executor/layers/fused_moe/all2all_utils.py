@@ -297,8 +297,8 @@ def maybe_make_prepare_finalize(
             use_fp8_dispatch=use_fp8_dispatch,
         )
         handle = all2all_manager.get_handle(all_to_all_args)
-        vllm_config = get_current_vllm_config()
-        use_cudagraph = not vllm_config.model_config.enforce_eager
+        model_config = get_current_vllm_config().model_config
+        use_cudagraph = model_config is not None and not model_config.enforce_eager
 
         prepare_finalize = DeepEPV2PrepareAndFinalize(
             buffer=handle,
