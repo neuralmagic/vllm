@@ -101,17 +101,25 @@ When NCCL is too old at runtime, vLLM logs the reason at startup and
 `deepep_v2` fails with the same message. You can check with:
 
 ```bash
-.venv/bin/python -c "from vllm.utils.import_utils import deep_ep_v2_unavailable_reason; print(deep_ep_v2_unavailable_reason() or 'deepep_v2 is available')"
+python -c "from vllm.utils.import_utils import deep_ep_v2_unavailable_reason; print(deep_ep_v2_unavailable_reason() or 'deepep_v2 is available')"
 ```
 
 ## Usage
 
+### Hopper
+
 ```bash
-bash tools/ep_kernels/install_python_libraries.sh
-bash tools/ep_kernels/install_python_libraries.sh \
-    --deepep-ref f6aa38fe06cd4a0489e7730365d4e0114970a2f3
+TORCH_CUDA_ARCH_LIST="9.0" bash tools/ep_kernels/install_python_libraries.sh
 ```
 
+### Blackwell
+
+```bash
+TORCH_CUDA_ARCH_LIST="10.0" bash tools/ep_kernels/install_python_libraries.sh
+```
+
+To build DeepEP 2.5, append
+`--deepep-ref f6aa38fe06cd4a0489e7730365d4e0114970a2f3` to either command.
 The installer selects NVSHMEM, NCCL, and source patches from the APIs present
 in the checked-out DeepEP revision.
 
