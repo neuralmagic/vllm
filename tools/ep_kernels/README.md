@@ -4,7 +4,7 @@ Large-scale cluster-level expert parallel, as described in the [DeepSeek-V3 Tech
 
 Here we break down the requirements in 2 steps:
 
-1. Build and install the Python libraries ([DeepEP](https://github.com/deepseek-ai/DeepEP)). The installer also initializes the bundled [DeepJIT](https://github.com/deepseek-ai/DeepJIT) submodule. This step does not require any privileged access. Any user can do it.
+1. Build and install the Python libraries ([DeepEP](https://github.com/deepseek-ai/DeepEP)). The default revision is DeepEP 2.0; a 2.5 revision also initializes the bundled [DeepJIT](https://github.com/deepseek-ai/DeepJIT) submodule. This step does not require any privileged access. Any user can do it.
 2. Configure NVIDIA driver to enable IBGDA. This step requires root access, and must be done on the host machine.
 
 Step 2 is necessary for multi-node deployment.
@@ -14,10 +14,35 @@ Step 2 is necessary for multi-node deployment.
 * `--workspace <dir>`: workspace directory for the DeepEP checkout and wheels.
 * `--mode <mode>`: `install` (default) or `wheel`.
 * `--deepep-ref <commit>`: DeepEP commit to build. The default is a full commit hash.
+* `--nvshmem-ver <ver>`: NVSHMEM version, only used by DeepEP 2.0.
 
-## DeepEP requirements
+## DeepEP versions
 
-DeepEP 2.5 requires:
+The installer inspects the checked-out source and selects the 2.0 path when it
+finds `ElasticBuffer` or the 2.5 path when it finds `EPBuffer`. Only one
+`deep_ep` installation can exist in a Python environment because DeepEP 2.0
+and 2.5 provide the same package name but different v2 APIs. Use separate
+environments, or reinstall `deep_ep` when switching revisions. vLLM runtime
+detection accepts either v2 API.
+
+### DeepEP 2.0 (default)
+
+The default DeepEP commit is
+`d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb` and builds the legacy V1 kernels
+with NVSHMEM. It requires:
+
+* Linux with Python 3.8 or newer (vLLM itself requires Python 3.11 or newer)
+* NVIDIA Hopper or newer GPUs
+* CUDA Toolkit 12.3 or newer
+* PyTorch 2.10 or newer with CUDA support
+* NCCL 2.30.4 or newer
+* NVSHMEM 3.3.24 or newer
+
+### DeepEP 2.5
+
+The supported DeepEP 2.5 commit is
+`f6aa38fe06cd4a0489e7730365d4e0114970a2f3`, initializes DeepJIT, and does not
+install NVSHMEM. It requires:
 
 * Linux with Python 3.10 or newer
 * NVIDIA Hopper or newer GPUs
@@ -40,10 +65,11 @@ CUDA toolkit and host compiler available at runtime for DeepJIT compilation.
 ## NCCL version requirement for DeepEPv2
 
 DeepEPv2 (`--all2all-backend deepep_v2`) uses the NCCL GIN (GPU-Initiated
-Networking) backend, which requires NCCL >= 2.32.3 both when DeepEP is built
-and at runtime. PyTorch pins an older release as a dependency (PyTorch 2.13
-pins `nvidia-nccl-cu13==2.29.7`), so a plain install of vLLM is not enough.
-The vLLM Docker images already override it.
+Networking) backend. DeepEP 2.0 requires NCCL >= 2.30.4 and DeepEP 2.5
+requires NCCL >= 2.32.3, both when DeepEP is built and at runtime. PyTorch
+pins an older release as a dependency (PyTorch 2.13 pins
+`nvidia-nccl-cu13==2.29.7`), so a plain install of vLLM is not enough. The
+default vLLM Docker image overrides NCCL for DeepEP 2.0.
 
 Upgrade NCCL before running `install_python_libraries.sh`. Use
 `nvidia-nccl-cu12` on CUDA 12. For a custom NCCL installation, set
@@ -53,7 +79,7 @@ Upgrade NCCL before running `install_python_libraries.sh`. Use
 
 ```bash
 # Create an override file
-echo "nvidia-nccl-cu13>=2.32.3" > /tmp/nccl-override.txt
+echo "nvidia-nccl-cu13>=2.30.4" > /tmp/nccl-override.txt
 export UV_OVERRIDE=/tmp/nccl-override.txt
 
 # All subsequent uv pip install commands will respect the override
@@ -66,7 +92,7 @@ it, any `uv pip install` that resolves PyTorch again restores the pinned NCCL.
 To fix an existing environment:
 
 ```bash
-uv pip install "nvidia-nccl-cu13>=2.32.3" --no-deps
+uv pip install "nvidia-nccl-cu13>=2.30.4" --no-deps
 ```
 
 `install_python_libraries.sh` warns when the installed NCCL is too old. If
@@ -82,7 +108,17 @@ When NCCL is too old at runtime, vLLM logs the reason at startup and
 
 ```bash
 bash tools/ep_kernels/install_python_libraries.sh
+bash tools/ep_kernels/install_python_libraries.sh \
+    --deepep-ref f6aa38fe06cd4a0489e7730365d4e0114970a2f3
 ```
+
+The installer selects NVSHMEM, NCCL, and source patches from the APIs present
+in the checked-out DeepEP revision.
+
+The Docker image builds the default DeepEP 2.0 commit. To use DeepEP 2.5,
+pass `--build-arg DEEPEP_COMMIT_HASH=f6aa38fe06cd4a0489e7730365d4e0114970a2f3`
+and `--build-arg NCCL_VERSION=2.32.3`. Use CUDA 13.1 or newer unless
+reproducing the tested CUDA 13.0.88 Hopper H200 build.
 
 Additional step for multi-node deployment:
 

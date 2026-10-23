@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from inspect import signature
+from typing import Any
 
 import deep_ep
 import torch
@@ -68,7 +70,7 @@ def _unpack_mxfp8_scale(
 
 
 class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
-    """Prepare/Finalize using the DeepEP v2 EPBuffer API.
+    """Prepare/Finalize using a DeepEP v2 buffer API.
 
     Supports two modes controlled by the `use_cudagraph` constructor arg:
 
@@ -106,7 +108,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def __init__(
         self,
-        buffer: deep_ep.EPBuffer,
+        buffer: Any,
         num_dispatchers: int,
         dp_size: int,
         rank_expert_offset: int,
@@ -211,23 +213,25 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 n = tokens.shape[0]
             num_max_tokens_per_rank = 1 << max(n - 1, 0).bit_length()
 
+        dispatch_kwargs = {
+            "x": token_data,
+            "topk_idx": rank_topk_ids,
+            "topk_weights": rank_topk_weights,
+            "num_experts": num_experts,
+            "num_max_tokens_per_rank": num_max_tokens_per_rank,
+            "do_expand": do_expand,
+            "do_cpu_sync": do_cpu_sync,
+            "async_with_compute_stream": False,
+        }
+        if "do_zero_padding" in signature(self.buffer.dispatch).parameters:
+            dispatch_kwargs["do_zero_padding"] = do_expand
         (
             recv_x,
             recv_topk_idx,
             recv_topk_weights,
             handle,
             event,
-        ) = self.buffer.dispatch(
-            x=token_data,
-            topk_idx=rank_topk_ids,
-            topk_weights=rank_topk_weights,
-            num_experts=num_experts,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            do_expand=do_expand,
-            do_zero_padding=do_expand,
-            do_cpu_sync=do_cpu_sync,
-            async_with_compute_stream=False,
-        )
+        ) = self.buffer.dispatch(**dispatch_kwargs)
 
         a2a_idx = dbo_current_ubatch_id()
         self.handles[a2a_idx] = handle

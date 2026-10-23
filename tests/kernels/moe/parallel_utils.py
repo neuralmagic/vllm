@@ -12,7 +12,11 @@ from torch.distributed import ProcessGroup
 from torch.multiprocessing import spawn  # pyright: ignore[reportPrivateImportUsage]
 from typing_extensions import ParamSpec
 
-from vllm.utils.import_utils import has_deep_ep_v1, has_deep_ep_v2
+from vllm.utils.import_utils import (
+    get_deep_ep_v2_buffer_class,
+    has_deep_ep_v1,
+    has_deep_ep_v2,
+)
 from vllm.utils.network_utils import get_file_store_init_method
 
 if has_deep_ep_v1():
@@ -232,11 +236,9 @@ def make_deepep_v2_a2a(
     v2_args: DeepEPV2Args,
     use_cudagraph: bool = False,
 ):
-    import deep_ep
-
     from vllm.utils.nccl import query_nccl_gin_type
 
-    # EPBuffer can segfault when GIN is unavailable. Initialize the
+    # DeepEP v2 buffers can segfault when GIN is unavailable. Initialize the
     # lazy communicator and reject unsupported systems before entering DeepEP.
     probe = torch.zeros(1, device=pgi.device)
     torch.distributed.all_reduce(probe, group=pg)
@@ -246,7 +248,9 @@ def make_deepep_v2_a2a(
     if gin_type == 0:
         raise GINNotAvailableError("NCCL GIN not available")
 
-    buffer = deep_ep.EPBuffer(
+    buffer_class = get_deep_ep_v2_buffer_class()
+    assert buffer_class is not None
+    buffer = buffer_class(
         group=pg,
         num_max_tokens_per_rank=v2_args.max_tokens_per_rank,
         hidden=v2_args.hidden_size,

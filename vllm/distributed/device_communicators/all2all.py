@@ -23,6 +23,7 @@ from vllm.utils.flashinfer import (
 from vllm.utils.import_utils import (
     check_moonep_system_support,
     deep_ep_v2_unavailable_reason,
+    get_deep_ep_v2_buffer_class,
     has_deep_ep_v1,
     has_deep_ep_v2,
     has_mori,
@@ -1038,7 +1039,7 @@ class MoriAll2AllManager(All2AllManagerBase):
 
 
 class DeepEPV2All2AllManager(All2AllManagerBase):
-    """All2All communication based on the DeepEP v2 EPBuffer API.
+    """All2All communication based on a DeepEP v2 buffer API.
     Uses NCCL Gin backend with analytical SM calculation.
     """
 
@@ -1100,17 +1101,15 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             )
 
     def get_handle(self, kwargs):
-        import deep_ep  # type: ignore[import-not-found]
-
         num_experts = kwargs.pop("num_experts", 256)
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
         if not self._gin_checked:
             self._check_gin_support(buffer_kwargs["group"])
             self._gin_checked = True
         logger.debug("DeepEP v2 all2all args %s", buffer_kwargs)
-        handle: deep_ep.EPBuffer = self.handle_cache.get_or_create(
-            buffer_kwargs, deep_ep.EPBuffer
-        )
+        buffer_class = get_deep_ep_v2_buffer_class()
+        assert buffer_class is not None, deep_ep_v2_unavailable_reason()
+        handle: Any = self.handle_cache.get_or_create(buffer_kwargs, buffer_class)
         if self._num_sms is None:
             self._num_sms = handle.get_theoretical_num_sms(
                 num_experts=num_experts,
