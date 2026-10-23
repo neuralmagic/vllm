@@ -5,14 +5,11 @@ set -ex
 #   --workspace <dir>    workspace directory (default: ./ep_kernels_workspace)
 #   --mode <mode>        "install" (default) or "wheel"
 #   --deepep-ref <commit> DeepEP commit hash
-#   --nvshmem-ver <ver>  NVSHMEM version 
 
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 # Pinned in full: an abbreviated hash is not a ref, so a consumer that
 # fetches the pin directly ("git fetch origin <sha>") cannot resolve it.
-DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb"}
-
-NVSHMEM_VER=${NVSHMEM_VER:-"3.3.24"}  # Default supports both CUDA 12 and 13
+DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"f6aa38fe06cd4a0489e7730365d4e0114970a2f3"}
 WORKSPACE=${WORKSPACE:-$(pwd)/ep_kernels_workspace}
 MODE=${MODE:-install}
 CUDA_VERSION_MAJOR=$("${CUDA_HOME}"/bin/nvcc --version | grep -E -o "release [0-9]+" | cut -d ' ' -f 2)
@@ -44,31 +41,12 @@ while [[ $# -gt 0 ]]; do
             DEEPEP_COMMIT_HASH="$2"
             shift 2
             ;;
-        --nvshmem-ver)
-            if [[ -z "$2" || "$2" =~ ^- ]]; then
-                echo "Error: --nvshmem-ver requires an argument." >&2
-                exit 1
-            fi
-            if [[ "$2" =~ / ]]; then
-                echo "Error: NVSHMEM version should not contain slashes." >&2
-                exit 1
-            fi
-            NVSHMEM_VER="$2"
-            shift 2
-            ;;
         *)
             echo "Error: Unknown argument '$1'" >&2
             exit 1
             ;;
     esac
 done
-
-# Validate NVSHMEM_VER to prevent path traversal attacks
-# Only allow alphanumeric characters, dots, and hyphens (typical version string chars)
-if [[ ! "$NVSHMEM_VER" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-    echo "Error: NVSHMEM_VER contains invalid characters. Only alphanumeric, dots, and hyphens are allowed." >&2
-    exit 1
-fi
 
 mkdir -p "$WORKSPACE"
 
@@ -84,9 +62,9 @@ if [ -z "$VIRTUAL_ENV" ]; then
 fi
 uv pip install "${UV_PIP_TARGET[@]}" cmake torch ninja
 
-# DeepEPv2 needs NCCL >= 2.30.4 at both build time and runtime, but PyTorch
+# DeepEPv2 needs NCCL >= 2.32.3 at both build time and runtime, but PyTorch
 # pins an older release.
-DEEPEP_V2_MIN_NCCL="2.30.4"
+DEEPEP_V2_MIN_NCCL="2.32.3"
 NCCL_PACKAGE="nvidia-nccl-cu${CUDA_VERSION_MAJOR}"
 NCCL_WARNING=""
 NCCL_INSTALLED=$(uv pip show "${UV_PIP_TARGET[@]}" "$NCCL_PACKAGE" 2>/dev/null | sed -n 's/^Version: //p')
@@ -98,36 +76,6 @@ requires NCCL >= ${DEEPEP_V2_MIN_NCCL} when DeepEP is built and when it runs. To
 and then run this script again. See tools/ep_kernels/README.md."
     echo "$NCCL_WARNING" >&2
 fi
-
-# fetch nvshmem
-ARCH=$(uname -m)
-case "${ARCH,,}" in
-  x86_64|amd64)
-    NVSHMEM_SUBDIR="linux-x86_64"
-    ;;
-  aarch64|arm64)
-    NVSHMEM_SUBDIR="linux-sbsa"
-    ;;
-  *)
-    echo "Unsupported architecture: ${ARCH}" >&2
-    exit 1
-    ;;
-esac
-
-NVSHMEM_FILE="libnvshmem-${NVSHMEM_SUBDIR}-${NVSHMEM_VER}_cuda${CUDA_VERSION_MAJOR}-archive.tar.xz"
-NVSHMEM_URL="https://developer.download.nvidia.com/compute/nvshmem/redist/libnvshmem/${NVSHMEM_SUBDIR}/${NVSHMEM_FILE}"
-
-pushd "$WORKSPACE"
-echo "Downloading NVSHMEM ${NVSHMEM_VER} for ${NVSHMEM_SUBDIR} ..."
-curl -fSL --retry 3 --retry-delay 2 "${NVSHMEM_URL}" -o "${NVSHMEM_FILE}"
-tar -xf "${NVSHMEM_FILE}"
-rm -rf nvshmem
-mv "${NVSHMEM_FILE%.tar.xz}" nvshmem
-rm -f "${NVSHMEM_FILE}"
-rm -rf nvshmem/lib/bin nvshmem/lib/share
-popd
-
-export CMAKE_PREFIX_PATH=$WORKSPACE/nvshmem/lib/cmake:$CMAKE_PREFIX_PATH
 
 is_git_dirty() {
     local dir=$1
@@ -154,19 +102,19 @@ clone_repo() {
             rm -rf "$dir_name"
             git clone "$repo_url"
             if [ -n "$commit_hash" ]; then
-                cd "$dir_name"
-                git checkout "$commit_hash"
-                cd ..
+                git -C "$dir_name" checkout "$commit_hash"
             fi
         else
             echo "$dir_name directory exists and appears complete"
+            git -C "$dir_name" fetch origin
+            if [ -n "$commit_hash" ]; then
+                git -C "$dir_name" checkout "$commit_hash"
+            fi
         fi
     else
         git clone "$repo_url"
         if [ -n "$commit_hash" ]; then
-            cd "$dir_name"
-            git checkout "$commit_hash"
-            cd ..
+            git -C "$dir_name" checkout "$commit_hash"
         fi
     fi
 }
@@ -176,45 +124,13 @@ do_build() {
     local name=$2
     local key=$3
     local commit=$4
-    local extra_env=$5
 
     pushd "$WORKSPACE"
     clone_repo "$repo" "$name" "$key" "$commit"
     cd "$name"
 
-    # DeepEP CUDA 13 patch
-    if [[ "$name" == "DeepEP" && "${CUDA_VERSION_MAJOR}" -ge 13 ]]; then
-        sed -i "s|f'{nvshmem_dir}/include']|f'{nvshmem_dir}/include', '${CUDA_HOME}/include/cccl']|" "setup.py"
-    fi
-
-    # DeepEPv2 requires Linux 5.6+ at runtime for pidfd_getfd (pidfd_open was
-    # added in Linux 5.3), but manylinux headers predate both definitions.
-    # DeepEP is built as a separate wheel for the vLLM container image and is
-    # not included in the vLLM wheel, so this does not change its manylinux ABI.
-    if [[ "$name" == "DeepEP" ]] && \
-        ! grep -q "vLLM manylinux syscall compatibility" \
-            csrc/kernels/backend/symmetric.hpp; then
-        sed -i '1i\
-// vLLM manylinux syscall compatibility\
-#if defined(__x86_64__) || defined(__aarch64__)\
-#ifndef SYS_pidfd_open\
-#ifdef __NR_pidfd_open\
-#define SYS_pidfd_open __NR_pidfd_open\
-#else\
-#define SYS_pidfd_open 434\
-#endif\
-#endif\
-#ifndef SYS_pidfd_getfd\
-#ifdef __NR_pidfd_getfd\
-#define SYS_pidfd_getfd __NR_pidfd_getfd\
-#else\
-#define SYS_pidfd_getfd 438\
-#endif\
-#endif\
-#endif' csrc/kernels/backend/symmetric.hpp
-    fi
-
     if [[ "$name" == "DeepEP" ]]; then
+        git submodule update --init --recursive
         # DeepEP links against the CUDA driver API in driverless build images.
         local cuda_driver_stub
         local cuda_driver_stub_dir
@@ -231,10 +147,10 @@ do_build() {
 
     if [ "$MODE" = "install" ]; then
         echo "Installing $name into environment"
-        eval "$extra_env" uv pip install --no-build-isolation -vvv .
+        uv pip install --no-build-isolation -vvv .
     else
         echo "Building $name wheel into $WHEEL_DIR"
-        eval "$extra_env" uv build --wheel --no-build-isolation -vvv --out-dir "$WHEEL_DIR" .
+        uv build --wheel --no-build-isolation -vvv --out-dir "$WHEEL_DIR" .
     fi
     popd
 }
@@ -244,8 +160,7 @@ do_build \
     "https://github.com/deepseek-ai/DeepEP" \
     "DeepEP" \
     "setup.py" \
-    "$DEEPEP_COMMIT_HASH" \
-    "export NVSHMEM_DIR=$WORKSPACE/nvshmem; "
+    "$DEEPEP_COMMIT_HASH"
 
 if [ "$MODE" = "wheel" ]; then
     echo "All wheels written to $WHEEL_DIR"
