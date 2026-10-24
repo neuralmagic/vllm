@@ -285,7 +285,8 @@ def maybe_make_prepare_finalize(
         assert moe.dp_size == all2all_manager.dp_world_size
 
         use_fp8_dispatch = (
-            quant_config is not None
+            input_dtype is None
+            and quant_config is not None
             and quant_config.quant_dtype == current_platform.fp8_dtype()
             and quant_config.is_block_quantized
         )
