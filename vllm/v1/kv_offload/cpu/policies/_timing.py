@@ -10,8 +10,10 @@ process exit. Without the env var the decorator is a no-op pass-through.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import functools
 import os
+import signal
 import statistics
 import time
 from collections.abc import Callable
@@ -48,9 +50,14 @@ def _percentiles(samples: list[float]) -> tuple[float, float, float]:
     return (statistics.median(samples), qs[94], qs[98])
 
 
-@atexit.register
 def _report() -> None:
     if not _SAMPLES:
+        if _ENABLED:
+            print(
+                "\ncache policy timing enabled but no samples recorded "
+                "(no decorated function ran in this process)",
+                flush=True,
+            )
         return
     print("\ncache policy timing summary", flush=True)
     header = (
@@ -67,3 +74,17 @@ def _report() -> None:
             f"{p99 * 1e6:>10.1f}us{max(samples) * 1e6:>10.1f}us",
             flush=True,
         )
+
+
+if _ENABLED:
+    atexit.register(_report)
+
+    # child processes are torn down with SIGTERM (proc.terminate()), which
+    # skips atexit; report there too, then restore the default disposition
+    def _report_on_sigterm(signum, frame):
+        _report()
+        os._exit(128 + signum)
+
+    # not the main thread of the main interpreter
+    with contextlib.suppress(ValueError):
+        signal.signal(signal.SIGTERM, _report_on_sigterm)
