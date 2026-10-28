@@ -31,7 +31,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import Qwen2Config
+# from transformers import Qwen2Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -40,6 +40,9 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
+)
+from vllm.model_executor.layers.fusion.residual_stream import (
+    Scatter, finalize_norm, ResidualStream
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -86,6 +89,7 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -100,6 +104,7 @@ class Qwen2MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
@@ -238,12 +243,15 @@ class Qwen2Attention(nn.Module):
 class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Qwen2Config,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        config = vllm_config.model_config.hf_config.get_text_config()
+        cache_config = vllm_config.cache_config
+        quant_config = self.get_quant_config(vllm_config)
+
         self.hidden_size = config.hidden_size
         set_default_rope_theta(config, default_theta=1000000)
         dual_chunk_attention_config = getattr(
@@ -310,6 +318,10 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
+        """Get quantization config for this layer. Override in subclasses."""
+        return vllm_config.quant_config
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -344,7 +356,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         super().__init__()
 
         config = vllm_config.model_config.hf_config.get_text_config()
-        cache_config = vllm_config.cache_config
+        # cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
         # TODO (@robertgshaw2): see if this can be moved out
@@ -380,9 +392,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: decoder_layer_type(
-                config=config,
-                cache_config=cache_config,
-                quant_config=quant_config,
+                vllm_config=vllm_config,
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
@@ -396,6 +406,9 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         else:
             self.norm = PPMissingLayer()
 
+        self.supports_residual_stream = False
+        self.vllm_config = vllm_config
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -406,16 +419,32 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            if self.supports_residual_stream:
+                residual_stream = ResidualStream(
+                    residual=None,
+                    vllm_config=self.vllm_config,
+                    # input_layernorm=self.input_layernorm,
+                    # post_attention_layernorm=self.post_attention_layernorm,
+                    # qkv_proj=self.self_attn.qkv_proj,
+                    # o_proj=self.self_attn.o_proj,
+                    # gate_up_proj=self.mlp.gate_up_proj,
+                    # down_proj=self.mlp.down_proj,
+                )
+
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            if self.supports_residual_stream:
+                residual_stream = ResidualStream.from_handoff(
+                    hidden_states, residual, Scatter.FULL, self.vllm_config)
 
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
 
@@ -428,7 +457,12 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            if self.supports_residual_stream:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, residual_stream)
+            else:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
@@ -442,7 +476,17 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                 }
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # Route the final norm through the residual-stream finalizer: it reduces
+        # only when the last decoder left its output PARTIAL (migrated/deferred
+        # decoders, e.g. Qwen3). Unmigrated decoders expose no output_scatter ->
+        # FULL -> plain norm, identical to the pre-fusion path.
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states = finalize_norm(
+            self.norm,
+            hidden_states,
+            residual,
+            incoming=getattr(last_layer, "output_scatter", Scatter.FULL),
+        )
 
         aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:

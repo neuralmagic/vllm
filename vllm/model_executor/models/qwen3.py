@@ -28,7 +28,7 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers import Qwen3Config
+# from transformers import Qwen3Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -37,6 +37,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.encoder_only_attention import (
     Attention,
     EncoderOnlyAttention,
+)
+from vllm.model_executor.layers.fusion.residual_stream import (
+    ResidualStream,
+    Scatter,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -80,6 +84,7 @@ class Qwen3Attention(nn.Module):
         dual_chunk_attention_config: dict[str, Any] | None = None,
         per_layer_sliding_window: int | None = None,
         mrope_positions_factor: int = 4,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -117,6 +122,7 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -176,19 +182,28 @@ class Qwen3Attention(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: Qwen3Config,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        vllm_config: VllmConfig,
+        # config: Qwen3Config,
+        # cache_config: CacheConfig | None = None,
+        # quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         per_layer_sliding_window: int | None = None,
         mrope_positions_factor: int = 4,
     ) -> None:
         super().__init__()
+
+        config = vllm_config.model_config.hf_config.get_text_config()
+        cache_config = vllm_config.cache_config
+        quant_config = self.get_quant_config(vllm_config)
+
         self.hidden_size = config.hidden_size
         set_default_rope_theta(config, default_theta=1000000)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
+
+        is_pp_enable = vllm_config.parallel_config.pipeline_parallel_size > 1
+        self_defer = not is_pp_enable
 
         # By default, Qwen3 uses causal attention as it is a decoder-only model.
         # You can override the HF config with `is_causal=False` to enable
@@ -215,6 +230,7 @@ class Qwen3DecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             per_layer_sliding_window=per_layer_sliding_window,
             mrope_positions_factor=mrope_positions_factor,
+            reduce_results=is_pp_enable,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -222,33 +238,45 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            reduce_results=is_pp_enable,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.output_scatter = Scatter.PARTIAL if self_defer else Scatter.FULL
+
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        residual_stream: ResidualStream,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = residual_stream.prepare(
+            hidden_states, self.input_layernorm, self.self_attn.qkv_proj)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
+        residual_stream.record(
+            hidden_states, Scatter.PARTIAL if residual_stream.defer_attn(self.self_attn.o_proj) else Scatter.FULL
+        )
+
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = residual_stream.prepare(
+            hidden_states, self.post_attention_layernorm, self.mlp.gate_up_proj)
         hidden_states = self.mlp(hidden_states)
+        residual_stream.record(
+            hidden_states, Scatter.PARTIAL if residual_stream.defer_mlp(self.mlp.down_proj) else Scatter.FULL
+        )
         return hidden_states, residual
+
+    def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
+        """Get quantization config for this layer. Override in subclasses."""
+        return vllm_config.quant_config
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -275,6 +303,7 @@ class Qwen3Model(Qwen2Model):
             prefix=prefix,
             decoder_layer_type=self.decoder_layer_type,
         )
+        self.supports_residual_stream = True
 
 
 class Qwen3ForCausalLM(
