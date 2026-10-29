@@ -28,8 +28,8 @@ from typing import Any
 
 import torch
 from torch import nn
-# from transformers import Qwen3Config
 
+# from transformers import Qwen3Config
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -246,7 +246,6 @@ class Qwen3DecoderLayer(nn.Module):
         )
         self.output_scatter = Scatter.PARTIAL if self_defer else Scatter.FULL
 
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -255,22 +254,30 @@ class Qwen3DecoderLayer(nn.Module):
         residual_stream: ResidualStream,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = residual_stream.prepare(
-            hidden_states, self.input_layernorm, self.self_attn.qkv_proj)
+            hidden_states, self.input_layernorm, self.self_attn.qkv_proj
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
         residual_stream.record(
-            hidden_states, Scatter.PARTIAL if residual_stream.defer_attn(self.self_attn.o_proj) else Scatter.FULL
+            hidden_states,
+            Scatter.PARTIAL
+            if residual_stream.defer_attn(self.self_attn.o_proj)
+            else Scatter.FULL,
         )
 
         # Fully Connected
         hidden_states, residual = residual_stream.prepare(
-            hidden_states, self.post_attention_layernorm, self.mlp.gate_up_proj)
+            hidden_states, self.post_attention_layernorm, self.mlp.gate_up_proj
+        )
         hidden_states = self.mlp(hidden_states)
         residual_stream.record(
-            hidden_states, Scatter.PARTIAL if residual_stream.defer_mlp(self.mlp.down_proj) else Scatter.FULL
+            hidden_states,
+            Scatter.PARTIAL
+            if residual_stream.defer_mlp(self.mlp.down_proj)
+            else Scatter.FULL,
         )
         return hidden_states, residual
 

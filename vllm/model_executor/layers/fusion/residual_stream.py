@@ -56,8 +56,7 @@ class Scatter(Enum):
 
 
 class ResidualStream:
-    """TODO: document
-    """
+    """TODO: document"""
 
     def __init__(
         self,
@@ -66,12 +65,14 @@ class ResidualStream:
         vllm_config: VllmConfig,
     ) -> None:
         self.residual = residual
-        self.pending = None
+        self.pending: tuple[torch.Tensor, Scatter] | None = None
         self.tp_size = get_tensor_model_parallel_world_size()
         self.is_lora_enable = vllm_config.lora_config is not None
 
     @classmethod
-    def from_handoff(cls, value, residual, incoming: Scatter, vllm_config: VllmConfig) -> "ResidualStream":
+    def from_handoff(
+        cls, value, residual, incoming: Scatter, vllm_config: VllmConfig
+    ) -> "ResidualStream":
         stream = cls.__new__(cls)
         stream.residual = residual
         stream.pending = (value, incoming)
@@ -82,17 +83,13 @@ class ResidualStream:
     def defer_attn(self, o_proj: torch.nn.Module) -> bool:
         # Single source of truth: the attention o_proj's reduce_results. A layer
         # whose row-linears skip their reduce leaves PARTIAL output for us.
-        return (
-            not getattr(o_proj, "reduce_results", True)
-        )
+        return not getattr(o_proj, "reduce_results", True)
 
     def defer_mlp(self, down_proj: torch.nn.Module) -> bool:
         # Single source of truth: the mlp down_proj's reduce_results. A layer
         # whose row-linears skip their reduce leaves PARTIAL output for us.
         # TODO: NOTE maybe we can run ar fusion before mlp when pp is used
-        return (
-            not getattr(down_proj, "reduce_results", True)
-        )
+        return not getattr(down_proj, "reduce_results", True)
 
     def _reduce_norm(
         self,
@@ -123,15 +120,18 @@ class ResidualStream:
             return norm(hidden), hidden
         return norm(hidden, residual)
 
-    def prepare(self,
-                  hidden: torch.Tensor,
-                  norm: torch.nn.Module,
-                  consumer_linear: torch.nn.Module | None,
-        ) -> NormOut:
+    def prepare(
+        self,
+        hidden: torch.Tensor,
+        norm: torch.nn.Module,
+        consumer_linear: torch.nn.Module | None,
+    ) -> NormOut:
         # input — read pending + residual, no side effects
         (value, incoming), residual = self.input(hidden)
         # entry.prepare — the fused transition: (AR +) residual-add + RMSNorm (+ quant)
-        out, new_residual = self._reduce_norm(value, residual, norm, incoming, consumer_linear)
+        out, new_residual = self._reduce_norm(
+            value, residual, norm, incoming, consumer_linear
+        )
         # write — consume pending, install the new residual
         self._write(new_residual)
         return out, new_residual
@@ -154,7 +154,9 @@ class ResidualStream:
                     "change layer outputs through the boundary accessors"
                 )
 
-    def input(self, hidden: torch.Tensor) -> tuple[tuple[torch.Tensor, Scatter], torch.Tensor | None]:
+    def input(
+        self, hidden: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, Scatter], torch.Tensor | None]:
         """READ ONLY: pending (value, tag) + running residual. Does not consume."""
         self.check(hidden)
         if self.pending is not None:
@@ -166,6 +168,22 @@ class ResidualStream:
         """CONSUME: install the new residual; release the pending contribution."""
         self.pending = None
         self.residual = residual
+
+    def snapshot(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Materialize the current sum WITHOUT consuming the pending.
+
+        For aux hidden-state capture (Eagle3/DFLASH): the captured value must be
+        the complete hidden state, but the pending contribution may still owe its
+        all-reduce to the next boundary. Complete the owed AR on a clone, so the
+        real consumer still sees the partial and reduces it exactly once.
+        """
+        (value, incoming), residual = self.input(hidden)
+        if incoming is Scatter.PARTIAL and self.tp_size > 1:
+            # Clone: the all-reduce may run in place, and the pending value the
+            # next boundary consumes must stay partial (a second AR would scale
+            # it by tp_size).
+            value = tensor_model_parallel_all_reduce(value.clone())
+        return value if residual is None else value + residual
 
 
 def finalize_norm(

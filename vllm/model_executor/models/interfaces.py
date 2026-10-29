@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import asyncio
 import weakref
 from bisect import bisect_right
@@ -51,6 +53,7 @@ if TYPE_CHECKING:
     from vllm.inputs import PromptType, TokensPrompt
     from vllm.lora.model_manager import LoRAModelManager
     from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.layers.fusion.residual_stream import ResidualStream
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.mamba.mamba_utils import (
         MambaStateCopyFunc,
@@ -137,7 +140,7 @@ def _require_is_multimodal(is_multimodal: Tensor | None) -> Tensor:
 
 
 # Cache results of `SupportsMultiModal.get_language_model`
-_language_model_by_module: "weakref.WeakKeyDictionary[nn.Module, VllmModel]" = (
+_language_model_by_module: weakref.WeakKeyDictionary[nn.Module, VllmModel] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -217,7 +220,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     in their raw form and not input embeddings.
     """
 
-    _processor_factory: ClassVar["_ProcessorFactories"]
+    _processor_factory: ClassVar[_ProcessorFactories]
     """
     Set internally by `MultiModalRegistry.register_processor`.
     """
@@ -267,7 +270,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
             self._has_oov_mm_tokens,
         )
 
-    def get_language_model(self) -> "VllmModel":
+    def get_language_model(self) -> VllmModel:
         """Returns the underlying language model used for text generation.
 
         This is typically the `torch.nn.Module` instance responsible for
@@ -312,7 +315,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     @contextmanager
     def _mark_language_model(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         *,
         targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
     ):
@@ -346,7 +349,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     @contextmanager
     def _mark_tower_model(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         modalities: set[str] | str,
         *,
         targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
@@ -404,7 +407,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     @contextmanager
     def _mark_composite_model(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         *,
         language_targets: type[nn.Module] | tuple[type[nn.Module], ...],
         tower_targets: dict[str, type[nn.Module] | tuple[type[nn.Module], ...]],
@@ -435,7 +438,7 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
         self,
         *,
         modality: str,
-        mm_kwargs: "MultiModalKwargsItem | None",
+        mm_kwargs: MultiModalKwargsItem | None,
         num_mm_embeds: int,
     ) -> tuple[int, int | None]:
         """Return ``(tower_tokens, connector_tokens)`` for multimodal LoRA mappings.
@@ -532,9 +535,7 @@ class SupportsMultiModalPruning(Protocol):
 
     supports_multimodal_pruning: ClassVar[Literal[True]] = True
 
-    supported_video_pruning_methods: ClassVar[tuple["VideoPruningMethod", ...]] = (
-        "evs",
-    )
+    supported_video_pruning_methods: ClassVar[tuple[VideoPruningMethod, ...]] = ("evs",)
     """Video pruning methods (as reported by
     `MultiModalConfig.get_video_pruning_spec`) implemented by this model.
     Models supporting methods beyond EVS should override this."""
@@ -649,7 +650,7 @@ class SupportsScoreTemplate(Protocol):
         ...
 
     @classmethod
-    def post_process_tokens(cls, prompt: "TokensPrompt") -> None:
+    def post_process_tokens(cls, prompt: TokensPrompt) -> None:
         """Perform architecture-specific manipulations on the input tokens."""
         ...
 
@@ -686,9 +687,9 @@ class SupportsKVCacheGrouping(Protocol):
     @classmethod
     def get_kv_cache_groups(
         cls,
-        vllm_config: "VllmConfig",
-        kv_cache_spec: dict[str, "KVCacheSpec"],
-    ) -> list["KVCacheGroupSpec"]:
+        vllm_config: VllmConfig,
+        kv_cache_spec: dict[str, KVCacheSpec],
+    ) -> list[KVCacheGroupSpec]:
         """Split the model's layers into logical KV cache groups."""
         ...
 
@@ -731,7 +732,7 @@ class SupportsLoRA(Protocol):
     packed_modules_mapping: dict[str, list[str]] = {}
     # Module prefixes to skip during LoRA loading (e.g., ["mtp."] for MTP layers)
     lora_skip_prefixes: ClassVar[list[str]] = []
-    lora_manager: "LoRAModelManager | None"
+    lora_manager: LoRAModelManager | None
 
 
 # We can't use runtime_checkable with ClassVar for issubclass checks
@@ -796,7 +797,7 @@ class _MakeEmptyIntermediateTensors(Protocol):
         batch_size: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> "IntermediateTensors": ...
+    ) -> IntermediateTensors: ...
 
 
 @runtime_checkable
@@ -820,8 +821,8 @@ class SupportsPP(Protocol):
         input_ids: Tensor | None,
         positions: Tensor,
         *,
-        intermediate_tensors: "IntermediateTensors | None",
-    ) -> "Tensor | IntermediateTensors | tuple[Tensor, list[Tensor]]":
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> Tensor | IntermediateTensors | tuple[Tensor, list[Tensor]]:
         """Accept [`IntermediateTensors`][vllm.sequence.IntermediateTensors] when
         PP rank > 0.
 
@@ -844,8 +845,8 @@ class _SupportsPPType(Protocol):
         input_ids: Tensor | None,
         positions: Tensor,
         *,
-        intermediate_tensors: "IntermediateTensors | None",
-    ) -> "Tensor | IntermediateTensors | tuple[Tensor, list[Tensor]]": ...
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> Tensor | IntermediateTensors | tuple[Tensor, list[Tensor]]: ...
 
 
 @overload
@@ -996,7 +997,7 @@ class IsHybrid(Protocol):
     @classmethod
     def get_mamba_state_shape_from_config(
         cls,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
     ) -> MambaStateShapes:
         """Calculate shapes for Mamba's convolutional and state caches.
 
@@ -1010,7 +1011,7 @@ class IsHybrid(Protocol):
         ...
 
     @classmethod
-    def get_mamba_state_copy_func(cls) -> tuple["MambaStateCopyFunc", ...]:
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, ...]:
         """Calculate copy-function callables for each Mamba state.
 
         Returns:
@@ -1026,8 +1027,8 @@ class IsHybrid(Protocol):
     @classmethod
     def get_mamba_state_copy_funcs(
         cls,
-        mamba_types: set["MambaAttentionBackendEnum"],
-    ) -> "MambaStateCopyFuncsByType":
+        mamba_types: set[MambaAttentionBackendEnum],
+    ) -> MambaStateCopyFuncsByType:
         copy_funcs = cls.get_mamba_state_copy_func()
         return {mamba_type: copy_funcs for mamba_type in mamba_types}
 
@@ -1082,7 +1083,7 @@ class MixtureOfExperts(Protocol):
     num_redundant_experts: int
     """Number of redundant experts in this model."""
 
-    moe_layers: Sequence["MoERunner"]
+    moe_layers: Sequence[MoERunner]
     """List of MoE layers in this model."""
 
     def set_eplb_state(
@@ -1188,15 +1189,15 @@ class SupportsMambaPrefixCaching(Protocol):
     """
 
     @classmethod
-    def get_mamba_state_copy_func(cls) -> tuple["MambaStateCopyFunc", ...]:
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, ...]:
         """Return copy functions for the model's Mamba states."""
         ...
 
     @classmethod
     def get_mamba_state_copy_funcs(
         cls,
-        mamba_types: set["MambaAttentionBackendEnum"],
-    ) -> "MambaStateCopyFuncsByType":
+        mamba_types: set[MambaAttentionBackendEnum],
+    ) -> MambaStateCopyFuncsByType:
         """Map legacy copy functions to each requested Mamba backend."""
         copy_funcs = cls.get_mamba_state_copy_func()
         return {mamba_type: copy_funcs for mamba_type in mamba_types}
@@ -1231,7 +1232,7 @@ def supports_replayssm(
 class SupportsCrossEncoding(Protocol):
     """The interface required for all models that support cross encoding."""
 
-    score_type: ClassVar["ScoreType"] = "cross-encoder"
+    score_type: ClassVar[ScoreType] = "cross-encoder"
 
 
 @runtime_checkable
@@ -1243,13 +1244,13 @@ class SupportsLateInteraction(Protocol):
     MaxSim (max over document tokens, sum over query tokens).
     """
 
-    score_type: ClassVar["ScoreType"] = "late-interaction"
+    score_type: ClassVar[ScoreType] = "late-interaction"
 
 
 class SupportsQuant:
     """The interface required for all models that support quantization."""
 
-    hf_to_vllm_mapper: "WeightsMapper | None" = None
+    hf_to_vllm_mapper: WeightsMapper | None = None
     packed_modules_mapping: dict[str, list[str]]
     quant_config: QuantizationConfig | None = None
 
@@ -1303,8 +1304,8 @@ class SupportsRealtime(Protocol):
         cls,
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
-        model_config: "ModelConfig",
-    ) -> AsyncGenerator["PromptType", None]: ...
+        model_config: ModelConfig,
+    ) -> AsyncGenerator[PromptType, None]: ...
 
 
 @overload
@@ -1376,8 +1377,8 @@ class SupportsTranscription(Protocol):
     @classmethod
     def get_generation_prompt(
         cls,
-        stt_params: "SpeechToTextParams",
-    ) -> "PromptType":
+        stt_params: SpeechToTextParams,
+    ) -> PromptType:
         """Get the prompt for the ASR model.
         The model has control over the construction, as long as it
         returns a valid PromptType."""
@@ -1414,8 +1415,8 @@ class SupportsTranscription(Protocol):
 
     @classmethod
     def get_speech_to_text_config(
-        cls, model_config: "ModelConfig", task_type: Literal["transcribe", "translate"]
-    ) -> "SpeechToTextConfig":
+        cls, model_config: ModelConfig, task_type: Literal["transcribe", "translate"]
+    ) -> SpeechToTextConfig:
         """Get the speech to text config for the ASR model."""
         ...
 
@@ -1423,8 +1424,8 @@ class SupportsTranscription(Protocol):
     def get_num_audio_tokens(
         cls,
         audio_duration_s: float,
-        stt_config: "SpeechToTextConfig",
-        model_config: "ModelConfig",
+        stt_config: SpeechToTextConfig,
+        model_config: ModelConfig,
     ) -> int | None:
         """Map from audio duration to number of audio tokens produced by the ASR
         model, without running a forward pass.
@@ -1473,8 +1474,8 @@ class SupportsTranscription(Protocol):
     def get_language_detection_prompt(
         cls,
         audio: np.ndarray,
-        stt_config: "SpeechToTextConfig",
-    ) -> "PromptType":
+        stt_config: SpeechToTextConfig,
+    ) -> PromptType:
         """Return a prompt that triggers language detection.
 
         Only needs to be implemented when
@@ -1486,7 +1487,7 @@ class SupportsTranscription(Protocol):
     def parse_language_detection_output(
         cls,
         token_ids: list[int],
-        tokenizer: "TokenizerLike",
+        tokenizer: TokenizerLike,
     ) -> str:
         """Parse the detected language from model output token IDs.
 
@@ -1498,7 +1499,7 @@ class SupportsTranscription(Protocol):
     @classmethod
     def get_language_token_ids(
         cls,
-        tokenizer: "TokenizerLike",
+        tokenizer: TokenizerLike,
     ) -> list[int] | None:
         """Return token IDs that represent valid language tokens.
 
@@ -1579,8 +1580,8 @@ class LocalArgmaxMixin:
         ``self.draft_id_to_target_id`` (optional): nn.Parameter
     """
 
-    logits_processor: "LogitsProcessor"
-    lm_head: "ParallelLMHead"
+    logits_processor: LogitsProcessor
+    lm_head: ParallelLMHead
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Vocab-parallel argmax with optional D2T remapping."""
@@ -1632,9 +1633,15 @@ class EagleModelMixin:
         layer_idx: int,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        residual_stream: ResidualStream | None = None,
     ) -> list[torch.Tensor]:
         if layer_idx in self.aux_hidden_state_layers:
-            value = hidden_states + residual if residual is not None else hidden_states
+            if residual_stream is not None:
+                value = residual_stream.snapshot(hidden_states)
+            else:
+                value = (
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             aux_hidden_states.append(value)
         return aux_hidden_states
 
@@ -1650,7 +1657,7 @@ class EagleModelMixin:
         }
 
     def collect_remote_aux_hidden_states(
-        self, intermediate_tensors: "IntermediateTensors | None"
+        self, intermediate_tensors: IntermediateTensors | None
     ) -> list[torch.Tensor]:
         total = self._aux_upstream_total_cached
         if total == 0:
@@ -1791,7 +1798,7 @@ class SupportsMRoPE(Protocol):
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
-        mm_features: list["MultiModalFeatureSpec"],
+        mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
         """Get M-RoPE input positions and delta value for this specific model.
 
@@ -1838,7 +1845,7 @@ class SupportsEncoderCudaGraph(Protocol):
 
     supports_encoder_cudagraph: ClassVar[Literal[True]] = True
 
-    def get_encoder_cudagraph_config(self) -> "EncoderCudaGraphConfig": ...
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig: ...
 
     def get_input_modality(
         self,
@@ -1855,7 +1862,7 @@ class SupportsEncoderCudaGraph(Protocol):
 
     def get_encoder_cudagraph_budget_range(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
     ) -> tuple[int, int]:
         """Return (min_token_budget, max_token_budget) for auto-inference.
 
@@ -1873,7 +1880,7 @@ class SupportsEncoderCudaGraph(Protocol):
     def get_encoder_cudagraph_item_specs(
         self,
         mm_kwargs: dict[str, Any],
-    ) -> list["EncoderItemSpec"]:
+    ) -> list[EncoderItemSpec]:
         """Return specs describing each item in the batch.
 
         Replaces the former separate methods for num_items,
@@ -1936,7 +1943,7 @@ class SupportsEncoderCudaGraph(Protocol):
         dtype: torch.dtype,
         path: str = "default",
         axis_keys: tuple[Hashable, ...] | None = None,
-    ) -> "EncoderCudaGraphCaptureInputs":
+    ) -> EncoderCudaGraphCaptureInputs:
         """Create dummy inputs and buffers for CUDA graph capture.
 
         Args:
@@ -1960,7 +1967,7 @@ class SupportsEncoderCudaGraph(Protocol):
         max_batch_size: int,
         max_frames_per_batch: int,
         path: str = "default",
-    ) -> "EncoderCudaGraphReplayBuffers":
+    ) -> EncoderCudaGraphReplayBuffers:
         """Compute buffer values from actual batch inputs for replay."""
         ...
 

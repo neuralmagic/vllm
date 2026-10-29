@@ -31,8 +31,8 @@ from typing import Any
 
 import torch
 from torch import nn
-# from transformers import Qwen2Config
 
+# from transformers import Qwen2Config
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -42,7 +42,9 @@ from vllm.model_executor.layers.attention import (
     EncoderOnlyAttention,
 )
 from vllm.model_executor.layers.fusion.residual_stream import (
-    Scatter, finalize_norm, ResidualStream
+    ResidualStream,
+    Scatter,
+    finalize_norm,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -419,7 +421,6 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -444,14 +445,19 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
             if self.supports_residual_stream:
                 residual_stream = ResidualStream.from_handoff(
-                    hidden_states, residual, Scatter.FULL, self.vllm_config)
+                    hidden_states, residual, Scatter.FULL, self.vllm_config
+                )
 
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
 
         aux_hidden_states: list[torch.Tensor] = []
         if get_pp_group().is_first_rank:
             self._maybe_add_hidden_state(
-                aux_hidden_states, self.start_layer, hidden_states, residual
+                aux_hidden_states,
+                self.start_layer,
+                hidden_states,
+                residual,
+                residual_stream if self.supports_residual_stream else None,
             )
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -459,12 +465,16 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         ):
             if self.supports_residual_stream:
                 hidden_states, residual = layer(
-                    positions, hidden_states, residual, residual_stream)
+                    positions, hidden_states, residual, residual_stream
+                )
             else:
-                hidden_states, residual = layer(
-                    positions, hidden_states, residual)
+                hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                aux_hidden_states,
+                idx + 1,
+                hidden_states,
+                residual,
+                residual_stream if self.supports_residual_stream else None,
             )
 
         if not get_pp_group().is_last_rank:
