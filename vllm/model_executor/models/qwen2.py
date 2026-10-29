@@ -32,7 +32,6 @@ from typing import Any
 import torch
 from torch import nn
 
-# from transformers import Qwen2Config
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -358,7 +357,6 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         super().__init__()
 
         config = vllm_config.model_config.hf_config.get_text_config()
-        # cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
         # TODO (@robertgshaw2): see if this can be moved out
@@ -431,12 +429,6 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                 residual_stream = ResidualStream(
                     residual=None,
                     vllm_config=self.vllm_config,
-                    # input_layernorm=self.input_layernorm,
-                    # post_attention_layernorm=self.post_attention_layernorm,
-                    # qkv_proj=self.self_attn.qkv_proj,
-                    # o_proj=self.self_attn.o_proj,
-                    # gate_up_proj=self.mlp.gate_up_proj,
-                    # down_proj=self.mlp.down_proj,
                 )
 
         else:

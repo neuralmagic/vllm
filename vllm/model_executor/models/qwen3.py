@@ -29,7 +29,6 @@ from typing import Any
 import torch
 from torch import nn
 
-# from transformers import Qwen3Config
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -183,9 +182,6 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        # config: Qwen3Config,
-        # cache_config: CacheConfig | None = None,
-        # quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         per_layer_sliding_window: int | None = None,
         mrope_positions_factor: int = 4,
