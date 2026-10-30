@@ -16,8 +16,7 @@ Optional env vars:
 - ``VLLM_CACHE_POLICY_TIMING_RAW``: overrides the raw CSV path (it is
   always written); columns
   ``elapsed_s,function,duration_ns,resident,evictable,heap``
-  (default ``cache_policy_timing_<pid>.csv.gz`` in the working
-  directory, gzip-compressed with one member per flush)
+  (default ``cache_policy_timing_<pid>.csv`` in the working directory)
 - ``VLLM_CACHE_POLICY_TIMING_INTERVAL``: flush/checkpoint seconds
   (default 10)
 
@@ -30,7 +29,6 @@ from __future__ import annotations
 import atexit
 import contextlib
 import functools
-import gzip
 import os
 import signal
 import statistics
@@ -50,7 +48,7 @@ _SUMMARY_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_OUT") or (
     f"cache_policy_timing_{os.getpid()}.txt"
 )
 _RAW_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_RAW") or (
-    f"cache_policy_timing_{os.getpid()}.csv.gz"
+    f"cache_policy_timing_{os.getpid()}.csv"
 )
 _INTERVAL = float(os.environ.get("VLLM_CACHE_POLICY_TIMING_INTERVAL", "10"))
 
@@ -101,9 +99,7 @@ def _flush_raw() -> None:
             return
         records, _RAW[:] = _RAW[:], []
     try:
-        # gzip streams concatenate: each append adds a member, so the
-        # kill-safe flush loop never rewrites the file
-        with gzip.open(_RAW_PATH, "at") as f:
+        with open(_RAW_PATH, "a") as f:
             f.write("elapsed_s,function,duration_ns,resident,evictable,heap\n")
             f.writelines(
                 f"{t:.6f},{name},{dur},{res},{evi},{heap}\n"
