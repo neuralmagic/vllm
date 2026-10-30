@@ -68,6 +68,7 @@ class LRUCachePolicy(CachePolicy):
         self._ranks[key] = (self._next_rank, 0)
         return key in self._evictable
 
+    @timed
     def _push_evictable(self, key: OffloadKey) -> None:
         heapq.heappush(
             self._heap,
@@ -78,6 +79,7 @@ class LRUCachePolicy(CachePolicy):
         rank, key = entry
         return key in self._evictable and self._ranks.get(key) == rank
 
+    @timed
     def _maybe_compact_heap(self) -> None:
         if len(self._heap) < max(64, 2 * len(self._evictable)):
             return
