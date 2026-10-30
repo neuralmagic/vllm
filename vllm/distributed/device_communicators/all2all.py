@@ -1038,7 +1038,7 @@ class MoriAll2AllManager(All2AllManagerBase):
 
 
 class DeepEPV2All2AllManager(All2AllManagerBase):
-    """All2All communication based on DeepEP v2 ElasticBuffer (unified API).
+    """All2All communication based on DeepEP v2 EPBuffer/ElasticBuffer.
     Uses NCCL Gin backend with analytical SM calculation.
     """
 
@@ -1108,9 +1108,10 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             self._check_gin_support(buffer_kwargs["group"])
             self._gin_checked = True
         logger.debug("DeepEP v2 all2all args %s", buffer_kwargs)
-        handle: deep_ep.ElasticBuffer = self.handle_cache.get_or_create(
-            buffer_kwargs, deep_ep.ElasticBuffer
-        )
+        # DeepEP 2.5 renamed ElasticBuffer to EPBuffer. Keep the fallback so
+        # the same vLLM tree works with both DeepEP API revisions.
+        buffer_cls = getattr(deep_ep, "ElasticBuffer", None) or deep_ep.EPBuffer
+        handle = self.handle_cache.get_or_create(buffer_kwargs, buffer_cls)
         if self._num_sms is None:
             self._num_sms = handle.get_theoretical_num_sms(
                 num_experts=num_experts,

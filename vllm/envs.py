@@ -211,6 +211,8 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_MOE_EXPERT_CAPACITY: int | None = None
+    VLLM_DEBUG_MOE_WORKSPACE: bool = False
     VLLM_STEP5_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
@@ -1638,6 +1640,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
     # treats topk_id == -1 as a skip sentinel
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # Per-source-rank assignments retained per expert in an elastic MoE
+    # workspace. Unset keeps the full-size workspace. The selected dispatcher
+    # must support elastic workspaces; otherwise vLLM falls back to full size.
+    "VLLM_MOE_EXPERT_CAPACITY": lambda: maybe_convert_int(
+        os.getenv("VLLM_MOE_EXPERT_CAPACITY")
+        or os.getenv("VLLM_TEST_MOE_EXPERT_CAPACITY")
+    ),
+    # Log elastic MoE workspace memory savings and spill sidecar allocation.
+    "VLLM_DEBUG_MOE_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MOE_WORKSPACE", "0"))
+    ),
     # Step5 SP dense/shared MLPs: opt into TP-sharded weights with AG/RS
     # instead of replicated weights and local-token computation.
     "VLLM_STEP5_SHARD_SP_SHARED_EXPERT": lambda: bool(

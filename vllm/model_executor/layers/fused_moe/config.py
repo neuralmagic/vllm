@@ -1345,6 +1345,10 @@ class FusedMoEConfig:
     # because get_current_vllm_config() isn't set there.
     use_mxfp4_w4a4_dsv4: bool = False
 
+    # Per-source-rank assignments retained per expert in an elastic workspace.
+    # None keeps the full max_num_tokens * num_dispatchers workspace.
+    expert_capacity: int | None = None
+
     def __post_init__(self):
         from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1358,6 +1362,8 @@ class FusedMoEConfig:
             )
 
         assert self.max_num_tokens > 0
+        if self.expert_capacity is not None and self.expert_capacity < 0:
+            raise ValueError("expert_capacity must be nonnegative")
 
         if self.router_logits_dtype is None:
             self.router_logits_dtype = self.in_dtype

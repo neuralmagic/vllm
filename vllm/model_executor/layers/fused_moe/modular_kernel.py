@@ -22,6 +22,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.elastic_workspace import (
+    ElasticWorkspace,
+    ElasticWorkspacePlan,
+)
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsSink,
@@ -192,6 +196,11 @@ class FusedMoEPrepareAndFinalize(ABC):
     * FusedMoEPrepareAndFinalizeMonolithic - the operates on router_logits
     """
 
+    # Set by prepare/finalize implementations whose dispatch already produces a
+    # compact expert workspace. This is a dispatcher capability, not a request:
+    # FusedMoEKernelModularImpl only resizes a workspace when it is true.
+    supports_elastic_workspace: bool = False
+
     def post_init_setup(self, fused_experts: "FusedMoEExperts"):
         """Initialize FusedMoEPrepareAndFinalizeModular settings that depend on
         FusedMoEExpertsModular experts object.
@@ -282,6 +291,32 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
     """An abstract base class for the [Quantize-Prepare] and [Finalize] steps
     described above for the Modular case.
     """
+
+    # Hooks for dispatchers that return the full logical layout. The default
+    # implementation intentionally does not compact or scatter. A dispatcher
+    # opts in only after implementing the corresponding hook.
+    requires_post_dispatch_compaction: bool = False
+    requires_pre_combine_scatter: bool = False
+
+    def post_dispatch_compact(
+        self,
+        a1: torch.Tensor,
+        a1_scale: torch.Tensor | None,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        expert_capacity: int,
+    ) -> PrepareResultType:
+        """Compact a full-layout prepare() result into the elastic workspace."""
+        raise NotImplementedError
+
+    def pre_combine_scatter(
+        self,
+        fused_expert_output: torch.Tensor,
+        expert_capacity: int,
+    ) -> torch.Tensor:
+        """Restore compact expert output before the dispatcher's combine stage."""
+        raise NotImplementedError
 
     @abstractmethod
     def prepare(
@@ -1098,6 +1133,186 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.dp_size > 1
             and moe_parallel_config.use_ep
         )
+        self.expert_capacity: int | None = None
+        self.elastic_workspace_plan: ElasticWorkspacePlan | None = None
+        self.elastic_workspace: ElasticWorkspace | None = None
+        self._elastic_workspace_resizes_workspace = False
+        self._elastic_workspace_usage: tuple[int | None, ...] | None = None
+        self._configure_elastic_workspace()
+
+    def _configure_elastic_workspace(self) -> None:
+        moe_config = self.fused_experts.moe_config
+        capacity = moe_config.expert_capacity
+        self.expert_capacity = capacity
+        if capacity is None:
+            return
+        if capacity < 0:
+            raise ValueError("expert_capacity must be nonnegative")
+        if capacity == 0:
+            logger.warning_once(
+                "expert_capacity=0 is not supported by elastic workspaces; "
+                "using the full-size workspace."
+            )
+            return
+        if not self.prepare_finalize.supports_elastic_workspace:
+            logger.warning_once(
+                "expert_capacity=%d ignored for %s because the dispatcher does "
+                "not support elastic workspaces; using the full-size workspace.",
+                capacity,
+                type(self.prepare_finalize).__name__,
+            )
+            return
+
+        max_num_tokens = getattr(self.fused_experts, "max_num_tokens", None)
+        if max_num_tokens is None:
+            max_num_tokens = moe_config.max_num_tokens
+        num_dispatchers = getattr(self.fused_experts, "num_dispatchers", None)
+        if num_dispatchers is None:
+            num_dispatchers = self.prepare_finalize.num_dispatchers()
+
+        self.elastic_workspace_plan = ElasticWorkspacePlan(
+            expert_capacity=capacity,
+            max_num_tokens_per_rank=max_num_tokens,
+            num_dispatchers=num_dispatchers,
+            num_local_experts=moe_config.num_local_experts,
+        )
+        if (
+            self.prepare_finalize.activation_format
+            == FusedMoEActivationFormat.BatchedExperts
+        ):
+            self._elastic_workspace_resizes_workspace = (
+                self.elastic_workspace_plan.resident_rows_per_expert
+                < self.elastic_workspace_plan.full_rows_per_expert
+            )
+            self.fused_experts.max_num_tokens = (
+                self.elastic_workspace_plan.resident_num_tokens_per_rank
+            )
+
+    @property
+    def uses_elastic_workspace(self) -> bool:
+        return self.elastic_workspace_plan is not None
+
+    def _get_elastic_workspace(
+        self, hidden_size: int, dtype: torch.dtype, device: torch.device
+    ) -> ElasticWorkspace | None:
+        if self.elastic_workspace_plan is None:
+            return None
+        if self.elastic_workspace is None:
+            self.elastic_workspace = ElasticWorkspace.allocate_sidecars(
+                self.elastic_workspace_plan,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+        return self.elastic_workspace
+
+    def _record_elastic_workspace_usage(
+        self,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        fused_out: torch.Tensor,
+        workspace13_shape: tuple[int, ...],
+        workspace2_shape: tuple[int, ...],
+        fused_out_shape: tuple[int, ...],
+    ) -> None:
+        if (
+            self.elastic_workspace_plan is None
+            or not self._elastic_workspace_resizes_workspace
+            or not (envs.VLLM_DEBUG_MOE_WORKSPACE or envs.VLLM_DEBUG_WORKSPACE)
+        ):
+            return
+
+        logical = tuple(
+            t.numel() * t.element_size()
+            for t in (
+                workspace13,
+                workspace2,
+                fused_out,
+            )
+        )
+        resident_bytes = max(logical[0], logical[2]) + logical[1]
+
+        full_shapes = tuple(
+            self.elastic_workspace_plan.full_shape(shape)
+            for shape in (workspace13_shape, workspace2_shape, fused_out_shape)
+        )
+        full_workspace13_shape, full_workspace2_shape, full_fused_out_shape = (
+            full_shapes
+        )
+        if (
+            full_workspace13_shape is not None
+            and full_workspace2_shape is not None
+            and full_fused_out_shape is not None
+        ):
+            element_size = workspace13.element_size()
+            full_workspace13_bytes = prod(full_workspace13_shape) * element_size
+            full_workspace2_bytes = prod(full_workspace2_shape) * element_size
+            full_fused_out_bytes = prod(full_fused_out_shape) * element_size
+            computed_full_bytes = (
+                max(full_workspace13_bytes, full_fused_out_bytes)
+                + full_workspace2_bytes
+            )
+            computed_savings_bytes = computed_full_bytes - resident_bytes
+            full_bytes: int | None = computed_full_bytes
+            savings_bytes: int | None = computed_savings_bytes
+            savings_pct: float | None = (
+                100.0 * computed_savings_bytes / computed_full_bytes
+            )
+        else:
+            full_bytes = None
+            savings_bytes = None
+            savings_pct = None
+
+        storages = {
+            t.untyped_storage().data_ptr(): t.untyped_storage()
+            for t in (workspace13, workspace2, fused_out)
+        }
+        backing_bytes = sum(storage.nbytes() for storage in storages.values())
+        elastic_workspace = self.elastic_workspace
+        sidecar_bytes = tuple(
+            tensor.numel() * tensor.element_size() if tensor is not None else 0
+            for tensor in (
+                elastic_workspace.spill_host if elastic_workspace else None,
+                elastic_workspace.spill_staging if elastic_workspace else None,
+                elastic_workspace.routing if elastic_workspace else None,
+            )
+        )
+
+        usage = (
+            resident_bytes,
+            full_bytes,
+            savings_bytes,
+            backing_bytes,
+            *sidecar_bytes,
+        )
+        if usage == self._elastic_workspace_usage:
+            return
+        self._elastic_workspace_usage = usage
+
+        plan = self.elastic_workspace_plan
+        logger.info(
+            "ELASTIC_MOE_WORKSPACE instance=%s dispatcher=%s capacity=%d "
+            "max_tokens_per_rank=%d dispatchers=%d "
+            "resident_rows_per_expert=%d full_rows_per_expert=%d "
+            "resident_bytes=%d full_bytes=%s savings_bytes=%s savings_pct=%s "
+            "workspace13_bytes=%d workspace2_bytes=%d output_bytes=%d "
+            "backing_bytes=%d spill_host_bytes=%d spill_staging_bytes=%d "
+            "routing_bytes=%d",
+            hex(id(self)),
+            type(self.prepare_finalize).__name__,
+            plan.expert_capacity,
+            plan.max_num_tokens_per_rank,
+            plan.num_dispatchers,
+            plan.resident_rows_per_expert,
+            plan.full_rows_per_expert,
+            resident_bytes,
+            full_bytes,
+            savings_bytes,
+            f"{savings_pct:.2f}" if savings_pct is not None else None,
+            *logical,
+            backing_bytes,
+            *sidecar_bytes,
+        )
 
     def _allocate_buffers(
         self,
@@ -1124,6 +1339,8 @@ class FusedMoEKernelModularImpl:
         assert M_full > 0 and M_chunk > 0
 
         workspace_dtype = self.fused_experts.workspace_dtype(out_dtype)
+        if not current_platform.is_cpu():
+            self._get_elastic_workspace(K, workspace_dtype, device)
 
         # Get intermediate workspace shapes based off the chunked M size.
         workspace13_shape, workspace2_shape, _ = self.fused_experts.workspace_shapes(
@@ -1180,6 +1397,14 @@ class FusedMoEKernelModularImpl:
             )
             workspace13 = _resize_cache(common_workspace, workspace13_shape)
             fused_out = _resize_cache(common_workspace, fused_out_shape)
+            self._record_elastic_workspace_usage(
+                workspace13,
+                workspace2,
+                fused_out,
+                workspace13_shape,
+                workspace2_shape,
+                fused_out_shape,
+            )
             return workspace13, workspace2, fused_out, False
 
         common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
@@ -1195,6 +1420,15 @@ class FusedMoEKernelModularImpl:
             assert fused_out_alias.device == device
             assert fused_out_alias.is_contiguous()
             fused_out = fused_out_alias
+
+        self._record_elastic_workspace_usage(
+            workspace13,
+            workspace2,
+            fused_out,
+            workspace13_shape,
+            workspace2_shape,
+            fused_out_shape,
+        )
 
         return workspace13, workspace2, fused_out, fused_out_alias is not None
 
@@ -1295,6 +1529,25 @@ class FusedMoEKernelModularImpl:
         topk_weights = (
             topk_weights if _expert_topk_weights is None else _expert_topk_weights
         )
+
+        if (
+            self.expert_capacity is not None
+            and self.prepare_finalize.requires_post_dispatch_compaction
+        ):
+            (
+                a1q,
+                a1q_scale,
+                expert_tokens_meta,
+                topk_ids,
+                topk_weights,
+            ) = self.prepare_finalize.post_dispatch_compact(
+                a1q,
+                a1q_scale,
+                expert_tokens_meta,
+                topk_ids,
+                topk_weights,
+                self.expert_capacity,
+            )
 
         return a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights
 
@@ -1421,6 +1674,14 @@ class FusedMoEKernelModularImpl:
                 dimension) needed by the shared expert MLP.
 
         """
+        if (
+            self.expert_capacity is not None
+            and self.prepare_finalize.requires_pre_combine_scatter
+        ):
+            fused_out = self.prepare_finalize.pre_combine_scatter(
+                fused_out, self.expert_capacity
+            )
+
         if not self.prepare_finalize.supports_async():
             assert not dbo_enabled() or self.prepare_finalize.supports_dbo()
 
@@ -1588,6 +1849,11 @@ class FusedMoEKernelMonolithicImpl:
         prepare_finalize: FusedMoEPrepareAndFinalizeMonolithic,
         fused_experts: FusedMoEExpertsMonolithic,
     ):
+        if fused_experts.moe_config.expert_capacity is not None:
+            logger.warning_once(
+                "expert_capacity is ignored for monolithic MoE kernels; using "
+                "the full-size expert workspace."
+            )
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
 
@@ -1735,6 +2001,13 @@ class FusedMoEKernel:
 
     def supports_lora(self) -> bool:
         return self.fused_experts.supports_lora()
+
+    @property
+    def uses_elastic_workspace(self) -> bool:
+        return (
+            isinstance(self.impl, FusedMoEKernelModularImpl)
+            and self.impl.uses_elastic_workspace
+        )
 
     def _post_init_setup(self):
         """Resolve any leftover setup dependencies between self.prepare_finalize

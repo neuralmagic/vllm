@@ -310,6 +310,7 @@ def maybe_make_prepare_finalize(
             use_fp8_dispatch=use_fp8_dispatch,
             use_cudagraph=use_cudagraph,
             sp_size=moe.moe_parallel_config.sp_size,
+            expert_capacity=moe.expert_capacity,
         )
 
     elif moe.use_moonep_kernels:

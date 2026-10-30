@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 from collections.abc import Callable
 
 import deep_ep
@@ -115,6 +117,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         use_fp8_dispatch: bool = False,
         use_cudagraph: bool = False,
         sp_size: int = 1,
+        expert_capacity: int | None = None,
     ):
         super().__init__()
         self.buffer = buffer
@@ -126,6 +129,11 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.use_fp8_dispatch = use_fp8_dispatch
         self.use_cudagraph = use_cudagraph
         self.sp_size = sp_size
+        self.expert_capacity = expert_capacity
+
+        # Prefill dispatch is exact-size and local-expert-contiguous. Decode
+        # uses worst-case receive buffers and is not an elastic producer.
+        self.supports_elastic_workspace = not use_cudagraph
 
         # Set by FusedMoEKernelModularImpl when the experts globalize
         # recv_topk_idx themselves, letting the decode path skip the standalone
