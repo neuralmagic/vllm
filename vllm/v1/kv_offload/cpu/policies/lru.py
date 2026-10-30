@@ -103,12 +103,10 @@ class LRUCachePolicy(CachePolicy):
                 self._push_evictable(key)  # K . log(n)
             self._maybe_compact_heap()  # o(n)
 
-    @timed
     @override
     def get(self, key: OffloadKey) -> ChunkStatus | None:
         return self.chunks.get(key)
 
-    @timed
     @override
     def insert(
         self, key: OffloadKey, chunk: ChunkStatus, req_context: ReqContext
@@ -124,19 +122,16 @@ class LRUCachePolicy(CachePolicy):
             self._evictable.add(key)
             self._push_evictable(key)  # log n
 
-    @timed
     @override
     def remove(self, key: OffloadKey) -> None:
         del self.chunks[key]
         self._ranks.pop(key, None)
         self._evictable.discard(key)
 
-    @timed
     @override
     def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
         self._update_recency(reversed(list(keys)))  # O(n)
 
-    @timed
     @override
     def on_request_access(
         self,
@@ -159,7 +154,6 @@ class LRUCachePolicy(CachePolicy):
                 updated_evictable.append(key)
         self._update_heap(updated_evictable)
 
-    @timed
     @override
     def on_request_finished(
         self,
@@ -171,7 +165,6 @@ class LRUCachePolicy(CachePolicy):
         del insertion_only_keys, reused_keys
         self._update_recency(reversed(order_request_keys(key_groups, req_context)))
 
-    @timed
     @override
     def clear(self) -> None:
         self.chunks.clear()
@@ -181,7 +174,6 @@ class LRUCachePolicy(CachePolicy):
         self._next_rank = 0
         self._cache_generation += 1
 
-    @timed
     @override
     def evict(
         self, n: int, protected: set[OffloadKey]
@@ -229,7 +221,6 @@ class LRUCachePolicy(CachePolicy):
         self._maybe_compact_heap()
         return candidates
 
-    @timed
     @override
     def mark_evictable(self, key: OffloadKey) -> None:
         # chunks can become evictable when,
@@ -239,7 +230,6 @@ class LRUCachePolicy(CachePolicy):
         self._push_evictable(key)
         self._maybe_compact_heap()
 
-    @timed
     @override
     def mark_non_evictable(self, key: OffloadKey) -> None:
         # key must have been evictable before it was pinned.
