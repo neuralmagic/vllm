@@ -1,24 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Env-gated function timing for cache policy debugging.
+"""Function timing for cache policy debugging.
 
 Wall times of decorated functions are recorded by default. Timings
 are:
 
 - summarized (count, p50/p95/p99, max) at process exit in a single
-  atomic write (SIGTERM included) and checkpointed to a file
-- written raw to a CSV (always on), one row per call, with the
-  policy's resident/evictable/heap sizes captured alongside each sample
+  atomic write (SIGTERM included)
+- written raw to a CSV (one row per call:
+  ``elapsed_s,function,duration_ns``), flushed by a background thread
+  every 450s and at process exit
+
+The wrapper's hot path is two perf_counter calls and two appends; all
+file writing happens on the background thread.
 
 Optional env vars:
 - ``VLLM_CACHE_POLICY_TIMING_OUT``: summary checkpoint path
   (default ``cache_policy_timing_<pid>.txt`` in the working directory)
 - ``VLLM_CACHE_POLICY_TIMING_RAW``: overrides the raw CSV path (it is
-  always written); columns
-  ``elapsed_s,function,duration_ns,resident,evictable,heap``
-  (default ``cache_policy_timing_<pid>.csv`` in the working directory)
+  always written; default ``cache_policy_timing_<pid>.csv`` in the
+  working directory)
 - ``VLLM_CACHE_POLICY_TIMING_INTERVAL``: flush/checkpoint seconds
-  (default 10)
+  (default 450)
 
 Set ``VLLM_CACHE_POLICY_TIMING=0`` to disable; then the decorator is
 a no-op pass-through.
@@ -34,14 +37,15 @@ import signal
 import statistics
 import threading
 import time
+from array import array
 from collections.abc import Callable
 from typing import TypeVar
 
 _T = TypeVar("_T")
 
 _ENABLED = os.environ.get("VLLM_CACHE_POLICY_TIMING", "1") != "0"
-_SAMPLES: dict[str, list[float]] = {}
-_RAW: list[tuple[float, str, int, int, int, int]] = []
+_SAMPLES: dict[str, array] = {}
+_RAW: list[tuple[float, str, float]] = []
 _RAW_LOCK = threading.Lock()
 _T0 = time.perf_counter()
 _SUMMARY_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_OUT") or (
@@ -50,13 +54,7 @@ _SUMMARY_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_OUT") or (
 _RAW_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_RAW") or (
     f"cache_policy_timing_{os.getpid()}.csv"
 )
-_INTERVAL = float(os.environ.get("VLLM_CACHE_POLICY_TIMING_INTERVAL", "10"))
-
-
-def _size(obj: object, attr: str) -> int:
-    """Length of ``obj.attr``, or -1 when the attribute is absent."""
-    val = getattr(obj, attr, None)
-    return len(val) if val is not None else -1
+_INTERVAL = float(os.environ.get("VLLM_CACHE_POLICY_TIMING_INTERVAL", "450"))
 
 
 def timed(fn: Callable[..., _T]) -> Callable[..., _T]:
@@ -64,30 +62,20 @@ def timed(fn: Callable[..., _T]) -> Callable[..., _T]:
     if not _ENABLED:
         return fn
     name = fn.__qualname__
+    samples = array("d")
+    _SAMPLES[name] = samples
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # hot path: two perf_counter calls and two appends; everything
+        # else (formatting, file writes) happens on the background thread
         t0 = time.perf_counter()
         try:
             return fn(*args, **kwargs)
         finally:
             elapsed = time.perf_counter() - t0
-            _SAMPLES.setdefault(name, []).append(elapsed)
-            policy = args[0] if args else None
-            # list.append is GIL-atomic; batching under the lock keeps the
-            # hot path lock-free until the background flush drains it
-            _RAW.append(
-                (
-                    t0 - _T0,
-                    name,
-                    round(elapsed * 1e9),
-                    _size(policy, "chunks"),
-                    _size(policy, "_evictable"),
-                    _size(policy, "_heap"),
-                )
-            )
-            if len(_RAW) >= 100_000:
-                _flush_raw()
+            samples.append(elapsed)
+            _RAW.append((t0 - _T0, name, elapsed))
 
     return wrapper
 
@@ -100,16 +88,15 @@ def _flush_raw() -> None:
         records, _RAW[:] = _RAW[:], []
     try:
         with open(_RAW_PATH, "a") as f:
-            f.write("elapsed_s,function,duration_ns,resident,evictable,heap\n")
+            f.write("elapsed_s,function,duration_ns\n")
             f.writelines(
-                f"{t:.6f},{name},{dur},{res},{evi},{heap}\n"
-                for t, name, dur, res, evi, heap in records
+                f"{t:.6f},{name},{dur * 1e9:.0f}\n" for t, name, dur in records
             )
     except OSError:
         pass
 
 
-def _percentiles(samples: list[float]) -> tuple[float, float, float]:
+def _percentiles(samples: array) -> tuple[float, float, float]:
     if len(samples) < 20:
         med = statistics.median(samples)
         return (med, med, med)
