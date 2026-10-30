@@ -2,18 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Env-gated function timing for cache policy debugging.
 
-Set ``VLLM_CACHE_POLICY_TIMING=1`` to record wall times of decorated
-functions. A per-function summary (count, p50/p95/p99, max) is:
+Wall times of decorated functions are recorded by default. Timings
+are:
 
-- printed at process exit as a single atomic write (SIGTERM included)
-- checkpointed to a file every few seconds, so no kill can lose data
+- summarized (count, p50/p95/p99, max) at process exit in a single
+  atomic write (SIGTERM included) and checkpointed to a file
+- written raw to a CSV (always on), one row per call, with the
+  policy's resident/evictable/heap sizes captured alongside each sample
 
 Optional env vars:
-- ``VLLM_CACHE_POLICY_TIMING_OUT``: checkpoint file path
-  (default ``/tmp/vllm_cache_policy_timing_<pid>.txt``)
-- ``VLLM_CACHE_POLICY_TIMING_INTERVAL``: checkpoint seconds (default 10)
+- ``VLLM_CACHE_POLICY_TIMING_OUT``: summary checkpoint path
+  (default ``cache_policy_timing_<pid>.txt`` in the working directory)
+- ``VLLM_CACHE_POLICY_TIMING_RAW``: overrides the raw CSV path (it is
+  always written); columns
+  ``elapsed_s,function,duration_ns,resident,evictable,heap``
+  (default ``cache_policy_timing_<pid>.csv`` in the working directory)
+- ``VLLM_CACHE_POLICY_TIMING_INTERVAL``: flush/checkpoint seconds
+  (default 10)
 
-Without ``VLLM_CACHE_POLICY_TIMING`` the decorator is a no-op pass-through.
+Set ``VLLM_CACHE_POLICY_TIMING=0`` to disable; then the decorator is
+a no-op pass-through.
 """
 
 from __future__ import annotations
@@ -31,12 +39,24 @@ from typing import TypeVar
 
 _T = TypeVar("_T")
 
-_ENABLED = bool(os.environ.get("VLLM_CACHE_POLICY_TIMING"))
+_ENABLED = os.environ.get("VLLM_CACHE_POLICY_TIMING", "1") != "0"
 _SAMPLES: dict[str, list[float]] = {}
-_OUT_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_OUT") or (
-    f"/tmp/vllm_cache_policy_timing_{os.getpid()}.txt"
+_RAW: list[tuple[float, str, int, int, int, int]] = []
+_RAW_LOCK = threading.Lock()
+_T0 = time.perf_counter()
+_SUMMARY_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_OUT") or (
+    f"cache_policy_timing_{os.getpid()}.txt"
+)
+_RAW_PATH = os.environ.get("VLLM_CACHE_POLICY_TIMING_RAW") or (
+    f"cache_policy_timing_{os.getpid()}.csv"
 )
 _INTERVAL = float(os.environ.get("VLLM_CACHE_POLICY_TIMING_INTERVAL", "10"))
+
+
+def _size(obj: object, attr: str) -> int:
+    """Length of ``obj.attr``, or -1 when the attribute is absent."""
+    val = getattr(obj, attr, None)
+    return len(val) if val is not None else -1
 
 
 def timed(fn: Callable[..., _T]) -> Callable[..., _T]:
@@ -51,9 +71,42 @@ def timed(fn: Callable[..., _T]) -> Callable[..., _T]:
         try:
             return fn(*args, **kwargs)
         finally:
-            _SAMPLES.setdefault(name, []).append(time.perf_counter() - t0)
+            elapsed = time.perf_counter() - t0
+            _SAMPLES.setdefault(name, []).append(elapsed)
+            policy = args[0] if args else None
+            # list.append is GIL-atomic; batching under the lock keeps the
+            # hot path lock-free until the background flush drains it
+            _RAW.append(
+                (
+                    t0 - _T0,
+                    name,
+                    round(elapsed * 1e9),
+                    _size(policy, "chunks"),
+                    _size(policy, "_evictable"),
+                    _size(policy, "_heap"),
+                )
+            )
+            if len(_RAW) >= 100_000:
+                _flush_raw()
 
     return wrapper
+
+
+def _flush_raw() -> None:
+    """Append buffered raw records to the CSV."""
+    with _RAW_LOCK:
+        if not _RAW:
+            return
+        records, _RAW[:] = _RAW[:], []
+    try:
+        with open(_RAW_PATH, "a") as f:
+            f.write("elapsed_s,function,duration_ns,resident,evictable,heap\n")
+            f.writelines(
+                f"{t:.6f},{name},{dur},{res},{evi},{heap}\n"
+                for t, name, dur, res, evi, heap in records
+            )
+    except OSError:
+        pass
 
 
 def _percentiles(samples: list[float]) -> tuple[float, float, float]:
@@ -85,12 +138,12 @@ def _table() -> str:
 
 
 def _checkpoint() -> None:
-    """Write the table to the checkpoint file, rename-atomic."""
-    tmp = _OUT_PATH + ".tmp"
+    """Write the summary table to its checkpoint file, rename-atomic."""
+    tmp = _SUMMARY_PATH + ".tmp"
     try:
         with open(tmp, "w") as f:
             f.write(f"# updated {time.strftime('%H:%M:%S')}\n" + _table())
-        os.replace(tmp, _OUT_PATH)
+        os.replace(tmp, _SUMMARY_PATH)
     except OSError:
         pass
 
@@ -108,16 +161,19 @@ def _report() -> None:
     # (stays under PIPE_BUF, keeping the pipe write atomic)
     os.write(1, ("\n" + _table()).encode())
     _checkpoint()
+    _flush_raw()
 
 
-def _checkpoint_loop() -> None:
+def _flush_loop() -> None:
     while True:
         time.sleep(_INTERVAL)
+        _flush_raw()
         if _SAMPLES:
             _checkpoint()
 
 
 if _ENABLED:
+    _flush_raw()  # emit the CSV header immediately
     atexit.register(_report)
 
     # child processes are torn down with SIGTERM (proc.terminate()), which
@@ -130,4 +186,4 @@ if _ENABLED:
     with contextlib.suppress(ValueError):
         signal.signal(signal.SIGTERM, _report_on_sigterm)
 
-    threading.Thread(target=_checkpoint_loop, daemon=True).start()
+    threading.Thread(target=_flush_loop, daemon=True).start()
