@@ -1136,7 +1136,7 @@ class FusedMoEKernelModularImpl:
         self.expert_capacity: int | None = None
         self.elastic_workspace_plan: ElasticWorkspacePlan | None = None
         self.elastic_workspace: ElasticWorkspace | None = None
-        self._elastic_workspace_resizes_workspace = False
+        self._elastic_workspace_capacity_enabled = False
         self._elastic_workspace_usage: tuple[int | None, ...] | None = None
         self._configure_elastic_workspace()
 
@@ -1175,15 +1175,21 @@ class FusedMoEKernelModularImpl:
             max_num_tokens_per_rank=max_num_tokens,
             num_dispatchers=num_dispatchers,
             num_local_experts=moe_config.num_local_experts,
+            num_global_experts=moe_config.num_experts,
+            top_k=moe_config.experts_per_token,
         )
+        if self.prepare_finalize.activation_format in (
+            FusedMoEActivationFormat.Standard,
+            FusedMoEActivationFormat.BatchedExperts,
+        ):
+            self._elastic_workspace_capacity_enabled = (
+                self.elastic_workspace_plan.resident_rows_per_expert
+                < self.elastic_workspace_plan.full_rows_per_expert
+            )
         if (
             self.prepare_finalize.activation_format
             == FusedMoEActivationFormat.BatchedExperts
         ):
-            self._elastic_workspace_resizes_workspace = (
-                self.elastic_workspace_plan.resident_rows_per_expert
-                < self.elastic_workspace_plan.full_rows_per_expert
-            )
             self.fused_experts.max_num_tokens = (
                 self.elastic_workspace_plan.resident_num_tokens_per_rank
             )
@@ -1206,6 +1212,93 @@ class FusedMoEKernelModularImpl:
             )
         return self.elastic_workspace
 
+    def _standard_elastic_chunk_spans(
+        self,
+        M_full: int,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        max_rows: int,
+    ) -> list[tuple[int, int, list[int] | None]] | None:
+        """Split compact Standard rows into resident-size expert-aligned chunks.
+
+        DeepEP v2 emits one row per routed assignment, grouped by local expert.
+        Splitting on expert boundaries keeps each chunk's routing metadata
+        consistent with its rows.  Without per-expert counts, row-aligned
+        slicing is still valid for kernels which derive routing from topk_ids,
+        but count-based kernels require the metadata-aware path.
+        """
+        if M_full <= max_rows:
+            return [(0, M_full, None)]
+        if expert_tokens_meta is None:
+            return [
+                (start, min(start + max_rows, M_full), None)
+                for start in range(0, M_full, max_rows)
+            ]
+
+        counts_cpu = expert_tokens_meta.expert_num_tokens_cpu
+        if counts_cpu is None:
+            return None
+        counts = [int(count) for count in counts_cpu.tolist()]
+        if sum(counts) != M_full:
+            return None
+
+        spans: list[tuple[int, int, list[int] | None]] = []
+        chunk_start = 0
+        chunk_rows = 0
+        chunk_counts = [0] * len(counts)
+        for expert, count in enumerate(counts):
+            remaining = count
+            while remaining:
+                take = min(remaining, max_rows - chunk_rows)
+                chunk_counts[expert] += take
+                chunk_rows += take
+                remaining -= take
+                if chunk_rows == max_rows:
+                    spans.append((chunk_start, chunk_start + chunk_rows, chunk_counts))
+                    chunk_start += chunk_rows
+                    chunk_rows = 0
+                    chunk_counts = [0] * len(counts)
+        if chunk_rows:
+            spans.append((chunk_start, chunk_start + chunk_rows, chunk_counts))
+
+        if not spans or spans[-1][1] != M_full:
+            return None
+        return spans
+
+    @staticmethod
+    def _standard_chunk_metadata(
+        expert_tokens_meta: ExpertTokensMetadata,
+        counts: list[int],
+        device: torch.device,
+    ) -> ExpertTokensMetadata:
+        counts_cpu = torch.tensor(
+            counts,
+            dtype=torch.int32,
+            pin_memory=device.type == "cuda",
+        )
+        counts_gpu = counts_cpu.to(device, non_blocking=True)
+        chunk_meta = ExpertTokensMetadata(
+            expert_num_tokens=counts_gpu,
+            expert_num_tokens_cpu=counts_cpu,
+        )
+        chunk_meta.psum_recv_per_rank = expert_tokens_meta.psum_recv_per_rank
+        chunk_meta.rank_expert_offset = expert_tokens_meta.rank_expert_offset
+        return chunk_meta
+
+    @staticmethod
+    def _standard_chunk_shape_metadata(counts: list[int]) -> ExpertTokensMetadata:
+        return ExpertTokensMetadata(
+            expert_num_tokens=None,
+            expert_num_tokens_cpu=torch.tensor(counts, dtype=torch.int32),
+        )
+
+    @staticmethod
+    def _slice_standard_scale(
+        scale: torch.Tensor | None, start: int, end: int, rows: int
+    ) -> torch.Tensor | None:
+        if scale is None or scale.dim() == 0 or scale.size(0) != rows:
+            return scale
+        return scale[start:end]
+
     def _record_elastic_workspace_usage(
         self,
         workspace13: torch.Tensor,
@@ -1214,13 +1307,23 @@ class FusedMoEKernelModularImpl:
         workspace13_shape: tuple[int, ...],
         workspace2_shape: tuple[int, ...],
         fused_out_shape: tuple[int, ...],
+        full_workspace13_shape: tuple[int, ...] | None = None,
+        full_workspace2_shape: tuple[int, ...] | None = None,
+        full_fused_out_shape: tuple[int, ...] | None = None,
     ) -> None:
-        if (
-            self.elastic_workspace_plan is None
-            or not self._elastic_workspace_resizes_workspace
-            or not (envs.VLLM_DEBUG_MOE_WORKSPACE or envs.VLLM_DEBUG_WORKSPACE)
-        ):
+        if not (envs.VLLM_DEBUG_MOE_WORKSPACE or envs.VLLM_DEBUG_WORKSPACE):
             return
+
+        plan = self.elastic_workspace_plan
+        capacity = plan.expert_capacity if plan is not None else self.expert_capacity
+        max_tokens_per_rank = plan.max_num_tokens_per_rank if plan is not None else 0
+        num_dispatchers = plan.num_dispatchers if plan is not None else 0
+        resident_rows_per_expert = (
+            plan.resident_rows_per_expert if plan is not None else 0
+        )
+        full_rows_per_expert = plan.full_rows_per_expert if plan is not None else 0
+        resident_standard_rows = plan.resident_standard_rows if plan else 0
+        full_standard_rows = plan.full_standard_rows if plan else 0
 
         logical = tuple(
             t.numel() * t.element_size()
@@ -1230,46 +1333,19 @@ class FusedMoEKernelModularImpl:
                 fused_out,
             )
         )
-        resident_bytes = max(logical[0], logical[2]) + logical[1]
-
-        full_shapes = tuple(
-            self.elastic_workspace_plan.full_shape(shape)
-            for shape in (workspace13_shape, workspace2_shape, fused_out_shape)
-        )
-        full_workspace13_shape, full_workspace2_shape, full_fused_out_shape = (
-            full_shapes
-        )
-        if (
-            full_workspace13_shape is not None
-            and full_workspace2_shape is not None
-            and full_fused_out_shape is not None
-        ):
-            element_size = workspace13.element_size()
-            full_workspace13_bytes = prod(full_workspace13_shape) * element_size
-            full_workspace2_bytes = prod(full_workspace2_shape) * element_size
-            full_fused_out_bytes = prod(full_fused_out_shape) * element_size
-            computed_full_bytes = (
-                max(full_workspace13_bytes, full_fused_out_bytes)
-                + full_workspace2_bytes
-            )
-            computed_savings_bytes = computed_full_bytes - resident_bytes
-            full_bytes: int | None = computed_full_bytes
-            savings_bytes: int | None = computed_savings_bytes
-            savings_pct: float | None = (
-                100.0 * computed_savings_bytes / computed_full_bytes
-            )
-        else:
-            full_bytes = None
-            savings_bytes = None
-            savings_pct = None
 
         storages = {
             t.untyped_storage().data_ptr(): t.untyped_storage()
             for t in (workspace13, workspace2, fused_out)
         }
-        backing_bytes = sum(storage.nbytes() for storage in storages.values())
+        logical_by_storage: dict[int, int] = {}
+        for tensor, tensor_bytes in zip((workspace13, workspace2, fused_out), logical):
+            ptr = tensor.untyped_storage().data_ptr()
+            logical_by_storage[ptr] = max(logical_by_storage.get(ptr, 0), tensor_bytes)
+        resident_bytes = sum(logical_by_storage.values())
+        allocated_bytes = sum(storage.nbytes() for storage in storages.values())
         elastic_workspace = self.elastic_workspace
-        sidecar_bytes = tuple(
+        spill_host_bytes, spill_staging_bytes, routing_bytes = tuple(
             tensor.numel() * tensor.element_size() if tensor is not None else 0
             for tensor in (
                 elastic_workspace.spill_host if elastic_workspace else None,
@@ -1277,41 +1353,192 @@ class FusedMoEKernelModularImpl:
                 elastic_workspace.routing if elastic_workspace else None,
             )
         )
+        gpu_sidecar_bytes = spill_staging_bytes + routing_bytes
+        gpu_physical_bytes = allocated_bytes + gpu_sidecar_bytes
+        capacity_applied = plan is not None and self._elastic_workspace_capacity_enabled
+        if (
+            capacity_applied
+            and self.prepare_finalize.activation_format
+            == FusedMoEActivationFormat.Standard
+        ):
+            assert plan is not None
+            if full_workspace13_shape is not None:
+                capacity_applied = workspace13_shape[0] < full_workspace13_shape[0]
+            else:
+                capacity_applied = plan.standard_shape_fits(workspace13_shape)
+
+        if not capacity_applied:
+            full_bytes = allocated_bytes
+            savings_bytes = 0
+            savings_pct = 0.0
+        else:
+            assert plan is not None
+            if (
+                self.prepare_finalize.activation_format
+                == FusedMoEActivationFormat.Standard
+                and full_workspace13_shape is not None
+                and full_workspace2_shape is not None
+                and full_fused_out_shape is not None
+            ):
+                full_shapes = tuple(
+                    (
+                        full_workspace13_shape,
+                        full_workspace2_shape,
+                        full_fused_out_shape,
+                    )
+                )
+            elif (
+                self.prepare_finalize.activation_format
+                == FusedMoEActivationFormat.Standard
+            ):
+                standard_full_shapes: list[tuple[int, ...]] = []
+                for shape in (
+                    workspace13_shape,
+                    workspace2_shape,
+                    fused_out_shape,
+                ):
+                    full_shape = plan.full_standard_shape(shape)
+                    assert full_shape is not None
+                    standard_full_shapes.append(full_shape)
+                full_shapes = tuple(standard_full_shapes)
+            else:
+                batched_full_shapes: list[tuple[int, ...]] = []
+                for shape in (
+                    workspace13_shape,
+                    workspace2_shape,
+                    fused_out_shape,
+                ):
+                    full_shape = plan.full_shape(shape)
+                    assert full_shape is not None
+                    batched_full_shapes.append(full_shape)
+                full_shapes = tuple(batched_full_shapes)
+            full_workspace13_shape, full_workspace2_shape, full_fused_out_shape = (
+                full_shapes
+            )
+            if (
+                full_workspace13_shape is not None
+                and full_workspace2_shape is not None
+                and full_fused_out_shape is not None
+            ):
+                element_size = workspace13.element_size()
+                full_workspace13_bytes = prod(full_workspace13_shape) * element_size
+                full_workspace2_bytes = prod(full_workspace2_shape) * element_size
+                full_fused_out_bytes = prod(full_fused_out_shape) * element_size
+                computed_full_bytes = (
+                    max(full_workspace13_bytes, full_fused_out_bytes)
+                    + full_workspace2_bytes
+                )
+                computed_savings_bytes = computed_full_bytes - resident_bytes
+                full_bytes = computed_full_bytes
+                savings_bytes = computed_savings_bytes
+                savings_pct = 100.0 * computed_savings_bytes / computed_full_bytes
+            else:
+                full_bytes = None
+                savings_bytes = None
+                savings_pct = None
+
+        allocation_savings_bytes = (
+            full_bytes - allocated_bytes if full_bytes is not None else None
+        )
+        allocation_savings_pct = (
+            100.0 * allocation_savings_bytes / full_bytes
+            if allocation_savings_bytes is not None and full_bytes
+            else None
+        )
+        virtual_tail_bytes = (
+            max(full_bytes - allocated_bytes, 0)
+            if capacity_applied and full_bytes is not None
+            else 0
+        )
+        gpu_savings_bytes = (
+            full_bytes - gpu_physical_bytes
+            if capacity_applied and full_bytes is not None
+            else 0
+        )
+        gpu_savings_pct = (
+            100.0 * gpu_savings_bytes / full_bytes
+            if capacity_applied and full_bytes
+            else 0.0
+        )
+        usage_pct = (
+            100.0 * resident_bytes / allocated_bytes if allocated_bytes else None
+        )
 
         usage = (
             resident_bytes,
+            allocated_bytes,
             full_bytes,
             savings_bytes,
-            backing_bytes,
-            *sidecar_bytes,
+            allocation_savings_bytes,
+            capacity_applied,
+            spill_host_bytes,
+            spill_staging_bytes,
+            routing_bytes,
         )
-        if usage == self._elastic_workspace_usage:
-            return
+        previous = self._elastic_workspace_usage
+        if previous is not None:
+            min_increment = max(1 << 20, allocated_bytes // 100)
+            if (
+                previous[1:] == usage[1:]
+                and resident_bytes < previous[0] + min_increment
+            ):
+                return
         self._elastic_workspace_usage = usage
 
-        plan = self.elastic_workspace_plan
         logger.info(
-            "ELASTIC_MOE_WORKSPACE instance=%s dispatcher=%s capacity=%d "
-            "max_tokens_per_rank=%d dispatchers=%d "
+            "ELASTIC_MOE_WORKSPACE instance=%s dispatcher=%s capacity=%s "
+            "max_tokens_per_rank=%s dispatchers=%s "
             "resident_rows_per_expert=%d full_rows_per_expert=%d "
+            "resident_standard_rows=%d full_standard_rows=%d "
+            "capacity_applied=%d "
+            "used_bytes=%d allocated_bytes=%d usage_pct=%s "
+            "full_capacity_bytes=%s "
             "resident_bytes=%d full_bytes=%s savings_bytes=%s savings_pct=%s "
+            "allocation_savings_bytes=%s allocation_savings_pct=%s "
+            "virtual_capacity_bytes=%s virtual_tail_bytes=%d "
+            "gpu_workspace_bytes=%d gpu_sidecar_bytes=%d "
+            "gpu_physical_bytes=%d cpu_pinned_bytes=%d "
+            "gpu_savings_bytes=%d gpu_savings_pct=%s "
             "workspace13_bytes=%d workspace2_bytes=%d output_bytes=%d "
             "backing_bytes=%d spill_host_bytes=%d spill_staging_bytes=%d "
             "routing_bytes=%d",
             hex(id(self)),
             type(self.prepare_finalize).__name__,
-            plan.expert_capacity,
-            plan.max_num_tokens_per_rank,
-            plan.num_dispatchers,
-            plan.resident_rows_per_expert,
-            plan.full_rows_per_expert,
+            capacity,
+            max_tokens_per_rank,
+            num_dispatchers,
+            resident_rows_per_expert,
+            full_rows_per_expert,
+            resident_standard_rows,
+            full_standard_rows,
+            int(capacity_applied),
+            resident_bytes,
+            allocated_bytes,
+            f"{usage_pct:.2f}" if usage_pct is not None else None,
+            full_bytes,
             resident_bytes,
             full_bytes,
             savings_bytes,
             f"{savings_pct:.2f}" if savings_pct is not None else None,
+            allocation_savings_bytes,
+            (
+                f"{allocation_savings_pct:.2f}"
+                if allocation_savings_pct is not None
+                else None
+            ),
+            full_bytes,
+            virtual_tail_bytes,
+            allocated_bytes,
+            gpu_sidecar_bytes,
+            gpu_physical_bytes,
+            spill_host_bytes,
+            gpu_savings_bytes,
+            f"{gpu_savings_pct:.2f}",
             *logical,
-            backing_bytes,
-            *sidecar_bytes,
+            allocated_bytes,
+            spill_host_bytes,
+            spill_staging_bytes,
+            routing_bytes,
         )
 
     def _allocate_buffers(
@@ -1327,6 +1554,8 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
+        scratch_expert_tokens_meta: ExpertTokensMetadata | None = None,
+        scratch_expert_tokens_metas: list[ExpertTokensMetadata] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         """Allocate temporary and output buffers for the fused experts op.
         Inputs:
@@ -1343,19 +1572,48 @@ class FusedMoEKernelModularImpl:
             self._get_elastic_workspace(K, workspace_dtype, device)
 
         # Get intermediate workspace shapes based off the chunked M size.
-        workspace13_shape, workspace2_shape, _ = self.fused_experts.workspace_shapes(
-            M_chunk,
-            N,
-            K,
-            top_k,
-            global_num_experts,
-            local_num_experts,
-            expert_tokens_meta,
-            activation,
+        # DeepGEMM derives its shape from the per-expert counts, so an elastic
+        # chunk must supply counts for that chunk rather than the full batch.
+        if scratch_expert_tokens_metas is not None:
+            scratch_metas: list[ExpertTokensMetadata | None] = list(
+                scratch_expert_tokens_metas
+            )
+        else:
+            scratch_metas = [
+                expert_tokens_meta
+                if scratch_expert_tokens_meta is None
+                else scratch_expert_tokens_meta
+            ]
+        scratch_shapes = [
+            self.fused_experts.workspace_shapes(
+                M_chunk,
+                N,
+                K,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                scratch_meta,
+                activation,
+            )
+            for scratch_meta in scratch_metas
+        ]
+        workspace13_shape = tuple(
+            max(shape[0][axis] for shape in scratch_shapes)
+            for axis in range(len(scratch_shapes[0][0]))
+        )
+        workspace2_shape = tuple(
+            max(shape[1][axis] for shape in scratch_shapes)
+            for axis in range(len(scratch_shapes[0][1]))
         )
 
-        # Get final output shape based on the full M size.
-        _, _, fused_out_shape = self.fused_experts.workspace_shapes(
+        # Get the full-size shapes as well.  For compact Standard rows the
+        # scratch tensors can be capped at M_chunk, but the output still needs
+        # every compact row because DeepEP's combine consumes the full tensor.
+        (
+            full_workspace13_shape,
+            full_workspace2_shape,
+            fused_out_shape,
+        ) = self.fused_experts.workspace_shapes(
             M_full,
             N,
             K,
@@ -1365,12 +1623,26 @@ class FusedMoEKernelModularImpl:
             expert_tokens_meta,
             activation,
         )
+        chunked = M_chunk < M_full
 
         fused_out_alias = self.prepare_finalize.allocate_fused_expert_output(
             fused_out_shape,
             workspace_dtype,
             device,
             self.fused_experts.finalize_weight_and_reduce_impl(),
+        )
+
+        is_standard = (
+            self.prepare_finalize.activation_format == FusedMoEActivationFormat.Standard
+        )
+        telemetry_full_shapes = (
+            (
+                full_workspace13_shape,
+                full_workspace2_shape,
+                fused_out_shape,
+            )
+            if is_standard
+            else (None, None, None)
         )
 
         # We can reuse the memory between cache1 and cache3 because by the
@@ -1389,14 +1661,29 @@ class FusedMoEKernelModularImpl:
             # workspace manager entirely here -- it's the one part of this
             # call graph Dynamo can't trace (ContextVar-based lane lookup),
             # and CPU never actually needs its cross-chunk memory reuse.
-            common_workspace = torch.empty(
-                (max_shape_size,), dtype=workspace_dtype, device=device
-            )
-            workspace2 = torch.empty(
-                workspace2_shape, dtype=workspace_dtype, device=device
-            )
-            workspace13 = _resize_cache(common_workspace, workspace13_shape)
-            fused_out = _resize_cache(common_workspace, fused_out_shape)
+            if chunked:
+                workspace13 = torch.empty(
+                    workspace13_shape, dtype=workspace_dtype, device=device
+                )
+                workspace2 = torch.empty(
+                    workspace2_shape, dtype=workspace_dtype, device=device
+                )
+                fused_out = (
+                    fused_out_alias
+                    if fused_out_alias is not None
+                    else torch.empty(
+                        fused_out_shape, dtype=workspace_dtype, device=device
+                    )
+                )
+            else:
+                common_workspace = torch.empty(
+                    (max_shape_size,), dtype=workspace_dtype, device=device
+                )
+                workspace2 = torch.empty(
+                    workspace2_shape, dtype=workspace_dtype, device=device
+                )
+                workspace13 = _resize_cache(common_workspace, workspace13_shape)
+                fused_out = _resize_cache(common_workspace, fused_out_shape)
             self._record_elastic_workspace_usage(
                 workspace13,
                 workspace2,
@@ -1404,17 +1691,31 @@ class FusedMoEKernelModularImpl:
                 workspace13_shape,
                 workspace2_shape,
                 fused_out_shape,
+                *telemetry_full_shapes,
             )
             return workspace13, workspace2, fused_out, False
 
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
-            (workspace2_shape, workspace_dtype),
-        )
-        workspace13 = _resize_cache(common_workspace, workspace13_shape)
-        if fused_out_alias is None:
-            fused_out = _resize_cache(common_workspace, fused_out_shape)
+        if chunked:
+            shapes_and_dtypes = [
+                ((prod(workspace13_shape),), workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            ]
+            if fused_out_alias is None:
+                shapes_and_dtypes.append((fused_out_shape, workspace_dtype))
+            allocations = current_workspace_manager().get_simultaneous(
+                *shapes_and_dtypes
+            )
+            workspace13 = _resize_cache(allocations[0], workspace13_shape)
+            workspace2 = allocations[1]
+            fused_out = allocations[2] if fused_out_alias is None else fused_out_alias
         else:
+            common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+                ((max_shape_size,), workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
+            workspace13 = _resize_cache(common_workspace, workspace13_shape)
+            fused_out = _resize_cache(common_workspace, fused_out_shape)
+        if fused_out_alias is not None:
             assert fused_out_alias.shape == fused_out_shape
             assert fused_out_alias.dtype == workspace_dtype
             assert fused_out_alias.device == device
@@ -1428,6 +1729,7 @@ class FusedMoEKernelModularImpl:
             workspace13_shape,
             workspace2_shape,
             fused_out_shape,
+            *telemetry_full_shapes,
         )
 
         return workspace13, workspace2, fused_out, fused_out_alias is not None
@@ -1582,11 +1884,47 @@ class FusedMoEKernelModularImpl:
             out_dim = self.fused_experts.output_hidden_dim(a1q.size(-1))
             return a1q.new_empty((*a1q.shape[:-1], out_dim), dtype=in_dtype)
 
+        chunk_spans: list[tuple[int, int, list[int] | None]] | None = None
+        scratch_expert_tokens_metas: list[ExpertTokensMetadata] | None = None
+        M_chunk = M_full
+        plan = self.elastic_workspace_plan
+        if (
+            self._elastic_workspace_capacity_enabled
+            and plan is not None
+            and self.prepare_finalize.activation_format
+            == FusedMoEActivationFormat.Standard
+            and M_full > plan.resident_standard_rows
+        ):
+            chunk_spans = self._standard_elastic_chunk_spans(
+                M_full,
+                expert_tokens_meta,
+                plan.resident_standard_rows,
+            )
+            if chunk_spans is None:
+                logger.warning_once(
+                    "expert_capacity=%d could not bound the compact Standard "
+                    "workspace because the per-expert token counts are "
+                    "unavailable; using the full-size workspace.",
+                    plan.expert_capacity,
+                )
+            else:
+                M_chunk = plan.resident_standard_rows
+                first_counts = chunk_spans[0][2]
+                if first_counts is not None:
+                    # Count-based kernels can round each expert independently.
+                    # Size the shared scratch for the worst chunk rather than
+                    # only the first one.
+                    scratch_expert_tokens_metas = [
+                        self._standard_chunk_shape_metadata(counts)
+                        for _, _, counts in chunk_spans
+                        if counts is not None
+                    ]
+
         workspace13, workspace2, fused_out, fused_out_is_specialized = (
             self._allocate_buffers(
                 in_dtype,
                 a1q.device,
-                M_full,
+                M_chunk,
                 M_full,
                 N,
                 K,
@@ -1595,6 +1933,7 @@ class FusedMoEKernelModularImpl:
                 local_num_experts,
                 expert_tokens_meta,
                 activation,
+                scratch_expert_tokens_metas=scratch_expert_tokens_metas,
             )
         )
 
@@ -1619,23 +1958,56 @@ class FusedMoEKernelModularImpl:
         elif use_output_alias:
             fused_out = output_alias
 
-        unfinalized = self.fused_experts.apply(
-            output=fused_out,
-            hidden_states=a1q,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            a1q_scale=a1q_scale,
-            a2_scale=self.fused_experts.a2_scale,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        if chunk_spans is None:
+            unfinalized = self.fused_experts.apply(
+                output=fused_out,
+                hidden_states=a1q,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=a1q_scale,
+                a2_scale=self.fused_experts.a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        else:
+            unfinalized = None
+            for start, end, chunk_counts in chunk_spans:
+                if chunk_counts is None:
+                    chunk_meta = expert_tokens_meta
+                else:
+                    assert expert_tokens_meta is not None
+                    chunk_meta = self._standard_chunk_metadata(
+                        expert_tokens_meta, chunk_counts, a1q.device
+                    )
+                chunk_unfinalized = self.fused_experts.apply(
+                    output=fused_out[start:end],
+                    hidden_states=a1q[start:end],
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=topk_weights[start:end],
+                    topk_ids=topk_ids[start:end],
+                    activation=activation,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                    a1q_scale=self._slice_standard_scale(a1q_scale, start, end, M_full),
+                    a2_scale=self.fused_experts.a2_scale,
+                    workspace13=workspace13,
+                    workspace2=workspace2,
+                    expert_tokens_meta=chunk_meta,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                )
+                if isinstance(chunk_unfinalized, UnfinalizedMoEOutput):
+                    raise RuntimeError(
+                        "Compact Standard chunking requires experts which "
+                        "finalize each chunk; got a deferred MoE output."
+                    )
 
         # Experts that stopped after GEMM2 wrote nothing into `fused_out`; the
         # top-k reduction they left open belongs to whoever takes this.

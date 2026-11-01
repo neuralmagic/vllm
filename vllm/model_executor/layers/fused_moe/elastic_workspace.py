@@ -21,6 +21,8 @@ class ElasticWorkspacePlan:
     max_num_tokens_per_rank: int
     num_dispatchers: int
     num_local_experts: int
+    num_global_experts: int | None = None
+    top_k: int = 1
     spill_capacity_rows: int = 8192
     spill_staging_rows: int = 256
 
@@ -33,6 +35,10 @@ class ElasticWorkspacePlan:
             raise ValueError("num_dispatchers must be positive")
         if self.num_local_experts <= 0:
             raise ValueError("num_local_experts must be positive")
+        if self.num_global_experts is not None and self.num_global_experts <= 0:
+            raise ValueError("num_global_experts must be positive")
+        if self.top_k <= 0:
+            raise ValueError("top_k must be positive")
         if self.spill_capacity_rows < 0:
             raise ValueError("spill_capacity_rows must be nonnegative")
         if self.spill_staging_rows < 0:
@@ -49,6 +55,37 @@ class ElasticWorkspacePlan:
     @property
     def full_rows_per_expert(self) -> int:
         return self.num_dispatchers * self.max_num_tokens_per_rank
+
+    @property
+    def resident_standard_rows(self) -> int:
+        """Resident assignment rows for a compact Standard layout.
+
+        DeepEP v2's compact Standard output has one row per routed assignment,
+        not one padded row per local expert.  A source token therefore
+        contributes ``top_k`` assignment rows, and the resident row budget is
+        the source-token capacity multiplied by the number of dispatchers and
+        top-k.  The per-expert capacity also bounds the total to
+        ``num_local_experts * num_dispatchers * capacity``.
+        """
+        return self._standard_rows(self.resident_num_tokens_per_rank)
+
+    @property
+    def full_standard_rows(self) -> int:
+        """Full-size assignment rows for a compact Standard layout."""
+        return self._standard_rows(self.max_num_tokens_per_rank)
+
+    def _standard_rows(self, num_tokens_per_rank: int) -> int:
+        local_assignment_budget = (
+            self.num_dispatchers * num_tokens_per_rank * self.top_k
+        )
+        num_global_experts = self.num_global_experts or self.num_local_experts
+        local_fraction_budget = (
+            local_assignment_budget * self.num_local_experts + num_global_experts - 1
+        ) // num_global_experts
+        per_expert_budget = (
+            self.num_local_experts * self.num_dispatchers * num_tokens_per_rank
+        )
+        return min(local_assignment_budget, local_fraction_budget, per_expert_budget)
 
     @property
     def workspace_reduction_fraction(self) -> float:
@@ -86,6 +123,20 @@ class ElasticWorkspacePlan:
 
         full_shape = list(resident_shape)
         full_shape[row_axis] = self.full_rows_per_expert
+        return tuple(full_shape)
+
+    def standard_shape_fits(self, resident_shape: tuple[int, ...]) -> bool:
+        """Whether compact Standard rows fit the GPU-resident capacity."""
+        return bool(resident_shape) and resident_shape[0] <= self.resident_standard_rows
+
+    def full_standard_shape(
+        self, resident_shape: tuple[int, ...]
+    ) -> tuple[int, ...] | None:
+        """Expand a compact Standard row extent to its full-size equivalent."""
+        if not resident_shape:
+            return None
+        full_shape = list(resident_shape)
+        full_shape[0] = self.full_standard_rows
         return tuple(full_shape)
 
 
