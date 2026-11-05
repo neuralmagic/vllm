@@ -453,6 +453,13 @@ class TieringOffloadingManager(OffloadingManager):
 
         # set of keys being promoted
         self._inflight_promotion_keys: set[OffloadKey] = set()
+        # Requests whose promotion failed to allocate primary slots. Once
+        # set, _initiate_promotion() returns False for every key of the
+        # request, so lookups report MISS and the chunk is recomputed on
+        # GPU. The policy is based on the principle that offloading is
+        # best-effort and shouldn't affect the baseline (i.e. simple GPU
+        # prefills)
+        self._promotion_failed_requests: set[str] = set()
 
     @property
     @override
@@ -658,6 +665,10 @@ class TieringOffloadingManager(OffloadingManager):
         self._inflight_promotion_keys.difference_update(transfer_job.requested_keys)
 
         if not transfer_job.is_materialized():
+            ## Promotion failed. lets not doom the request into a retry loop.
+            req_id = transfer_job.req_context.req_id
+            if req_id in self._req_state:
+                self._promotion_failed_requests.add(req_id)
             _maybe_update_load_sources(set(transfer_job.requested_keys))
             return
 
@@ -949,12 +960,17 @@ class TieringOffloadingManager(OffloadingManager):
 
         Returns:
             True if promotion was scheduled or already in flight.
-            False if the request's promotion demand this step exceeds
-            primary tier availability.
+            False,
+             - if the request's promotion demand this step exceeds primary tier
+               availability. or,
+             - if the request failed promotion once already.
 
         """
         if key in self._inflight_promotion_keys:
             return True
+
+        if req_context.req_id in self._promotion_failed_requests:
+            return False
 
         # Per-request demand accounting: the manager only admits a promotion
         # set the primary tier could hold on its own, so every submitted job
@@ -1332,6 +1348,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._metrics.on_request_finished(state.req_context)
         self._request_load_sources.pop(req_id, None)
         del self._req_state[req_id]
+        self._promotion_failed_requests.discard(req_id)
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
@@ -1453,6 +1470,7 @@ class TieringOffloadingManager(OffloadingManager):
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
         self._request_load_sources.clear()
+        self._promotion_failed_requests.clear()
         self._metrics.assert_idle()
 
         finished_req_ids = []
