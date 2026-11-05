@@ -103,6 +103,9 @@ class RequestState:
     request_level_tiers: set[int] | None = None
     pending_cascade_keys: list[OffloadKey] = field(default_factory=list)
     promotion_job_ids: set[JobId] = field(default_factory=set)
+    # Remaining promotion demand budget for the current scheduler step;
+    # None until the request's first initiate_promotion of the step.
+    promotion_demand: int | None = None
 
 
 PrimaryAllocFn = Callable[
@@ -946,10 +949,24 @@ class TieringOffloadingManager(OffloadingManager):
 
         Returns:
             True if promotion was scheduled or already in flight.
+            False if the request's promotion demand this step exceeds
+            primary tier availability.
 
         """
         if key in self._inflight_promotion_keys:
             return True
+
+        # Per-request demand accounting: the manager only admits a promotion
+        # set the primary tier could hold on its own, so every submitted job
+        # is materializable. The budget is per request and resets each step;
+        # aggregate over-admission across requests is intentional and left
+        # for the tiers to resolve at materialize() time.
+        state = self._req_state[req_context.req_id]
+        if state.promotion_demand is None:
+            state.promotion_demand = self.primary_tier.get_num_available_chunks()
+        if state.promotion_demand <= 0:
+            return False
+        state.promotion_demand -= 1
 
         # Record load_sources
         load_sources = self._request_load_sources.setdefault(req_context.req_id, {})
@@ -1337,6 +1354,10 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = False
 
         self._flush_pending_promotions()
+        # The demand budget is per step: a request's next lookup walk starts
+        # from the primary tier's availability at that time.
+        for req_state in self._req_state.values():
+            req_state.promotion_demand = None
         # Keys parked by this step's prepare_store cannot have completed yet, so
         # they are simply re-parked here and retried on the next step. That is
         # safe: _maybe_finalize_request() holds off while pending_cascade_keys is
