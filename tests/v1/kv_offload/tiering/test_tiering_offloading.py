@@ -1819,10 +1819,9 @@ class TestTieringOffloadingManager:
         # the lookup that staged it).
         promo_chunk = to_keys([99])[0]
         self.secondary_tier1.chunks[promo_chunk] = True
-        assert (
-            self.manager.lookup(promo_chunk, ReqContext(req_id="pending"))
-            is LookupResult.HIT_PENDING
-        )
+        pending_ctx = ReqContext(req_id="pending")
+        self.manager.on_new_request(pending_ctx)
+        assert self.manager.lookup(promo_chunk, pending_ctx) is LookupResult.HIT_PENDING
         assert self.manager._pending_load_submissions
 
         # Request-level tier registration.
@@ -1850,7 +1849,11 @@ class TestTieringOffloadingManager:
         assert self.manager._jobs == {}
         assert self.manager._pending_load_submissions == {}
         assert self.manager._request_load_sources == {}
-        assert set(self.manager._req_state) == {_CTX.req_id, rl_ctx.req_id}
+        assert set(self.manager._req_state) == {
+            _CTX.req_id,
+            rl_ctx.req_id,
+            pending_ctx.req_id,
+        }
         assert self.manager._processed_jobs_this_step is False
 
         # Primary tier reset to a fresh state.
@@ -1936,6 +1939,7 @@ class TestTieringOffloadingManager:
         monkeypatch.setattr(self.secondary_tier1, "lookup", tier1_lookup)
 
         ctx = ReqContext(req_id="r2", load_tier_filter=load_tier_filter)
+        self.manager.on_new_request(ctx)
         assert self.manager.lookup(chunks[0], ctx) is LookupResult.HIT_PENDING
         tier1_lookup.assert_called()
 
