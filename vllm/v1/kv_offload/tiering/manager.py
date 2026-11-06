@@ -106,6 +106,9 @@ class RequestState:
     # Remaining promotion demand budget for the current scheduler step;
     # None until the request's first initiate_promotion of the step.
     promotion_demand: int | None = None
+    # Primary-tier keys this step's walk hit that are still evictable: the
+    # request depends on them, so they are reserved against its own budget.
+    evictable_cpu_hits: set[OffloadKey] = field(default_factory=set)
 
 
 PrimaryAllocFn = Callable[
@@ -867,6 +870,9 @@ class TieringOffloadingManager(OffloadingManager):
             lookup_duration,
         )
         if primary_hit is LookupResult.HIT:
+            chunk = self.primary_tier._policy.get(key)
+            if chunk is not None and chunk.ref_cnt == 0:
+                self._req_state[req_context.req_id].evictable_cpu_hits.add(key)
             return LookupResult.HIT
         if primary_hit is LookupResult.HIT_PENDING:
             return LookupResult.HIT_PENDING
@@ -980,7 +986,7 @@ class TieringOffloadingManager(OffloadingManager):
         state = self._req_state[req_context.req_id]
         if state.promotion_demand is None:
             state.promotion_demand = self.primary_tier.get_num_available_chunks()
-        if state.promotion_demand <= 0:
+        if state.promotion_demand - len(state.evictable_cpu_hits) <= 0:
             return False
         state.promotion_demand -= 1
 
@@ -1375,6 +1381,7 @@ class TieringOffloadingManager(OffloadingManager):
         # from the primary tier's availability at that time.
         for req_state in self._req_state.values():
             req_state.promotion_demand = None
+            req_state.evictable_cpu_hits.clear()
         # Keys parked by this step's prepare_store cannot have completed yet, so
         # they are simply re-parked here and retried on the next step. That is
         # safe: _maybe_finalize_request() holds off while pending_cascade_keys is

@@ -694,25 +694,31 @@ class TestTieringOffloadingManager:
         assert count_hits(self.manager, chunks) == 3
 
     def test_promotion_batch_larger_than_primary_capacity(self, manager_setup):
-        """A promotion batch larger than the primary capacity is denied
-        eventually.
+        """A promotion batch larger than the primary capacity shrinks to the
+        primary capacity: only a capacity-sized prefix is promoted, the rest
+        MISS.
         """
         keys = to_keys(range(15))
         for key in keys:
             self.secondary_tier1.chunks[key] = True
 
         self._start_request()
-        # Attempt promotion atmost 3 times to see if the mechanics
-        # abandons it eventually.
-        max_attempts = 3
-        success = False
-        for _ in range(max_attempts):
-            results = [self.manager.lookup(key, _CTX) for key in keys]
-            if success := all(r is LookupResult.MISS for r in results):
-                break
-            self._simulate_on_schedule_end()
+        results = [self.manager.lookup(key, _CTX) for key in keys]
+        assert all(r is LookupResult.HIT_PENDING for r in results[:5])
+        assert all(r is LookupResult.MISS for r in results[5:])
 
-        assert success, "Expected all keys to be missed"
+        self._simulate_on_schedule_end()
+        # After the promotion lands, the connector walk stops at the first
+        # MISS: a stable capacity-sized prefix hit, no retry loop back to
+        # HIT_PENDING on all 15.
+        walked: list[LookupResult] = []
+        for key in keys:
+            result = self.manager.lookup(key, _CTX)
+            if result is LookupResult.MISS:
+                break
+            walked.append(result)
+        assert len(walked) == 5
+        assert all(r is LookupResult.HIT for r in walked)
 
     @pytest.mark.parametrize(
         "source",
