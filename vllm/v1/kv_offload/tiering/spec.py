@@ -417,6 +417,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 )
                 self._scheduler_mmap = scheduler_mmap
 
+                # Every worker mapped the region inside the blocking
+                # initialize_from_config collective RPC, and this scheduler
+                # region is the last opener, so unliking is safe.
+                scheduler_mmap.unlink_mmap_files()
+
                 # Create primary tier (CPU-based)
                 primary_tier = CPUPrimaryTierOffloadingManager(
                     num_chunks=self.num_chunks,

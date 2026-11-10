@@ -212,7 +212,7 @@ class SharedOffloadRegion:
                 barriers_remaining -= 1
                 barrier()
                 if self._creator:
-                    self._unlink()
+                    self.unlink_mmap_files()
                     self._creator = False
                     logger.info("Unlinked mmap file %s", self.mmap_path)
             if populate_shard is not None:
@@ -228,7 +228,7 @@ class SharedOffloadRegion:
                     barrier()
         except Exception:
             if self._creator:
-                self._unlink()
+                self.unlink_mmap_files()
                 self._creator = False
             if hasattr(self, "mmap_obj") and self.mmap_obj is not None:
                 # The prefault traceback may retain an exported buffer.
@@ -298,7 +298,13 @@ class SharedOffloadRegion:
             if address != base + offset:
                 raise OSError(ctypes.get_errno(), f"Failed to map {path}")
 
-    def _unlink(self) -> None:
+    def unlink_mmap_files(self) -> None:
+        """Unlink the backing files, leaving existing mappings valid.
+
+        Safe only once every opener of this region already holds an fd or
+        mapping: the kernel reclaims the memory when the last reference
+        drops, no matter how the holders exit.
+        """
         for path, _, _ in self._segments:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
@@ -465,7 +471,7 @@ class SharedOffloadRegion:
             self.fd = None
         if self._creator and getattr(self, "mmap_path", None):
             try:
-                self._unlink()
+                self.unlink_mmap_files()
                 logger.info("Removed mmap file %s", self.mmap_path)
             except Exception:
                 logger.warning(
