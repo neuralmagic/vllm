@@ -28,11 +28,12 @@ def _make_dspark_config(architecture: str) -> dict:
     }
 
 
-def test_dspark_updater_preserves_quantization_config() -> None:
+@pytest.mark.parametrize("quant_format", ["float-quantized", "nvfp4-pack-quantized"])
+def test_dspark_updater_preserves_quantization_config(quant_format: str) -> None:
     outer_config = _make_dspark_config("Qwen3DSparkModel")
     quantization_config = {
         "quant_method": "compressed-tensors",
-        "format": "float-quantized",
+        "format": quant_format,
     }
     outer_config["quantization_config"] = quantization_config
 
