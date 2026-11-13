@@ -28,6 +28,19 @@ def _make_dspark_config(architecture: str) -> dict:
     }
 
 
+def test_dspark_updater_preserves_quantization_config() -> None:
+    outer_config = _make_dspark_config("Qwen3DSparkModel")
+    quantization_config = {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+    }
+    outer_config["quantization_config"] = quantization_config
+
+    config = SpeculatorsConfig.extract_transformers_pre_trained_config(outer_config)
+
+    assert config["quantization_config"] == quantization_config
+
+
 def test_dspark_updater_preserves_qwen3_omni_contract() -> None:
     config = SpeculatorsConfig.extract_transformers_pre_trained_config(
         _make_dspark_config("Qwen3OmniDSparkModel")

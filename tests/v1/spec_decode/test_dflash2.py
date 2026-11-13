@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
@@ -670,6 +671,109 @@ def test_dflash_fc_runs_fp32_target_hidden_states_in_draft_dtype(monkeypatch):
 
     assert combined.dtype == torch.bfloat16
     torch.testing.assert_close(combined, fc(aux_hidden_states.to(torch.bfloat16)))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="CUDA required")
+@pytest.mark.skip_global_cleanup
+def test_dflash_loads_compressed_tensors_draft(tmp_path, dist_init):
+    from torch import nn
+
+    from vllm.config import LoadConfig, ModelConfig, SpeculativeConfig, VllmConfig
+    from vllm.config.parallel import ParallelConfig
+    from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+
+    hidden_size = 16
+    transformer_config = {
+        "model_type": "qwen3",
+        "architectures": ["Qwen3ForCausalLM"],
+        "hidden_size": hidden_size,
+        "intermediate_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "vocab_size": 64,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
+    }
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    target_path.mkdir()
+    draft_path.mkdir()
+    (target_path / "config.json").write_text(json.dumps(transformer_config))
+    draft_config = {
+        "speculators_model_type": "dspark",
+        "architectures": ["Qwen3DSparkModel"],
+        "transformer_layer_config": transformer_config,
+        "speculators_config": {
+            "proposal_methods": [{"speculative_tokens": 2}],
+            "verifier": {"name_or_path": str(target_path)},
+        },
+        "aux_hidden_state_layer_ids": [1],
+        "target_hidden_size": hidden_size,
+        "draft_vocab_size": 64,
+        "mask_token_id": 63,
+        "markov_rank": 4,
+        "markov_head_type": "vanilla",
+        "block_size": 2,
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "strategy": "channel",
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "strategy": "token",
+                        "symmetric": True,
+                        "dynamic": True,
+                    },
+                }
+            },
+        },
+    }
+    (draft_path / "config.json").write_text(json.dumps(draft_config))
+    target_model_config = ModelConfig(
+        model=str(target_path),
+        tokenizer=str(target_path),
+        tokenizer_mode="auto",
+        trust_remote_code=False,
+        dtype="bfloat16",
+        seed=0,
+        skip_tokenizer_init=True,
+        max_model_len=64,
+    )
+    speculative_config = SpeculativeConfig(
+        model=str(draft_path),
+        method="dspark",
+        num_speculative_tokens=2,
+        target_model_config=target_model_config,
+        target_parallel_config=ParallelConfig(),
+    )
+    vllm_config = VllmConfig(
+        model_config=target_model_config,
+        speculative_config=speculative_config,
+        load_config=LoadConfig(load_format="dummy"),
+    )
+    target_model = nn.Module()
+    target_model.model = nn.Module()
+    target_model.model.embed_tokens = nn.Embedding(64, hidden_size)
+    target_model.lm_head = nn.Linear(hidden_size, 64, bias=False)
+
+    draft_model = load_dflash_model(target_model, vllm_config)
+
+    qkv_proj = draft_model.model.layers[0].self_attn.qkv_proj
+    assert qkv_proj.weight.dtype == torch.float8_e4m3fn
+    assert qkv_proj.weight_scale.dtype == torch.float32
 
 
 def test_conv_projections_use_draft_quant_config(monkeypatch):
